@@ -38,6 +38,11 @@ const (
 	JobTypeDiscover JobType = "discover"
 	JobTypeVerify   JobType = "verify"
 	JobTypeDelete   JobType = "delete"
+	// JobTypePatch — emitted by RequestService.Approve when a patch
+	// request transitions to approved. The agent retrieves the wraps
+	// referenced in payload.wraps and writes them to the target
+	// provider, then marks the job complete.
+	JobTypePatch JobType = "patch"
 )
 
 // JobStatus is constrained by a CHECK in the schema.

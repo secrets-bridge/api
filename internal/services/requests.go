@@ -30,6 +30,13 @@ import (
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
+// JobEnqueuer is the slice of *JobService that RequestService needs.
+// Decoupling the type lets the test harness inject a fake without
+// dragging audit + repo plumbing.
+type JobEnqueuer interface {
+	Enqueue(ctx context.Context, req EnqueueRequest) (*storage.SyncJob, error)
+}
+
 // RequestService orchestrates the patch-request lifecycle.
 type RequestService struct {
 	requests  storage.AccessRequestRepository
@@ -38,10 +45,14 @@ type RequestService struct {
 	workflows storage.WorkflowRepository
 	policy    *PolicyEngine
 	audit     storage.AuditEventRepository
+	jobs      JobEnqueuer
 	now       func() time.Time
 }
 
-// NewRequestService wires a RequestService to its dependencies.
+// NewRequestService wires a RequestService to its dependencies. The
+// jobs argument may be nil — when nil, Approve will not enqueue a
+// follow-up job (useful for the older test harnesses; production
+// always wires a JobService).
 func NewRequestService(
 	requests storage.AccessRequestRepository,
 	approvals storage.ApprovalRepository,
@@ -49,6 +60,7 @@ func NewRequestService(
 	workflows storage.WorkflowRepository,
 	policy *PolicyEngine,
 	audit storage.AuditEventRepository,
+	jobs JobEnqueuer,
 ) *RequestService {
 	return &RequestService{
 		requests:  requests,
@@ -57,6 +69,7 @@ func NewRequestService(
 		workflows: workflows,
 		policy:    policy,
 		audit:     audit,
+		jobs:      jobs,
 		now:       time.Now,
 	}
 }
@@ -256,6 +269,21 @@ func (s *RequestService) Approve(ctx context.Context, requestID uuid.UUID, appro
 				Status:        storage.AuditStatusFailure,
 				CorrelationID: requestID,
 				Metadata:      map[string]any{"error": err.Error(), "phase": "approved"},
+			})
+		}
+
+		// Enqueue the patch job so an agent can pick it up. Same
+		// failure posture as TTL refresh: audit-on-failure but don't
+		// roll back the approval — operators can re-issue the enqueue
+		// out-of-band if the job persistence fails.
+		if err := s.enqueuePatchJob(ctx, req); err != nil {
+			_ = s.audit.Append(ctx, &storage.AuditEvent{
+				Actor:         "user:" + approverID,
+				Action:        "request.enqueue_job_failed",
+				Resource:      "request:" + requestID.String(),
+				Status:        storage.AuditStatusFailure,
+				CorrelationID: requestID,
+				Metadata:      map[string]any{"error": err.Error()},
 			})
 		}
 	}
@@ -461,5 +489,108 @@ func (s *RequestService) refreshWrapsForRequest(ctx context.Context, requestID u
 			return fmt.Errorf("refresh wrap %s: %w", id, err)
 		}
 	}
+	return nil
+}
+
+// OnJobCompleted is the hook RequestService registers on JobService.
+// It transitions the owning access_request to `executed` (on success)
+// or `failed` (on failure) when the completed job was a patch job.
+//
+// Other job types are ignored — patch is the only flow that pins a
+// request lifecycle to a job today.
+//
+// Wired in main.go via `jobSvc.OnCompleted(requestSvc.OnJobCompleted)`.
+func (s *RequestService) OnJobCompleted(ctx context.Context, job *storage.SyncJob) {
+	if job == nil {
+		return
+	}
+	if job.JobType != storage.JobTypePatch || job.RequestID == nil {
+		return
+	}
+	var target storage.AccessRequestStatus
+	switch job.Status {
+	case storage.JobStatusSucceeded:
+		target = storage.AccessRequestStatusExecuted
+	case storage.JobStatusFailed:
+		target = storage.AccessRequestStatusFailed
+	default:
+		return
+	}
+	if err := s.requests.UpdateStatus(ctx, *job.RequestID, target); err != nil {
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:         "system",
+			Action:        "request.transition_failed",
+			Resource:      "request:" + job.RequestID.String(),
+			Status:        storage.AuditStatusFailure,
+			CorrelationID: job.CorrelationID,
+			Metadata: map[string]any{
+				"error":  err.Error(),
+				"target": string(target),
+				"job_id": job.ID.String(),
+			},
+		})
+		return
+	}
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:         "system",
+		Action:        "request.transition",
+		Resource:      "request:" + job.RequestID.String(),
+		Status:        storage.AuditStatusSuccess,
+		CorrelationID: job.CorrelationID,
+		Metadata: map[string]any{
+			"target": string(target),
+			"job_id": job.ID.String(),
+		},
+	})
+}
+
+// enqueuePatchJob creates the patch-type sync_job that an agent will
+// claim to apply the approved changes. The payload carries everything
+// the agent needs except secret values: target provider info, the
+// request id, and an ordered list of {wrap_id, key_name} pairs so the
+// agent can iterate Piece 3c's retrieval endpoint.
+//
+// Sets req.JobID on success so the UI can link request → job.
+func (s *RequestService) enqueuePatchJob(ctx context.Context, req *storage.AccessRequest) error {
+	if s.jobs == nil {
+		return errors.New("services: no JobEnqueuer wired")
+	}
+	summaries, err := s.wraps.ListSummariesForRequest(ctx, req.ID)
+	if err != nil {
+		return fmt.Errorf("list wrap summaries: %w", err)
+	}
+	wraps := make([]map[string]any, 0, len(summaries))
+	for _, sm := range summaries {
+		wraps = append(wraps, map[string]any{
+			"wrap_id":  sm.ID.String(),
+			"key_name": sm.KeyName,
+		})
+	}
+
+	payload := map[string]any{
+		"request_id":             req.ID.String(),
+		"target_provider_type":   req.TargetProviderType,
+		"target_provider_config": req.TargetProviderConfig,
+		"target_secret_ref":      req.TargetSecretRef,
+		"target_keys":            req.TargetKeys,
+		"target_scope":           req.TargetScope,
+		"wraps":                  wraps,
+	}
+
+	reqID := req.ID
+	job, err := s.jobs.Enqueue(ctx, EnqueueRequest{
+		JobType:       storage.JobTypePatch,
+		AgentScope:    map[string]any{},
+		Payload:       payload,
+		RequestID:     &reqID,
+		CorrelationID: reqID,
+	})
+	if err != nil {
+		return fmt.Errorf("enqueue patch job: %w", err)
+	}
+	if err := s.requests.SetJobID(ctx, req.ID, job.ID); err != nil {
+		return fmt.Errorf("set request job_id: %w", err)
+	}
+	req.JobID = &job.ID
 	return nil
 }

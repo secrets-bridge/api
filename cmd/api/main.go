@@ -174,7 +174,10 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	jobSvc := services.NewJobService(jobRepo, auditRepo)
 	wrapSvc := services.NewWrapService(wrapRepo, auditRepo, km)
 	policyEng := services.NewPolicyEngine(policyRepo, workflowRepo)
-	requestSvc := services.NewRequestService(requestRepo, approvalRepo, wrapSvc, workflowRepo, policyEng, auditRepo)
+	requestSvc := services.NewRequestService(requestRepo, approvalRepo, wrapSvc, workflowRepo, policyEng, auditRepo, jobSvc)
+	// Wire the back-edge: when a patch job terminates, RequestService
+	// transitions the owning access_request to executed/failed.
+	jobSvc.OnCompleted(requestSvc.OnJobCompleted)
 
 	agentsH := handlers.NewAgents(agentSvc)
 	jobsH := handlers.NewJobs(jobSvc)
