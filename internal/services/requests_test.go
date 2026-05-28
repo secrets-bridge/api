@@ -21,12 +21,14 @@ import (
 type requestHarness struct {
 	requests *services.RequestService
 	wraps    *services.WrapService
+	jobs     *services.JobService
 	pool     *storage.Pool
 	requestsR *storage.AccessRequests
 	approvalsR *storage.Approvals
 	workflowsR *storage.Workflows
 	policiesR  *storage.Policies
 	wrapsR     *storage.SecretWraps
+	jobsR      *storage.SyncJobs
 }
 
 func bootstrapRequests(t *testing.T) *requestHarness {
@@ -51,6 +53,7 @@ func bootstrapRequests(t *testing.T) *requestHarness {
 	// because of its append-only triggers.
 	const wipe = `
 		DELETE FROM approvals;
+		DELETE FROM sync_jobs;
 		DELETE FROM secret_wraps;
 		DELETE FROM access_requests;
 		DELETE FROM policy_rules WHERE is_system = false;
@@ -79,20 +82,25 @@ func bootstrapRequests(t *testing.T) *requestHarness {
 	approvalsR := storage.NewApprovals(pool)
 	workflowsR := storage.NewWorkflows(pool)
 	policiesR := storage.NewPolicies(pool)
+	jobsR := storage.NewSyncJobs(pool)
 
 	wrapSvc := services.NewWrapService(wrapsR, auditR, km)
 	policy := services.NewPolicyEngine(policiesR, workflowsR)
-	reqSvc := services.NewRequestService(requestsR, approvalsR, wrapSvc, workflowsR, policy, auditR)
+	jobSvc := services.NewJobService(jobsR, auditR)
+	reqSvc := services.NewRequestService(requestsR, approvalsR, wrapSvc, workflowsR, policy, auditR, jobSvc)
+	jobSvc.OnCompleted(reqSvc.OnJobCompleted)
 
 	return &requestHarness{
 		requests:   reqSvc,
 		wraps:      wrapSvc,
+		jobs:       jobSvc,
 		pool:       pool,
 		requestsR:  requestsR,
 		approvalsR: approvalsR,
 		workflowsR: workflowsR,
 		policiesR:  policiesR,
 		wrapsR:     wrapsR,
+		jobsR:      jobsR,
 	}
 }
 

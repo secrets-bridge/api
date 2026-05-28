@@ -12,19 +12,35 @@ import (
 )
 
 // JobService owns the admin-enqueue and agent claim/complete flows.
+// JobCompletedHook is fired AFTER a job's terminal Complete succeeds.
+// It receives the freshly loaded job row so the hook can branch on
+// job_type. The hook runs synchronously inside Complete; errors are
+// surfaced to telemetry via the hook's own audit emission — the
+// completion itself is durable regardless.
+type JobCompletedHook func(ctx context.Context, job *storage.SyncJob)
+
 type JobService struct {
-	jobs      storage.SyncJobRepository
-	audit     storage.AuditEventRepository
-	claimLease time.Duration
+	jobs        storage.SyncJobRepository
+	audit       storage.AuditEventRepository
+	claimLease  time.Duration
+	onCompleted JobCompletedHook
 }
 
 // NewJobService binds a JobService to its repositories.
 func NewJobService(jobs storage.SyncJobRepository, audit storage.AuditEventRepository) *JobService {
 	return &JobService{
-		jobs:      jobs,
-		audit:     audit,
+		jobs:       jobs,
+		audit:      audit,
 		claimLease: 30 * time.Second,
 	}
+}
+
+// OnCompleted installs a hook fired after every terminal Complete
+// call. Pass nil to clear. Useful for downstream state machines (e.g.
+// RequestService transitioning access_request status when its patch
+// job finishes).
+func (s *JobService) OnCompleted(hook JobCompletedHook) {
+	s.onCompleted = hook
 }
 
 // EnqueueRequest is the shape admins post when creating a job. RequestID
@@ -131,6 +147,16 @@ func (s *JobService) Complete(ctx context.Context, agentID uuid.UUID, req Comple
 			"job_status": string(req.Status),
 		},
 	})
+
+	// Fire the post-complete hook (RequestService listens for patch
+	// jobs to flip access_request.status). Loading the job row here is
+	// cheap and gives the hook the full context it needs without
+	// piling more parameters on the public Complete signature.
+	if s.onCompleted != nil {
+		if job, err := s.jobs.Get(ctx, req.JobID); err == nil {
+			s.onCompleted(ctx, job)
+		}
+	}
 	return nil
 }
 
