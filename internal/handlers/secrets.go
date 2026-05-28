@@ -192,11 +192,11 @@ func filterFromQuery(c fiber.Ctx) storage.SecretsListFilter {
 // the multi-value variant.
 func labelQueryValues(c fiber.Ctx) []string {
 	out := []string{}
-	c.RequestCtx().QueryArgs().VisitAll(func(k, v []byte) {
+	for k, v := range c.RequestCtx().QueryArgs().All() {
 		if string(k) == "label" {
 			out = append(out, string(v))
 		}
-	})
+	}
 	return out
 }
 
