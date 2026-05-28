@@ -5,6 +5,9 @@ package services_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -202,11 +205,112 @@ func TestHeartbeat_CachesLastSeenInRedis(t *testing.T) {
 
 	scanCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	keys, _, err := rdb.Raw().Scan(scanCtx, 0, "*:agent:lastseen:"+minted.ID.String(), 10).Result()
+	keys, _, err := rdb.Raw().Scan(scanCtx, 0, "*:agent-lastseen:"+minted.ID.String(), 10).Result()
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
 	if len(keys) == 0 {
 		t.Fatal("Heartbeat did not write last-seen to Redis")
 	}
+}
+
+// TestHeartbeat_ColdCachePrimes verifies the first heartbeat populates
+// the secret-hash cache so subsequent calls can serve from Redis.
+func TestHeartbeat_ColdCachePrimes(t *testing.T) {
+	svc, _, rdb := bootstrap(t)
+	ctx := t.Context()
+	minted, _ := svc.Mint(ctx, "agent", nil)
+
+	// Cache should be empty before the first heartbeat.
+	if cached := scanCacheKey(t, rdb, "*:agent-hash:"+minted.ID.String()); cached != 0 {
+		t.Fatalf("expected cold cache, found %d entries", cached)
+	}
+	if err := svc.Heartbeat(ctx, minted.ID, minted.AgentSecret); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	// First heartbeat should have primed the cache.
+	if cached := scanCacheKey(t, rdb, "*:agent-hash:"+minted.ID.String()); cached != 1 {
+		t.Fatalf("expected primed cache, found %d entries", cached)
+	}
+}
+
+// TestHeartbeat_UsesCachedHashWhenWarm verifies the validation path
+// can serve from Redis without touching Postgres. We simulate that by
+// poisoning the cache with a known hash and confirming heartbeat with
+// THAT hash's plaintext succeeds — proving the cache was consulted.
+func TestHeartbeat_UsesCachedHashWhenWarm(t *testing.T) {
+	svc, _, rdb := bootstrap(t)
+	ctx := t.Context()
+	minted, _ := svc.Mint(ctx, "agent", nil)
+
+	// First heartbeat to prime the cache and confirm it works.
+	if err := svc.Heartbeat(ctx, minted.ID, minted.AgentSecret); err != nil {
+		t.Fatalf("first heartbeat: %v", err)
+	}
+
+	// Hand-deliver a poisoned cache entry mapping the agent ID to a
+	// different secret. If the validation path still consulted
+	// Postgres on every call, the original secret would still work.
+	// With the cache, the original secret should now FAIL.
+	poisonSecret := "completely-different-secret"
+	poisonHash := sha256.Sum256([]byte(poisonSecret))
+	poisonPayload, _ := json.Marshal(map[string]any{
+		"status": "active",
+		"hash":   base64.StdEncoding.EncodeToString(poisonHash[:]),
+	})
+	cacheKey := rdb.Key("agent-hash", minted.ID.String())
+	if _, err := rdb.Raw().Set(ctx, cacheKey, poisonPayload, time.Minute).Result(); err != nil {
+		t.Fatalf("poison: %v", err)
+	}
+
+	// Real secret now fails — proves cache served the lookup.
+	if err := svc.Heartbeat(ctx, minted.ID, minted.AgentSecret); !errors.Is(err, storage.ErrUnauthorized) {
+		t.Fatalf("expected ErrUnauthorized via poisoned cache, got %v", err)
+	}
+	// Poisoned secret succeeds — same proof, other direction.
+	if err := svc.Heartbeat(ctx, minted.ID, poisonSecret); err != nil {
+		t.Fatalf("poisoned cache entry should accept the matching plaintext: %v", err)
+	}
+}
+
+// TestRevoke_InvalidatesCache is the SECURITY-CRITICAL test: revoke
+// must immediately delete the cached hash so the next heartbeat fails
+// even though the cache TTL hasn't expired.
+func TestRevoke_InvalidatesCache(t *testing.T) {
+	svc, _, rdb := bootstrap(t)
+	ctx := t.Context()
+	minted, _ := svc.Mint(ctx, "agent", nil)
+
+	// Prime the cache with a successful heartbeat.
+	if err := svc.Heartbeat(ctx, minted.ID, minted.AgentSecret); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	if cached := scanCacheKey(t, rdb, "*:agent-hash:"+minted.ID.String()); cached != 1 {
+		t.Fatalf("expected primed cache, found %d entries", cached)
+	}
+
+	// Revoke through the service — the only correct revocation path.
+	if err := svc.Revoke(ctx, minted.ID); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+
+	// Cache must be gone IMMEDIATELY — not waiting for TTL.
+	if cached := scanCacheKey(t, rdb, "*:agent-hash:"+minted.ID.String()); cached != 0 {
+		t.Fatalf("Revoke did not invalidate cache; %d entries remain", cached)
+	}
+	// And the next heartbeat must fail even though the secret is
+	// (was) correct. Without invalidation this would succeed for up
+	// to the TTL.
+	if err := svc.Heartbeat(ctx, minted.ID, minted.AgentSecret); !errors.Is(err, storage.ErrUnauthorized) {
+		t.Fatalf("post-revoke heartbeat must reject; got %v", err)
+	}
+}
+
+func scanCacheKey(t *testing.T, rdb *runtime.Client, pattern string) int {
+	t.Helper()
+	keys, _, err := rdb.Raw().Scan(t.Context(), 0, pattern, 100).Result()
+	if err != nil {
+		t.Fatalf("Scan %q: %v", pattern, err)
+	}
+	return len(keys)
 }
