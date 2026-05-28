@@ -29,6 +29,22 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: secrets_bridge
+          POSTGRES_PASSWORD: devpass
+          POSTGRES_DB: secrets_bridge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U secrets_bridge -d secrets_bridge_test"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://secrets_bridge:devpass@localhost:5432/secrets_bridge_test?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
