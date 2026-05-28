@@ -260,6 +260,10 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// Handlers downstream simply read it via middleware.AgentIDFromContext.
 	agentRoutes := v1.Group("/agents/:id", middleware.AgentAuth(agentSvc))
 	agentRoutes.Post("/heartbeat", agentsH.Heartbeat)
+	// Agent self-registers its X25519 public key after generating
+	// the keypair at startup. Idempotent. Lets existing minted
+	// agents opt into the sealed-wire path without an admin re-mint.
+	agentRoutes.Put("/public-key", agentsH.SetPublicKey)
 	agentRoutes.Post("/jobs/claim", jobsH.Claim)
 	agentRoutes.Post("/jobs/:job/complete", jobsH.Complete)
 	// Single-shot wrap retrieval. RetrieveWrap requires the owning

@@ -64,6 +64,11 @@ type AgentRepository interface {
 
 	// UpdateStatus transitions an agent to a new status.
 	UpdateStatus(ctx context.Context, id uuid.UUID, status AgentStatus) error
+
+	// UpdatePublicKey upserts an agent's X25519 public key. Used by
+	// the agent self-registration endpoint so an existing minted
+	// agent can flip into the sealed-wire path without a re-mint.
+	UpdatePublicKey(ctx context.Context, id uuid.UUID, publicKey []byte, algorithm string) error
 }
 
 // ErrUnauthorized is returned when authentication material is presented
@@ -183,6 +188,25 @@ func (r *Agents) UpdateStatus(ctx context.Context, id uuid.UUID, status AgentSta
 	tag, err := r.pool.Exec(ctx, q, id, status)
 	if err != nil {
 		return fmt.Errorf("storage: update agent status: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdatePublicKey upserts the agent's wire-envelope public key. Used
+// by the agent self-registration endpoint so existing agents can opt
+// into the sealed-wire path without an admin re-mint.
+func (r *Agents) UpdatePublicKey(ctx context.Context, id uuid.UUID, publicKey []byte, algorithm string) error {
+	const q = `
+		UPDATE agents
+		SET public_key = $2,
+		    public_key_algorithm = NULLIF($3, '')
+		WHERE id = $1`
+	tag, err := r.pool.Exec(ctx, q, id, publicKey, algorithm)
+	if err != nil {
+		return fmt.Errorf("storage: update agent public key: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
