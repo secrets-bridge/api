@@ -83,20 +83,24 @@ func main() {
 		logger.Error("runtime open", "error", err)
 		os.Exit(1)
 	}
-	bootCancel()
 	defer func() {
 		_ = rdb.Close()
 		pool.Close()
 	}()
 
-	// KMS bootstrap. Required for wrap encryption; without it the patch
-	// flow cannot accept secret values. Same fail-fast posture as
-	// storage and runtime.
-	km, err := keymgmt.NewLocalKMSFromEnv()
+	// KMS bootstrap. Backend chosen via SB_KMS_BACKEND env var:
+	//   - "local" (default): SB_WRAP_MASTER_KEY env var. Dev / single-node.
+	//   - "vault-transit":   SB_KMS_VAULT_* env vars. OSS-first prod.
+	// Same fail-fast posture as storage and runtime — the CP refuses to
+	// start without a working KeyManager. Reuses bootCtx so the timeout
+	// covers vault-transit's auth handshake too.
+	km, err := keymgmt.FromEnv(bootCtx)
+	bootCancel()
 	if err != nil {
 		logger.Error("keymgmt bootstrap", "error", err)
 		os.Exit(1)
 	}
+	logger.Info("keymgmt backend ready", "key_id", km.CurrentKeyID())
 
 	app := newApp(cfg, logger, pool, rdb, km)
 
