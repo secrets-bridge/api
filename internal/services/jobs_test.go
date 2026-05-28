@@ -61,7 +61,7 @@ func bootstrapJobs(t *testing.T) (*services.JobService, *services.AgentService, 
 
 func mintAgent(t *testing.T, agents *services.AgentService, name string) uuid.UUID {
 	t.Helper()
-	m, err := agents.Mint(t.Context(), name, nil)
+	m, err := agents.Mint(t.Context(), services.MintInput{Name: name})
 	if err != nil {
 		t.Fatalf("Mint %s: %v", name, err)
 	}

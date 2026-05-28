@@ -90,13 +90,33 @@ type MintedAgent struct {
 	AgentSecret string
 }
 
+// MintInput captures everything Mint accepts. PublicKey is optional;
+// when present (Piece 8b agents that ran key generation at startup),
+// the CP will SEAL wrap retrieval responses to that key instead of
+// returning plaintext-over-TLS.
+type MintInput struct {
+	Name               string
+	Scope              map[string]any
+	PublicKey          []byte
+	PublicKeyAlgorithm string // "x25519" today; future schemes slot in
+}
+
 // Mint creates a new agent and returns its long-lived credential. The
 // returned struct should be handed to the agent through whatever
 // secret-distribution mechanism the deployment uses (mounted K8s
 // Secret, env vars, SOPS-encrypted Helm values).
-func (s *AgentService) Mint(ctx context.Context, name string, scope map[string]any) (*MintedAgent, error) {
-	if name == "" {
+func (s *AgentService) Mint(ctx context.Context, in MintInput) (*MintedAgent, error) {
+	if in.Name == "" {
 		return nil, errors.New("agents: name is required")
+	}
+	if len(in.PublicKey) > 0 && in.PublicKeyAlgorithm == "" {
+		return nil, errors.New("agents: public_key_algorithm is required when public_key is provided")
+	}
+	if in.PublicKeyAlgorithm != "" && in.PublicKeyAlgorithm != "x25519" {
+		return nil, fmt.Errorf("agents: unsupported public_key_algorithm %q", in.PublicKeyAlgorithm)
+	}
+	if in.PublicKeyAlgorithm == "x25519" && len(in.PublicKey) != 32 {
+		return nil, fmt.Errorf("agents: x25519 public key must be 32 bytes, got %d", len(in.PublicKey))
 	}
 
 	secretBytes, err := randomBytes(32)
@@ -107,21 +127,27 @@ func (s *AgentService) Mint(ctx context.Context, name string, scope map[string]a
 	hash := sha256.Sum256([]byte(secret))
 
 	agent := &storage.Agent{
-		Name:       name,
-		Scope:      scope,
-		Status:     storage.AgentStatusActive,
-		SecretHash: hash[:],
+		Name:               in.Name,
+		Scope:              in.Scope,
+		Status:             storage.AgentStatusActive,
+		SecretHash:         hash[:],
+		PublicKey:          in.PublicKey,
+		PublicKeyAlgorithm: in.PublicKeyAlgorithm,
 	}
 	if err := s.agents.Create(ctx, agent); err != nil {
 		return nil, fmt.Errorf("agents: create: %w", err)
 	}
 
+	meta := map[string]any{"name": in.Name}
+	if len(in.PublicKey) > 0 {
+		meta["public_key_algorithm"] = in.PublicKeyAlgorithm
+	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
 		Actor:    "admin", // wired to real auth in #10
 		Action:   "agent.mint",
 		Resource: "agent:" + agent.ID.String(),
 		Status:   storage.AuditStatusSuccess,
-		Metadata: map[string]any{"name": name},
+		Metadata: meta,
 	})
 
 	return &MintedAgent{

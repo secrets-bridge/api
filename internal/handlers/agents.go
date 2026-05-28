@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/base64"
 	"errors"
 	"strings"
 
@@ -20,10 +21,15 @@ type Agents struct {
 // NewAgents binds an Agents handler to its service.
 func NewAgents(svc *services.AgentService) *Agents { return &Agents{svc: svc} }
 
-// MintRequest is the body of POST /api/v1/agents.
+// MintRequest is the body of POST /api/v1/agents. PublicKey is the
+// agent's X25519 public key, base64-encoded. When present, the CP
+// SEALS wrap retrieval responses to this key (Piece 8b); when absent,
+// the CP falls back to plaintext-over-TLS (backwards compat).
 type MintRequest struct {
-	Name  string         `json:"name"`
-	Scope map[string]any `json:"scope,omitempty"`
+	Name               string         `json:"name"`
+	Scope              map[string]any `json:"scope,omitempty"`
+	PublicKey          string         `json:"public_key,omitempty"`           // base64
+	PublicKeyAlgorithm string         `json:"public_key_algorithm,omitempty"` // "x25519" today
 }
 
 // MintResponse is returned by POST /api/v1/agents. The agent_secret is
@@ -47,7 +53,19 @@ func (h *Agents) Mint(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "name is required")
 	}
 
-	minted, err := h.svc.Mint(c.Context(), req.Name, req.Scope)
+	in := services.MintInput{Name: req.Name, Scope: req.Scope}
+	if req.PublicKey != "" {
+		pk, err := base64.StdEncoding.DecodeString(req.PublicKey)
+		if err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, "public_key is not valid base64: "+err.Error())
+		}
+		in.PublicKey = pk
+		in.PublicKeyAlgorithm = req.PublicKeyAlgorithm
+		if in.PublicKeyAlgorithm == "" {
+			in.PublicKeyAlgorithm = "x25519"
+		}
+	}
+	minted, err := h.svc.Mint(c.Context(), in)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
