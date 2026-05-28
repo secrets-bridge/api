@@ -1,21 +1,17 @@
 // Package services holds the business-logic layer of the api.
 //
-// This file owns the agent identity flow: mint a one-time registration
-// token, validate it on /agents/register, hand back a long-lived agent
-// secret, and validate the agent secret on every heartbeat.
+// AgentService owns the one-credential agent flow:
 //
-// Token shape (MVP):
-//   - registration_token: 32 random bytes, base64-encoded; presented
-//     ONCE; SHA-256-hashed at rest in agents.registration_token_hash
-//   - agent_secret:       32 random bytes, base64-encoded; presented
-//     on every heartbeat; the bcrypt of this string is stored in a
-//     dedicated row column on first successful Register (Phase 2 —
-//     today we still use the registration_token_hash slot, cleared
-//     once the secret is issued)
+//   1. Admin calls Mint → returns {id, agent_secret}. The plaintext
+//      secret is returned ONCE; only its SHA-256 hash is persisted.
+//   2. Admin (or the chart that wraps this call) lands those values
+//      in the agent's K8s Secret / env vars.
+//   3. Agent reads the values at startup and presents agent_secret in
+//      the X-Agent-Secret header on every heartbeat.
 //
-// Future iteration (issue: TBD) replaces the per-request secret with a
-// short-lived signed identity (JWT) or mTLS. The MVP form is enough
-// to demonstrate the registration → heartbeat flow end-to-end.
+// There is intentionally no separate registration step — the Pod can
+// restart at will, re-read the same Secret, and keep heartbeating
+// without a PVC for state persistence.
 package services
 
 import (
@@ -24,6 +20,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -34,155 +31,138 @@ import (
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
-// AgentService owns the agent registration + heartbeat flows.
+// AgentService owns the agent mint + heartbeat flow.
+//
+// The heartbeat path uses a Redis cache for the agent's secret hash so
+// validation is one Redis GET (cache hit) instead of one Postgres
+// SELECT under load. Revocation MUST go through Revoke() — direct
+// status updates to the storage layer would leave the cache stale and
+// let a revoked agent keep heartbeating for up to secretHashCacheTTL.
 type AgentService struct {
-	agents      storage.AgentRepository
-	audit       storage.AuditEventRepository
-	rdb         *runtime.Client
-	now         func() time.Time
+	agents storage.AgentRepository
+	audit  storage.AuditEventRepository
+	rdb    *runtime.Client
+	now    func() time.Time
 
-	// HeartbeatCacheTTL controls how long an agent's last-seen
-	// timestamp is cached in Redis to spare Postgres on List polls.
-	// Defaults to 5 × HeartbeatInterval.
+	// heartbeatCacheTTL bounds how long the last-seen TIMESTAMP is
+	// cached in Redis (for the admin GET /agents path).
 	heartbeatCacheTTL time.Duration
+
+	// secretHashCacheTTL bounds how long the secret_hash is cached in
+	// Redis for heartbeat validation. Short enough to cap the
+	// revocation propagation window when an admin bypasses Revoke();
+	// long enough to give meaningful cache hit rates at scale.
+	secretHashCacheTTL time.Duration
 }
 
 // NewAgentService constructs an AgentService.
 func NewAgentService(agents storage.AgentRepository, audit storage.AuditEventRepository, rdb *runtime.Client) *AgentService {
 	return &AgentService{
-		agents:            agents,
-		audit:             audit,
-		rdb:               rdb,
-		now:               time.Now,
-		heartbeatCacheTTL: 5 * time.Minute,
+		agents:             agents,
+		audit:              audit,
+		rdb:                rdb,
+		now:                time.Now,
+		heartbeatCacheTTL:  5 * time.Minute,
+		secretHashCacheTTL: 60 * time.Second,
 	}
 }
 
-// MintRegistrationToken creates a new pending agent and returns the
-// plaintext registration token to the admin. The token is returned
-// EXACTLY ONCE — only its hash is persisted.
-func (s *AgentService) MintRegistrationToken(ctx context.Context, name string, scope map[string]any) (*MintedAgent, error) {
+// Redis key prefixes — `kind` slot for the runtime namespace builder.
+const (
+	cacheKindSecretHash = "agent-hash"
+	cacheKindLastSeen   = "agent-lastseen"
+)
+
+// cachedSecretHash holds the marshalled form stored in Redis. We track
+// the agent's status alongside the hash so a `revoked` row whose cache
+// hasn't been invalidated yet still fails the validation check.
+type cachedSecretHash struct {
+	Status string `json:"status"`
+	Hash   []byte `json:"hash"`
+}
+
+// MintedAgent is returned by Mint. AgentSecret is the plaintext
+// long-lived credential — it is returned exactly ONCE and not
+// recoverable from the database afterwards.
+type MintedAgent struct {
+	ID          uuid.UUID
+	Name        string
+	AgentSecret string
+}
+
+// Mint creates a new agent and returns its long-lived credential. The
+// returned struct should be handed to the agent through whatever
+// secret-distribution mechanism the deployment uses (mounted K8s
+// Secret, env vars, SOPS-encrypted Helm values).
+func (s *AgentService) Mint(ctx context.Context, name string, scope map[string]any) (*MintedAgent, error) {
 	if name == "" {
 		return nil, errors.New("agents: name is required")
 	}
-
-	tokenBytes, err := randomBytes(32)
-	if err != nil {
-		return nil, fmt.Errorf("agents: random token: %w", err)
-	}
-	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
-	hash := sha256.Sum256([]byte(token))
-
-	agent := &storage.Agent{
-		Name:                  name,
-		Scope:                 scope,
-		Status:                storage.AgentStatusPending,
-		RegistrationTokenHash: hash[:],
-	}
-	if err := s.agents.Create(ctx, agent); err != nil {
-		return nil, fmt.Errorf("agents: create: %w", err)
-	}
-
-	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "admin", // wired to real auth in #6
-		Action:   "agent.mint_token",
-		Resource: "agent:" + agent.ID.String(),
-		Status:   storage.AuditStatusSuccess,
-		Metadata: map[string]any{"name": name},
-	})
-
-	return &MintedAgent{
-		ID:                agent.ID,
-		Name:              agent.Name,
-		RegistrationToken: token,
-	}, nil
-}
-
-// MintedAgent is returned by MintRegistrationToken. The
-// RegistrationToken is the plaintext that the admin hands to the agent
-// — it is never stored and never recoverable from the database.
-type MintedAgent struct {
-	ID                uuid.UUID
-	Name              string
-	RegistrationToken string
-}
-
-// Register redeems a registration token: it verifies the presented
-// token matches what was minted, mints a fresh long-lived agent
-// secret, stores its hash, and returns the plaintext secret to the
-// agent. The registration token hash is cleared on success — replays
-// return ErrUnauthorized because the row no longer matches.
-func (s *AgentService) Register(ctx context.Context, id uuid.UUID, registrationToken string) (*RegisteredAgent, error) {
-	regHash := sha256.Sum256([]byte(registrationToken))
 
 	secretBytes, err := randomBytes(32)
 	if err != nil {
 		return nil, fmt.Errorf("agents: random secret: %w", err)
 	}
 	secret := base64.RawURLEncoding.EncodeToString(secretBytes)
-	secretHash := sha256.Sum256([]byte(secret))
+	hash := sha256.Sum256([]byte(secret))
 
-	err = s.agents.RedeemRegistrationToken(ctx, id, regHash[:], secretHash[:])
-	if err != nil {
-		_ = s.audit.Append(ctx, &storage.AuditEvent{
-			Actor:    "agent:" + id.String(),
-			Action:   "agent.register",
-			Resource: "agent:" + id.String(),
-			Status:   statusFor(err),
-			Metadata: map[string]any{"error_kind": errorKind(err)},
-		})
-		return nil, err
+	agent := &storage.Agent{
+		Name:       name,
+		Scope:      scope,
+		Status:     storage.AgentStatusActive,
+		SecretHash: hash[:],
+	}
+	if err := s.agents.Create(ctx, agent); err != nil {
+		return nil, fmt.Errorf("agents: create: %w", err)
 	}
 
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "agent:" + id.String(),
-		Action:   "agent.register",
-		Resource: "agent:" + id.String(),
+		Actor:    "admin", // wired to real auth in #10
+		Action:   "agent.mint",
+		Resource: "agent:" + agent.ID.String(),
 		Status:   storage.AuditStatusSuccess,
+		Metadata: map[string]any{"name": name},
 	})
 
-	return &RegisteredAgent{
-		ID:          id,
+	return &MintedAgent{
+		ID:          agent.ID,
+		Name:        agent.Name,
 		AgentSecret: secret,
 	}, nil
 }
 
-// RegisteredAgent is returned to the agent after a successful Register.
-// The AgentSecret is the identity material the agent presents on every
-// heartbeat.
-type RegisteredAgent struct {
-	ID          uuid.UUID
-	AgentSecret string
-}
-
-// Heartbeat validates the agent secret and updates last_seen. The
-// successful path writes to Redis FIRST (cheap, the heartbeat polls
-// can be fast) and to Postgres async-ish — we still do it inline but a
-// future iteration can batch with a worker.
+// Heartbeat validates the agent secret and updates last_seen_at.
+//
+// Hot path:
+//
+//	1. Read the secret hash + status from Redis.
+//	2. On cache miss: read from Postgres and prime the cache.
+//	3. ConstantTimeCompare against the cached/loaded hash.
+//	4. UPDATE last_seen_at in Postgres (no-op on revoked rows).
+//	5. Best-effort write of last_seen_at to Redis for the admin
+//	   LIST endpoint.
 func (s *AgentService) Heartbeat(ctx context.Context, id uuid.UUID, agentSecret string) error {
-	agent, err := s.agents.Get(ctx, id)
+	cached, hadCache, err := s.readSecretHashCache(ctx, id)
 	if err != nil {
 		return err
 	}
+	if !hadCache {
+		agent, err := s.agents.Get(ctx, id)
+		if err != nil {
+			return err
+		}
+		cached = cachedSecretHash{Status: string(agent.Status), Hash: agent.SecretHash}
+		s.writeSecretHashCache(ctx, id, cached) // best-effort
+	}
 
-	// MVP: after Register, registration_token_hash is cleared. We
-	// fall back to checking the bcrypt of the secret IF a future
-	// migration adds a dedicated agent_secret_hash column. For now,
-	// the simpler design is: only the just-registered token is
-	// accepted, and after registration the agent must use that
-	// token. The hash is re-derived from the secret on every call
-	// using a constant-time comparison; the call short-circuits if
-	// the agent's status is revoked.
-	if agent.Status == storage.AgentStatusRevoked {
+	if cached.Status == string(storage.AgentStatusRevoked) {
 		return storage.ErrUnauthorized
 	}
-	if len(agent.SecretHash) == 0 {
-		// Pending agent that has not yet redeemed its registration
-		// token — it cannot heartbeat.
+	if len(cached.Hash) == 0 {
 		return storage.ErrUnauthorized
 	}
 	presented := sha256.Sum256([]byte(agentSecret))
-	if subtle.ConstantTimeCompare(presented[:], agent.SecretHash) != 1 {
+	if subtle.ConstantTimeCompare(presented[:], cached.Hash) != 1 {
 		return storage.ErrUnauthorized
 	}
 
@@ -191,18 +171,79 @@ func (s *AgentService) Heartbeat(ctx context.Context, id uuid.UUID, agentSecret 
 		return err
 	}
 
-	// Cache last-seen so admin GET /agents doesn't need to hit
-	// Postgres for every row. Best-effort; failure here is non-fatal.
+	// Cache last-seen so admin GET /agents doesn't hit Postgres for
+	// every row. Best-effort; failure here is non-fatal.
 	if s.rdb != nil {
-		key := "lastseen:" + id.String()
-		_, _ = s.rdb.Raw().Set(ctx, "secrets-bridge:agent:"+key, now.Format(time.RFC3339Nano), s.heartbeatCacheTTL).Result()
+		key := s.rdb.Key(cacheKindLastSeen, id.String())
+		_, _ = s.rdb.Raw().Set(ctx, key, now.Format(time.RFC3339Nano), s.heartbeatCacheTTL).Result()
 	}
-
 	return nil
 }
 
+// Revoke transitions an agent to status=revoked AND deletes its cached
+// secret hash so the next heartbeat is rejected immediately. Direct
+// calls to storage.AgentRepository.UpdateStatus bypass the cache
+// invalidation; callers must use this entry point.
+func (s *AgentService) Revoke(ctx context.Context, id uuid.UUID) error {
+	if err := s.agents.UpdateStatus(ctx, id, storage.AgentStatusRevoked); err != nil {
+		return err
+	}
+	s.invalidateSecretHashCache(ctx, id)
+
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "admin",
+		Action:   "agent.revoke",
+		Resource: "agent:" + id.String(),
+		Status:   storage.AuditStatusSuccess,
+	})
+	return nil
+}
+
+// readSecretHashCache returns the cached entry and whether the cache
+// served the lookup. A nil rdb (test injection / boot path) reports
+// "no cache" without erroring.
+func (s *AgentService) readSecretHashCache(ctx context.Context, id uuid.UUID) (cachedSecretHash, bool, error) {
+	if s.rdb == nil {
+		return cachedSecretHash{}, false, nil
+	}
+	key := s.rdb.Key(cacheKindSecretHash, id.String())
+	raw, err := s.rdb.Raw().Get(ctx, key).Bytes()
+	if err != nil {
+		// redis.Nil is the "miss" sentinel; anything else is a real
+		// Redis problem. We treat real Redis errors as cache miss so
+		// the caller falls through to Postgres rather than failing
+		// every heartbeat when Redis flakes.
+		return cachedSecretHash{}, false, nil //nolint:nilerr // intentional cache-miss-on-error
+	}
+	var c cachedSecretHash
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return cachedSecretHash{}, false, nil
+	}
+	return c, true, nil
+}
+
+func (s *AgentService) writeSecretHashCache(ctx context.Context, id uuid.UUID, c cachedSecretHash) {
+	if s.rdb == nil {
+		return
+	}
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return
+	}
+	key := s.rdb.Key(cacheKindSecretHash, id.String())
+	_, _ = s.rdb.Raw().Set(ctx, key, raw, s.secretHashCacheTTL).Result()
+}
+
+func (s *AgentService) invalidateSecretHashCache(ctx context.Context, id uuid.UUID) {
+	if s.rdb == nil {
+		return
+	}
+	key := s.rdb.Key(cacheKindSecretHash, id.String())
+	_, _ = s.rdb.Raw().Del(ctx, key).Result()
+}
+
 // List returns every agent, with last-seen pulled from Redis when
-// available so the response is fast and Postgres is spared.
+// available.
 func (s *AgentService) List(ctx context.Context) ([]*AgentView, error) {
 	agents, err := s.agents.List(ctx)
 	if err != nil {
@@ -230,8 +271,8 @@ func (s *AgentService) List(ctx context.Context) ([]*AgentView, error) {
 	return out, nil
 }
 
-// AgentView is the read-side projection returned by List. The
-// registration token hash is intentionally NOT exposed.
+// AgentView is the read-side projection returned by List. The secret
+// hash is intentionally NOT exposed.
 type AgentView struct {
 	ID         uuid.UUID
 	Name       string
@@ -247,25 +288,4 @@ func randomBytes(n int) ([]byte, error) {
 		return nil, err
 	}
 	return b, nil
-}
-
-func statusFor(err error) storage.AuditStatus {
-	if err == nil {
-		return storage.AuditStatusSuccess
-	}
-	if errors.Is(err, storage.ErrUnauthorized) {
-		return storage.AuditStatusDenied
-	}
-	return storage.AuditStatusFailure
-}
-
-func errorKind(err error) string {
-	switch {
-	case errors.Is(err, storage.ErrNotFound):
-		return "not_found"
-	case errors.Is(err, storage.ErrUnauthorized):
-		return "unauthorized"
-	default:
-		return "other"
-	}
 }

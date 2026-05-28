@@ -137,3 +137,9 @@ func (c *Client) Raw() *redis.Client { return c.rdb }
 func (c *Client) key(kind, rest string) string {
 	return c.cfg.Namespace + ":" + kind + ":" + rest
 }
+
+// Key is the public exposure of the namespaced-key builder so callers
+// outside this package (the agent + workflow services that need their
+// own kinds — "agent-hash", "agent-lastseen", "approval-cache" — can
+// use the same shape without reaching into the internals.
+func (c *Client) Key(kind, rest string) string { return c.key(kind, rest) }
