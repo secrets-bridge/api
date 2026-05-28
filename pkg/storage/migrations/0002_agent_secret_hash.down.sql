@@ -1,0 +1,5 @@
+BEGIN;
+
+ALTER TABLE agents DROP COLUMN IF EXISTS secret_hash;
+
+COMMIT;
