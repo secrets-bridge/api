@@ -7,6 +7,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
@@ -57,25 +58,27 @@ func (h *Agents) Mint(c fiber.Ctx) error {
 	})
 }
 
-// Heartbeat is the agent's check-in. Authentication is via the agent
-// secret in the X-Agent-Secret header.
+// Heartbeat is the agent's check-in. Authentication is handled by the
+// AgentAuth middleware on the enclosing route group, so the handler
+// simply pulls the authenticated agent ID from context, bumps
+// last_seen_at, and returns 204.
 func (h *Agents) Heartbeat(c fiber.Ctx) error {
-	id, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid agent id")
+	id, ok := middleware.AgentIDFromContext(c.Context())
+	if !ok {
+		return fiber.NewError(fiber.StatusInternalServerError, "agent identity missing in context")
 	}
+	// The header is still required for the service call — the
+	// middleware has already validated it; we re-read so Heartbeat can
+	// touch last_seen_at without a second cache lookup pattern that'd
+	// fork the validation path.
 	secret := c.Get("X-Agent-Secret")
-	if secret == "" {
-		return fiber.NewError(fiber.StatusUnauthorized, "X-Agent-Secret header required")
-	}
-
-	err = h.svc.Heartbeat(c.Context(), id, secret)
-	switch {
-	case errors.Is(err, storage.ErrNotFound):
-		return fiber.NewError(fiber.StatusNotFound, "agent not found")
-	case errors.Is(err, storage.ErrUnauthorized):
-		return fiber.NewError(fiber.StatusUnauthorized, "heartbeat rejected")
-	case err != nil:
+	if err := h.svc.Heartbeat(c.Context(), id, secret); err != nil {
+		switch {
+		case errors.Is(err, storage.ErrNotFound):
+			return fiber.NewError(fiber.StatusNotFound, "agent not found")
+		case errors.Is(err, storage.ErrUnauthorized):
+			return fiber.NewError(fiber.StatusUnauthorized, "heartbeat rejected")
+		}
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 	return c.SendStatus(fiber.StatusNoContent)
