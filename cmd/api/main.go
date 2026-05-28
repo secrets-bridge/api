@@ -169,12 +169,14 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	wrapRepo := storage.NewSecretWraps(pool)
 	requestRepo := storage.NewAccessRequests(pool)
 	approvalRepo := storage.NewApprovals(pool)
+	secretsRepo := storage.NewSecrets(pool)
 
 	agentSvc := services.NewAgentService(agentRepo, auditRepo, rdb)
 	jobSvc := services.NewJobService(jobRepo, auditRepo)
 	wrapSvc := services.NewWrapService(wrapRepo, auditRepo, km)
 	policyEng := services.NewPolicyEngine(policyRepo, workflowRepo)
 	requestSvc := services.NewRequestService(requestRepo, approvalRepo, wrapSvc, workflowRepo, policyEng, auditRepo, jobSvc)
+	secretsSvc := services.NewSecretsService(secretsRepo, auditRepo)
 	// Wire the back-edge: when a patch job terminates, RequestService
 	// transitions the owning access_request to executed/failed.
 	jobSvc.OnCompleted(requestSvc.OnJobCompleted)
@@ -184,6 +186,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	adminH := handlers.NewAdmin(roleRepo, userRoleRepo, workflowRepo, policyRepo)
 	requestsH := handlers.NewRequests(requestSvc)
 	wrapsH := handlers.NewWraps(requestSvc, wrapSvc)
+	secretsH := handlers.NewSecrets(secretsSvc)
 
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
@@ -241,6 +244,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// requester==userID + request.type=read.
 	v1.Get("/requests/:id/wraps/:wrap_id", requestsH.RetrieveWrap)
 
+	// Discovery surface. Admins search the cache via GET; the agent's
+	// DiscoverExecutor upserts batches via the bulk endpoint (under
+	// the AgentAuth group further down).
+	v1.Get("/secrets", secretsH.List)
+	v1.Get("/secrets/:id", secretsH.Get)
+
 	// Agent-side endpoints. The `/agents/:id` sub-group is gated by
 	// the AgentAuth middleware which validates X-Agent-Secret and
 	// stashes the authenticated agent ID in the request context.
@@ -258,6 +267,10 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// plaintext here so the CP envelope-encrypts and persists. The
 	// requester later retrieves through the user-bound endpoint.
 	agentRoutes.Post("/wraps", wrapsH.Create)
+	// Agent-side discovery upload. The agent's DiscoverExecutor calls
+	// core/providers.ListMetadata against the configured provider and
+	// POSTs the batch here; CP upserts into the secrets cache.
+	agentRoutes.Post("/secrets/bulk", secretsH.BulkUpsert)
 
 	return app
 }
