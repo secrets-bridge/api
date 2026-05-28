@@ -155,6 +155,61 @@ func (s *WrapService) Retrieve(ctx context.Context, id, agentID uuid.UUID) ([]by
 	return plaintext, w, nil
 }
 
+// RetrieveByUser is the user-facing counterpart of Retrieve. Same
+// atomic single-shot consume + KMS decrypt, but the consumer is a
+// user (named via userID) rather than an agent. Used by the read
+// flow's user-bound retrieval endpoint.
+func (s *WrapService) RetrieveByUser(ctx context.Context, id uuid.UUID, userID string) ([]byte, *storage.SecretWrap, error) {
+	w, err := s.wraps.Get(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := s.wraps.MarkConsumedByUser(ctx, id, userID, s.now().UTC()); err != nil {
+		s.auditRetrieveOutcomeUser(ctx, userID, id, err)
+		return nil, nil, err
+	}
+
+	dataKey, err := s.kms.DecryptDataKey(ctx, w.DataKeyCiphertext, w.KMSKeyID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("wraps: decrypt data key: %w", err)
+	}
+	defer zero(dataKey)
+
+	plaintext, err := aeadDecrypt(dataKey, w.Nonce, w.EncryptedValue)
+	if err != nil {
+		return nil, nil, fmt.Errorf("wraps: decrypt value: %w", err)
+	}
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "user:" + userID,
+		Action:   "wrap.retrieve",
+		Resource: "wrap:" + id.String(),
+		Status:   storage.AuditStatusSuccess,
+	})
+	return plaintext, w, nil
+}
+
+func (s *WrapService) auditRetrieveOutcomeUser(ctx context.Context, userID string, wrapID uuid.UUID, err error) {
+	status := storage.AuditStatusDenied
+	kind := "other"
+	switch {
+	case errors.Is(err, storage.ErrAlreadyConsumed):
+		kind = "already_consumed"
+	case errors.Is(err, storage.ErrExpired):
+		kind = "expired"
+	case errors.Is(err, storage.ErrNotFound):
+		kind = "not_found"
+	default:
+		status = storage.AuditStatusFailure
+	}
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "user:" + userID,
+		Action:   "wrap.retrieve",
+		Resource: "wrap:" + wrapID.String(),
+		Status:   status,
+		Metadata: map[string]any{"error_kind": kind},
+	})
+}
+
 // Refresh shortens (or extends) the wrap's TTL. Called by the workflow
 // engine on state transitions.
 func (s *WrapService) Refresh(ctx context.Context, id uuid.UUID, newTTL time.Duration) error {
@@ -184,6 +239,21 @@ func (s *WrapService) ListSummariesForRequest(ctx context.Context, requestID uui
 // request_id / key_name before deciding whether to call Retrieve.
 func (s *WrapService) Peek(ctx context.Context, id uuid.UUID) (*storage.SecretWrap, error) {
 	return s.wraps.Get(ctx, id)
+}
+
+// WrapByAgent is the read-flow counterpart of the original Wrap. It's
+// called by the agent-side wrap-creation endpoint after the agent has
+// fetched a value via core/providers.GetValue. The audit Actor is the
+// agent ID so the trail shows which agent produced the wrap.
+//
+// Caller is responsible for zeroing the plaintext slice — Wrap zeros
+// it internally on success, but on error the caller may want a chance
+// to log byte_length / hash before discarding.
+func (s *WrapService) WrapByAgent(ctx context.Context, agentID uuid.UUID, req WrapRequest) (*storage.SecretWrap, error) {
+	if req.Actor == "" {
+		req.Actor = "agent:" + agentID.String()
+	}
+	return s.Wrap(ctx, req)
 }
 
 func (s *WrapService) auditRetrieveOutcome(ctx context.Context, agentID, wrapID uuid.UUID, err error) {

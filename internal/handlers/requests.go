@@ -16,6 +16,8 @@
 package handlers
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"time"
@@ -199,6 +201,120 @@ func (h *Requests) Reject(c fiber.Ctx) error {
 type CancelBody struct {
 	ActorID string `json:"actor_id"`
 }
+
+// ---- read flow -------------------------------------------------------
+
+// SubmitReadRequestBody is the JSON sent by the UI when a user wants
+// to VIEW one or more keys from a provider secret. No values are sent —
+// the agent will fetch them after approval.
+type SubmitReadRequestBody struct {
+	RequesterID          string         `json:"requester_id"`
+	ProjectID            string         `json:"project_id,omitempty"`
+	Environment          string         `json:"environment,omitempty"`
+	TargetProviderType   string         `json:"target_provider_type"`
+	TargetProviderConfig map[string]any `json:"target_provider_config,omitempty"`
+	TargetSecretRef      string         `json:"target_secret_ref"`
+	TargetKeys           []string       `json:"target_keys,omitempty"`
+	Justification        string         `json:"justification"`
+}
+
+// SubmitRead handles POST /requests/read.
+func (h *Requests) SubmitRead(c fiber.Ctx) error {
+	var body SubmitReadRequestBody
+	if err := c.Bind().JSON(&body); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
+	}
+	req, err := h.svc.SubmitRead(c.Context(), services.ReadInput{
+		RequesterID:          body.RequesterID,
+		ProjectID:            body.ProjectID,
+		Environment:          body.Environment,
+		TargetProviderType:   body.TargetProviderType,
+		TargetProviderConfig: body.TargetProviderConfig,
+		TargetSecretRef:      body.TargetSecretRef,
+		TargetKeys:           body.TargetKeys,
+		Justification:        body.Justification,
+	})
+	if err != nil {
+		return requestErr(err)
+	}
+	return c.Status(fiber.StatusCreated).JSON(requestToBody(req))
+}
+
+// RetrieveWrapBody is the JSON returned to the requesting user when
+// retrieving a wrap created by the agent during a read flow.
+type RetrieveWrapBody struct {
+	WrapID      string `json:"wrap_id"`
+	RequestID   string `json:"request_id"`
+	KeyName     string `json:"key_name,omitempty"`
+	Value       string `json:"value"` // base64-encoded plaintext
+	ByteLength  int    `json:"byte_length"`
+	ContentHash string `json:"content_hash"`
+	Algorithm   string `json:"algorithm"`
+}
+
+// RetrieveWrapForUserQuery holds the user identifier the handler needs
+// to authorize the retrieval. Today the user identity comes from a
+// `user_id` query string param — real auth integration replaces this
+// with a middleware-stashed identity later.
+type RetrieveWrapForUserQuery struct {
+	UserID string `json:"user_id"`
+}
+
+// RetrieveWrap handles GET /api/v1/requests/:id/wraps/:wrap_id.
+//
+// Authorization (today): user identity comes from the `user_id` query
+// param. When the auth design lands this swaps to a middleware-stashed
+// identity, but the service-layer check (requester == userID) remains
+// the load-bearing rule.
+func (h *Requests) RetrieveWrap(c fiber.Ctx) error {
+	reqID, err := parseID(c, "id")
+	if err != nil {
+		return err
+	}
+	wrapID, err := parseID(c, "wrap_id")
+	if err != nil {
+		return err
+	}
+	userID := c.Query("user_id")
+	if userID == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "user_id query param required (until auth middleware lands)")
+	}
+
+	plaintext, wrap, err := h.svc.RetrieveWrapForUser(c.Context(), reqID, wrapID, userID)
+	if err != nil {
+		return retrieveUserWrapErr(err)
+	}
+	defer zero(plaintext)
+
+	return c.Status(fiber.StatusOK).JSON(RetrieveWrapBody{
+		WrapID:      wrap.ID.String(),
+		RequestID:   reqID.String(),
+		KeyName:     wrap.KeyName,
+		Value:       base64.StdEncoding.EncodeToString(plaintext),
+		ByteLength:  wrap.ByteLength,
+		ContentHash: hex.EncodeToString(wrap.ContentHash),
+		Algorithm:   wrap.Algorithm,
+	})
+}
+
+func retrieveUserWrapErr(err error) error {
+	switch {
+	case errors.Is(err, storage.ErrNotFound), errors.Is(err, services.ErrWrongRequest):
+		return fiber.NewError(fiber.StatusNotFound, "wrap not found")
+	case errors.Is(err, storage.ErrAlreadyConsumed):
+		return fiber.NewError(fiber.StatusGone, "wrap already consumed")
+	case errors.Is(err, storage.ErrExpired):
+		return fiber.NewError(fiber.StatusGone, "wrap expired")
+	case errors.Is(err, services.ErrRequestNotApproved):
+		return fiber.NewError(fiber.StatusConflict, "request not retrievable in current state")
+	case errors.Is(err, services.ErrNotRequestOwner):
+		return fiber.NewError(fiber.StatusForbidden, "only the original requester may retrieve")
+	default:
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+}
+
+// ---- end read flow ---------------------------------------------------
 
 // Cancel handles POST /requests/:id/cancel.
 func (h *Requests) Cancel(c fiber.Ctx) error {

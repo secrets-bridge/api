@@ -89,6 +89,24 @@ type PatchInput struct {
 	Justification        string
 }
 
+// ReadInput is the data the UI POSTs to submit a read request. There
+// are no values — the user is asking the system to FETCH them.
+//
+// TargetKeys lists the keys inside the provider's secret bundle the
+// requester wants to view. An empty list means "all keys in the
+// bundle" — the agent's ReadExecutor returns one wrap per key in
+// whatever GetValue brings back.
+type ReadInput struct {
+	RequesterID          string
+	ProjectID            string
+	Environment          string
+	TargetProviderType   string
+	TargetProviderConfig map[string]any
+	TargetSecretRef      string
+	TargetKeys           []string
+	Justification        string
+}
+
 // Sentinel errors. Map to HTTP at the handler layer.
 var (
 	ErrInvalidInput      = errors.New("services: invalid input")
@@ -187,6 +205,74 @@ func (s *RequestService) Submit(ctx context.Context, in PatchInput) (*storage.Ac
 	return req, nil
 }
 
+// SubmitRead creates a read request — the requester wants to VIEW
+// existing values from the provider, not write new ones. No wraps are
+// created at submit time; the agent's ReadExecutor produces wraps
+// AFTER approval via the agent-side wrap-creation endpoint.
+//
+// TargetKeys may be empty — that signals "all keys in the bundle".
+// The ReadExecutor decides what to do with that; the service layer
+// stores it as-is so the audit trail captures the original intent.
+func (s *RequestService) SubmitRead(ctx context.Context, in ReadInput) (*storage.AccessRequest, error) {
+	if in.RequesterID == "" || in.TargetProviderType == "" || in.TargetSecretRef == "" {
+		return nil, fmt.Errorf("%w: requester_id, target_provider_type, target_secret_ref required", ErrInvalidInput)
+	}
+	if in.Justification == "" {
+		return nil, fmt.Errorf("%w: justification required", ErrInvalidInput)
+	}
+
+	wf, _, err := s.policy.Resolve(ctx, Scope{
+		ProjectID:       in.ProjectID,
+		Environment:     in.Environment,
+		ProviderType:    in.TargetProviderType,
+		SecretRefPrefix: in.TargetSecretRef,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("services: resolve workflow: %w", err)
+	}
+
+	keys := in.TargetKeys
+	if keys == nil {
+		keys = []string{}
+	}
+
+	wfID := wf.ID
+	req := &storage.AccessRequest{
+		RequesterID:          in.RequesterID,
+		Type:                 storage.AccessRequestTypeRead,
+		Justification:        in.Justification,
+		WorkflowID:           &wfID,
+		TargetProviderType:   in.TargetProviderType,
+		TargetProviderConfig: in.TargetProviderConfig,
+		TargetSecretRef:      in.TargetSecretRef,
+		TargetKeys:           keys,
+		TargetScope: map[string]any{
+			"project_id":  in.ProjectID,
+			"environment": in.Environment,
+		},
+	}
+	if err := s.requests.Create(ctx, req); err != nil {
+		return nil, fmt.Errorf("services: create read request: %w", err)
+	}
+
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:         "user:" + in.RequesterID,
+		Action:        "request.submit",
+		Resource:      "request:" + req.ID.String(),
+		Status:        storage.AuditStatusSuccess,
+		CorrelationID: req.ID,
+		Metadata: map[string]any{
+			"workflow_id":          wf.ID.String(),
+			"request_type":         string(req.Type),
+			"target_provider_type": in.TargetProviderType,
+			"target_secret_ref":    in.TargetSecretRef,
+			"key_count":            len(keys),
+			"min_approvers":        wf.MinApprovers,
+		},
+	})
+	return req, nil
+}
+
 // Approve records an approval vote. When the vote count crosses the
 // workflow threshold the request transitions to approved and all
 // associated wraps get their TTL refreshed to WrapTTLApproved.
@@ -276,7 +362,7 @@ func (s *RequestService) Approve(ctx context.Context, requestID uuid.UUID, appro
 		// failure posture as TTL refresh: audit-on-failure but don't
 		// roll back the approval — operators can re-issue the enqueue
 		// out-of-band if the job persistence fails.
-		if err := s.enqueuePatchJob(ctx, req); err != nil {
+		if err := s.enqueueRequestJob(ctx, req); err != nil {
 			_ = s.audit.Append(ctx, &storage.AuditEvent{
 				Actor:         "user:" + approverID,
 				Action:        "request.enqueue_job_failed",
@@ -433,6 +519,16 @@ func (s *RequestService) WrapSummariesForRequest(ctx context.Context, requestID 
 	return s.wraps.ListSummariesForRequest(ctx, requestID)
 }
 
+// WorkflowFor returns the workflow definition bound to a request at
+// submit time. The wrap-creation handler uses it to pick the
+// appropriate TTL when persisting agent-supplied plaintext.
+func (s *RequestService) WorkflowFor(ctx context.Context, req *storage.AccessRequest) (*storage.WorkflowDefinition, error) {
+	if req == nil || req.WorkflowID == nil {
+		return nil, errors.New("services: request has no workflow")
+	}
+	return s.workflows.Get(ctx, *req.WorkflowID)
+}
+
 // RetrieveWrap is the agent-side single-wrap fetch. It guarantees
 // the owning request is in a state where retrieval is allowed
 // (approved) before the wrap layer's atomic MarkConsumed runs.
@@ -476,6 +572,59 @@ func (s *RequestService) RetrieveWrap(ctx context.Context, wrapID, agentID uuid.
 // handler.
 var ErrRequestNotApproved = errors.New("services: owning request is not approved")
 
+// ErrNotRequestOwner is returned by RetrieveWrapForUser when the
+// calling user isn't the requester who owns the wrap. Maps to 403.
+var ErrNotRequestOwner = errors.New("services: caller is not the request owner")
+
+// ErrWrongRequest is returned by RetrieveWrapForUser when the wrap's
+// request_id doesn't match the requestID path param. Maps to 404 —
+// from the user's perspective the wrap simply doesn't exist under
+// that request.
+var ErrWrongRequest = errors.New("services: wrap does not belong to the given request")
+
+// RetrieveWrapForUser is the requester-facing single-shot fetch used
+// by the read flow. The agent's ReadExecutor created the wrap; the
+// user retrieves it through this method.
+//
+// Gating:
+//   - Wrap must belong to the request named in the URL (defense
+//     against a user enumerating other requests' wraps).
+//   - Request must be of type 'read' (the patch flow's wraps are NOT
+//     reachable through this endpoint).
+//   - Request must be in `executed` or `approved` status — `executed`
+//     once the agent has marked the job complete; `approved` allows
+//     the user to retrieve incrementally as wraps land.
+//   - userID must equal request.RequesterID.
+//
+// On success runs WrapService.Retrieve atomically (single-shot).
+func (s *RequestService) RetrieveWrapForUser(ctx context.Context, requestID, wrapID uuid.UUID, userID string) ([]byte, *storage.SecretWrap, error) {
+	wrap, err := s.wraps.Peek(ctx, wrapID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if wrap.RequestID == nil || *wrap.RequestID != requestID {
+		return nil, nil, ErrWrongRequest
+	}
+	req, err := s.requests.Get(ctx, requestID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("services: load owning request: %w", err)
+	}
+	if req.Type != storage.AccessRequestTypeRead {
+		return nil, nil, ErrWrongRequest
+	}
+	if req.RequesterID != userID {
+		return nil, nil, ErrNotRequestOwner
+	}
+	switch req.Status {
+	case storage.AccessRequestStatusApproved, storage.AccessRequestStatusExecuted:
+		// retrievable
+	default:
+		return nil, nil, ErrRequestNotApproved
+	}
+
+	return s.wraps.RetrieveByUser(ctx, wrapID, userID)
+}
+
 // refreshWrapsForRequest extends/shrinks every wrap tied to the
 // request. The wrap layer takes the new TTL relative to now, so this
 // produces a consistent expires_at across all wraps in the request.
@@ -504,7 +653,10 @@ func (s *RequestService) OnJobCompleted(ctx context.Context, job *storage.SyncJo
 	if job == nil {
 		return
 	}
-	if job.JobType != storage.JobTypePatch || job.RequestID == nil {
+	if job.RequestID == nil {
+		return
+	}
+	if job.JobType != storage.JobTypePatch && job.JobType != storage.JobTypeRead {
 		return
 	}
 	var target storage.AccessRequestStatus
@@ -544,27 +696,19 @@ func (s *RequestService) OnJobCompleted(ctx context.Context, job *storage.SyncJo
 	})
 }
 
-// enqueuePatchJob creates the patch-type sync_job that an agent will
-// claim to apply the approved changes. The payload carries everything
-// the agent needs except secret values: target provider info, the
-// request id, and an ordered list of {wrap_id, key_name} pairs so the
-// agent can iterate Piece 3c's retrieval endpoint.
+// enqueueRequestJob creates the sync_job that an agent will claim to
+// service the approved request. Branches by request type:
+//
+//   - patch: emits JobTypePatch with payload.wraps listing the
+//     pre-created write wraps the agent must fetch via Piece 3c.
+//   - read:  emits JobTypeRead with payload.target_keys naming the
+//     keys to fetch. The agent will create wraps post-fetch via the
+//     agent-side wrap-creation endpoint (Piece 5a).
 //
 // Sets req.JobID on success so the UI can link request → job.
-func (s *RequestService) enqueuePatchJob(ctx context.Context, req *storage.AccessRequest) error {
+func (s *RequestService) enqueueRequestJob(ctx context.Context, req *storage.AccessRequest) error {
 	if s.jobs == nil {
 		return errors.New("services: no JobEnqueuer wired")
-	}
-	summaries, err := s.wraps.ListSummariesForRequest(ctx, req.ID)
-	if err != nil {
-		return fmt.Errorf("list wrap summaries: %w", err)
-	}
-	wraps := make([]map[string]any, 0, len(summaries))
-	for _, sm := range summaries {
-		wraps = append(wraps, map[string]any{
-			"wrap_id":  sm.ID.String(),
-			"key_name": sm.KeyName,
-		})
 	}
 
 	payload := map[string]any{
@@ -574,19 +718,45 @@ func (s *RequestService) enqueuePatchJob(ctx context.Context, req *storage.Acces
 		"target_secret_ref":      req.TargetSecretRef,
 		"target_keys":            req.TargetKeys,
 		"target_scope":           req.TargetScope,
-		"wraps":                  wraps,
+	}
+
+	var jobType storage.JobType
+	switch req.Type {
+	case storage.AccessRequestTypePatch:
+		jobType = storage.JobTypePatch
+		summaries, err := s.wraps.ListSummariesForRequest(ctx, req.ID)
+		if err != nil {
+			return fmt.Errorf("list wrap summaries: %w", err)
+		}
+		wraps := make([]map[string]any, 0, len(summaries))
+		for _, sm := range summaries {
+			wraps = append(wraps, map[string]any{
+				"wrap_id":  sm.ID.String(),
+				"key_name": sm.KeyName,
+			})
+		}
+		payload["wraps"] = wraps
+	case storage.AccessRequestTypeRead:
+		jobType = storage.JobTypeRead
+		// No pre-existing wraps for read; the agent creates them
+		// after fetching the value.
+	default:
+		// Other types (update/rotate) don't yet have a job-emission
+		// path. Skip silently — Approve still flips status to
+		// approved; an operator can dispatch manually.
+		return nil
 	}
 
 	reqID := req.ID
 	job, err := s.jobs.Enqueue(ctx, EnqueueRequest{
-		JobType:       storage.JobTypePatch,
+		JobType:       jobType,
 		AgentScope:    map[string]any{},
 		Payload:       payload,
 		RequestID:     &reqID,
 		CorrelationID: reqID,
 	})
 	if err != nil {
-		return fmt.Errorf("enqueue patch job: %w", err)
+		return fmt.Errorf("enqueue %s job: %w", jobType, err)
 	}
 	if err := s.requests.SetJobID(ctx, req.ID, job.ID); err != nil {
 		return fmt.Errorf("set request job_id: %w", err)
