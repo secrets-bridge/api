@@ -20,8 +20,9 @@ func Metrics(c fiber.Ctx) error {
 			SendString("metrics gather failed: " + err.Error())
 	}
 
-	c.Set(fiber.HeaderContentType, string(expfmt.FmtText))
-	enc := expfmt.NewEncoder(c.Response().BodyWriter(), expfmt.FmtText)
+	format := expfmt.NewFormat(expfmt.TypeTextPlain)
+	c.Set(fiber.HeaderContentType, string(format))
+	enc := expfmt.NewEncoder(c.Response().BodyWriter(), format)
 	for _, mf := range families {
 		if err := enc.Encode(mf); err != nil {
 			return err
