@@ -180,6 +180,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	jobsH := handlers.NewJobs(jobSvc)
 	adminH := handlers.NewAdmin(roleRepo, userRoleRepo, workflowRepo, policyRepo)
 	requestsH := handlers.NewRequests(requestSvc)
+	wrapsH := handlers.NewWraps(requestSvc)
 
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
@@ -239,6 +240,10 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	agentRoutes.Post("/heartbeat", agentsH.Heartbeat)
 	agentRoutes.Post("/jobs/claim", jobsH.Claim)
 	agentRoutes.Post("/jobs/:job/complete", jobsH.Complete)
+	// Single-shot wrap retrieval. RetrieveWrap requires the owning
+	// access_request to be in approved status; the wrap is consumed
+	// on success (concurrent racers see ErrAlreadyConsumed → HTTP 410).
+	agentRoutes.Get("/wraps/:wrap_id", wrapsH.Retrieve)
 
 	return app
 }

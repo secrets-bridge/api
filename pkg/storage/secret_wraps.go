@@ -17,6 +17,7 @@ import (
 type SecretWrap struct {
 	ID                uuid.UUID
 	RequestID         *uuid.UUID
+	KeyName           string
 	EncryptedValue    []byte
 	Nonce             []byte
 	DataKeyCiphertext []byte
@@ -63,6 +64,21 @@ type SecretWrapRepository interface {
 	// access_request. The workflow engine uses this to refresh TTLs in
 	// bulk on state transitions (approved → 1h, rejected → 5m, etc.).
 	ListIDsForRequest(ctx context.Context, requestID uuid.UUID) ([]uuid.UUID, error)
+
+	// ListSummariesForRequest returns every wrap tied to a request as
+	// a (wrap_id, key_name, consumed) triple. Used by the agent
+	// retrieval endpoint to enumerate which wraps still need fetching
+	// without leaking value-bearing fields.
+	ListSummariesForRequest(ctx context.Context, requestID uuid.UUID) ([]WrapSummary, error)
+}
+
+// WrapSummary is the value-free metadata view of a wrap used for
+// listing endpoints (e.g. "what wraps does this request own?").
+type WrapSummary struct {
+	ID        uuid.UUID
+	KeyName   string
+	Consumed  bool
+	ExpiresAt time.Time
 }
 
 // ErrAlreadyConsumed signals a single-shot violation.
@@ -98,25 +114,25 @@ func (r *SecretWraps) Create(ctx context.Context, w *SecretWrap) error {
 
 	const insertGenerated = `
 		INSERT INTO secret_wraps
-		  (request_id, encrypted_value, nonce, data_key_ciphertext,
+		  (request_id, key_name, encrypted_value, nonce, data_key_ciphertext,
 		   kms_key_id, algorithm, content_hash, byte_length, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		VALUES ($1, NULLIF($2, ''), $3, $4, $5, $6, $7, $8, $9, $10)
 		RETURNING id, created_at`
 	const insertWithID = `
 		INSERT INTO secret_wraps
-		  (id, request_id, encrypted_value, nonce, data_key_ciphertext,
+		  (id, request_id, key_name, encrypted_value, nonce, data_key_ciphertext,
 		   kms_key_id, algorithm, content_hash, byte_length, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING created_at`
 
 	if w.ID == uuid.Nil {
 		return r.pool.QueryRow(ctx, insertGenerated,
-			w.RequestID, w.EncryptedValue, w.Nonce, w.DataKeyCiphertext,
+			w.RequestID, w.KeyName, w.EncryptedValue, w.Nonce, w.DataKeyCiphertext,
 			w.KMSKeyID, w.Algorithm, w.ContentHash, w.ByteLength, w.ExpiresAt,
 		).Scan(&w.ID, &w.CreatedAt)
 	}
 	return r.pool.QueryRow(ctx, insertWithID,
-		w.ID, w.RequestID, w.EncryptedValue, w.Nonce, w.DataKeyCiphertext,
+		w.ID, w.RequestID, w.KeyName, w.EncryptedValue, w.Nonce, w.DataKeyCiphertext,
 		w.KMSKeyID, w.Algorithm, w.ContentHash, w.ByteLength, w.ExpiresAt,
 	).Scan(&w.CreatedAt)
 }
@@ -124,7 +140,8 @@ func (r *SecretWraps) Create(ctx context.Context, w *SecretWrap) error {
 // Get returns the wrap by id.
 func (r *SecretWraps) Get(ctx context.Context, id uuid.UUID) (*SecretWrap, error) {
 	const q = `
-		SELECT id, request_id, encrypted_value, nonce, data_key_ciphertext,
+		SELECT id, request_id, COALESCE(key_name, ''),
+		       encrypted_value, nonce, data_key_ciphertext,
 		       kms_key_id, algorithm, content_hash, byte_length,
 		       created_at, expires_at, consumed_at, consumed_by_agent
 		FROM secret_wraps
@@ -218,6 +235,31 @@ func (r *SecretWraps) ListIDsForRequest(ctx context.Context, requestID uuid.UUID
 	return out, rows.Err()
 }
 
+// ListSummariesForRequest returns a value-free enumeration of wraps
+// tied to the given request. Used by the agent to discover which wraps
+// it must retrieve.
+func (r *SecretWraps) ListSummariesForRequest(ctx context.Context, requestID uuid.UUID) ([]WrapSummary, error) {
+	const q = `
+		SELECT id, COALESCE(key_name, ''), consumed_at IS NOT NULL, expires_at
+		FROM secret_wraps
+		WHERE request_id = $1
+		ORDER BY created_at ASC`
+	rows, err := r.pool.Query(ctx, q, requestID)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list wrap summaries: %w", err)
+	}
+	defer rows.Close()
+	var out []WrapSummary
+	for rows.Next() {
+		var s WrapSummary
+		if err := rows.Scan(&s.ID, &s.KeyName, &s.Consumed, &s.ExpiresAt); err != nil {
+			return nil, fmt.Errorf("storage: scan wrap summary: %w", err)
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 func scanSecretWrap(row interface {
 	Scan(dest ...any) error
 }) (*SecretWrap, error) {
@@ -228,7 +270,8 @@ func scanSecretWrap(row interface {
 		consumedByAgent *uuid.UUID
 	)
 	err := row.Scan(
-		&w.ID, &requestID, &w.EncryptedValue, &w.Nonce, &w.DataKeyCiphertext,
+		&w.ID, &requestID, &w.KeyName,
+		&w.EncryptedValue, &w.Nonce, &w.DataKeyCiphertext,
 		&w.KMSKeyID, &w.Algorithm, &w.ContentHash, &w.ByteLength,
 		&w.CreatedAt, &w.ExpiresAt, &consumedAt, &consumedByAgent,
 	)
