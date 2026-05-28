@@ -31,6 +31,7 @@ import (
 	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/observability"
 	"github.com/secrets-bridge/api/internal/services"
+	"github.com/secrets-bridge/api/pkg/keymgmt"
 	"github.com/secrets-bridge/api/pkg/runtime"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
@@ -88,7 +89,16 @@ func main() {
 		pool.Close()
 	}()
 
-	app := newApp(cfg, logger, pool, rdb)
+	// KMS bootstrap. Required for wrap encryption; without it the patch
+	// flow cannot accept secret values. Same fail-fast posture as
+	// storage and runtime.
+	km, err := keymgmt.NewLocalKMSFromEnv()
+	if err != nil {
+		logger.Error("keymgmt bootstrap", "error", err)
+		os.Exit(1)
+	}
+
+	app := newApp(cfg, logger, pool, rdb, km)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -117,7 +127,7 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
-func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Client) *fiber.App {
+func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Client, km keymgmt.KeyManager) *fiber.App {
 	app := fiber.New(fiber.Config{
 		AppName:      "secrets-bridge-api",
 		ReadTimeout:  10 * time.Second,
@@ -156,13 +166,20 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	userRoleRepo := storage.NewUserRoles(pool)
 	workflowRepo := storage.NewWorkflows(pool)
 	policyRepo := storage.NewPolicies(pool)
+	wrapRepo := storage.NewSecretWraps(pool)
+	requestRepo := storage.NewAccessRequests(pool)
+	approvalRepo := storage.NewApprovals(pool)
 
 	agentSvc := services.NewAgentService(agentRepo, auditRepo, rdb)
 	jobSvc := services.NewJobService(jobRepo, auditRepo)
+	wrapSvc := services.NewWrapService(wrapRepo, auditRepo, km)
+	policyEng := services.NewPolicyEngine(policyRepo, workflowRepo)
+	requestSvc := services.NewRequestService(requestRepo, approvalRepo, wrapSvc, workflowRepo, policyEng, auditRepo)
 
 	agentsH := handlers.NewAgents(agentSvc)
 	jobsH := handlers.NewJobs(jobSvc)
 	adminH := handlers.NewAdmin(roleRepo, userRoleRepo, workflowRepo, policyRepo)
+	requestsH := handlers.NewRequests(requestSvc)
 
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
@@ -203,6 +220,16 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Get("/policies/:id", adminH.GetPolicy)
 	v1.Put("/policies/:id", adminH.UpdatePolicy)
 	v1.Delete("/policies/:id", adminH.DeletePolicy)
+
+	// Patch-request lifecycle. Plaintext values arrive only via
+	// POST /requests, are envelope-encrypted by WrapService before
+	// touching Postgres, and never appear in responses.
+	v1.Post("/requests", requestsH.Submit)
+	v1.Get("/requests", requestsH.List)
+	v1.Get("/requests/:id", requestsH.Get)
+	v1.Post("/requests/:id/approve", requestsH.Approve)
+	v1.Post("/requests/:id/reject", requestsH.Reject)
+	v1.Post("/requests/:id/cancel", requestsH.Cancel)
 
 	// Agent-side endpoints. The `/agents/:id` sub-group is gated by
 	// the AgentAuth middleware which validates X-Agent-Secret and

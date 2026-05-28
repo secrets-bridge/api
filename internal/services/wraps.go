@@ -157,6 +157,13 @@ func (s *WrapService) Refresh(ctx context.Context, id uuid.UUID, newTTL time.Dur
 	return s.wraps.SetExpiry(ctx, id, s.now().Add(newTTL).UTC())
 }
 
+// ListIDsForRequest exposes the storage-layer enumeration so the
+// RequestService can bulk-refresh TTLs without reaching past the
+// service-layer boundary.
+func (s *WrapService) ListIDsForRequest(ctx context.Context, requestID uuid.UUID) ([]uuid.UUID, error) {
+	return s.wraps.ListIDsForRequest(ctx, requestID)
+}
+
 func (s *WrapService) auditRetrieveOutcome(ctx context.Context, agentID, wrapID uuid.UUID, err error) {
 	status := storage.AuditStatusDenied
 	kind := "other"

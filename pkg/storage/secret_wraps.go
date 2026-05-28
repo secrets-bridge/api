@@ -58,6 +58,11 @@ type SecretWrapRepository interface {
 	// number of rows deleted. Called by the background cleanup
 	// worker (Step 11).
 	DeleteExpired(ctx context.Context, now time.Time) (int64, error)
+
+	// ListIDsForRequest returns every wrap id tied to a given
+	// access_request. The workflow engine uses this to refresh TTLs in
+	// bulk on state transitions (approved → 1h, rejected → 5m, etc.).
+	ListIDsForRequest(ctx context.Context, requestID uuid.UUID) ([]uuid.UUID, error)
 }
 
 // ErrAlreadyConsumed signals a single-shot violation.
@@ -192,6 +197,25 @@ func (r *SecretWraps) DeleteExpired(ctx context.Context, now time.Time) (int64, 
 		return 0, fmt.Errorf("storage: delete expired: %w", err)
 	}
 	return tag.RowsAffected(), nil
+}
+
+// ListIDsForRequest returns every wrap id tied to a given request.
+func (r *SecretWraps) ListIDsForRequest(ctx context.Context, requestID uuid.UUID) ([]uuid.UUID, error) {
+	const q = `SELECT id FROM secret_wraps WHERE request_id = $1 ORDER BY created_at ASC`
+	rows, err := r.pool.Query(ctx, q, requestID)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list wrap ids: %w", err)
+	}
+	defer rows.Close()
+	var out []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("storage: scan wrap id: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
 
 func scanSecretWrap(row interface {
