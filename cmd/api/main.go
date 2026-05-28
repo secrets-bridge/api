@@ -152,12 +152,17 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	agentRepo := storage.NewAgents(pool)
 	auditRepo := storage.NewAuditEvents(pool)
 	jobRepo := storage.NewSyncJobs(pool)
+	roleRepo := storage.NewRoles(pool)
+	userRoleRepo := storage.NewUserRoles(pool)
+	workflowRepo := storage.NewWorkflows(pool)
+	policyRepo := storage.NewPolicies(pool)
 
 	agentSvc := services.NewAgentService(agentRepo, auditRepo, rdb)
 	jobSvc := services.NewJobService(jobRepo, auditRepo)
 
 	agentsH := handlers.NewAgents(agentSvc)
 	jobsH := handlers.NewJobs(jobSvc)
+	adminH := handlers.NewAdmin(roleRepo, userRoleRepo, workflowRepo, policyRepo)
 
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
@@ -172,6 +177,32 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Post("/agents", agentsH.Mint)
 	v1.Get("/agents", agentsH.List)
 	v1.Post("/jobs", jobsH.Enqueue)
+
+	// Dynamic workflow + policy engine — admin CRUD over the four
+	// entities Piece 2 introduced. Real RBAC enforcement (checking
+	// the caller has role.edit / workflow.edit / policy.edit
+	// permissions) layers on top once the auth design lands.
+	v1.Post("/roles", adminH.CreateRole)
+	v1.Get("/roles", adminH.ListRoles)
+	v1.Get("/roles/:id", adminH.GetRole)
+	v1.Put("/roles/:id/permissions", adminH.UpdateRolePermissions)
+	v1.Delete("/roles/:id", adminH.DeleteRole)
+
+	v1.Post("/user-roles", adminH.GrantUserRole)
+	v1.Delete("/user-roles/:id", adminH.RevokeUserRole)
+	v1.Get("/users/:userID/roles", adminH.ListUserRoles)
+
+	v1.Post("/workflows", adminH.CreateWorkflow)
+	v1.Get("/workflows", adminH.ListWorkflows)
+	v1.Get("/workflows/:id", adminH.GetWorkflow)
+	v1.Put("/workflows/:id", adminH.UpdateWorkflow)
+	v1.Delete("/workflows/:id", adminH.DeleteWorkflow)
+
+	v1.Post("/policies", adminH.CreatePolicy)
+	v1.Get("/policies", adminH.ListPolicies)
+	v1.Get("/policies/:id", adminH.GetPolicy)
+	v1.Put("/policies/:id", adminH.UpdatePolicy)
+	v1.Delete("/policies/:id", adminH.DeletePolicy)
 
 	// Agent-side endpoints. The `/agents/:id` sub-group is gated by
 	// the AgentAuth middleware which validates X-Agent-Secret and
