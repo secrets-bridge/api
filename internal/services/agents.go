@@ -216,6 +216,43 @@ func (s *AgentService) Heartbeat(ctx context.Context, id uuid.UUID, agentSecret 
 // secret hash so the next heartbeat is rejected immediately. Direct
 // calls to storage.AgentRepository.UpdateStatus bypass the cache
 // invalidation; callers must use this entry point.
+// SetPublicKey upserts the agent's wire-envelope public key. The
+// agent calls this after generating its X25519 keypair at startup so
+// future GetWrap responses come sealed (Piece 8b). Validates the
+// key shape; emits an audit event with the new key id so an operator
+// can spot a key rotation in the audit log.
+func (s *AgentService) SetPublicKey(ctx context.Context, id uuid.UUID, publicKey []byte, algorithm string) error {
+	if len(publicKey) == 0 {
+		return errors.New("agents: public_key is required")
+	}
+	if algorithm == "" {
+		algorithm = "x25519"
+	}
+	if algorithm != "x25519" {
+		return fmt.Errorf("agents: unsupported public_key_algorithm %q", algorithm)
+	}
+	if len(publicKey) != 32 {
+		return fmt.Errorf("agents: x25519 public key must be 32 bytes, got %d", len(publicKey))
+	}
+	if err := s.agents.UpdatePublicKey(ctx, id, publicKey, algorithm); err != nil {
+		return fmt.Errorf("agents: update public key: %w", err)
+	}
+	// content_hash-style identifier for the new key — useful in audit
+	// without revealing the key itself.
+	sum := sha256.Sum256(publicKey)
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "agent:" + id.String(),
+		Action:   "agent.public_key.set",
+		Resource: "agent:" + id.String(),
+		Status:   storage.AuditStatusSuccess,
+		Metadata: map[string]any{
+			"algorithm":       algorithm,
+			"public_key_sha":  base64.RawURLEncoding.EncodeToString(sum[:8]),
+		},
+	})
+	return nil
+}
+
 func (s *AgentService) Revoke(ctx context.Context, id uuid.UUID) error {
 	if err := s.agents.UpdateStatus(ctx, id, storage.AgentStatusRevoked); err != nil {
 		return err

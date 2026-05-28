@@ -76,6 +76,42 @@ func (h *Agents) Mint(c fiber.Ctx) error {
 	})
 }
 
+// PublicKeyRequest is the body the agent PUTs to register its X25519
+// public key after generating the keypair at startup. Idempotent —
+// repeatedly posting the same key is a no-op.
+type PublicKeyRequest struct {
+	PublicKey          string `json:"public_key"`           // base64
+	PublicKeyAlgorithm string `json:"public_key_algorithm"` // "x25519"
+}
+
+// SetPublicKey handles PUT /api/v1/agents/:id/public-key. Authentication
+// is AgentAuth — only the agent itself can register its own public key.
+func (h *Agents) SetPublicKey(c fiber.Ctx) error {
+	agentID, ok := middleware.AgentIDFromContext(c.Context())
+	if !ok {
+		return fiber.NewError(fiber.StatusInternalServerError, "agent identity missing in context")
+	}
+	var body PublicKeyRequest
+	if err := c.Bind().JSON(&body); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
+	}
+	if body.PublicKey == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "public_key is required")
+	}
+	pk, err := base64.StdEncoding.DecodeString(body.PublicKey)
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "public_key is not valid base64: "+err.Error())
+	}
+	alg := body.PublicKeyAlgorithm
+	if alg == "" {
+		alg = "x25519"
+	}
+	if err := h.svc.SetPublicKey(c.Context(), agentID, pk, alg); err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
 // Heartbeat is the agent's check-in. Authentication is handled by the
 // AgentAuth middleware on the enclosing route group, so the handler
 // simply pulls the authenticated agent ID from context, bumps
