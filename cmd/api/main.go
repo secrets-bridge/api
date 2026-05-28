@@ -151,26 +151,36 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// a handler + a Mount call below.
 	agentRepo := storage.NewAgents(pool)
 	auditRepo := storage.NewAuditEvents(pool)
-	agentSvc := services.NewAgentService(agentRepo, auditRepo, rdb)
-	agentsH := handlers.NewAgents(agentSvc)
+	jobRepo := storage.NewSyncJobs(pool)
 
-	// Authenticated API surface. Auth + RBAC + audit are stub
+	agentSvc := services.NewAgentService(agentRepo, auditRepo, rdb)
+	jobSvc := services.NewJobService(jobRepo, auditRepo)
+
+	agentsH := handlers.NewAgents(agentSvc)
+	jobsH := handlers.NewJobs(jobSvc)
+
+	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
-	// (issue #10) and the auth design (TBD).
+	// (issue #10).
 	v1 := app.Group("/api/v1",
 		middleware.Auth(),
 		middleware.RBAC(),
 		middleware.Audit(logger),
 	)
 
-	// Agent mint + heartbeat. There is intentionally no separate
-	// registration step — the Mint response carries the long-lived
-	// agent_secret directly. See pkg/storage/migrations/0003 for the
-	// rationale; tl;dr: operators don't have to manage a PVC for
-	// post-registration identity persistence.
+	// Admin-side endpoints.
 	v1.Post("/agents", agentsH.Mint)
 	v1.Get("/agents", agentsH.List)
-	v1.Post("/agents/:id/heartbeat", agentsH.Heartbeat)
+	v1.Post("/jobs", jobsH.Enqueue)
+
+	// Agent-side endpoints. The `/agents/:id` sub-group is gated by
+	// the AgentAuth middleware which validates X-Agent-Secret and
+	// stashes the authenticated agent ID in the request context.
+	// Handlers downstream simply read it via middleware.AgentIDFromContext.
+	agentRoutes := v1.Group("/agents/:id", middleware.AgentAuth(agentSvc))
+	agentRoutes.Post("/heartbeat", agentsH.Heartbeat)
+	agentRoutes.Post("/jobs/claim", jobsH.Claim)
+	agentRoutes.Post("/jobs/:job/complete", jobsH.Complete)
 
 	return app
 }

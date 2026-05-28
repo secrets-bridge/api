@@ -131,17 +131,16 @@ func (s *AgentService) Mint(ctx context.Context, name string, scope map[string]a
 	}, nil
 }
 
-// Heartbeat validates the agent secret and updates last_seen_at.
+// Authenticate validates the agent secret without any side effects on
+// last_seen_at. Shared by Heartbeat (which also bumps last_seen) and
+// by the agent-auth middleware (which guards /jobs/* endpoints).
 //
 // Hot path:
 //
 //	1. Read the secret hash + status from Redis.
 //	2. On cache miss: read from Postgres and prime the cache.
 //	3. ConstantTimeCompare against the cached/loaded hash.
-//	4. UPDATE last_seen_at in Postgres (no-op on revoked rows).
-//	5. Best-effort write of last_seen_at to Redis for the admin
-//	   LIST endpoint.
-func (s *AgentService) Heartbeat(ctx context.Context, id uuid.UUID, agentSecret string) error {
+func (s *AgentService) Authenticate(ctx context.Context, id uuid.UUID, agentSecret string) error {
 	cached, hadCache, err := s.readSecretHashCache(ctx, id)
 	if err != nil {
 		return err
@@ -165,14 +164,21 @@ func (s *AgentService) Heartbeat(ctx context.Context, id uuid.UUID, agentSecret 
 	if subtle.ConstantTimeCompare(presented[:], cached.Hash) != 1 {
 		return storage.ErrUnauthorized
 	}
+	return nil
+}
+
+// Heartbeat authenticates the agent and bumps last_seen_at. Best-effort
+// writes the timestamp to Redis for the admin LIST path.
+func (s *AgentService) Heartbeat(ctx context.Context, id uuid.UUID, agentSecret string) error {
+	if err := s.Authenticate(ctx, id, agentSecret); err != nil {
+		return err
+	}
 
 	now := s.now().UTC()
 	if err := s.agents.TouchLastSeen(ctx, id, now); err != nil {
 		return err
 	}
 
-	// Cache last-seen so admin GET /agents doesn't hit Postgres for
-	// every row. Best-effort; failure here is non-fatal.
 	if s.rdb != nil {
 		key := s.rdb.Key(cacheKindLastSeen, id.String())
 		_, _ = s.rdb.Raw().Set(ctx, key, now.Format(time.RFC3339Nano), s.heartbeatCacheTTL).Result()
