@@ -138,12 +138,14 @@ func (s *RequestService) Submit(ctx context.Context, in PatchInput) (*storage.Ac
 	}
 
 	// Wrap each plaintext under the workflow's created-TTL. Each wrap
-	// is tied back to req.ID via RequestID so an admin viewing the
-	// request can enumerate all the wraps that belong to it.
+	// is tied back to req.ID via RequestID and tagged with the key
+	// name so the agent retrieving them later knows which key inside
+	// the provider's secret bundle each value belongs to.
 	for k, v := range in.KeyValues {
 		_, err := s.wraps.Wrap(ctx, WrapRequest{
 			Plaintext: v,
 			RequestID: &req.ID,
+			KeyName:   k,
 			TTL:       wf.WrapTTLCreated,
 			Actor:     "user:" + in.RequesterID,
 		})
@@ -396,6 +398,55 @@ func (s *RequestService) List(ctx context.Context, f storage.AccessRequestListFi
 func (s *RequestService) Approvals(ctx context.Context, requestID uuid.UUID) ([]*storage.Approval, error) {
 	return s.approvals.ListByRequest(ctx, requestID)
 }
+
+// WrapSummariesForRequest returns value-free wrap metadata for a
+// request — used by the agent to discover which wraps to fetch.
+func (s *RequestService) WrapSummariesForRequest(ctx context.Context, requestID uuid.UUID) ([]storage.WrapSummary, error) {
+	return s.wraps.ListSummariesForRequest(ctx, requestID)
+}
+
+// RetrieveWrap is the agent-side single-wrap fetch. It guarantees
+// the owning request is in a state where retrieval is allowed
+// (approved) before the wrap layer's atomic MarkConsumed runs.
+//
+// Returns:
+//   - plaintext bytes (caller is responsible for zeroing after use)
+//   - the storage row (for content_hash / byte_length echo to client)
+//
+// On any failure that mutated visible state (consume succeeded but
+// later step failed), the wrap is still marked consumed — same
+// guarantee Piece 1 made: one-shot.
+func (s *RequestService) RetrieveWrap(ctx context.Context, wrapID, agentID uuid.UUID) ([]byte, *storage.SecretWrap, error) {
+	// Peek at the wrap row so we can look up the owning request and
+	// validate its status BEFORE we trigger the single-shot consume.
+	// There's a small race window where the request status could
+	// change between this peek and the actual consume — but the
+	// consume itself is atomic, and a status flip mid-call is
+	// extremely rare in practice. We don't pretend to be perfect
+	// here; we just want to refuse the common case of "wrap exists
+	// but its request isn't approved yet" without burning the wrap.
+	wrap, err := s.wraps.Peek(ctx, wrapID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if wrap.RequestID != nil {
+		req, err := s.requests.Get(ctx, *wrap.RequestID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("services: load owning request: %w", err)
+		}
+		if req.Status != storage.AccessRequestStatusApproved {
+			return nil, nil, ErrRequestNotApproved
+		}
+	}
+	// Consume + decrypt is one shot; WrapService handles audit.
+	return s.wraps.Retrieve(ctx, wrapID, agentID)
+}
+
+// ErrRequestNotApproved is returned by RetrieveWrap when the owning
+// request hasn't transitioned to approved yet (or has transitioned
+// past approved into a terminal state). Maps to HTTP 409 at the
+// handler.
+var ErrRequestNotApproved = errors.New("services: owning request is not approved")
 
 // refreshWrapsForRequest extends/shrinks every wrap tied to the
 // request. The wrap layer takes the new TTL relative to now, so this

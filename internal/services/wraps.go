@@ -47,6 +47,12 @@ type WrapRequest struct {
 	// layer).
 	RequestID *uuid.UUID
 
+	// KeyName is the key the value will be written under in the
+	// provider's secret bundle (e.g. "DB_PASSWORD"). The agent reads
+	// it back when retrieving the wrap so it knows which key to PUT.
+	// Optional — leaving it empty is fine for single-value flows.
+	KeyName string
+
 	// TTL determines expires_at. Workflow engine picks the value based
 	// on policy (default 7 days, refreshed on state transitions).
 	TTL time.Duration
@@ -82,6 +88,7 @@ func (s *WrapService) Wrap(ctx context.Context, req WrapRequest) (*storage.Secre
 
 	w := &storage.SecretWrap{
 		RequestID:         req.RequestID,
+		KeyName:           req.KeyName,
 		EncryptedValue:    encrypted,
 		Nonce:             nonce,
 		DataKeyCiphertext: dk.Ciphertext,
@@ -162,6 +169,21 @@ func (s *WrapService) Refresh(ctx context.Context, id uuid.UUID, newTTL time.Dur
 // service-layer boundary.
 func (s *WrapService) ListIDsForRequest(ctx context.Context, requestID uuid.UUID) ([]uuid.UUID, error) {
 	return s.wraps.ListIDsForRequest(ctx, requestID)
+}
+
+// ListSummariesForRequest returns value-free summaries of every wrap
+// tied to a request. Safe to expose to the UI / agent — no ciphertext,
+// no plaintext, just IDs and key names.
+func (s *WrapService) ListSummariesForRequest(ctx context.Context, requestID uuid.UUID) ([]storage.WrapSummary, error) {
+	return s.wraps.ListSummariesForRequest(ctx, requestID)
+}
+
+// Peek returns the wrap row WITHOUT consuming it. The returned struct
+// carries ciphertext fields too — callers must NOT log it. Intended
+// for orchestration code (e.g. RequestService) that needs to inspect
+// request_id / key_name before deciding whether to call Retrieve.
+func (s *WrapService) Peek(ctx context.Context, id uuid.UUID) (*storage.SecretWrap, error) {
+	return s.wraps.Get(ctx, id)
 }
 
 func (s *WrapService) auditRetrieveOutcome(ctx context.Context, agentID, wrapID uuid.UUID, err error) {
