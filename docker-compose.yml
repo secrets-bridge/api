@@ -1,14 +1,15 @@
 # Local dev stack for secrets-bridge/api.
 #
-#   docker compose up --build              # api + postgres
+#   docker compose up --build              # api + postgres + redis
 #   curl localhost:8080/healthz
-#   curl localhost:8080/readyz             # green once Postgres migrations finish
+#   curl localhost:8080/readyz             # green once dependencies healthy
 #   curl localhost:8080/metrics
 #
 # For integration tests:
-#   docker compose up -d postgres
+#   docker compose up -d postgres redis
 #   export TEST_DATABASE_URL=postgres://secrets_bridge:devpass@localhost:5432/secrets_bridge_test?sslmode=disable
-#   go test -count=1 ./pkg/storage/...
+#   export TEST_REDIS_URL=redis://localhost:6379/1
+#   go test -count=1 ./pkg/storage/... ./pkg/runtime/...
 
 services:
   postgres:
@@ -24,10 +25,19 @@ services:
       interval: 2s
       timeout: 2s
       retries: 20
-    # Create the dedicated test database used by the integration suite.
-    # The init script only runs on a fresh data volume.
     volumes:
       - ./hack/postgres-init.sh:/docker-entrypoint-initdb.d/00-create-test-db.sh:ro
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
 
   api:
     build:
@@ -36,6 +46,7 @@ services:
     environment:
       API_ADDR: ":8080"
       DATABASE_URL: postgres://secrets_bridge:devpass@postgres:5432/secrets_bridge?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
       LOG_LEVEL: info
     ports:
       # Host port can be overridden by exporting `API_HOST_PORT`. The
@@ -43,4 +54,6 @@ services:
       - "${API_HOST_PORT:-8080}:8080"
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy

@@ -30,6 +30,7 @@ import (
 	"github.com/secrets-bridge/api/internal/handlers"
 	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/observability"
+	"github.com/secrets-bridge/api/pkg/runtime"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
@@ -65,10 +66,28 @@ func main() {
 		logger.Error("storage open", "error", err)
 		os.Exit(1)
 	}
+	// Runtime (Redis) wiring. Required like storage — every meaningful
+	// CP operation relies on coordination primitives. Idempotency,
+	// locks, rate limit, and pub/sub all live here.
+	runtimeCfg, err := runtime.LoadConfig()
+	if err != nil {
+		bootCancel()
+		logger.Error("runtime config", "error", err)
+		os.Exit(1)
+	}
+	rdb, err := runtime.Open(bootCtx, runtimeCfg)
+	if err != nil {
+		bootCancel()
+		logger.Error("runtime open", "error", err)
+		os.Exit(1)
+	}
 	bootCancel()
-	defer pool.Close()
+	defer func() {
+		_ = rdb.Close()
+		pool.Close()
+	}()
 
-	app := newApp(cfg, logger, pool)
+	app := newApp(cfg, logger, pool, rdb)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -97,7 +116,7 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
-func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool) *fiber.App {
+func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Client) *fiber.App {
 	app := fiber.New(fiber.Config{
 		AppName:      "secrets-bridge-api",
 		ReadTimeout:  10 * time.Second,
@@ -118,6 +137,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool) *fiber.App {
 	probes := handlers.NewProbes()
 	probes.AddReadinessCheck("postgres", func(ctx context.Context) error {
 		return pool.Ping(ctx)
+	})
+	probes.AddReadinessCheck("redis", func(ctx context.Context) error {
+		return rdb.Ping(ctx)
 	})
 	app.Get("/healthz", probes.Healthz)
 	app.Get("/readyz", probes.Readyz)
