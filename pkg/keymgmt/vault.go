@@ -27,10 +27,9 @@ import (
 // covers the common dev + bootstrap case and the test suite. k8s auth
 // can be added incrementally without changing the interface.
 type VaultTransit struct {
-	logical    vaultLogical
-	keyName    string
-	mountPath  string // e.g. "transit"; allows non-default mounts
-	keyVersion int    // 0 = use Vault's latest
+	logical   vaultLogical
+	keyName   string
+	mountPath string // e.g. "transit"; allows non-default mounts
 }
 
 // vaultLogical is the small slice of the Vault API client this
