@@ -7,14 +7,21 @@ import (
 )
 
 // EnvVarBackend selects which KeyManager implementation FromEnv
-// constructs. Recognised values: "local" (default), "vault-transit".
-// Adding a new backend means: implementing KeyManager somewhere, then
-// adding a case to FromEnv.
+// constructs. Recognised values: "local" (default), "vault-transit",
+// "aws-kms". Adding a new backend means: implementing KeyManager
+// somewhere, then adding a case to FromEnv.
+//
+// Scope today: one master key per CP deployment, wrapping per-row
+// data keys (envelope encryption). Per-tenant / per-project CMK
+// selection is a future phase (Piece 8c) — it will thread a scope
+// through the KeyManager interface; existing backends keep their
+// no-scope constructors and a new resolver layer routes per row.
 const EnvVarBackend = "SB_KMS_BACKEND"
 
 const (
 	BackendLocal        = "local"
 	BackendVaultTransit = "vault-transit"
+	BackendAWSKMS       = "aws-kms"
 )
 
 // FromEnv reads SB_KMS_BACKEND and constructs the matching KeyManager.
@@ -35,7 +42,9 @@ func FromEnv(ctx context.Context) (KeyManager, error) {
 		return NewLocalKMSFromEnv()
 	case BackendVaultTransit:
 		return NewVaultTransitFromEnv(ctx)
+	case BackendAWSKMS:
+		return NewAWSKMSFromEnv(ctx)
 	default:
-		return nil, fmt.Errorf("keymgmt: unknown backend %q (set %s to one of: local, vault-transit)", backend, EnvVarBackend)
+		return nil, fmt.Errorf("keymgmt: unknown backend %q (set %s to one of: local, vault-transit, aws-kms)", backend, EnvVarBackend)
 	}
 }

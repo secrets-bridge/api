@@ -10,6 +10,15 @@
 #   export TEST_DATABASE_URL=postgres://secrets_bridge:devpass@localhost:5432/secrets_bridge_test?sslmode=disable
 #   export TEST_REDIS_URL=redis://localhost:6379/1
 #   go test -count=1 ./pkg/storage/... ./pkg/runtime/...
+#
+# To exercise the aws-kms backend against LocalStack:
+#   docker compose --profile awskms up -d localstack
+#   aws --endpoint-url=http://localhost:4566 kms create-key
+#   aws --endpoint-url=http://localhost:4566 kms create-alias \
+#       --alias-name alias/sb-wrap --target-key-id <key-id>
+#   SB_KMS_BACKEND=aws-kms SB_KMS_AWS_REGION=us-east-1 \
+#     SB_KMS_AWS_KEY_ID=alias/sb-wrap \
+#     SB_KMS_AWS_ENDPOINT=http://localhost:4566 ./api
 
 services:
   postgres:
@@ -38,6 +47,22 @@ services:
       interval: 2s
       timeout: 2s
       retries: 20
+
+  # LocalStack KMS — opt-in via `--profile awskms`. Lets devs exercise
+  # the aws-kms backend without an AWS account.
+  localstack:
+    profiles: ["awskms"]
+    image: localstack/localstack:3
+    environment:
+      SERVICES: kms
+      DEBUG: "0"
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
 
   api:
     build:
