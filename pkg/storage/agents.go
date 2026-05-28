@@ -21,9 +21,15 @@ type Agent struct {
 	Scope      map[string]any
 	Status     AgentStatus
 	SecretHash []byte
-	LastSeenAt *time.Time
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// PublicKey is the agent's X25519 public key (32 bytes) used by
+	// the CP to seal wrap retrieval responses (Piece 8b). NULL means
+	// the agent registered before wire-envelope encryption was wired;
+	// the CP falls back to plaintext-over-TLS for those.
+	PublicKey          []byte
+	PublicKeyAlgorithm string
+	LastSeenAt         *time.Time
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 // AgentStatus is constrained by a CHECK in the schema. Migration 0003
@@ -92,27 +98,29 @@ func (r *Agents) Create(ctx context.Context, a *Agent) error {
 	}
 
 	const insertGenerated = `
-		INSERT INTO agents (name, scope, status, secret_hash)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO agents (name, scope, status, secret_hash, public_key, public_key_algorithm)
+		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''))
 		RETURNING id, created_at, updated_at`
 	const insertWithID = `
-		INSERT INTO agents (id, name, scope, status, secret_hash)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO agents (id, name, scope, status, secret_hash, public_key, public_key_algorithm)
+		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''))
 		RETURNING created_at, updated_at`
 
 	var row pgx.Row
 	if a.ID == uuid.Nil {
-		row = r.pool.QueryRow(ctx, insertGenerated, a.Name, scope, a.Status, a.SecretHash)
+		row = r.pool.QueryRow(ctx, insertGenerated, a.Name, scope, a.Status, a.SecretHash, a.PublicKey, a.PublicKeyAlgorithm)
 		return row.Scan(&a.ID, &a.CreatedAt, &a.UpdatedAt)
 	}
-	row = r.pool.QueryRow(ctx, insertWithID, a.ID, a.Name, scope, a.Status, a.SecretHash)
+	row = r.pool.QueryRow(ctx, insertWithID, a.ID, a.Name, scope, a.Status, a.SecretHash, a.PublicKey, a.PublicKeyAlgorithm)
 	return row.Scan(&a.CreatedAt, &a.UpdatedAt)
 }
 
 // Get fetches one agent by ID. Returns ErrNotFound when no row matches.
 func (r *Agents) Get(ctx context.Context, id uuid.UUID) (*Agent, error) {
 	const q = `
-		SELECT id, name, scope, status, secret_hash, last_seen_at, created_at, updated_at
+		SELECT id, name, scope, status, secret_hash,
+		       public_key, COALESCE(public_key_algorithm, ''),
+		       last_seen_at, created_at, updated_at
 		FROM agents WHERE id = $1`
 	return scanAgent(r.pool.QueryRow(ctx, q, id))
 }
@@ -120,7 +128,9 @@ func (r *Agents) Get(ctx context.Context, id uuid.UUID) (*Agent, error) {
 // GetByName fetches one agent by name. Names are UNIQUE in the schema.
 func (r *Agents) GetByName(ctx context.Context, name string) (*Agent, error) {
 	const q = `
-		SELECT id, name, scope, status, secret_hash, last_seen_at, created_at, updated_at
+		SELECT id, name, scope, status, secret_hash,
+		       public_key, COALESCE(public_key_algorithm, ''),
+		       last_seen_at, created_at, updated_at
 		FROM agents WHERE name = $1`
 	return scanAgent(r.pool.QueryRow(ctx, q, name))
 }
@@ -128,7 +138,9 @@ func (r *Agents) GetByName(ctx context.Context, name string) (*Agent, error) {
 // List returns every agent ordered by created_at ASC.
 func (r *Agents) List(ctx context.Context) ([]*Agent, error) {
 	const q = `
-		SELECT id, name, scope, status, secret_hash, last_seen_at, created_at, updated_at
+		SELECT id, name, scope, status, secret_hash,
+		       public_key, COALESCE(public_key_algorithm, ''),
+		       last_seen_at, created_at, updated_at
 		FROM agents ORDER BY created_at ASC`
 	rows, err := r.pool.Query(ctx, q)
 	if err != nil {
@@ -185,9 +197,12 @@ func scanAgent(row interface {
 		a          Agent
 		scopeRaw   []byte
 		secretHash []byte
+		publicKey  []byte
 		lastSeen   *time.Time
 	)
-	err := row.Scan(&a.ID, &a.Name, &scopeRaw, &a.Status, &secretHash, &lastSeen, &a.CreatedAt, &a.UpdatedAt)
+	err := row.Scan(&a.ID, &a.Name, &scopeRaw, &a.Status, &secretHash,
+		&publicKey, &a.PublicKeyAlgorithm,
+		&lastSeen, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -200,6 +215,7 @@ func scanAgent(row interface {
 		}
 	}
 	a.SecretHash = secretHash
+	a.PublicKey = publicKey
 	a.LastSeenAt = lastSeen
 	return &a, nil
 }

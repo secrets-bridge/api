@@ -82,7 +82,7 @@ func TestWrap_Roundtrip(t *testing.T) {
 	}
 
 	// Mint an agent so Retrieve has a real FK target.
-	minted, _ := agents.Mint(ctx, "agent-1", nil)
+	minted, _ := agents.Mint(ctx, services.MintInput{Name: "agent-1"})
 
 	got, _, err := svc.Retrieve(ctx, w.ID, minted.ID)
 	if err != nil {
@@ -129,7 +129,7 @@ func TestRetrieve_OneShotRejectsDoubleRead(t *testing.T) {
 	svc, agents, _ := bootstrapWraps(t)
 	ctx := t.Context()
 	w, _ := svc.Wrap(ctx, services.WrapRequest{Plaintext: []byte("v"), TTL: time.Hour})
-	minted, _ := agents.Mint(ctx, "agent-1", nil)
+	minted, _ := agents.Mint(ctx, services.MintInput{Name: "agent-1"})
 
 	if _, _, err := svc.Retrieve(ctx, w.ID, minted.ID); err != nil {
 		t.Fatalf("first Retrieve: %v", err)
@@ -143,7 +143,7 @@ func TestRetrieve_ExpiredWrapRejected(t *testing.T) {
 	svc, agents, pool := bootstrapWraps(t)
 	ctx := t.Context()
 	w, _ := svc.Wrap(ctx, services.WrapRequest{Plaintext: []byte("v"), TTL: time.Hour})
-	minted, _ := agents.Mint(ctx, "agent-1", nil)
+	minted, _ := agents.Mint(ctx, services.MintInput{Name: "agent-1"})
 
 	// Backdate expires_at so the wrap looks expired.
 	if _, err := pool.Exec(ctx,
@@ -168,7 +168,7 @@ func TestRetrieve_ConcurrentAgents_ExactlyOneWins(t *testing.T) {
 	const N = 6
 	agentIDs := make([]uuid.UUID, N)
 	for i := range agentIDs {
-		minted, _ := agents.Mint(ctx, fmt.Sprintf("agent-%d", i), nil)
+		minted, _ := agents.Mint(ctx, services.MintInput{Name: fmt.Sprintf("agent-%d", i)})
 		agentIDs[i] = minted.ID
 	}
 

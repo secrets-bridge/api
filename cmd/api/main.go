@@ -189,7 +189,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	jobsH := handlers.NewJobs(jobSvc)
 	adminH := handlers.NewAdmin(roleRepo, userRoleRepo, workflowRepo, policyRepo)
 	requestsH := handlers.NewRequests(requestSvc)
-	wrapsH := handlers.NewWraps(requestSvc, wrapSvc)
+	wrapsH := handlers.NewWraps(requestSvc, wrapSvc, agentRepo, km)
 	secretsH := handlers.NewSecrets(secretsSvc)
 
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
@@ -270,7 +270,15 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// fetches a value via core/providers.GetValue, it POSTs each key's
 	// plaintext here so the CP envelope-encrypts and persists. The
 	// requester later retrieves through the user-bound endpoint.
+	// Accepts either base64 plaintext (legacy) or a wire-envelope
+	// shape (Piece 8b) — the body shape itself selects the path.
 	agentRoutes.Post("/wraps", wrapsH.Create)
+	// Wire-envelope DEK issuance (Piece 8b). The agent calls this
+	// FIRST when it has plaintext to send back to CP, uses the
+	// returned plaintext key to AES-GCM-encrypt the value locally,
+	// then POSTs the resulting ciphertext + the round-tripped
+	// dek_ciphertext to /wraps. Plaintext never on the wire.
+	agentRoutes.Post("/dek", wrapsH.IssueDEK)
 	// Agent-side discovery upload. The agent's DiscoverExecutor calls
 	// core/providers.ListMetadata against the configured provider and
 	// POSTs the batch here; CP upserts into the secrets cache.
