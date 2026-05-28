@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net/http/httptest"
 	"strings"
@@ -55,6 +57,34 @@ func TestProbes_Readyz_GatedByState(t *testing.T) {
 	}
 	if resp2.StatusCode != fiber.StatusServiceUnavailable {
 		t.Fatalf("ready=false status: got %d want %d", resp2.StatusCode, fiber.StatusServiceUnavailable)
+	}
+}
+
+func TestProbes_Readyz_FailingCheckProduces503(t *testing.T) {
+	app := fiber.New()
+	p := NewProbes()
+	app.Get("/readyz", p.Readyz)
+
+	// Register a check that always fails — Readyz must report 503
+	// and surface the check name in the body so kubectl describe
+	// shows which dependency is unhealthy.
+	p.AddReadinessCheck("postgres", func(context.Context) error {
+		return errors.New("connection refused")
+	})
+
+	resp, err := app.Test(httptest.NewRequest("GET", "/readyz", nil))
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusServiceUnavailable {
+		t.Fatalf("status: got %d want %d", resp.StatusCode, fiber.StatusServiceUnavailable)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "postgres") {
+		t.Fatalf("body did not name the failing check: %q", body)
+	}
+	if !strings.Contains(string(body), "connection refused") {
+		t.Fatalf("body did not surface the check's error: %q", body)
 	}
 }
 

@@ -30,6 +30,7 @@ import (
 	"github.com/secrets-bridge/api/internal/handlers"
 	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/observability"
+	"github.com/secrets-bridge/api/pkg/storage"
 )
 
 func main() {
@@ -43,7 +44,31 @@ func main() {
 		"shutdown_grace", cfg.ShutdownGrace,
 	)
 
-	app := newApp(cfg, logger)
+	// Storage wiring. The pool is required; the api refuses to start
+	// without it because every meaningful endpoint depends on Postgres.
+	// LOG_LEVEL=debug shows the migration tool's chatter; production
+	// deploys are expected to stay at info or above.
+	storageCfg, err := storage.LoadConfig()
+	if err != nil {
+		logger.Error("storage config", "error", err)
+		os.Exit(1)
+	}
+	bootCtx, bootCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	if err := storage.Migrate(bootCtx, storageCfg); err != nil {
+		bootCancel()
+		logger.Error("storage migrate", "error", err)
+		os.Exit(1)
+	}
+	pool, err := storage.Open(bootCtx, storageCfg)
+	if err != nil {
+		bootCancel()
+		logger.Error("storage open", "error", err)
+		os.Exit(1)
+	}
+	bootCancel()
+	defer pool.Close()
+
+	app := newApp(cfg, logger, pool)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -72,7 +97,7 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
-func newApp(cfg Config, logger *slog.Logger) *fiber.App {
+func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool) *fiber.App {
 	app := fiber.New(fiber.Config{
 		AppName:      "secrets-bridge-api",
 		ReadTimeout:  10 * time.Second,
@@ -87,8 +112,13 @@ func newApp(cfg Config, logger *slog.Logger) *fiber.App {
 	app.Use(middleware.Recover(logger))
 
 	// Probes and metrics are public; they must answer before auth so
-	// kubelet and Prometheus can scrape without credentials.
+	// kubelet and Prometheus can scrape without credentials. Readyz
+	// gates on a fresh Postgres ping so kubelet removes the pod from
+	// the Service when the database becomes unreachable.
 	probes := handlers.NewProbes()
+	probes.AddReadinessCheck("postgres", func(ctx context.Context) error {
+		return pool.Ping(ctx)
+	})
 	app.Get("/healthz", probes.Healthz)
 	app.Get("/readyz", probes.Readyz)
 	app.Get("/metrics", handlers.Metrics)

@@ -1,0 +1,46 @@
+# Local dev stack for secrets-bridge/api.
+#
+#   docker compose up --build              # api + postgres
+#   curl localhost:8080/healthz
+#   curl localhost:8080/readyz             # green once Postgres migrations finish
+#   curl localhost:8080/metrics
+#
+# For integration tests:
+#   docker compose up -d postgres
+#   export TEST_DATABASE_URL=postgres://secrets_bridge:devpass@localhost:5432/secrets_bridge_test?sslmode=disable
+#   go test -count=1 ./pkg/storage/...
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: secrets_bridge
+      POSTGRES_PASSWORD: devpass
+      POSTGRES_DB: secrets_bridge
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U secrets_bridge -d secrets_bridge"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    # Create the dedicated test database used by the integration suite.
+    # The init script only runs on a fresh data volume.
+    volumes:
+      - ./hack/postgres-init.sh:/docker-entrypoint-initdb.d/00-create-test-db.sh:ro
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      API_ADDR: ":8080"
+      DATABASE_URL: postgres://secrets_bridge:devpass@postgres:5432/secrets_bridge?sslmode=disable
+      LOG_LEVEL: info
+    ports:
+      # Host port can be overridden by exporting `API_HOST_PORT`. The
+      # container always listens on 8080 internally.
+      - "${API_HOST_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
