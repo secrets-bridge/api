@@ -145,7 +145,7 @@ func TestRoles_CreateGetUpdateDelete(t *testing.T) {
 	if resp.StatusCode != fiber.StatusNoContent {
 		t.Fatalf("update: status %d body %s", resp.StatusCode, body)
 	}
-	resp, body = doJSON(t, app, "GET", "/api/v1/roles/"+created.ID.String(), nil)
+	_, body = doJSON(t, app, "GET", "/api/v1/roles/"+created.ID.String(), nil)
 	_ = json.Unmarshal(body, &got)
 	if len(got.Permissions) != 2 {
 		t.Fatalf("update did not persist: %+v", got)
