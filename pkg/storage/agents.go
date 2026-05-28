@@ -11,27 +11,26 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Agent mirrors a row in the agents table. Neither the registration
-// token nor the agent secret is stored in plaintext — only their
-// SHA-256 hashes. Both plaintexts are returned to the admin / agent
-// exactly once at issuance.
+// Agent mirrors a row in the agents table. The plaintext agent secret
+// is NEVER stored — only its SHA-256 hash. The plaintext is returned to
+// the admin exactly ONCE at mint time and from then on lives only in
+// the K8s Secret / env vars the agent reads at startup.
 type Agent struct {
-	ID                    uuid.UUID
-	Name                  string
-	Scope                 map[string]any
-	Status                AgentStatus
-	RegistrationTokenHash []byte // cleared after the agent redeems the token
-	SecretHash            []byte // set by Register; checked by Heartbeat
-	LastSeenAt            *time.Time
-	CreatedAt             time.Time
-	UpdatedAt             time.Time
+	ID         uuid.UUID
+	Name       string
+	Scope      map[string]any
+	Status     AgentStatus
+	SecretHash []byte
+	LastSeenAt *time.Time
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
-// AgentStatus is constrained by a CHECK in the schema.
+// AgentStatus is constrained by a CHECK in the schema. Migration 0003
+// dropped the 'pending' value — agents are active immediately at mint.
 type AgentStatus string
 
 const (
-	AgentStatusPending AgentStatus = "pending"
 	AgentStatusActive  AgentStatus = "active"
 	AgentStatusStale   AgentStatus = "stale"
 	AgentStatusRevoked AgentStatus = "revoked"
@@ -39,9 +38,10 @@ const (
 
 // AgentRepository is the read/write surface for the agents table.
 type AgentRepository interface {
-	// Create inserts a new agent and stores its one-time registration
-	// token hash. The caller is responsible for hashing the plaintext
-	// token before this call — the repository never touches plaintext.
+	// Create inserts a new agent with its hashed long-lived secret.
+	// The caller (services.AgentService) generates the plaintext
+	// secret and computes the hash before this call — the repository
+	// never touches plaintext.
 	Create(ctx context.Context, a *Agent) error
 
 	// Get returns one agent by ID.
@@ -53,16 +53,7 @@ type AgentRepository interface {
 	// List returns every agent ordered by created_at ASC.
 	List(ctx context.Context) ([]*Agent, error)
 
-	// RedeemRegistrationToken transitions the agent from pending →
-	// active. The presented registration_token_hash is compared
-	// against the stored hash; on match it is cleared and the
-	// supplied secret_hash is stored for subsequent heartbeats.
-	// Returns ErrNotFound when no agent matches the ID, ErrUnauthorized
-	// when the agent exists but the registration hash is wrong.
-	RedeemRegistrationToken(ctx context.Context, id uuid.UUID, registrationHash, secretHash []byte) error
-
-	// TouchLastSeen records that an agent has heartbeated. No-op if
-	// the agent has been revoked.
+	// TouchLastSeen records a heartbeat. No-op on revoked agents.
 	TouchLastSeen(ctx context.Context, id uuid.UUID, at time.Time) error
 
 	// UpdateStatus transitions an agent to a new status.
@@ -81,14 +72,16 @@ type Agents struct {
 // NewAgents binds an Agents repository to the given pool.
 func NewAgents(pool *Pool) *Agents { return &Agents{pool: pool} }
 
-// Create inserts a new agent row. ID is assigned by the database when
-// a.ID is uuid.Nil. Scope is JSON-marshalled.
+// Create inserts a new agent row.
 func (r *Agents) Create(ctx context.Context, a *Agent) error {
 	if a.Name == "" {
 		return errors.New("storage: agent Name is required")
 	}
+	if len(a.SecretHash) == 0 {
+		return errors.New("storage: agent SecretHash is required")
+	}
 	if a.Status == "" {
-		a.Status = AgentStatusPending
+		a.Status = AgentStatusActive
 	}
 	if a.Scope == nil {
 		a.Scope = map[string]any{}
@@ -99,27 +92,27 @@ func (r *Agents) Create(ctx context.Context, a *Agent) error {
 	}
 
 	const insertGenerated = `
-		INSERT INTO agents (name, scope, status, registration_token_hash)
+		INSERT INTO agents (name, scope, status, secret_hash)
 		VALUES ($1, $2, $3, $4)
 		RETURNING id, created_at, updated_at`
 	const insertWithID = `
-		INSERT INTO agents (id, name, scope, status, registration_token_hash)
+		INSERT INTO agents (id, name, scope, status, secret_hash)
 		VALUES ($1, $2, $3, $4, $5)
 		RETURNING created_at, updated_at`
 
 	var row pgx.Row
 	if a.ID == uuid.Nil {
-		row = r.pool.QueryRow(ctx, insertGenerated, a.Name, scope, a.Status, a.RegistrationTokenHash)
+		row = r.pool.QueryRow(ctx, insertGenerated, a.Name, scope, a.Status, a.SecretHash)
 		return row.Scan(&a.ID, &a.CreatedAt, &a.UpdatedAt)
 	}
-	row = r.pool.QueryRow(ctx, insertWithID, a.ID, a.Name, scope, a.Status, a.RegistrationTokenHash)
+	row = r.pool.QueryRow(ctx, insertWithID, a.ID, a.Name, scope, a.Status, a.SecretHash)
 	return row.Scan(&a.CreatedAt, &a.UpdatedAt)
 }
 
 // Get fetches one agent by ID. Returns ErrNotFound when no row matches.
 func (r *Agents) Get(ctx context.Context, id uuid.UUID) (*Agent, error) {
 	const q = `
-		SELECT id, name, scope, status, registration_token_hash, secret_hash, last_seen_at, created_at, updated_at
+		SELECT id, name, scope, status, secret_hash, last_seen_at, created_at, updated_at
 		FROM agents WHERE id = $1`
 	return scanAgent(r.pool.QueryRow(ctx, q, id))
 }
@@ -127,7 +120,7 @@ func (r *Agents) Get(ctx context.Context, id uuid.UUID) (*Agent, error) {
 // GetByName fetches one agent by name. Names are UNIQUE in the schema.
 func (r *Agents) GetByName(ctx context.Context, name string) (*Agent, error) {
 	const q = `
-		SELECT id, name, scope, status, registration_token_hash, secret_hash, last_seen_at, created_at, updated_at
+		SELECT id, name, scope, status, secret_hash, last_seen_at, created_at, updated_at
 		FROM agents WHERE name = $1`
 	return scanAgent(r.pool.QueryRow(ctx, q, name))
 }
@@ -135,7 +128,7 @@ func (r *Agents) GetByName(ctx context.Context, name string) (*Agent, error) {
 // List returns every agent ordered by created_at ASC.
 func (r *Agents) List(ctx context.Context) ([]*Agent, error) {
 	const q = `
-		SELECT id, name, scope, status, registration_token_hash, secret_hash, last_seen_at, created_at, updated_at
+		SELECT id, name, scope, status, secret_hash, last_seen_at, created_at, updated_at
 		FROM agents ORDER BY created_at ASC`
 	rows, err := r.pool.Query(ctx, q)
 	if err != nil {
@@ -152,36 +145,6 @@ func (r *Agents) List(ctx context.Context) ([]*Agent, error) {
 		out = append(out, a)
 	}
 	return out, rows.Err()
-}
-
-// RedeemRegistrationToken transitions a pending agent → active when
-// the presented registration hash matches. The registration hash is
-// cleared on success so the token cannot be replayed; the supplied
-// secret_hash is stored for subsequent heartbeat validation.
-func (r *Agents) RedeemRegistrationToken(ctx context.Context, id uuid.UUID, registrationHash, secretHash []byte) error {
-	const q = `
-		UPDATE agents
-		SET    status = 'active',
-		       registration_token_hash = NULL,
-		       secret_hash = $3,
-		       last_seen_at = now()
-		WHERE  id = $1
-		  AND  registration_token_hash = $2
-		  AND  status = 'pending'`
-	tag, err := r.pool.Exec(ctx, q, id, registrationHash, secretHash)
-	if err != nil {
-		return fmt.Errorf("storage: redeem registration token: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		// Distinguish "no agent" from "wrong hash" so the service
-		// layer can return distinct error responses.
-		_, err := r.Get(ctx, id)
-		if err != nil {
-			return err // ErrNotFound or a real DB error
-		}
-		return ErrUnauthorized
-	}
-	return nil
 }
 
 // TouchLastSeen records a heartbeat. Bumps updated_at via the trigger.
@@ -221,11 +184,10 @@ func scanAgent(row interface {
 	var (
 		a          Agent
 		scopeRaw   []byte
-		regHash    []byte
 		secretHash []byte
 		lastSeen   *time.Time
 	)
-	err := row.Scan(&a.ID, &a.Name, &scopeRaw, &a.Status, &regHash, &secretHash, &lastSeen, &a.CreatedAt, &a.UpdatedAt)
+	err := row.Scan(&a.ID, &a.Name, &scopeRaw, &a.Status, &secretHash, &lastSeen, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -237,7 +199,6 @@ func scanAgent(row interface {
 			return nil, fmt.Errorf("storage: unmarshal agent scope: %w", err)
 		}
 	}
-	a.RegistrationTokenHash = regHash
 	a.SecretHash = secretHash
 	a.LastSeenAt = lastSeen
 	return &a, nil

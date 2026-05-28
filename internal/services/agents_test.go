@@ -1,6 +1,6 @@
 package services_test
 
-// Integration tests for the agent registration + heartbeat flow.
+// Integration tests for the one-credential agent flow.
 // Requires both TEST_DATABASE_URL and TEST_REDIS_URL; SKIPs otherwise.
 
 import (
@@ -37,7 +37,6 @@ func bootstrap(t *testing.T) (*services.AgentService, *storage.Pool, *runtime.Cl
 	}
 	t.Cleanup(pool.Close)
 
-	// Truncate so each test starts clean.
 	const truncate = `
 		TRUNCATE TABLE
 			audit_events, sync_runs, sync_jobs, approvals,
@@ -66,72 +65,53 @@ func bootstrap(t *testing.T) (*services.AgentService, *storage.Pool, *runtime.Cl
 	return svc, pool, rdb
 }
 
-func TestMintRegister_HappyPath(t *testing.T) {
+func TestMint_ReturnsSecret(t *testing.T) {
 	svc, _, _ := bootstrap(t)
 	ctx := t.Context()
 
-	minted, err := svc.MintRegistrationToken(ctx, "agent-prod-eu", map[string]any{"cluster": "prod-eu"})
+	minted, err := svc.Mint(ctx, "agent-prod-eu", map[string]any{"cluster": "prod-eu"})
 	if err != nil {
-		t.Fatalf("MintRegistrationToken: %v", err)
+		t.Fatalf("Mint: %v", err)
 	}
-	if minted.RegistrationToken == "" {
-		t.Fatal("Mint did not return a registration token")
+	if minted.AgentSecret == "" {
+		t.Fatal("Mint did not return a secret")
 	}
 	if minted.ID == uuid.Nil {
 		t.Fatal("Mint did not assign an ID")
 	}
-
-	reg, err := svc.Register(ctx, minted.ID, minted.RegistrationToken)
-	if err != nil {
-		t.Fatalf("Register: %v", err)
-	}
-	if reg.AgentSecret == "" {
-		t.Fatal("Register did not return an agent secret")
-	}
-	if reg.AgentSecret == minted.RegistrationToken {
-		t.Fatal("agent secret must be distinct from the registration token")
-	}
 }
 
-func TestRegister_WrongTokenIsRejected(t *testing.T) {
-	svc, _, _ := bootstrap(t)
+func TestMint_PersistsHashOnly(t *testing.T) {
+	svc, pool, _ := bootstrap(t)
 	ctx := t.Context()
-	minted, err := svc.MintRegistrationToken(ctx, "a", nil)
+	minted, err := svc.Mint(ctx, "agent", nil)
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
 
-	_, err = svc.Register(ctx, minted.ID, "obviously-wrong-token")
-	if !errors.Is(err, storage.ErrUnauthorized) {
-		t.Fatalf("expected ErrUnauthorized, got %v", err)
+	// Confirm the stored hash is NOT the plaintext.
+	a, err := storage.NewAgents(pool).Get(ctx, minted.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
 	}
-}
-
-func TestRegister_ReplayIsRejected(t *testing.T) {
-	svc, _, _ := bootstrap(t)
-	ctx := t.Context()
-	minted, _ := svc.MintRegistrationToken(ctx, "a", nil)
-
-	if _, err := svc.Register(ctx, minted.ID, minted.RegistrationToken); err != nil {
-		t.Fatalf("first Register: %v", err)
+	if string(a.SecretHash) == minted.AgentSecret {
+		t.Fatal("storage stored the plaintext secret instead of its hash")
 	}
-	if _, err := svc.Register(ctx, minted.ID, minted.RegistrationToken); !errors.Is(err, storage.ErrUnauthorized) {
-		t.Fatalf("replay must be rejected, got %v", err)
+	if len(a.SecretHash) != 32 {
+		t.Fatalf("SecretHash must be 32-byte SHA-256, got %d bytes", len(a.SecretHash))
 	}
 }
 
 func TestHeartbeat_HappyPath(t *testing.T) {
 	svc, pool, _ := bootstrap(t)
 	ctx := t.Context()
-	minted, _ := svc.MintRegistrationToken(ctx, "a", nil)
-	reg, _ := svc.Register(ctx, minted.ID, minted.RegistrationToken)
+	minted, _ := svc.Mint(ctx, "agent", nil)
 
-	if err := svc.Heartbeat(ctx, reg.ID, reg.AgentSecret); err != nil {
+	if err := svc.Heartbeat(ctx, minted.ID, minted.AgentSecret); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
 	}
 
-	// last_seen_at must have been written.
-	a, err := storage.NewAgents(pool).Get(ctx, reg.ID)
+	a, err := storage.NewAgents(pool).Get(ctx, minted.ID)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -146,10 +126,9 @@ func TestHeartbeat_HappyPath(t *testing.T) {
 func TestHeartbeat_WrongSecretRejected(t *testing.T) {
 	svc, _, _ := bootstrap(t)
 	ctx := t.Context()
-	minted, _ := svc.MintRegistrationToken(ctx, "a", nil)
-	reg, _ := svc.Register(ctx, minted.ID, minted.RegistrationToken)
+	minted, _ := svc.Mint(ctx, "agent", nil)
 
-	if err := svc.Heartbeat(ctx, reg.ID, "fake-secret"); !errors.Is(err, storage.ErrUnauthorized) {
+	if err := svc.Heartbeat(ctx, minted.ID, "fake-secret"); !errors.Is(err, storage.ErrUnauthorized) {
 		t.Fatalf("expected ErrUnauthorized, got %v", err)
 	}
 }
@@ -165,15 +144,28 @@ func TestHeartbeat_UnknownAgent(t *testing.T) {
 func TestHeartbeat_RevokedAgentRejected(t *testing.T) {
 	svc, pool, _ := bootstrap(t)
 	ctx := t.Context()
-	minted, _ := svc.MintRegistrationToken(ctx, "a", nil)
-	reg, _ := svc.Register(ctx, minted.ID, minted.RegistrationToken)
+	minted, _ := svc.Mint(ctx, "agent", nil)
 
-	if err := storage.NewAgents(pool).UpdateStatus(ctx, reg.ID, storage.AgentStatusRevoked); err != nil {
+	if err := storage.NewAgents(pool).UpdateStatus(ctx, minted.ID, storage.AgentStatusRevoked); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
-
-	if err := svc.Heartbeat(ctx, reg.ID, reg.AgentSecret); !errors.Is(err, storage.ErrUnauthorized) {
+	if err := svc.Heartbeat(ctx, minted.ID, minted.AgentSecret); !errors.Is(err, storage.ErrUnauthorized) {
 		t.Fatalf("revoked agent must be rejected, got %v", err)
+	}
+}
+
+func TestHeartbeat_PodRestartScenario(t *testing.T) {
+	// The whole point of the one-credential model: a Pod restart is
+	// just "construct another caller with the same secret and keep
+	// going". No PVC, no re-mint, no re-registration.
+	svc, _, _ := bootstrap(t)
+	ctx := t.Context()
+	minted, _ := svc.Mint(ctx, "agent", nil)
+
+	for i := 0; i < 3; i++ {
+		if err := svc.Heartbeat(ctx, minted.ID, minted.AgentSecret); err != nil {
+			t.Fatalf("heartbeat #%d after simulated restart: %v", i, err)
+		}
 	}
 }
 
@@ -181,7 +173,7 @@ func TestList_OmitsCredentials(t *testing.T) {
 	svc, _, _ := bootstrap(t)
 	ctx := t.Context()
 	for _, name := range []string{"a", "b", "c"} {
-		if _, err := svc.MintRegistrationToken(ctx, name, nil); err != nil {
+		if _, err := svc.Mint(ctx, name, nil); err != nil {
 			t.Fatalf("Mint %s: %v", name, err)
 		}
 	}
@@ -192,10 +184,6 @@ func TestList_OmitsCredentials(t *testing.T) {
 	if len(views) != 3 {
 		t.Fatalf("expected 3 agents, got %d", len(views))
 	}
-	// AgentView is the projection — there are no token/secret fields
-	// in its declaration. This test mostly guards against someone
-	// future-adding a field that exposes them. We assert by inspecting
-	// the zero-allocation struct shape.
 	for _, v := range views {
 		if v.ID == uuid.Nil {
 			t.Fatal("view ID is zero")
@@ -203,25 +191,18 @@ func TestList_OmitsCredentials(t *testing.T) {
 	}
 }
 
-// TestHeartbeat_CachesLastSeenInRedis verifies the Redis-side cache
-// receives the timestamp so admin polls can skip Postgres.
 func TestHeartbeat_CachesLastSeenInRedis(t *testing.T) {
 	svc, _, rdb := bootstrap(t)
 	ctx := t.Context()
-	minted, _ := svc.MintRegistrationToken(ctx, "a", nil)
-	reg, _ := svc.Register(ctx, minted.ID, minted.RegistrationToken)
+	minted, _ := svc.Mint(ctx, "agent", nil)
 
-	if err := svc.Heartbeat(ctx, reg.ID, reg.AgentSecret); err != nil {
+	if err := svc.Heartbeat(ctx, minted.ID, minted.AgentSecret); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
 	}
 
-	// We can't reach the namespace via the public API, so peek at
-	// the underlying redis client. We can use the well-known namespace
-	// prefix ("secrets-bridge:") + the "agent:lastseen:" kind we use
-	// in services/agents.go.
 	scanCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	keys, _, err := rdb.Raw().Scan(scanCtx, 0, "*:agent:lastseen:"+reg.ID.String(), 10).Result()
+	keys, _, err := rdb.Raw().Scan(scanCtx, 0, "*:agent:lastseen:"+minted.ID.String(), 10).Result()
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}

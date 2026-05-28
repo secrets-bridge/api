@@ -163,10 +163,13 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		middleware.Audit(logger),
 	)
 
-	// Agent registration + heartbeat flow.
+	// Agent mint + heartbeat. There is intentionally no separate
+	// registration step — the Mint response carries the long-lived
+	// agent_secret directly. See pkg/storage/migrations/0003 for the
+	// rationale; tl;dr: operators don't have to manage a PVC for
+	// post-registration identity persistence.
 	v1.Post("/agents", agentsH.Mint)
 	v1.Get("/agents", agentsH.List)
-	v1.Post("/agents/:id/register", agentsH.Register)
 	v1.Post("/agents/:id/heartbeat", agentsH.Heartbeat)
 
 	return app

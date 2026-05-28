@@ -25,17 +25,18 @@ type MintRequest struct {
 	Scope map[string]any `json:"scope,omitempty"`
 }
 
-// MintResponse is returned by POST /api/v1/agents. The registration
-// token is returned EXACTLY ONCE — the admin must save it.
+// MintResponse is returned by POST /api/v1/agents. The agent_secret is
+// returned EXACTLY ONCE — the admin must save it and hand it to the
+// agent through a K8s Secret / env vars / SOPS-encrypted Helm values.
 type MintResponse struct {
-	ID                uuid.UUID `json:"id"`
-	Name              string    `json:"name"`
-	RegistrationToken string    `json:"registration_token"`
+	ID          uuid.UUID `json:"id"`
+	Name        string    `json:"name"`
+	AgentSecret string    `json:"agent_secret"`
 }
 
-// Mint handles the admin-initiated mint of a new agent registration
-// token. Treated as authenticated by the api/v1 group's middleware
-// chain (auth stub today; real RBAC in #10).
+// Mint handles the admin-initiated mint of a new agent. The response
+// includes the plaintext long-lived secret; the API does NOT support
+// retrieving it after the fact.
 func (h *Agents) Mint(c fiber.Ctx) error {
 	var req MintRequest
 	if err := c.Bind().JSON(&req); err != nil {
@@ -45,63 +46,19 @@ func (h *Agents) Mint(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "name is required")
 	}
 
-	minted, err := h.svc.MintRegistrationToken(c.Context(), req.Name, req.Scope)
+	minted, err := h.svc.Mint(c.Context(), req.Name, req.Scope)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 	return c.Status(fiber.StatusCreated).JSON(MintResponse{
-		ID:                minted.ID,
-		Name:              minted.Name,
-		RegistrationToken: minted.RegistrationToken,
-	})
-}
-
-// RegisterRequest is the body of POST /api/v1/agents/{id}/register.
-type RegisterRequest struct {
-	RegistrationToken string `json:"registration_token"`
-}
-
-// RegisterResponse is returned to the agent after a successful
-// register. The agent_secret is the credential used on every
-// subsequent heartbeat — the agent must persist it.
-type RegisterResponse struct {
-	ID          uuid.UUID `json:"id"`
-	AgentSecret string    `json:"agent_secret"`
-}
-
-// Register accepts a one-time registration token and returns the
-// long-lived agent secret. Unauthenticated by design — the bearer of
-// the registration token is the agent we just provisioned.
-func (h *Agents) Register(c fiber.Ctx) error {
-	id, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid agent id")
-	}
-	var req RegisterRequest
-	if err := c.Bind().JSON(&req); err != nil || req.RegistrationToken == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "registration_token is required")
-	}
-
-	reg, err := h.svc.Register(c.Context(), id, req.RegistrationToken)
-	switch {
-	case errors.Is(err, storage.ErrNotFound):
-		return fiber.NewError(fiber.StatusNotFound, "agent not found")
-	case errors.Is(err, storage.ErrUnauthorized):
-		// Generic message — don't leak whether the agent exists or
-		// the token is wrong. The audit log holds the specifics.
-		return fiber.NewError(fiber.StatusUnauthorized, "registration rejected")
-	case err != nil:
-		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
-	}
-	return c.Status(fiber.StatusOK).JSON(RegisterResponse{
-		ID:          reg.ID,
-		AgentSecret: reg.AgentSecret,
+		ID:          minted.ID,
+		Name:        minted.Name,
+		AgentSecret: minted.AgentSecret,
 	})
 }
 
 // Heartbeat is the agent's check-in. Authentication is via the agent
-// secret in the X-Agent-Secret header — the path id MUST match the
-// owner of that secret.
+// secret in the X-Agent-Secret header.
 func (h *Agents) Heartbeat(c fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
@@ -125,7 +82,7 @@ func (h *Agents) Heartbeat(c fiber.Ctx) error {
 }
 
 // AgentListItem is one row in the response to GET /api/v1/agents.
-// Notice the registration_token and agent_secret are NOT exposed.
+// The agent secret is NOT exposed.
 type AgentListItem struct {
 	ID         uuid.UUID      `json:"id"`
 	Name       string         `json:"name"`
@@ -135,8 +92,8 @@ type AgentListItem struct {
 	LastSeenAt *string        `json:"last_seen_at,omitempty"`
 }
 
-// List returns every agent. Admin-only in production; the auth stub
-// in middleware.Auth() admits everything during scaffolding.
+// List returns every agent. Admin-only in production; today the auth
+// stub admits everything.
 func (h *Agents) List(c fiber.Ctx) error {
 	views, err := h.svc.List(c.Context())
 	if err != nil {
