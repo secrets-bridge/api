@@ -29,6 +29,7 @@ type SecretWrap struct {
 	ExpiresAt         time.Time
 	ConsumedAt        *time.Time
 	ConsumedByAgent   *uuid.UUID
+	ConsumedByUser    string
 }
 
 // SecretWrapRepository is the read/write surface for secret_wraps.
@@ -44,12 +45,18 @@ type SecretWrapRepository interface {
 	Get(ctx context.Context, id uuid.UUID) (*SecretWrap, error)
 
 	// MarkConsumed atomically transitions a wrap from "available" to
-	// "consumed" — sets consumed_at, consumed_by_agent. Returns
-	// ErrAlreadyConsumed when the row is already consumed and
+	// "consumed" by an AGENT — sets consumed_at, consumed_by_agent.
+	// Returns ErrAlreadyConsumed when the row is already consumed and
 	// ErrExpired when the wrap has aged past expires_at. Both are
 	// observable, so the service layer can produce the right HTTP
 	// status to the agent.
 	MarkConsumed(ctx context.Context, id, agentID uuid.UUID, at time.Time) error
+
+	// MarkConsumedByUser is the user-bound counterpart of MarkConsumed.
+	// Used by the read flow's user-bound retrieval endpoint to
+	// atomically consume a wrap created by an agent. Same single-shot
+	// semantics; same error mapping.
+	MarkConsumedByUser(ctx context.Context, id uuid.UUID, userID string, at time.Time) error
 
 	// SetExpiry updates expires_at. Called by the workflow engine
 	// during state transitions (request approved → shorter TTL).
@@ -143,7 +150,8 @@ func (r *SecretWraps) Get(ctx context.Context, id uuid.UUID) (*SecretWrap, error
 		SELECT id, request_id, COALESCE(key_name, ''),
 		       encrypted_value, nonce, data_key_ciphertext,
 		       kms_key_id, algorithm, content_hash, byte_length,
-		       created_at, expires_at, consumed_at, consumed_by_agent
+		       created_at, expires_at, consumed_at, consumed_by_agent,
+		       COALESCE(consumed_by_user, '')
 		FROM secret_wraps
 		WHERE id = $1`
 	return scanSecretWrap(r.pool.QueryRow(ctx, q, id))
@@ -181,6 +189,35 @@ func (r *SecretWraps) MarkConsumed(ctx context.Context, id, agentID uuid.UUID, a
 	}
 	// Race we lost: someone else consumed it between our UPDATE and
 	// our Get. Treat as already-consumed.
+	return ErrAlreadyConsumed
+}
+
+// MarkConsumedByUser is the user-bound counterpart of MarkConsumed.
+// See the MarkConsumed comment for the contract.
+func (r *SecretWraps) MarkConsumedByUser(ctx context.Context, id uuid.UUID, userID string, at time.Time) error {
+	const q = `
+		UPDATE secret_wraps
+		SET consumed_at = $3, consumed_by_user = $2
+		WHERE id = $1
+		  AND consumed_at IS NULL
+		  AND expires_at > $3`
+	tag, err := r.pool.Exec(ctx, q, id, userID, at)
+	if err != nil {
+		return fmt.Errorf("storage: mark consumed by user: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	cur, getErr := r.Get(ctx, id)
+	if getErr != nil {
+		return getErr
+	}
+	if cur.ConsumedAt != nil {
+		return ErrAlreadyConsumed
+	}
+	if !cur.ExpiresAt.After(at) {
+		return ErrExpired
+	}
 	return ErrAlreadyConsumed
 }
 
@@ -274,6 +311,7 @@ func scanSecretWrap(row interface {
 		&w.EncryptedValue, &w.Nonce, &w.DataKeyCiphertext,
 		&w.KMSKeyID, &w.Algorithm, &w.ContentHash, &w.ByteLength,
 		&w.CreatedAt, &w.ExpiresAt, &consumedAt, &consumedByAgent,
+		&w.ConsumedByUser,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

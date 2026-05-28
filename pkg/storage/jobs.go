@@ -43,6 +43,12 @@ const (
 	// referenced in payload.wraps and writes them to the target
 	// provider, then marks the job complete.
 	JobTypePatch JobType = "patch"
+	// JobTypeRead — emitted when a read request is approved. The
+	// agent calls provider.GetValue, decomposes the bundle into the
+	// requested keys, and POSTs each plaintext to the CP's
+	// agent-side wrap-creation endpoint. The requester then
+	// retrieves each wrap through the user-bound endpoint.
+	JobTypeRead JobType = "read"
 )
 
 // JobStatus is constrained by a CHECK in the schema.

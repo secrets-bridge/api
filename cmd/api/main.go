@@ -183,7 +183,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	jobsH := handlers.NewJobs(jobSvc)
 	adminH := handlers.NewAdmin(roleRepo, userRoleRepo, workflowRepo, policyRepo)
 	requestsH := handlers.NewRequests(requestSvc)
-	wrapsH := handlers.NewWraps(requestSvc)
+	wrapsH := handlers.NewWraps(requestSvc, wrapSvc)
 
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
@@ -229,11 +229,17 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// POST /requests, are envelope-encrypted by WrapService before
 	// touching Postgres, and never appear in responses.
 	v1.Post("/requests", requestsH.Submit)
+	v1.Post("/requests/read", requestsH.SubmitRead)
 	v1.Get("/requests", requestsH.List)
 	v1.Get("/requests/:id", requestsH.Get)
 	v1.Post("/requests/:id/approve", requestsH.Approve)
 	v1.Post("/requests/:id/reject", requestsH.Reject)
 	v1.Post("/requests/:id/cancel", requestsH.Cancel)
+	// User-bound wrap retrieval for the read flow. Auth identity comes
+	// from a `user_id` query param today; swaps to a middleware-stashed
+	// identity once the auth design lands. Service-layer enforces
+	// requester==userID + request.type=read.
+	v1.Get("/requests/:id/wraps/:wrap_id", requestsH.RetrieveWrap)
 
 	// Agent-side endpoints. The `/agents/:id` sub-group is gated by
 	// the AgentAuth middleware which validates X-Agent-Secret and
@@ -247,6 +253,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// access_request to be in approved status; the wrap is consumed
 	// on success (concurrent racers see ErrAlreadyConsumed → HTTP 410).
 	agentRoutes.Get("/wraps/:wrap_id", wrapsH.Retrieve)
+	// Agent-side wrap CREATION for the read flow: after the agent
+	// fetches a value via core/providers.GetValue, it POSTs each key's
+	// plaintext here so the CP envelope-encrypts and persists. The
+	// requester later retrieves through the user-bound endpoint.
+	agentRoutes.Post("/wraps", wrapsH.Create)
 
 	return app
 }
