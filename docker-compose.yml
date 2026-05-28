@@ -48,6 +48,7 @@ services:
       DATABASE_URL: postgres://secrets_bridge:devpass@postgres:5432/secrets_bridge?sslmode=disable
       REDIS_URL: redis://redis:6379/0
       LOG_LEVEL: info
+      SB_WRAP_MASTER_KEY: jZgf2iut94A/dHVP85HY4wqkLATXodgs4N3qTDKn9i8=
     ports:
       # Host port can be overridden by exporting `API_HOST_PORT`. The
       # container always listens on 8080 internally.

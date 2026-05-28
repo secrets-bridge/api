@@ -61,7 +61,12 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - run: go test -race -count=1 ./...
+      # -p 1 forces serial PACKAGE execution. Multiple integration
+      # test packages share one Postgres + Redis pair and TRUNCATE
+      # between tests; running packages concurrently would race the
+      # truncates against each other. Tests within a package still
+      # run serially by default.
+      - run: go test -race -count=1 -p 1 ./...
 
   lint:
     name: lint
