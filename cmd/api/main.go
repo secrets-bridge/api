@@ -30,6 +30,7 @@ import (
 	"github.com/secrets-bridge/api/internal/handlers"
 	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/observability"
+	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/runtime"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
@@ -145,16 +146,28 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	app.Get("/readyz", probes.Readyz)
 	app.Get("/metrics", handlers.Metrics)
 
+	// Repositories + services + handlers wired off the pool/rdb so
+	// concrete state lives in one place. Each new endpoint group adds
+	// a handler + a Mount call below.
+	agentRepo := storage.NewAgents(pool)
+	auditRepo := storage.NewAuditEvents(pool)
+	agentSvc := services.NewAgentService(agentRepo, auditRepo, rdb)
+	agentsH := handlers.NewAgents(agentSvc)
+
 	// Authenticated API surface. Auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
-	// (issue #6) and storage (issue #2).
+	// (issue #10) and the auth design (TBD).
 	v1 := app.Group("/api/v1",
 		middleware.Auth(),
 		middleware.RBAC(),
 		middleware.Audit(logger),
 	)
-	_ = v1 // route groups land in follow-up issues; the group is
-	// registered now so middleware ordering is fixed in this PR.
+
+	// Agent registration + heartbeat flow.
+	v1.Post("/agents", agentsH.Mint)
+	v1.Get("/agents", agentsH.List)
+	v1.Post("/agents/:id/register", agentsH.Register)
+	v1.Post("/agents/:id/heartbeat", agentsH.Heartbeat)
 
 	return app
 }
