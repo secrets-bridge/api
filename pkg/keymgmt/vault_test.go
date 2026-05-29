@@ -195,7 +195,7 @@ func TestFromEnv_DefaultsToLocal(t *testing.T) {
 	t.Setenv(EnvVarMasterKey, base64.StdEncoding.EncodeToString(master))
 	t.Setenv(EnvVarBackend, "") // explicit empty = default
 
-	km, err := FromEnv(context.Background())
+	km, err := FromEnv(context.Background(), "dev")
 	if err != nil {
 		t.Fatalf("FromEnv: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestFromEnv_ExplicitLocal(t *testing.T) {
 	t.Setenv(EnvVarMasterKey, base64.StdEncoding.EncodeToString(master))
 	t.Setenv(EnvVarBackend, BackendLocal)
 
-	km, err := FromEnv(context.Background())
+	km, err := FromEnv(context.Background(), "dev")
 	if err != nil {
 		t.Fatalf("FromEnv: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestFromEnv_VaultTransit(t *testing.T) {
 	t.Setenv(EnvVaultToken, "devroot")
 	t.Setenv(EnvVaultKeyName, "sb-wrap")
 
-	km, err := FromEnv(context.Background())
+	km, err := FromEnv(context.Background(), "dev")
 	if err != nil {
 		t.Fatalf("FromEnv: %v", err)
 	}
@@ -236,7 +236,7 @@ func TestFromEnv_VaultTransit(t *testing.T) {
 
 func TestFromEnv_UnknownBackend(t *testing.T) {
 	t.Setenv(EnvVarBackend, "wat")
-	_, err := FromEnv(context.Background())
+	_, err := FromEnv(context.Background(), "dev")
 	if err == nil || !strings.Contains(err.Error(), "unknown backend") {
 		t.Fatalf("error: %v", err)
 	}

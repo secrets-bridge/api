@@ -73,7 +73,14 @@ services:
       DATABASE_URL: postgres://secrets_bridge:devpass@postgres:5432/secrets_bridge?sslmode=disable
       REDIS_URL: redis://redis:6379/0
       LOG_LEVEL: info
+      # Dev mode unlocks LocalKMS and the 3-user seeder. Default in
+      # code is "production" so any forgotten SB_ENV fails closed
+      # (LocalKMS rejected at boot).
+      SB_ENV: dev
       SB_WRAP_MASTER_KEY: jZgf2iut94A/dHVP85HY4wqkLATXodgs4N3qTDKn9i8=
+      # Optional shared password for the 3 dev users. Leave unset for
+      # a fresh random password per user, logged ONCE on first boot.
+      SB_DEV_SEED_PASSWORD: "${SB_DEV_SEED_PASSWORD:-changeme-dev-only}"
     ports:
       # Host port can be overridden by exporting `API_HOST_PORT`. The
       # container always listens on 8080 internally.
