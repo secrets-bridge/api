@@ -213,6 +213,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	requestsH := handlers.NewRequests(requestSvc)
 	wrapsH := handlers.NewWraps(requestSvc, wrapSvc, agentRepo, km)
 	secretsH := handlers.NewSecrets(secretsSvc)
+	permissionsH := handlers.NewPermissions()
 
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
@@ -253,6 +254,13 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Get("/policies/:id", adminH.GetPolicy)
 	v1.Put("/policies/:id", adminH.UpdatePolicy)
 	v1.Delete("/policies/:id", adminH.DeletePolicy)
+
+	// Canonical permission catalog. Read by the Roles admin UI to
+	// hydrate its permission picker, replacing the interim "union of
+	// permissions across existing roles" client-side discovery
+	// (ui#6). Cacheable for the api binary's lifetime — the catalog
+	// is a compile-time package value (auth.Catalog).
+	v1.Get("/permissions", permissionsH.List)
 
 	// Patch-request lifecycle. Plaintext values arrive only via
 	// POST /requests, are envelope-encrypted by WrapService before
