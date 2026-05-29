@@ -251,3 +251,109 @@ func TestAuditEvents_AppendValidatesRequiredFields(t *testing.T) {
 		}
 	}
 }
+
+func TestEnvironments_CRUDLifecycle(t *testing.T) {
+	pool := freshDB(t)
+	ctx := t.Context()
+	projects := storage.NewProjects(pool)
+	envs := storage.NewEnvironments(pool)
+
+	proj := &storage.Project{Name: "archive"}
+	if err := projects.Create(ctx, proj); err != nil {
+		t.Fatalf("Project Create: %v", err)
+	}
+
+	created := &storage.Environment{ProjectID: proj.ID, Name: "uat", Type: storage.EnvironmentTypeUAT}
+	if err := envs.Create(ctx, created); err != nil {
+		t.Fatalf("Env Create: %v", err)
+	}
+	if created.ID == uuid.Nil {
+		t.Fatal("Create did not populate ID")
+	}
+
+	got, err := envs.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Name != "uat" || got.Type != storage.EnvironmentTypeUAT || got.ProjectID != proj.ID {
+		t.Fatalf("Get returned wrong row: %+v", got)
+	}
+
+	_, err = envs.Get(ctx, uuid.New())
+	if !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("Get(missing) expected ErrNotFound, got %v", err)
+	}
+
+	// Second env under the same project.
+	prod := &storage.Environment{ProjectID: proj.ID, Name: "prod", Type: storage.EnvironmentTypeProd}
+	if err := envs.Create(ctx, prod); err != nil {
+		t.Fatalf("prod Create: %v", err)
+	}
+
+	byProject, err := envs.ListByProject(ctx, proj.ID)
+	if err != nil {
+		t.Fatalf("ListByProject: %v", err)
+	}
+	if len(byProject) != 2 {
+		t.Fatalf("ListByProject: want 2 envs, got %d", len(byProject))
+	}
+
+	all, err := envs.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("List: want 2 envs, got %d", len(all))
+	}
+
+	if err := envs.Delete(ctx, created.ID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := envs.Delete(ctx, created.ID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("Delete(missing) expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestEnvironments_RejectsDuplicateWithinProject(t *testing.T) {
+	pool := freshDB(t)
+	ctx := t.Context()
+	projects := storage.NewProjects(pool)
+	envs := storage.NewEnvironments(pool)
+
+	proj := &storage.Project{Name: "archive"}
+	if err := projects.Create(ctx, proj); err != nil {
+		t.Fatalf("Project Create: %v", err)
+	}
+
+	if err := envs.Create(ctx, &storage.Environment{ProjectID: proj.ID, Name: "uat", Type: storage.EnvironmentTypeUAT}); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+	err := envs.Create(ctx, &storage.Environment{ProjectID: proj.ID, Name: "uat", Type: storage.EnvironmentTypeUAT})
+	if !errors.Is(err, storage.ErrDuplicateName) {
+		t.Fatalf("duplicate Create: want ErrDuplicateName, got %v", err)
+	}
+}
+
+func TestEnvironments_AllowsSameNameAcrossProjects(t *testing.T) {
+	pool := freshDB(t)
+	ctx := t.Context()
+	projects := storage.NewProjects(pool)
+	envs := storage.NewEnvironments(pool)
+
+	for _, name := range []string{"archive", "elite"} {
+		if err := projects.Create(ctx, &storage.Project{Name: name}); err != nil {
+			t.Fatalf("Project Create %q: %v", name, err)
+		}
+	}
+	all, _ := projects.List(ctx)
+	if len(all) != 2 {
+		t.Fatalf("projects: %d", len(all))
+	}
+
+	// Both projects get an env named "uat" — should NOT collide.
+	for _, p := range all {
+		if err := envs.Create(ctx, &storage.Environment{ProjectID: p.ID, Name: "uat", Type: storage.EnvironmentTypeUAT}); err != nil {
+			t.Fatalf("Create env for %s: %v", p.Name, err)
+		}
+	}
+}

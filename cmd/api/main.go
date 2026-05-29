@@ -174,6 +174,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	requestRepo := storage.NewAccessRequests(pool)
 	approvalRepo := storage.NewApprovals(pool)
 	secretsRepo := storage.NewSecrets(pool)
+	projectRepo := storage.NewProjects(pool)
+	environmentRepo := storage.NewEnvironments(pool)
 
 	agentSvc := services.NewAgentService(agentRepo, auditRepo, rdb)
 	jobSvc := services.NewJobService(jobRepo, auditRepo)
@@ -214,6 +216,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	wrapsH := handlers.NewWraps(requestSvc, wrapSvc, agentRepo, km)
 	secretsH := handlers.NewSecrets(secretsSvc)
 	permissionsH := handlers.NewPermissions()
+	tenancyH := handlers.NewTenancy(projectRepo, environmentRepo)
 
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
@@ -261,6 +264,21 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// (ui#6). Cacheable for the api binary's lifetime — the catalog
 	// is a compile-time package value (auth.Catalog).
 	v1.Get("/permissions", permissionsH.List)
+
+	// Tenancy admin — projects + environments. Pre-existed in the
+	// schema (BRD §17, migration 0001) without an HTTP surface; this
+	// wires admin CRUD so the UI can manage them. Projects use a
+	// soft-delete (archive via status flip); environments hard-delete.
+	v1.Post("/projects", tenancyH.CreateProject)
+	v1.Get("/projects", tenancyH.ListProjects)
+	v1.Get("/projects/:id", tenancyH.GetProject)
+	v1.Put("/projects/:id/status", tenancyH.UpdateProjectStatus)
+	v1.Get("/projects/:id/environments", tenancyH.ListEnvironmentsForProject)
+
+	v1.Post("/environments", tenancyH.CreateEnvironment)
+	v1.Get("/environments", tenancyH.ListEnvironments)
+	v1.Get("/environments/:id", tenancyH.GetEnvironment)
+	v1.Delete("/environments/:id", tenancyH.DeleteEnvironment)
 
 	// Patch-request lifecycle. Plaintext values arrive only via
 	// POST /requests, are envelope-encrypted by WrapService before
