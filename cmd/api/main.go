@@ -31,6 +31,7 @@ import (
 	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/observability"
 	"github.com/secrets-bridge/api/internal/services"
+	"github.com/secrets-bridge/api/pkg/argocd"
 	"github.com/secrets-bridge/api/pkg/keymgmt"
 	"github.com/secrets-bridge/api/pkg/runtime"
 	"github.com/secrets-bridge/api/pkg/storage"
@@ -197,7 +198,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		gitopsSvc := services.NewGitOpsService(argoEndpointRepo, gitopsMappingRepo, gitopsObservationRepo, requestRepo, auditRepo, services.GitOpsConfig{})
 		argoEndpointSvc := services.NewArgoCDEndpointService(argoEndpointRepo, km, auditRepo)
 		requestSvc = requestSvc.WithGitOps(gitopsSvc)
-		gitopsH = handlers.NewGitOps(argoEndpointSvc, gitopsMappingRepo, gitopsSvc, requestRepo)
+		gitopsH = handlers.NewGitOps(argoEndpointSvc, gitopsMappingRepo, gitopsSvc, requestRepo, newArgoCDDiscoveryFactory())
 		logger.Info("gitops visibility integration enabled (BRD §26)")
 	} else {
 		logger.Info("gitops visibility integration disabled (set SB_GITOPS_ENABLED=true to enable)")
@@ -314,6 +315,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		v1.Put("/argocd-endpoints/:id/enabled", gitopsH.SetArgoCDEndpointEnabled)
 		v1.Delete("/argocd-endpoints/:id", gitopsH.DeleteArgoCDEndpoint)
 
+		// Read-only ArgoCD discovery: drives the UI's bulk-create
+		// mappings flow. Calls ArgoCD via the endpoint's KMS-wrapped
+		// token, returns a trimmed list of applications. NEVER writes
+		// to ArgoCD; the pkg/argocd readOnlyTransport enforces.
+		v1.Get("/argocd-endpoints/:id/discovered-apps", gitopsH.GetDiscoveredApps)
+
 		// Admin: secret_mapping (or provider_connection) → ArgoCD app(s).
 		v1.Post("/gitops-app-mappings", gitopsH.CreateGitOpsMapping)
 		v1.Get("/gitops-app-mappings", gitopsH.ListGitOpsMappings)
@@ -361,4 +368,52 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	agentRoutes.Post("/secrets/bulk", secretsH.BulkUpsert)
 
 	return app
+}
+
+// newArgoCDDiscoveryFactory returns the factory wired into the GitOps
+// handler so it can build a read-only ArgoCD client for the
+// `discovered-apps` endpoint. The factory is a thin adapter:
+// services.ArgoCDClientConfig → argocd.Config → *argocd.Client wrapped
+// to satisfy services.AppLister (which returns the trimmed
+// DiscoveredApp shape, not pkg/argocd's Application).
+//
+// pkg/argocd stays the canonical source for the wire shape; this
+// adapter just trims to what the discovery flow needs.
+func newArgoCDDiscoveryFactory() services.ArgoCDClientFactory {
+	return func(in services.ArgoCDClientConfig) (services.AppLister, error) {
+		c, err := argocd.New(argocd.Config{
+			BaseURL:       in.BaseURL,
+			Token:         in.Token,
+			TLSCAPEM:      in.TLSCAPEM,
+			TLSServerName: in.TLSServerName,
+			Timeout:       15 * time.Second,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &argoCDDiscoveryAdapter{c: c}, nil
+	}
+}
+
+type argoCDDiscoveryAdapter struct{ c *argocd.Client }
+
+func (a *argoCDDiscoveryAdapter) ListApplications(ctx context.Context, project string) ([]services.DiscoveredApp, error) {
+	apps, err := a.c.ListApplications(ctx, project)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]services.DiscoveredApp, 0, len(apps))
+	for _, app := range apps {
+		out = append(out, services.DiscoveredApp{
+			Name:                 app.Name,
+			Namespace:            app.Namespace,
+			Project:              app.Project,
+			DestinationServer:    app.DestinationServer,
+			DestinationCluster:   app.DestinationCluster,
+			DestinationNamespace: app.DestinationNamespace,
+			HealthStatus:         app.HealthStatus,
+			SyncStatus:           app.SyncStatus,
+		})
+	}
+	return out, nil
 }
