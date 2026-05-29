@@ -312,6 +312,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Post("/requests/:id/approve", requestsH.Approve)
 	v1.Post("/requests/:id/reject", requestsH.Reject)
 	v1.Post("/requests/:id/cancel", requestsH.Cancel)
+	// Value-free wrap summaries for the request detail page. Lets the
+	// UI render the Wraps card (one row per key with a ready/consumed
+	// pill) without ever fetching plaintext until the user clicks
+	// Reveal. Same `user_id` stub-auth as the retrieval endpoint.
+	v1.Get("/requests/:id/wraps", requestsH.ListWraps)
+
 	// User-bound wrap retrieval for the read flow. Auth identity comes
 	// from a `user_id` query param today; swaps to a middleware-stashed
 	// identity once the auth design lands. Service-layer enforces
