@@ -84,23 +84,46 @@ func Recover(logger *slog.Logger) fiber.Handler {
 	}
 }
 
-// Auth is a STUB upgrade ahead of real OIDC (api#26). The middleware
-// reads an `X-User-Id` header — when present, it's used verbatim as
-// the actor identity; when absent, falls back to the legacy
-// "anonymous" placeholder so existing tests + UI flows that don't yet
-// know about identity keep working.
+// TokenVerifier is the slice of `services.AuthService` the middleware
+// needs to verify Bearer JWTs. Kept as an interface so the middleware
+// stays test-friendly + so consumers without a JWT signer can pass
+// nil (header-only mode, useful for the offline test path).
+type TokenVerifier interface {
+	SubjectFromToken(token string) (string, error)
+}
+
+// Auth resolves the request actor identity.
 //
-// This is NOT a security boundary. The header is trivially spoofable
-// from any caller and exists ONLY to let downstream RBAC middleware
-// (`internal/auth.Require`) be exercised end-to-end before the OIDC
-// swap lands. The header reading code is the only piece that changes
-// when OIDC arrives — the rest of the platform reads identity from
-// `CtxKeyActor` and is agnostic to how it got there.
-func Auth() fiber.Handler {
+// Resolution order:
+//   1. `Authorization: Bearer <jwt>` — validated via TokenVerifier;
+//      the `sub` claim becomes the actor.
+//   2. `X-User-Id: <id>` — legacy header used by curl / pre-JWT UI
+//      flows. NOT a security boundary; kept so existing tests and
+//      development scripts keep working.
+//   3. Fallback: "anonymous".
+//
+// A Bearer token that FAILS verification falls through to the
+// X-User-Id / anonymous path rather than returning 401 — the actual
+// authorization gate is `internal/auth.Require`, which is permission-
+// driven. Generic-401 surfaces from there once it's enabled.
+//
+// When OIDC lands (api#26), the Bearer branch swaps to an OIDC token
+// verifier without changing the rest of the platform — every consumer
+// reads from `CtxKeyActor`.
+func Auth(verifier TokenVerifier) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		actor := "anonymous"
-		if v := c.Get("X-User-Id"); v != "" {
-			actor = v
+		if verifier != nil {
+			if h := c.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+				if sub, err := verifier.SubjectFromToken(strings.TrimPrefix(h, "Bearer ")); err == nil {
+					actor = sub
+				}
+			}
+		}
+		if actor == "anonymous" {
+			if v := c.Get("X-User-Id"); v != "" {
+				actor = v
+			}
 		}
 		c.SetContext(context.WithValue(c.Context(), CtxKeyActor, actor))
 		return c.Next()

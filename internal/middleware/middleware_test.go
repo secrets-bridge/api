@@ -77,7 +77,7 @@ func TestRequestID_RejectsOverlongInbound(t *testing.T) {
 
 func TestAuth_StubSetsAnonymousActor(t *testing.T) {
 	app := fiber.New()
-	app.Use(Auth())
+	app.Use(Auth(nil))
 	app.Get("/x", func(c fiber.Ctx) error {
 		if v, ok := c.Context().Value(CtxKeyActor).(string); !ok || v != "anonymous" {
 			return c.Status(500).SendString("actor not set")

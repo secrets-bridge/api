@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/base64"
+	"errors"
 	"os"
 	"time"
 )
@@ -38,15 +40,72 @@ type Config struct {
 	// OIDC login flow (api#26) ships. The value is an opaque user_id
 	// matching the future OIDC `sub` claim; it is NOT a credential.
 	BootstrapAdminUserID string
+
+	// JWTSecret is the HMAC key for HS256-signed login tokens. Must
+	// be ≥32 bytes. Accepted as a base64 string OR raw bytes; the
+	// loader picks whichever decode path yields ≥32 bytes.
+	//
+	// When unset, the api refuses to start (fail loud rather than
+	// silently mint useless tokens).
+	JWTSecret []byte
+
+	// JWTTokenTTL bounds the login session lifetime. Default 8h —
+	// matches typical admin-session expectations. Operators wanting
+	// a tighter window override via SB_JWT_TOKEN_TTL.
+	JWTTokenTTL time.Duration
+
+	// BootstrapAdminEmail / Password seed a local admin user on
+	// first boot when local_users is empty. Idempotent: once any
+	// user exists, the bootstrap step is a no-op.
+	//
+	// Recommended for break-glass; production deployments rotate the
+	// password immediately after first login (UI surface for that
+	// lands in a follow-up — for now operators update the row via
+	// psql + bcrypt or simply mint another admin from a privileged
+	// session).
+	BootstrapAdminEmail    string
+	BootstrapAdminPassword string
 }
 
 func loadConfig() Config {
 	return Config{
-		Addr:          envOr("API_ADDR", ":8080"),
-		ShutdownGrace: envDuration("API_SHUTDOWN_GRACE", 15*time.Second),
-		GitOpsEnabled:        envBool("SB_GITOPS_ENABLED", false),
-		BootstrapAdminUserID: envOr("SB_BOOTSTRAP_ADMIN_USER_ID", ""),
+		Addr:                   envOr("API_ADDR", ":8080"),
+		ShutdownGrace:          envDuration("API_SHUTDOWN_GRACE", 15*time.Second),
+		GitOpsEnabled:          envBool("SB_GITOPS_ENABLED", false),
+		BootstrapAdminUserID:   envOr("SB_BOOTSTRAP_ADMIN_USER_ID", ""),
+		JWTSecret:              loadJWTSecret(),
+		JWTTokenTTL:            envDuration("SB_JWT_TOKEN_TTL", 8*time.Hour),
+		BootstrapAdminEmail:    envOr("SB_BOOTSTRAP_ADMIN_EMAIL", ""),
+		BootstrapAdminPassword: envOr("SB_BOOTSTRAP_ADMIN_PASSWORD", ""),
 	}
+}
+
+// loadJWTSecret reads SB_JWT_SECRET as base64 (preferred) or raw
+// bytes. Returns nil when the env var is unset; main fails the boot
+// in that case.
+func loadJWTSecret() []byte {
+	raw, ok := os.LookupEnv("SB_JWT_SECRET")
+	if !ok || raw == "" {
+		return nil
+	}
+	// Try base64 first.
+	if decoded, err := base64.StdEncoding.DecodeString(raw); err == nil && len(decoded) >= 32 {
+		return decoded
+	}
+	if decoded, err := base64.RawStdEncoding.DecodeString(raw); err == nil && len(decoded) >= 32 {
+		return decoded
+	}
+	// Fall back to raw bytes.
+	return []byte(raw)
+}
+
+// ValidateJWTSecret returns an error when the secret is too short or
+// missing. Called by main on boot.
+func (c Config) ValidateJWTSecret() error {
+	if len(c.JWTSecret) < 32 {
+		return errors.New("SB_JWT_SECRET must be set and ≥32 bytes (base64 or raw)")
+	}
+	return nil
 }
 
 func envBool(key string, fallback bool) bool {
