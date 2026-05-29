@@ -25,6 +25,7 @@ type UserRole struct {
 type UserRoleRepository interface {
 	Grant(ctx context.Context, ur *UserRole) error
 	Revoke(ctx context.Context, id uuid.UUID) error
+	List(ctx context.Context) ([]*UserRole, error)
 	ListByUser(ctx context.Context, userID string) ([]*UserRole, error)
 	ListByRole(ctx context.Context, roleID uuid.UUID) ([]*UserRole, error)
 }
@@ -77,6 +78,30 @@ func (r *UserRoles) ListByUser(ctx context.Context, userID string) ([]*UserRole,
 	rows, err := r.pool.Query(ctx, q, userID)
 	if err != nil {
 		return nil, fmt.Errorf("storage: list user_roles by user: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*UserRole
+	for rows.Next() {
+		ur, err := scanUserRole(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ur)
+	}
+	return out, rows.Err()
+}
+
+// List returns every assignment ordered by user_id then granted_at.
+// Small table by design — no pagination yet.
+func (r *UserRoles) List(ctx context.Context) ([]*UserRole, error) {
+	const q = `
+		SELECT id, user_id, role_id, scope, COALESCE(granted_by, ''), granted_at
+		FROM user_roles
+		ORDER BY user_id ASC, granted_at ASC`
+	rows, err := r.pool.Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list user_roles: %w", err)
 	}
 	defer rows.Close()
 

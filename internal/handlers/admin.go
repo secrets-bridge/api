@@ -251,6 +251,21 @@ func (h *Admin) ListUserRoles(c fiber.Ctx) error {
 	return c.JSON(out)
 }
 
+// ListAllUserRoles handles GET /user-roles. Flat list across every
+// user — drives the Assignments admin page. Filtering by user or
+// role is the caller's job for now; the table is small.
+func (h *Admin) ListAllUserRoles(c fiber.Ctx) error {
+	urs, err := h.userRoles.List(c.Context())
+	if err != nil {
+		return adminErr(err)
+	}
+	out := make([]UserRoleBody, 0, len(urs))
+	for _, ur := range urs {
+		out = append(out, userRoleToBody(ur))
+	}
+	return c.JSON(out)
+}
+
 // ---- workflow_definitions -------------------------------------------
 
 // WorkflowBody is the request/response JSON shape. TTLs are exposed as
