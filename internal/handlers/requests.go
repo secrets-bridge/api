@@ -314,6 +314,62 @@ func retrieveUserWrapErr(err error) error {
 	}
 }
 
+// WrapSummaryBody is the value-free metadata view returned by the
+// wrap-summaries endpoint. Lets the UI render the Wraps card on the
+// request detail page (one row per key with a ready/consumed pill)
+// without ever fetching plaintext until the user explicitly clicks
+// Reveal — which goes through the existing single-shot RetrieveWrap
+// path. NEVER carries plaintext.
+type WrapSummaryBody struct {
+	ID        string `json:"id"`
+	KeyName   string `json:"key_name,omitempty"`
+	Consumed  bool   `json:"consumed"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+// ListWraps handles GET /api/v1/requests/:id/wraps and returns the
+// value-free wrap summaries for the request. Lets the requester see
+// which keys have wraps issued (and whether each is already consumed)
+// without revealing any plaintext.
+//
+// Authorization (today): consistent with RetrieveWrap, the user
+// identity comes from the `user_id` query param. The service layer's
+// ownership check (requester == userID) gates the response.
+func (h *Requests) ListWraps(c fiber.Ctx) error {
+	reqID, err := parseID(c, "id")
+	if err != nil {
+		return err
+	}
+	userID := c.Query("user_id")
+	if userID == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "user_id query param required (until auth middleware lands)")
+	}
+
+	req, err := h.svc.Get(c.Context(), reqID)
+	if err != nil {
+		return requestErr(err)
+	}
+	if req.RequesterID != userID {
+		return fiber.NewError(fiber.StatusForbidden, "only the original requester may list wraps")
+	}
+
+	summaries, err := h.svc.WrapSummariesForRequest(c.Context(), reqID)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+
+	out := make([]WrapSummaryBody, 0, len(summaries))
+	for _, s := range summaries {
+		out = append(out, WrapSummaryBody{
+			ID:        s.ID.String(),
+			KeyName:   s.KeyName,
+			Consumed:  s.Consumed,
+			ExpiresAt: s.ExpiresAt.UTC().Format(time.RFC3339),
+		})
+	}
+	return c.JSON(out)
+}
+
 // ---- end read flow ---------------------------------------------------
 
 // Cancel handles POST /requests/:id/cancel.
