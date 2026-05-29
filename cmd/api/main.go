@@ -244,6 +244,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Delete("/roles/:id", adminH.DeleteRole)
 
 	v1.Post("/user-roles", adminH.GrantUserRole)
+	v1.Get("/user-roles", adminH.ListAllUserRoles)
 	v1.Delete("/user-roles/:id", adminH.RevokeUserRole)
 	v1.Get("/users/:userID/roles", adminH.ListUserRoles)
 
