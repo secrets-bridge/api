@@ -28,13 +28,24 @@ type Config struct {
 	// endpoint are NOT mounted and the request lifecycle has no GitOps
 	// fan-out step. Existing deployments behave exactly as before.
 	GitOpsEnabled bool
+
+	// BootstrapAdminUserID — when set AND `user_roles` has NO admin
+	// grants at first boot, the api creates one assignment binding
+	// this user_id to the seed `admin` role. Idempotent: if any admin
+	// grant already exists, the bootstrap is a no-op.
+	//
+	// v1 escape hatch so operators can use the platform before the
+	// OIDC login flow (api#26) ships. The value is an opaque user_id
+	// matching the future OIDC `sub` claim; it is NOT a credential.
+	BootstrapAdminUserID string
 }
 
 func loadConfig() Config {
 	return Config{
 		Addr:          envOr("API_ADDR", ":8080"),
 		ShutdownGrace: envDuration("API_SHUTDOWN_GRACE", 15*time.Second),
-		GitOpsEnabled: envBool("SB_GITOPS_ENABLED", false),
+		GitOpsEnabled:        envBool("SB_GITOPS_ENABLED", false),
+		BootstrapAdminUserID: envOr("SB_BOOTSTRAP_ADMIN_USER_ID", ""),
 	}
 }
 

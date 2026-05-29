@@ -27,6 +27,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/handlers"
 	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/observability"
@@ -102,6 +103,16 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("keymgmt backend ready", "key_id", km.CurrentKeyID())
+
+	// Bootstrap admin assignment. Idempotent: if any user already
+	// holds an admin grant, this is a no-op. v1 escape hatch so the
+	// platform is usable before OIDC + a real login flow ship.
+	if cfg.BootstrapAdminUserID != "" {
+		if err := bootstrapAdminGrant(context.Background(), pool, cfg.BootstrapAdminUserID, logger); err != nil {
+			logger.Error("bootstrap admin grant", "error", err)
+			os.Exit(1)
+		}
+	}
 
 	app := newApp(cfg, logger, pool, rdb, km)
 
@@ -219,6 +230,10 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	permissionsH := handlers.NewPermissions()
 	tenancyH := handlers.NewTenancy(projectRepo, environmentRepo)
 
+	// RBAC resolver for the `auth.Require(perm)` middleware. Loads each
+	// caller's user_role assignments + the role catalog at request time.
+	rbacResolver := auth.NewRepoResolver(userRoleRepo, roleRepo)
+
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
 	// (issue #10).
@@ -229,36 +244,41 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	)
 
 	// Admin-side endpoints.
-	v1.Post("/agents", agentsH.Mint)
+	//
+	// Each WRITE endpoint is gated by `auth.Require(perm)`, which
+	// resolves the caller's identity from `middleware.CtxKeyActor`
+	// (set by the stub `middleware.Auth()` from the `X-User-Id`
+	// header today; real OIDC lands with api#26) and checks against
+	// the canonical catalog (`auth.Catalog`). READ endpoints stay
+	// unauthenticated for v1 so the UI can hydrate without a session;
+	// list-level RBAC lands as a follow-up.
+	v1.Post("/agents", auth.Require(auth.PermAgentMint, rbacResolver), agentsH.Mint)
 	v1.Get("/agents", agentsH.List)
 	v1.Post("/jobs", jobsH.Enqueue)
 
-	// Dynamic workflow + policy engine — admin CRUD over the four
-	// entities Piece 2 introduced. Real RBAC enforcement (checking
-	// the caller has role.edit / workflow.edit / policy.edit
-	// permissions) layers on top once the auth design lands.
-	v1.Post("/roles", adminH.CreateRole)
+	// Dynamic workflow + policy engine.
+	v1.Post("/roles", auth.Require(auth.PermRoleEdit, rbacResolver), adminH.CreateRole)
 	v1.Get("/roles", adminH.ListRoles)
 	v1.Get("/roles/:id", adminH.GetRole)
-	v1.Put("/roles/:id/permissions", adminH.UpdateRolePermissions)
-	v1.Delete("/roles/:id", adminH.DeleteRole)
+	v1.Put("/roles/:id/permissions", auth.Require(auth.PermRoleEdit, rbacResolver), adminH.UpdateRolePermissions)
+	v1.Delete("/roles/:id", auth.Require(auth.PermRoleEdit, rbacResolver), adminH.DeleteRole)
 
-	v1.Post("/user-roles", adminH.GrantUserRole)
+	v1.Post("/user-roles", auth.Require(auth.PermUserRoleEdit, rbacResolver), adminH.GrantUserRole)
 	v1.Get("/user-roles", adminH.ListAllUserRoles)
-	v1.Delete("/user-roles/:id", adminH.RevokeUserRole)
+	v1.Delete("/user-roles/:id", auth.Require(auth.PermUserRoleEdit, rbacResolver), adminH.RevokeUserRole)
 	v1.Get("/users/:userID/roles", adminH.ListUserRoles)
 
-	v1.Post("/workflows", adminH.CreateWorkflow)
+	v1.Post("/workflows", auth.Require(auth.PermWorkflowEdit, rbacResolver), adminH.CreateWorkflow)
 	v1.Get("/workflows", adminH.ListWorkflows)
 	v1.Get("/workflows/:id", adminH.GetWorkflow)
-	v1.Put("/workflows/:id", adminH.UpdateWorkflow)
-	v1.Delete("/workflows/:id", adminH.DeleteWorkflow)
+	v1.Put("/workflows/:id", auth.Require(auth.PermWorkflowEdit, rbacResolver), adminH.UpdateWorkflow)
+	v1.Delete("/workflows/:id", auth.Require(auth.PermWorkflowEdit, rbacResolver), adminH.DeleteWorkflow)
 
-	v1.Post("/policies", adminH.CreatePolicy)
+	v1.Post("/policies", auth.Require(auth.PermPolicyEdit, rbacResolver), adminH.CreatePolicy)
 	v1.Get("/policies", adminH.ListPolicies)
 	v1.Get("/policies/:id", adminH.GetPolicy)
-	v1.Put("/policies/:id", adminH.UpdatePolicy)
-	v1.Delete("/policies/:id", adminH.DeletePolicy)
+	v1.Put("/policies/:id", auth.Require(auth.PermPolicyEdit, rbacResolver), adminH.UpdatePolicy)
+	v1.Delete("/policies/:id", auth.Require(auth.PermPolicyEdit, rbacResolver), adminH.DeletePolicy)
 
 	// Canonical permission catalog. Read by the Roles admin UI to
 	// hydrate its permission picker, replacing the interim "union of
@@ -310,11 +330,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		// Admin: ArgoCD endpoint CRUD. Plaintext tokens arrive only
 		// via POST, are envelope-encrypted via KeyManager before
 		// touching Postgres, and never appear in responses.
-		v1.Post("/argocd-endpoints", gitopsH.CreateArgoCDEndpoint)
+		v1.Post("/argocd-endpoints", auth.Require(auth.PermIntegrationEdit, rbacResolver), gitopsH.CreateArgoCDEndpoint)
 		v1.Get("/argocd-endpoints", gitopsH.ListArgoCDEndpoints)
 		v1.Get("/argocd-endpoints/:id", gitopsH.GetArgoCDEndpoint)
-		v1.Put("/argocd-endpoints/:id/enabled", gitopsH.SetArgoCDEndpointEnabled)
-		v1.Delete("/argocd-endpoints/:id", gitopsH.DeleteArgoCDEndpoint)
+		v1.Put("/argocd-endpoints/:id/enabled", auth.Require(auth.PermIntegrationEdit, rbacResolver), gitopsH.SetArgoCDEndpointEnabled)
+		v1.Delete("/argocd-endpoints/:id", auth.Require(auth.PermIntegrationEdit, rbacResolver), gitopsH.DeleteArgoCDEndpoint)
 
 		// Read-only ArgoCD discovery: drives the UI's bulk-create
 		// mappings flow. Calls ArgoCD via the endpoint's KMS-wrapped
@@ -323,9 +343,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		v1.Get("/argocd-endpoints/:id/discovered-apps", gitopsH.GetDiscoveredApps)
 
 		// Admin: secret_mapping (or provider_connection) → ArgoCD app(s).
-		v1.Post("/gitops-app-mappings", gitopsH.CreateGitOpsMapping)
+		v1.Post("/gitops-app-mappings", auth.Require(auth.PermIntegrationEdit, rbacResolver), gitopsH.CreateGitOpsMapping)
 		v1.Get("/gitops-app-mappings", gitopsH.ListGitOpsMappings)
-		v1.Delete("/gitops-app-mappings/:id", gitopsH.DeleteGitOpsMapping)
+		v1.Delete("/gitops-app-mappings/:id", auth.Require(auth.PermIntegrationEdit, rbacResolver), gitopsH.DeleteGitOpsMapping)
 	}
 
 	// Discovery surface. Admins search the cache via GET; the agent's
@@ -417,4 +437,48 @@ func (a *argoCDDiscoveryAdapter) ListApplications(ctx context.Context, project s
 		})
 	}
 	return out, nil
+}
+
+// bootstrapAdminGrant idempotently ensures the configured
+// `BootstrapAdminUserID` holds the seed `admin` role. Runs once at
+// boot:
+//
+//   - If ANY admin grant already exists in user_roles, log + return.
+//   - Else: insert one (user_id, admin_role_id, scope={}) row.
+//
+// Identity is opaque text (matches the future OIDC `sub` claim). No
+// password material is involved — this is purely the assignment side.
+// The login + password flow lands as slice 7.
+func bootstrapAdminGrant(ctx context.Context, pool *storage.Pool, userID string, logger *slog.Logger) error {
+	roles := storage.NewRoles(pool)
+	userRoles := storage.NewUserRoles(pool)
+
+	adminRole, err := roles.GetByName(ctx, "admin")
+	if err != nil {
+		return errors.New("bootstrap: seed `admin` role missing — was migration 0005 applied?")
+	}
+
+	existing, err := userRoles.ListByRole(ctx, adminRole.ID)
+	if err != nil {
+		return err
+	}
+	if len(existing) > 0 {
+		logger.Info("bootstrap admin already assigned (idempotent skip)",
+			"existing_count", len(existing))
+		return nil
+	}
+
+	grant := &storage.UserRole{
+		UserID: userID,
+		RoleID: adminRole.ID,
+		Scope:  map[string]any{}, // global
+	}
+	if err := userRoles.Grant(ctx, grant); err != nil {
+		return err
+	}
+	logger.Info("bootstrap admin assignment created",
+		"user_id", userID,
+		"role", "admin",
+		"scope", "global")
+	return nil
 }
