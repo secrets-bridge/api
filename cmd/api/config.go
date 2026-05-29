@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"os"
 	"time"
 )
@@ -10,6 +11,14 @@ import (
 // buildVersion is set at link time via -ldflags '-X main.buildVersion=...'.
 // Defaults to "dev" for `go run` and local builds.
 var buildVersion = "dev"
+
+// Deployment mode. Default ModeProduction so a missing/forgotten
+// SB_ENV gives the safe behavior (LocalKMS rejected, dev seeder
+// skipped).
+const (
+	ModeDev        = "dev"
+	ModeProduction = "production"
+)
 
 // Config carries the runtime configuration for the api service.
 //
@@ -24,12 +33,34 @@ type Config struct {
 	// ShutdownGrace bounds the graceful-shutdown wait.
 	ShutdownGrace time.Duration
 
+	// Env is the deployment mode (SB_ENV). Recognised values: "dev"
+	// or "production"; default "production" so a forgotten env var
+	// fails closed (LocalKMS rejected, dev seeder skipped).
+	//
+	// Two effects:
+	//   1. KMS resolver (pkg/keymgmt.FromEnv) refuses BackendLocal
+	//      when Env != "dev".
+	//   2. Dev seeder runs only when Env == "dev" — see
+	//      services.AuthService.BootstrapDevUsers.
+	Env string
+
 	// GitOpsEnabled gates the read-only ArgoCD visibility integration
 	// (BRD §26). Default OFF — operators opt in via Helm value or env
 	// var. When false: the admin CRUD endpoints + user observation
 	// endpoint are NOT mounted and the request lifecycle has no GitOps
 	// fan-out step. Existing deployments behave exactly as before.
 	GitOpsEnabled bool
+
+	// DevSeedPassword is the shared password the dev seeder assigns
+	// to all three seeded users (admin / approver / requester) when
+	// SB_ENV=dev. Optional — when unset, the seeder generates a
+	// random password per user and logs it ONCE at WARN level so the
+	// operator can capture it from the boot log.
+	//
+	// Production deployments leave this unset and rely on
+	// BootstrapAdminEmail/Password (single break-glass admin) +
+	// OIDC for everyone else once api#26 lands.
+	DevSeedPassword string
 
 	// BootstrapAdminUserID — when set AND `user_roles` has NO admin
 	// grants at first boot, the api creates one assignment binding
@@ -71,12 +102,27 @@ func loadConfig() Config {
 	return Config{
 		Addr:                   envOr("API_ADDR", ":8080"),
 		ShutdownGrace:          envDuration("API_SHUTDOWN_GRACE", 15*time.Second),
+		Env:                    envOr("SB_ENV", ModeProduction),
 		GitOpsEnabled:          envBool("SB_GITOPS_ENABLED", false),
 		BootstrapAdminUserID:   envOr("SB_BOOTSTRAP_ADMIN_USER_ID", ""),
 		JWTSecret:              loadJWTSecret(),
 		JWTTokenTTL:            envDuration("SB_JWT_TOKEN_TTL", 8*time.Hour),
 		BootstrapAdminEmail:    envOr("SB_BOOTSTRAP_ADMIN_EMAIL", ""),
 		BootstrapAdminPassword: envOr("SB_BOOTSTRAP_ADMIN_PASSWORD", ""),
+		DevSeedPassword:        envOr("SB_DEV_SEED_PASSWORD", ""),
+	}
+}
+
+// ValidateEnv returns an error when SB_ENV is set to an unknown
+// value. The default (ModeProduction) and ModeDev are the only
+// recognised modes; anything else means a typo that would otherwise
+// silently fall through to ModeProduction's strict posture.
+func (c Config) ValidateEnv() error {
+	switch c.Env {
+	case ModeDev, ModeProduction:
+		return nil
+	default:
+		return fmt.Errorf("SB_ENV=%q is not recognised (allowed: %s, %s)", c.Env, ModeDev, ModeProduction)
 	}
 }
 

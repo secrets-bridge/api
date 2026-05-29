@@ -28,7 +28,9 @@ package services
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
@@ -205,6 +207,117 @@ func (s *AuthService) BootstrapLocalAdmin(ctx context.Context, email, password s
 	})
 
 	return user.ID.String(), nil
+}
+
+// DevSeededUser is the value-free projection the dev seeder returns
+// to main.go so it can print a one-time WARN block with the seeded
+// credentials.
+type DevSeededUser struct {
+	Email    string
+	Role     string
+	Password string
+}
+
+// BootstrapDevUsers creates three seed users — admin, approver,
+// requester — bound to the matching system roles, when AND ONLY WHEN
+// `local_users` is empty. Idempotent: a second call with any user
+// already present returns an empty slice and `nil`.
+//
+// `sharedPassword` is optional. When empty, the seeder generates a
+// distinct random password per user; the caller is expected to log
+// these ONCE at WARN level so the operator can capture them from the
+// boot output. When non-empty, all three users get the same password
+// (typical UAT pattern — operator sets one env var).
+//
+// This step runs only when SB_ENV=dev. main.go gates the call; the
+// service-layer function itself does not re-check, so tests can
+// exercise the seeding logic without depending on env vars.
+func (s *AuthService) BootstrapDevUsers(ctx context.Context, sharedPassword string) ([]DevSeededUser, error) {
+	n, err := s.users.Count(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("services: count users: %w", err)
+	}
+	if n > 0 {
+		return nil, nil
+	}
+
+	specs := []struct {
+		email       string
+		displayName string
+		role        string
+	}{
+		{"admin@secrets-bridge.dev", "Admin", "admin"},
+		{"approver@secrets-bridge.dev", "Approver", "approver"},
+		{"requester@secrets-bridge.dev", "Requester", "developer"},
+	}
+
+	created := make([]DevSeededUser, 0, len(specs))
+	for _, spec := range specs {
+		password := sharedPassword
+		if password == "" {
+			password, err = randomDevPassword()
+			if err != nil {
+				return nil, fmt.Errorf("services: generate dev password: %w", err)
+			}
+		}
+
+		hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+		if err != nil {
+			return nil, fmt.Errorf("services: hash password for %s: %w", spec.email, err)
+		}
+
+		user := &storage.LocalUser{
+			Email:        spec.email,
+			PasswordHash: hash,
+			DisplayName:  spec.displayName,
+		}
+		if err := s.users.Create(ctx, user); err != nil {
+			return nil, fmt.Errorf("services: create %s: %w", spec.email, err)
+		}
+
+		role, err := s.roles.GetByName(ctx, spec.role)
+		if err != nil {
+			return nil, fmt.Errorf("services: lookup role %q for %s: %w", spec.role, spec.email, err)
+		}
+		grant := &storage.UserRole{
+			UserID: user.ID.String(),
+			RoleID: role.ID,
+			Scope:  map[string]any{},
+		}
+		if err := s.userRoles.Grant(ctx, grant); err != nil {
+			return nil, fmt.Errorf("services: grant role %q to %s: %w", spec.role, spec.email, err)
+		}
+
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:    "system:bootstrap",
+			Action:   "auth.bootstrap_dev_user",
+			Resource: "user:" + user.ID.String(),
+			Status:   storage.AuditStatusSuccess,
+			Metadata: map[string]any{
+				"email": user.Email,
+				"role":  spec.role,
+			},
+		})
+
+		created = append(created, DevSeededUser{
+			Email:    user.Email,
+			Role:     spec.role,
+			Password: password,
+		})
+	}
+
+	return created, nil
+}
+
+// randomDevPassword generates a 24-byte random URL-safe password
+// (~32 base64url characters). Used by BootstrapDevUsers when the
+// operator hasn't pinned one via SB_DEV_SEED_PASSWORD.
+func randomDevPassword() (string, error) {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 // --- audit helpers --------------------------------------------------

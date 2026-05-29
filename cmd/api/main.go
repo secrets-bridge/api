@@ -43,11 +43,19 @@ func main() {
 	slog.SetDefault(logger)
 
 	cfg := loadConfig()
+	if err := cfg.ValidateEnv(); err != nil {
+		logger.Error("config env", "error", err)
+		os.Exit(1)
+	}
 	logger.Info("starting secrets-bridge api",
 		"version", buildVersion,
 		"addr", cfg.Addr,
+		"env", cfg.Env,
 		"shutdown_grace", cfg.ShutdownGrace,
 	)
+	if cfg.Env == ModeDev {
+		logger.Warn("SB_ENV=dev — LocalKMS allowed, dev seeder will run if local_users is empty. Do NOT use this in production.")
+	}
 
 	// Storage wiring. The pool is required; the api refuses to start
 	// without it because every meaningful endpoint depends on Postgres.
@@ -96,7 +104,7 @@ func main() {
 	// Same fail-fast posture as storage and runtime — the CP refuses to
 	// start without a working KeyManager. Reuses bootCtx so the timeout
 	// covers vault-transit's auth handshake too.
-	km, err := keymgmt.FromEnv(bootCtx)
+	km, err := keymgmt.FromEnv(bootCtx, cfg.Env)
 	bootCancel()
 	if err != nil {
 		logger.Error("keymgmt bootstrap", "error", err)
@@ -146,6 +154,37 @@ func main() {
 			logger.Info("bootstrap local admin created", "user_id", id, "email", cfg.BootstrapAdminEmail)
 		} else {
 			logger.Info("bootstrap local admin skipped (users already exist)")
+		}
+	}
+
+	// Dev seeder. Runs only when SB_ENV=dev AND local_users is
+	// empty. Creates three users (admin / approver / requester) bound
+	// to the matching system roles, then logs the credentials ONCE so
+	// the operator can capture them from the boot output. The password
+	// is either SB_DEV_SEED_PASSWORD (shared, useful for UAT) or
+	// generated per user at random.
+	if cfg.Env == ModeDev {
+		bootCtx3, bootCancel3 := context.WithTimeout(context.Background(), 30*time.Second)
+		seeded, err := authSvc.BootstrapDevUsers(bootCtx3, cfg.DevSeedPassword)
+		bootCancel3()
+		if err != nil {
+			logger.Error("bootstrap dev users", "error", err)
+			os.Exit(1)
+		}
+		if len(seeded) == 0 {
+			logger.Info("bootstrap dev users skipped (users already exist)")
+		} else {
+			logger.Warn("================================================================")
+			logger.Warn("DEV SEEDER — capture these credentials, they are logged ONCE")
+			logger.Warn("================================================================")
+			for _, u := range seeded {
+				logger.Warn("dev user seeded",
+					"email", u.Email,
+					"role", u.Role,
+					"password", u.Password,
+				)
+			}
+			logger.Warn("================================================================")
 		}
 	}
 

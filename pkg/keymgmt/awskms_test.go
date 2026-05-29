@@ -265,7 +265,7 @@ func TestResolver_RoutesToAWSKMS(t *testing.T) {
 	t.Setenv(EnvAWSKMSRegion, "us-east-1")
 	t.Setenv(EnvAWSKMSKeyID, "alias/sb-wrap")
 	t.Setenv(EnvAWSKMSEndpoint, "")
-	km, err := FromEnv(context.Background())
+	km, err := FromEnv(context.Background(), "dev")
 	if err != nil {
 		t.Fatalf("FromEnv: %v", err)
 	}

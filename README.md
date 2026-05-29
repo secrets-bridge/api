@@ -57,6 +57,8 @@ pkg/
 | `API_ADDR` | `:8080` | Listen address |
 | `API_SHUTDOWN_GRACE` | `15s` | Graceful-shutdown deadline |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `SB_ENV` | `production` | Deployment mode: `dev` or `production`. In `dev` all KMS backends are accepted AND the dev seeder creates three users (admin/approver/requester) when `local_users` is empty. In `production` the `local` KMS backend is REJECTED at startup and the dev seeder never runs. Any other value (including a typo) is rejected at boot. |
+| `SB_DEV_SEED_PASSWORD` | _(unset)_ | Optional shared password the dev seeder assigns to the three seeded users. When unset, the seeder generates a 24-byte random password per user and logs them ONCE at WARN level. Only consulted when `SB_ENV=dev`. |
 | `SB_GITOPS_ENABLED` | `false` | Opt-in for the read-only ArgoCD visibility integration (BRD §26). When off, the admin / observation endpoints are NOT mounted and the request lifecycle has no GitOps fan-out step. Operators flip via Helm value or a future UI integrations toggle. |
 
 Real dependencies (`DATABASE_URL`, `REDIS_URL`, OIDC issuer, etc.) are deliberately absent from this scaffold — they land with the issues that introduce their package.
