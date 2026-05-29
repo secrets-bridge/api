@@ -114,7 +114,42 @@ func main() {
 		}
 	}
 
-	app := newApp(cfg, logger, pool, rdb, km)
+	// JWT secret is REQUIRED — the login endpoint can't function
+	// without it.
+	if err := cfg.ValidateJWTSecret(); err != nil {
+		logger.Error("jwt secret missing", "error", err)
+		os.Exit(1)
+	}
+	jwtSigner := auth.NewSigner(cfg.JWTSecret)
+
+	// Local-admin bootstrap. Creates the seed admin user + role
+	// assignment on first boot when local_users is empty. Idempotent
+	// once any local user exists.
+	localUsersRepo := storage.NewLocalUsers(pool)
+	authSvc := services.NewAuthService(
+		localUsersRepo,
+		storage.NewRoles(pool),
+		storage.NewUserRoles(pool),
+		storage.NewAuditEvents(pool),
+		jwtSigner,
+		cfg.JWTTokenTTL,
+	)
+	if cfg.BootstrapAdminEmail != "" && cfg.BootstrapAdminPassword != "" {
+		bootCtx2, bootCancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+		id, err := authSvc.BootstrapLocalAdmin(bootCtx2, cfg.BootstrapAdminEmail, cfg.BootstrapAdminPassword)
+		bootCancel2()
+		if err != nil {
+			logger.Error("bootstrap local admin", "error", err)
+			os.Exit(1)
+		}
+		if id != "" {
+			logger.Info("bootstrap local admin created", "user_id", id, "email", cfg.BootstrapAdminEmail)
+		} else {
+			logger.Info("bootstrap local admin skipped (users already exist)")
+		}
+	}
+
+	app := newApp(cfg, logger, pool, rdb, km, authSvc)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -143,7 +178,7 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
-func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Client, km keymgmt.KeyManager) *fiber.App {
+func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Client, km keymgmt.KeyManager, authSvc *services.AuthService) *fiber.App {
 	app := fiber.New(fiber.Config{
 		AppName:      "secrets-bridge-api",
 		ReadTimeout:  10 * time.Second,
@@ -238,10 +273,18 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// placeholders today; real implementations land with workflow
 	// (issue #10).
 	v1 := app.Group("/api/v1",
-		middleware.Auth(),
+		middleware.Auth(authSvc),
 		middleware.RBAC(),
 		middleware.Audit(logger),
 	)
+
+	// Authentication — public route, no auth gating. The UI POSTs
+	// email + password here and receives a signed JWT in return. The
+	// rest of the platform reads identity from `middleware.CtxKeyActor`
+	// which the upstream `middleware.Auth(authSvc)` populated from
+	// either the Bearer JWT or the legacy X-User-Id header.
+	authH := handlers.NewAuth(authSvc)
+	v1.Post("/auth/login", authH.Login)
 
 	// Admin-side endpoints.
 	//
