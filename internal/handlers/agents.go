@@ -151,6 +151,29 @@ type AgentListItem struct {
 
 // List returns every agent. Admin-only in production; today the auth
 // stub admits everything.
+// Revoke handles POST /api/v1/agents/:id/revoke.
+//
+// Transitions the agent to status=revoked. Subsequent heartbeats are
+// rejected (the Authenticate path filters revoked rows) and any
+// in-flight job claims fail when the agent next tries to complete
+// them. The agent row stays in the table for audit; the operator
+// must mint a fresh identity to bring capacity back.
+//
+// Authorization: gated by `auth.Require(agent.revoke)` at route
+// registration. The bootstrap admin grant covers it by default;
+// other operators need an explicit role binding with the
+// `agent.revoke` permission.
+func (h *Agents) Revoke(c fiber.Ctx) error {
+	id, err := parseID(c, "id")
+	if err != nil {
+		return err
+	}
+	if err := h.svc.Revoke(c.Context(), id); err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
 func (h *Agents) List(c fiber.Ctx) error {
 	views, err := h.svc.List(c.Context())
 	if err != nil {

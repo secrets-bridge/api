@@ -253,6 +253,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// unauthenticated for v1 so the UI can hydrate without a session;
 	// list-level RBAC lands as a follow-up.
 	v1.Post("/agents", auth.Require(auth.PermAgentMint, rbacResolver), agentsH.Mint)
+	v1.Post("/agents/:id/revoke", auth.Require(auth.PermAgentRevoke, rbacResolver), agentsH.Revoke)
 	v1.Get("/agents", agentsH.List)
 	v1.Post("/jobs", jobsH.Enqueue)
 
