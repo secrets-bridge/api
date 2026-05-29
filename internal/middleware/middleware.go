@@ -84,13 +84,25 @@ func Recover(logger *slog.Logger) fiber.Handler {
 	}
 }
 
-// Auth is a stub. Once issue #5 (storage) and the auth design land it
-// will validate an OIDC bearer token or mTLS agent cert and populate
-// CtxKeyActor with the resolved principal. Today every request is
-// implicitly authenticated as the placeholder "anonymous" actor.
+// Auth is a STUB upgrade ahead of real OIDC (api#26). The middleware
+// reads an `X-User-Id` header — when present, it's used verbatim as
+// the actor identity; when absent, falls back to the legacy
+// "anonymous" placeholder so existing tests + UI flows that don't yet
+// know about identity keep working.
+//
+// This is NOT a security boundary. The header is trivially spoofable
+// from any caller and exists ONLY to let downstream RBAC middleware
+// (`internal/auth.Require`) be exercised end-to-end before the OIDC
+// swap lands. The header reading code is the only piece that changes
+// when OIDC arrives — the rest of the platform reads identity from
+// `CtxKeyActor` and is agnostic to how it got there.
 func Auth() fiber.Handler {
 	return func(c fiber.Ctx) error {
-		c.SetContext(context.WithValue(c.Context(), CtxKeyActor, "anonymous"))
+		actor := "anonymous"
+		if v := c.Get("X-User-Id"); v != "" {
+			actor = v
+		}
+		c.SetContext(context.WithValue(c.Context(), CtxKeyActor, actor))
 		return c.Next()
 	}
 }
