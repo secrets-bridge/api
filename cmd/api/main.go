@@ -287,6 +287,14 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// is a compile-time package value (auth.Catalog).
 	v1.Get("/permissions", permissionsH.List)
 
+	// Audit log — read-only over the append-only audit_events table
+	// (NFR-07). Gated by `audit.read` so platform operators with no
+	// direct DB access can still see the chain of who-did-what to
+	// every resource. Filters: actor / action / resource /
+	// correlation_id / since / until / limit.
+	auditH := handlers.NewAudit(auditRepo)
+	v1.Get("/audit-events", auth.Require(auth.PermAuditRead, rbacResolver), auditH.List)
+
 	// Tenancy admin — projects + environments. Pre-existed in the
 	// schema (BRD §17, migration 0001) without an HTTP surface; this
 	// wires admin CRUD so the UI can manage them. Projects use a
