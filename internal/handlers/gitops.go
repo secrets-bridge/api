@@ -38,6 +38,7 @@ type GitOps struct {
 	mappings      storage.GitOpsAppMappingRepository
 	observations  *services.GitOpsService
 	requests      storage.AccessRequestRepository
+	clientFactory services.ArgoCDClientFactory // builds an AppLister for discover calls
 }
 
 // NewGitOps wires the handler.
@@ -46,12 +47,14 @@ func NewGitOps(
 	mappings storage.GitOpsAppMappingRepository,
 	observations *services.GitOpsService,
 	requests storage.AccessRequestRepository,
+	clientFactory services.ArgoCDClientFactory,
 ) *GitOps {
 	return &GitOps{
-		endpoints:    endpoints,
-		mappings:     mappings,
-		observations: observations,
-		requests:     requests,
+		endpoints:     endpoints,
+		mappings:      mappings,
+		observations:  observations,
+		requests:      requests,
+		clientFactory: clientFactory,
 	}
 }
 
@@ -395,3 +398,34 @@ func observationToResponse(o *storage.GitOpsObservation) observationResponse {
 	}
 	return out
 }
+
+// GetDiscoveredApps handles GET /argocd-endpoints/:id/discovered-apps.
+//
+// Calls ArgoCD via the endpoint's KMS-wrapped token and returns the
+// list of applications visible to that token, trimmed to the metadata
+// the UI needs to bulk-create gitops_app_mappings rows.
+//
+// Optional query parameter:
+//   ?project=<name>   filter to a single ArgoCD project (e.g. "egov-uat")
+//
+// Returns 503 when the endpoint is disabled or the ArgoCD call fails;
+// the UI then renders "discovery unavailable" without retrying.
+func (h *GitOps) GetDiscoveredApps(c fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid UUID")
+	}
+	if h.clientFactory == nil {
+		return fiber.NewError(fiber.StatusServiceUnavailable, "argocd discovery not wired")
+	}
+	apps, err := h.endpoints.Discover(c.Context(), id, c.Query("project"), h.clientFactory)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "argocd endpoint not found")
+		}
+		// 503 instead of 500 — the upstream is the failure point, not the api.
+		return fiber.NewError(fiber.StatusServiceUnavailable, err.Error())
+	}
+	return c.JSON(apps)
+}
+

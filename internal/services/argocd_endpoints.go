@@ -165,6 +165,108 @@ func (s *ArgoCDEndpointService) SoftDelete(ctx context.Context, id uuid.UUID) er
 	return nil
 }
 
+// Discover calls ArgoCD via the configured endpoint and returns the
+// list of applications visible to the registered token. Used by the
+// admin UI's bulk-create-from-discovered-apps flow.
+//
+// `project` is an optional ArgoCD project name filter. Empty = no
+// filter.
+//
+// Audits a `argocd_endpoint.discover` event with the count of apps
+// returned and the filter (if any) in metadata. NEVER persists the
+// returned data.
+//
+// The caller (handler) supplies a `factory` that knows how to build
+// an `AppLister` from a Config — keeping the service test-friendly
+// (real factory wraps argocd.New; tests inject a fake).
+func (s *ArgoCDEndpointService) Discover(
+	ctx context.Context,
+	id uuid.UUID,
+	project string,
+	factory ArgoCDClientFactory,
+) ([]DiscoveredApp, error) {
+	ep, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if !ep.Enabled {
+		return nil, errors.New("services: endpoint is disabled")
+	}
+	tok, err := s.ResolveToken(ctx, ep)
+	if err != nil {
+		return nil, fmt.Errorf("services: resolve token: %w", err)
+	}
+	defer zero(tok)
+
+	client, err := factory(ArgoCDClientConfig{
+		BaseURL:       ep.BaseURL,
+		Token:         string(tok),
+		TLSCAPEM:      ep.TLSCAPEM,
+		TLSServerName: ep.TLSServerName,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("services: build argocd client: %w", err)
+	}
+
+	apps, err := client.ListApplications(ctx, project)
+	if err != nil {
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:    "admin",
+			Action:   "argocd_endpoint.discover",
+			Resource: "argocd_endpoint:" + id.String(),
+			Status:   storage.AuditStatusFailure,
+			Metadata: map[string]any{"project_filter": project, "error_kind": "list_failed"},
+		})
+		return nil, fmt.Errorf("services: list applications: %w", err)
+	}
+
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "admin",
+		Action:   "argocd_endpoint.discover",
+		Resource: "argocd_endpoint:" + id.String(),
+		Status:   storage.AuditStatusSuccess,
+		Metadata: map[string]any{"project_filter": project, "app_count": len(apps)},
+	})
+	return apps, nil
+}
+
+// ArgoCDClientConfig is the slim subset of pkg/argocd.Config the
+// service needs. Decoupled so the service doesn't import pkg/argocd
+// at compile time — keeps the factory injectable for tests.
+type ArgoCDClientConfig struct {
+	BaseURL       string
+	Token         string
+	TLSCAPEM      string
+	TLSServerName string
+}
+
+// AppLister is the interface the service uses to call ArgoCD. The real
+// implementation is `*argocd.Client`; tests inject a fake.
+type AppLister interface {
+	ListApplications(ctx context.Context, project string) ([]DiscoveredApp, error)
+}
+
+// ArgoCDClientFactory builds an AppLister from a config. The real
+// factory wraps pkg/argocd.New; the wiring lives in cmd/api/main.go
+// so this package doesn't drag pkg/argocd into its imports.
+type ArgoCDClientFactory func(ArgoCDClientConfig) (AppLister, error)
+
+// DiscoveredApp is the trimmed shape returned to the admin UI. Mirrors
+// the relevant subset of pkg/argocd.Application — kept here so callers
+// don't have to import pkg/argocd to consume the result.
+//
+// NO manifests, NO sync revisions of secrets, NO sensitive metadata.
+type DiscoveredApp struct {
+	Name                 string `json:"name"`
+	Namespace            string `json:"namespace,omitempty"`
+	Project              string `json:"project,omitempty"`
+	DestinationServer    string `json:"destination_server,omitempty"`
+	DestinationCluster   string `json:"destination_cluster,omitempty"`
+	DestinationNamespace string `json:"destination_namespace,omitempty"`
+	HealthStatus         string `json:"health_status,omitempty"`
+	SyncStatus           string `json:"sync_status,omitempty"`
+}
+
 // UpdateHealth pass-through wrapper.
 func (s *ArgoCDEndpointService) UpdateHealth(ctx context.Context, id uuid.UUID, ok bool, errMsg string) error {
 	healthErr := errMsg

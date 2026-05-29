@@ -113,16 +113,24 @@ func (r *readOnlyTransport) RoundTrip(req *http.Request) (*http.Response, error)
 // Application is the trimmed status shape we surface to operators.
 // Manifests are NEVER carried; only filtered status fields per
 // BRD §26.4.
+//
+// `Namespace` is the namespace of the ArgoCD Application CR itself
+// (usually "argocd"). `DestinationNamespace` is the namespace where
+// the application's resources actually land — this is the field the
+// gitops mapping creator's "namespace" column should mirror.
 type Application struct {
-	Name           string             `json:"name"`
-	Namespace      string             `json:"namespace,omitempty"`
-	Project        string             `json:"project,omitempty"`
-	HealthStatus   string             `json:"health_status,omitempty"`   // Healthy / Progressing / Degraded / Missing / Unknown
-	HealthMessage  string             `json:"health_message,omitempty"`
-	SyncStatus     string             `json:"sync_status,omitempty"`     // Synced / OutOfSync / Unknown
-	SyncRevision   string             `json:"sync_revision,omitempty"`
-	OperationPhase string             `json:"operation_phase,omitempty"` // Running / Succeeded / Failed / Error
-	Resources      []ApplicationResource `json:"resources,omitempty"`
+	Name                 string                `json:"name"`
+	Namespace            string                `json:"namespace,omitempty"`
+	Project              string                `json:"project,omitempty"`
+	DestinationServer    string                `json:"destination_server,omitempty"`
+	DestinationCluster   string                `json:"destination_cluster,omitempty"`
+	DestinationNamespace string                `json:"destination_namespace,omitempty"`
+	HealthStatus         string                `json:"health_status,omitempty"`   // Healthy / Progressing / Degraded / Missing / Unknown
+	HealthMessage        string                `json:"health_message,omitempty"`
+	SyncStatus           string                `json:"sync_status,omitempty"`     // Synced / OutOfSync / Unknown
+	SyncRevision         string                `json:"sync_revision,omitempty"`
+	OperationPhase       string                `json:"operation_phase,omitempty"` // Running / Succeeded / Failed / Error
+	Resources            []ApplicationResource `json:"resources,omitempty"`
 }
 
 // ApplicationResource is one child resource (Deployment, StatefulSet,
@@ -147,7 +155,12 @@ type rawApplication struct {
 		Namespace string `json:"namespace"`
 	} `json:"metadata"`
 	Spec struct {
-		Project string `json:"project"`
+		Project     string `json:"project"`
+		Destination struct {
+			Server    string `json:"server"`
+			Name      string `json:"name"`
+			Namespace string `json:"namespace"`
+		} `json:"destination"`
 	} `json:"spec"`
 	Status struct {
 		Health struct {
@@ -186,16 +199,50 @@ func (c *Client) GetApplication(ctx context.Context, name string) (*Application,
 	if err := c.do(ctx, "/api/v1/applications/"+url.PathEscape(name), &raw); err != nil {
 		return nil, err
 	}
+	return appFromRaw(raw), nil
+}
+
+// ListApplications returns every application visible to the
+// configured token. Use `project` to filter by ArgoCD project name
+// (matches ArgoCD's own ?projects= query param); pass "" for no
+// filter.
+//
+// Manifests are NEVER carried in the response — only the trimmed
+// `Application` status fields.
+func (c *Client) ListApplications(ctx context.Context, project string) ([]Application, error) {
+	path := "/api/v1/applications"
+	if project != "" {
+		path += "?projects=" + url.QueryEscape(project)
+	}
+	var raw struct {
+		Items []rawApplication `json:"items"`
+	}
+	if err := c.do(ctx, path, &raw); err != nil {
+		return nil, err
+	}
+	out := make([]Application, 0, len(raw.Items))
+	for _, item := range raw.Items {
+		out = append(out, *appFromRaw(item))
+	}
+	return out, nil
+}
+
+// appFromRaw is the single mapping point from raw → trimmed shape so
+// GetApplication and ListApplications stay consistent.
+func appFromRaw(raw rawApplication) *Application {
 	return &Application{
-		Name:           raw.Metadata.Name,
-		Namespace:      raw.Metadata.Namespace,
-		Project:        raw.Spec.Project,
-		HealthStatus:   raw.Status.Health.Status,
-		HealthMessage:  raw.Status.Health.Message,
-		SyncStatus:     raw.Status.Sync.Status,
-		SyncRevision:   raw.Status.Sync.Revision,
-		OperationPhase: phaseOrEmpty(raw),
-	}, nil
+		Name:                 raw.Metadata.Name,
+		Namespace:            raw.Metadata.Namespace,
+		Project:              raw.Spec.Project,
+		DestinationServer:    raw.Spec.Destination.Server,
+		DestinationCluster:   raw.Spec.Destination.Name,
+		DestinationNamespace: raw.Spec.Destination.Namespace,
+		HealthStatus:         raw.Status.Health.Status,
+		HealthMessage:        raw.Status.Health.Message,
+		SyncStatus:           raw.Status.Sync.Status,
+		SyncRevision:         raw.Status.Sync.Revision,
+		OperationPhase:       phaseOrEmpty(raw),
+	}
 }
 
 func phaseOrEmpty(raw rawApplication) string {
