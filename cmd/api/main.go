@@ -181,8 +181,30 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	policyEng := services.NewPolicyEngine(policyRepo, workflowRepo)
 	requestSvc := services.NewRequestService(requestRepo, approvalRepo, wrapSvc, workflowRepo, policyEng, auditRepo, jobSvc)
 	secretsSvc := services.NewSecretsService(secretsRepo, auditRepo)
+
+	// GitOps observation integration (BRD §26) is OFF by default. The
+	// flag is opt-in via `SB_GITOPS_ENABLED=true` (operators set this
+	// via Helm values or a future UI integrations toggle). When the
+	// flag is off, the request lifecycle behaves exactly as before
+	// and the admin / user endpoints are not mounted.
+	var gitopsH *handlers.GitOps
+	if cfg.GitOpsEnabled {
+		argoEndpointRepo := storage.NewArgoCDEndpoints(pool)
+		gitopsMappingRepo := storage.NewGitOpsAppMappings(pool)
+		gitopsObservationRepo := storage.NewGitOpsObservations(pool)
+		gitopsSvc := services.NewGitOpsService(argoEndpointRepo, gitopsMappingRepo, gitopsObservationRepo, requestRepo, auditRepo, services.GitOpsConfig{})
+		argoEndpointSvc := services.NewArgoCDEndpointService(argoEndpointRepo, km, auditRepo)
+		requestSvc = requestSvc.WithGitOps(gitopsSvc)
+		gitopsH = handlers.NewGitOps(argoEndpointSvc, gitopsMappingRepo, gitopsSvc, requestRepo)
+		logger.Info("gitops visibility integration enabled (BRD §26)")
+	} else {
+		logger.Info("gitops visibility integration disabled (set SB_GITOPS_ENABLED=true to enable)")
+	}
+
 	// Wire the back-edge: when a patch job terminates, RequestService
-	// transitions the owning access_request to executed/failed.
+	// transitions the owning access_request to executed/failed AND,
+	// when GitOps is enabled, fans out observation rows for the
+	// request's configured app mappings.
 	jobSvc.OnCompleted(requestSvc.OnJobCompleted)
 
 	agentsH := handlers.NewAgents(agentSvc)
@@ -247,6 +269,30 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// identity once the auth design lands. Service-layer enforces
 	// requester==userID + request.type=read.
 	v1.Get("/requests/:id/wraps/:wrap_id", requestsH.RetrieveWrap)
+
+	// GitOps observation panel + ArgoCD admin surface are mounted
+	// ONLY when SB_GITOPS_ENABLED=true. The flag is opt-in via Helm
+	// values or a future UI integrations toggle — disabled deployments
+	// keep the existing wrap-only request shape unchanged.
+	if gitopsH != nil {
+		// User-bound observation panel (BRD §26). Same `user_id`
+		// stub-auth as the wrap retrieval endpoint.
+		v1.Get("/requests/:id/gitops", gitopsH.GetRequestObservations)
+
+		// Admin: ArgoCD endpoint CRUD. Plaintext tokens arrive only
+		// via POST, are envelope-encrypted via KeyManager before
+		// touching Postgres, and never appear in responses.
+		v1.Post("/argocd-endpoints", gitopsH.CreateArgoCDEndpoint)
+		v1.Get("/argocd-endpoints", gitopsH.ListArgoCDEndpoints)
+		v1.Get("/argocd-endpoints/:id", gitopsH.GetArgoCDEndpoint)
+		v1.Put("/argocd-endpoints/:id/enabled", gitopsH.SetArgoCDEndpointEnabled)
+		v1.Delete("/argocd-endpoints/:id", gitopsH.DeleteArgoCDEndpoint)
+
+		// Admin: secret_mapping (or provider_connection) → ArgoCD app(s).
+		v1.Post("/gitops-app-mappings", gitopsH.CreateGitOpsMapping)
+		v1.Get("/gitops-app-mappings", gitopsH.ListGitOpsMappings)
+		v1.Delete("/gitops-app-mappings/:id", gitopsH.DeleteGitOpsMapping)
+	}
 
 	// Discovery surface. Admins search the cache via GET; the agent's
 	// DiscoverExecutor upserts batches via the bulk endpoint (under
