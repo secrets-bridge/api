@@ -37,6 +37,14 @@ type JobEnqueuer interface {
 	Enqueue(ctx context.Context, req EnqueueRequest) (*storage.SyncJob, error)
 }
 
+// GitOpsStarter is the slice of *GitOpsService that RequestService
+// calls into after a successful transition to `executed`. Decoupled
+// as an interface so the service stays optional — passing nil is
+// fine when no ArgoCD endpoints / mappings are configured.
+type GitOpsStarter interface {
+	Start(ctx context.Context, request *storage.AccessRequest) error
+}
+
 // RequestService orchestrates the patch-request lifecycle.
 type RequestService struct {
 	requests  storage.AccessRequestRepository
@@ -46,6 +54,7 @@ type RequestService struct {
 	policy    *PolicyEngine
 	audit     storage.AuditEventRepository
 	jobs      JobEnqueuer
+	gitops    GitOpsStarter
 	now       func() time.Time
 }
 
@@ -72,6 +81,14 @@ func NewRequestService(
 		jobs:      jobs,
 		now:       time.Now,
 	}
+}
+
+// WithGitOps attaches an optional GitOpsStarter that gets invoked
+// after a successful transition to `executed`. Returns the service
+// for chaining. Pass nil to disable the integration.
+func (s *RequestService) WithGitOps(g GitOpsStarter) *RequestService {
+	s.gitops = g
+	return s
 }
 
 // PatchInput is the data the UI POSTs to submit a patch request.
@@ -694,6 +711,16 @@ func (s *RequestService) OnJobCompleted(ctx context.Context, job *storage.SyncJo
 			"job_id": job.ID.String(),
 		},
 	})
+
+	// GitOps observation fan-out runs only on successful transition to
+	// `executed`. Failure is audited inside Start; we don't bubble it
+	// because the underlying request transition is already complete.
+	if s.gitops != nil && target == storage.AccessRequestStatusExecuted {
+		req, err := s.requests.Get(ctx, *job.RequestID)
+		if err == nil && req != nil {
+			_ = s.gitops.Start(ctx, req)
+		}
+	}
 }
 
 // enqueueRequestJob creates the sync_job that an agent will claim to

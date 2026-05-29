@@ -21,12 +21,35 @@ type Config struct {
 
 	// ShutdownGrace bounds the graceful-shutdown wait.
 	ShutdownGrace time.Duration
+
+	// GitOpsEnabled gates the read-only ArgoCD visibility integration
+	// (BRD §26). Default OFF — operators opt in via Helm value or env
+	// var. When false: the admin CRUD endpoints + user observation
+	// endpoint are NOT mounted and the request lifecycle has no GitOps
+	// fan-out step. Existing deployments behave exactly as before.
+	GitOpsEnabled bool
 }
 
 func loadConfig() Config {
 	return Config{
 		Addr:          envOr("API_ADDR", ":8080"),
 		ShutdownGrace: envDuration("API_SHUTDOWN_GRACE", 15*time.Second),
+		GitOpsEnabled: envBool("SB_GITOPS_ENABLED", false),
+	}
+}
+
+func envBool(key string, fallback bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return fallback
+	}
+	switch v {
+	case "1", "true", "TRUE", "True", "yes", "YES":
+		return true
+	case "0", "false", "FALSE", "False", "no", "NO":
+		return false
+	default:
+		return fallback
 	}
 }
 
