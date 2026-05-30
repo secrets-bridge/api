@@ -37,9 +37,10 @@ import (
 // `internal/auth.EffectiveProjectAccess` + the `project_secrets`
 // repository (api#43 Slice A) for the join.
 type Secrets struct {
-	svc            *services.SecretsService
-	bindings       storage.ProjectSecretRepository
-	scopeResolver  auth.Resolver
+	svc           *services.SecretsService
+	bindings      storage.ProjectSecretRepository
+	scopeResolver auth.Resolver
+	teamScope     auth.TeamScopeResolver
 }
 
 // NewSecrets binds the handler. `bindings` and `scopeResolver` may be
@@ -52,6 +53,13 @@ func NewSecrets(svc *services.SecretsService) *Secrets { return &Secrets{svc: sv
 func (h *Secrets) WithProjectScoping(b storage.ProjectSecretRepository, r auth.Resolver) *Secrets {
 	h.bindings = b
 	h.scopeResolver = r
+	return h
+}
+
+// WithTeamScope wires the team-subtree expander. Optional: when nil,
+// team-scoped grants are ignored (project-scoped grants still work).
+func (h *Secrets) WithTeamScope(tr auth.TeamScopeResolver) *Secrets {
+	h.teamScope = tr
 	return h
 }
 
@@ -208,7 +216,7 @@ func (h *Secrets) applyProjectScope(c fiber.Ctx, f *storage.SecretsListFilter) e
 		return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
 	}
 
-	access, err := auth.EffectiveProjectAccess(c.Context(), userID, auth.PermSecretList, h.scopeResolver)
+	access, err := auth.EffectiveProjectAccess(c.Context(), userID, auth.PermSecretList, h.scopeResolver, h.teamScope)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}

@@ -19,13 +19,22 @@ import (
 
 // Me is the HTTP layer for "current user" projections.
 type Me struct {
-	projects storage.ProjectRepository
-	resolver auth.Resolver
+	projects  storage.ProjectRepository
+	resolver  auth.Resolver
+	teamScope auth.TeamScopeResolver
 }
 
-// NewMe wires the handler. Both args required.
+// NewMe wires the handler. Both args required. Call WithTeamScope to
+// expand team-scoped role grants into the descendant project set; when
+// not set, only project_id-scoped grants are honoured.
 func NewMe(p storage.ProjectRepository, r auth.Resolver) *Me {
 	return &Me{projects: p, resolver: r}
+}
+
+// WithTeamScope plumbs the team-aware access resolver. Optional.
+func (h *Me) WithTeamScope(tr auth.TeamScopeResolver) *Me {
+	h.teamScope = tr
+	return h
 }
 
 // ProjectSummary is the wire shape for the user-projects projection.
@@ -47,13 +56,13 @@ func (h *Me) ListProjects(c fiber.Ctx) error {
 	// either at global scope. If a caller only has secret.request
 	// (write-only) the projection still returns the same set —
 	// EffectiveProjectAccess falls back to ProjectIDs from any grant.
-	access, err := auth.EffectiveProjectAccess(c.Context(), userID, auth.PermSecretList, h.resolver)
+	access, err := auth.EffectiveProjectAccess(c.Context(), userID, auth.PermSecretList, h.resolver, h.teamScope)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 	if !access.IsGlobal && len(access.ProjectIDs) == 0 {
 		// Try secret.request as a fallback signal.
-		alt, err := auth.EffectiveProjectAccess(c.Context(), userID, auth.PermSecretRequest, h.resolver)
+		alt, err := auth.EffectiveProjectAccess(c.Context(), userID, auth.PermSecretRequest, h.resolver, h.teamScope)
 		if err == nil && (alt.IsGlobal || len(alt.ProjectIDs) > 0) {
 			access = alt
 		}

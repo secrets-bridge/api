@@ -13,12 +13,19 @@ import (
 // Project mirrors a row in the projects table. The mutable fields are
 // safe to log; the table has no secret-bearing columns by design.
 type Project struct {
-	ID          uuid.UUID
-	Name        string
-	OwnerTeamID string // empty when unset
-	Status      ProjectStatus
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	ID   uuid.UUID
+	Name string
+	// OwnerTeamID is the legacy free-text owner identifier from 0001.
+	// New code SHOULD use TeamID (typed FK to teams) instead; this
+	// stays in place until external tooling that reads it has moved.
+	OwnerTeamID string
+	// TeamID is the typed FK introduced by 0018. nil = unscoped to a
+	// team. Role grants with scope = {team_id: <uuid>} expand through
+	// the team subtree and project rows whose TeamID is in that subtree.
+	TeamID    *uuid.UUID
+	Status    ProjectStatus
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // ProjectStatus is constrained by a CHECK in the schema.
@@ -44,6 +51,14 @@ type ProjectRepository interface {
 	GetByName(ctx context.Context, name string) (*Project, error)
 	List(ctx context.Context) ([]*Project, error)
 	UpdateStatus(ctx context.Context, id uuid.UUID, status ProjectStatus) error
+	// SetTeam reassigns project.team_id. Passing nil un-scopes the
+	// project from any team. The team_id FK in the schema enforces
+	// the referenced team exists.
+	SetTeam(ctx context.Context, id uuid.UUID, teamID *uuid.UUID) error
+	// IDsForTeams returns every project whose team_id appears in the
+	// given set. Empty input → empty output. Drives the
+	// auth.TeamScopeResolver expansion path.
+	IDsForTeams(ctx context.Context, teamIDs []uuid.UUID) ([]uuid.UUID, error)
 }
 
 // Projects is the Postgres-backed implementation of ProjectRepository.
@@ -65,27 +80,27 @@ func (r *Projects) Create(ctx context.Context, p *Project) error {
 	}
 
 	const insertGenerated = `
-		INSERT INTO projects (name, owner_team_id, status)
-		VALUES ($1, NULLIF($2, ''), $3)
+		INSERT INTO projects (name, owner_team_id, team_id, status)
+		VALUES ($1, NULLIF($2, ''), $3, $4)
 		RETURNING id, created_at, updated_at`
 	const insertWithID = `
-		INSERT INTO projects (id, name, owner_team_id, status)
-		VALUES ($1, $2, NULLIF($3, ''), $4)
+		INSERT INTO projects (id, name, owner_team_id, team_id, status)
+		VALUES ($1, $2, NULLIF($3, ''), $4, $5)
 		RETURNING created_at, updated_at`
 
 	var row pgx.Row
 	if p.ID == uuid.Nil {
-		row = r.pool.QueryRow(ctx, insertGenerated, p.Name, p.OwnerTeamID, p.Status)
+		row = r.pool.QueryRow(ctx, insertGenerated, p.Name, p.OwnerTeamID, p.TeamID, p.Status)
 		return row.Scan(&p.ID, &p.CreatedAt, &p.UpdatedAt)
 	}
-	row = r.pool.QueryRow(ctx, insertWithID, p.ID, p.Name, p.OwnerTeamID, p.Status)
+	row = r.pool.QueryRow(ctx, insertWithID, p.ID, p.Name, p.OwnerTeamID, p.TeamID, p.Status)
 	return row.Scan(&p.CreatedAt, &p.UpdatedAt)
 }
 
 // Get fetches one project by ID. Returns ErrNotFound when no row matches.
 func (r *Projects) Get(ctx context.Context, id uuid.UUID) (*Project, error) {
 	const q = `
-		SELECT id, name, COALESCE(owner_team_id, ''), status, created_at, updated_at
+		SELECT id, name, COALESCE(owner_team_id, ''), team_id, status, created_at, updated_at
 		FROM projects
 		WHERE id = $1`
 	return scanProject(r.pool.QueryRow(ctx, q, id))
@@ -94,7 +109,7 @@ func (r *Projects) Get(ctx context.Context, id uuid.UUID) (*Project, error) {
 // GetByName fetches one project by name. Names are UNIQUE in the schema.
 func (r *Projects) GetByName(ctx context.Context, name string) (*Project, error) {
 	const q = `
-		SELECT id, name, COALESCE(owner_team_id, ''), status, created_at, updated_at
+		SELECT id, name, COALESCE(owner_team_id, ''), team_id, status, created_at, updated_at
 		FROM projects
 		WHERE name = $1`
 	return scanProject(r.pool.QueryRow(ctx, q, name))
@@ -104,7 +119,7 @@ func (r *Projects) GetByName(ctx context.Context, name string) (*Project, error)
 // table by design; pagination lands when the data shape demands it.
 func (r *Projects) List(ctx context.Context) ([]*Project, error) {
 	const q = `
-		SELECT id, name, COALESCE(owner_team_id, ''), status, created_at, updated_at
+		SELECT id, name, COALESCE(owner_team_id, ''), team_id, status, created_at, updated_at
 		FROM projects
 		ORDER BY created_at ASC`
 	rows, err := r.pool.Query(ctx, q)
@@ -138,13 +153,54 @@ func (r *Projects) UpdateStatus(ctx context.Context, id uuid.UUID, status Projec
 	return nil
 }
 
+// SetTeam reassigns project.team_id. nil un-scopes the project from
+// any team. The FK in the schema enforces existence of the target.
+func (r *Projects) SetTeam(ctx context.Context, id uuid.UUID, teamID *uuid.UUID) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE projects SET team_id = $1 WHERE id = $2`,
+		teamID, id,
+	)
+	if err != nil {
+		return fmt.Errorf("storage: set project team_id: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// IDsForTeams returns every project whose team_id appears in the given
+// set. Empty input → empty output (no SQL round trip). Used by the
+// auth.TeamScopeResolver to expand a team-scoped role grant into the
+// matching project_id set.
+func (r *Projects) IDsForTeams(ctx context.Context, teamIDs []uuid.UUID) ([]uuid.UUID, error) {
+	if len(teamIDs) == 0 {
+		return nil, nil
+	}
+	const q = `SELECT id FROM projects WHERE team_id = ANY($1::uuid[])`
+	rows, err := r.pool.Query(ctx, q, teamIDs)
+	if err != nil {
+		return nil, fmt.Errorf("storage: project IDsForTeams: %w", err)
+	}
+	defer rows.Close()
+	var out []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("storage: project IDsForTeams scan: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // scanProject is shared between QueryRow.Scan and the rows-iter Scan
 // paths so the column order is declared once.
 func scanProject(row interface {
 	Scan(dest ...any) error
 }) (*Project, error) {
 	var p Project
-	err := row.Scan(&p.ID, &p.Name, &p.OwnerTeamID, &p.Status, &p.CreatedAt, &p.UpdatedAt)
+	err := row.Scan(&p.ID, &p.Name, &p.OwnerTeamID, &p.TeamID, &p.Status, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
