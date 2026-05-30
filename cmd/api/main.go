@@ -308,6 +308,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	teamRepo := storage.NewTeams(pool)
 	teamsH := handlers.NewTeams(teamRepo)
 	teamScopeResolver := auth.NewRepoTeamScopeResolver(teamRepo, projectRepo)
+	// Reused by meH.WithIdentity to hydrate GET /users/me with the
+	// caller's local_users row (email, display_name).
+	localUsersRepoInApp := storage.NewLocalUsers(pool)
 
 	// RBAC resolver for the `auth.Require(perm)` middleware. Loads each
 	// caller's user_role assignments + the role catalog at request time.
@@ -340,7 +343,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// "What are my projects?" projection (api#43 Slice D) — drives the
 	// UI project switcher.
 	meH := handlers.NewMe(projectRepo, rbacResolver).
-		WithTeamScope(teamScopeResolver)
+		WithTeamScope(teamScopeResolver).
+		WithIdentity(localUsersRepoInApp, teamRepo)
 
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
@@ -433,6 +437,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 
 	// Slice D (api#43): caller-scoped projection used by the UI
 	// project switcher.
+	v1.Get("/users/me", meH.GetMe)
 	v1.Get("/users/me/projects", meH.ListProjects)
 
 	v1.Post("/environments", tenancyH.CreateEnvironment)
