@@ -313,6 +313,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// caller's user_role assignments + the role catalog at request time.
 	rbacResolver := auth.NewRepoResolver(userRoleRepo, roleRepo)
 
+	// Slice 3 of the team-hierarchy work: the approve / reject paths
+	// now refuse with `out_of_scope_project` when the approver's
+	// effective project access (PermSecretApprove, expanded through
+	// the team subtree) doesn't cover the request's project_id.
+	requestSvc = requestSvc.WithApproverScope(rbacResolver, teamScopeResolver)
+
 	// Project-scoped catalog (api#43 Slice B): GET /secrets restricts
 	// results to the caller's project bindings unless they hold
 	// secret.list at global scope. Team-scoped grants expand through

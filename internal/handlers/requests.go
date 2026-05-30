@@ -80,6 +80,8 @@ func requestErr(err error) error {
 		return fiber.NewError(fiber.StatusConflict, "request is not pending")
 	case errors.Is(err, services.ErrNotRequester):
 		return fiber.NewError(fiber.StatusForbidden, "only the original requester can cancel")
+	case errors.Is(err, services.ErrOutOfScopeProject):
+		return fiber.NewError(fiber.StatusForbidden, "out_of_scope_project")
 	case errors.Is(err, services.ErrNoDefaultWorkflow):
 		return fiber.NewError(fiber.StatusInternalServerError, "no policy matched and no default workflow exists")
 	case errors.Is(err, storage.ErrNotFound):

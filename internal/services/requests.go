@@ -27,6 +27,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
@@ -56,6 +57,12 @@ type RequestService struct {
 	jobs      JobEnqueuer
 	gitops    GitOpsStarter
 	now       func() time.Time
+
+	// Approver-side scope check. Both nil = legacy behaviour (no
+	// project-coverage check on approve/reject). Wire via
+	// WithApproverScope from main.
+	approverResolver  auth.Resolver
+	approverTeamScope auth.TeamScopeResolver
 }
 
 // NewRequestService wires a RequestService to its dependencies. The
@@ -88,6 +95,21 @@ func NewRequestService(
 // for chaining. Pass nil to disable the integration.
 func (s *RequestService) WithGitOps(g GitOpsStarter) *RequestService {
 	s.gitops = g
+	return s
+}
+
+// WithApproverScope wires the auth-resolver pair that gates Approve +
+// Reject against the approver's effective project access for
+// PermSecretApprove. Section heads holding `secret.approve` scoped
+// to a team_id automatically cover the descendant subtree of projects;
+// the resolver pair expands that path via teamScope.
+//
+// Pass nil for either argument to disable the check (legacy behaviour).
+// The check ONLY fires when the request carries a project_id in its
+// TargetScope — un-scoped legacy requests pass through unchanged.
+func (s *RequestService) WithApproverScope(r auth.Resolver, tr auth.TeamScopeResolver) *RequestService {
+	s.approverResolver = r
+	s.approverTeamScope = tr
 	return s
 }
 
@@ -126,11 +148,18 @@ type ReadInput struct {
 
 // Sentinel errors. Map to HTTP at the handler layer.
 var (
-	ErrInvalidInput      = errors.New("services: invalid input")
+	ErrInvalidInput       = errors.New("services: invalid input")
 	ErrSelfApprovalDenied = errors.New("services: requester cannot approve own request")
-	ErrDuplicateVote     = errors.New("services: approver already voted")
-	ErrRequestNotPending = errors.New("services: request is not pending")
-	ErrNotRequester      = errors.New("services: only the requester can cancel")
+	ErrDuplicateVote      = errors.New("services: approver already voted")
+	ErrRequestNotPending  = errors.New("services: request is not pending")
+	ErrNotRequester       = errors.New("services: only the requester can cancel")
+	// ErrOutOfScopeProject is returned when an approver / rejecter
+	// votes on a request whose project_id falls outside their
+	// effective project access for PermSecretApprove. The handler maps
+	// this to HTTP 403 with the stable body `out_of_scope_project` so
+	// the UI can render the precise reason. Requires WithApproverScope
+	// to be wired; nil resolver leaves the check disabled (legacy).
+	ErrOutOfScopeProject = errors.New("services: approver out of scope for request project")
 )
 
 // Submit creates a patch request, wraps each key's plaintext under
@@ -320,6 +349,9 @@ func (s *RequestService) Approve(ctx context.Context, requestID uuid.UUID, appro
 	if approverID == req.RequesterID && !wf.AllowSelfApproval {
 		return nil, ErrSelfApprovalDenied
 	}
+	if err := s.checkApproverScope(ctx, approverID, req); err != nil {
+		return nil, err
+	}
 
 	// Idempotency: reject double-voting.
 	existing, err := s.approvals.ListByRequest(ctx, requestID)
@@ -431,6 +463,9 @@ func (s *RequestService) Reject(ctx context.Context, requestID uuid.UUID, approv
 	}
 	if approverID == req.RequesterID && !wf.AllowSelfApproval {
 		return nil, ErrSelfApprovalDenied
+	}
+	if err := s.checkApproverScope(ctx, approverID, req); err != nil {
+		return nil, err
 	}
 
 	if err := s.approvals.Append(ctx, &storage.Approval{
@@ -640,6 +675,47 @@ func (s *RequestService) RetrieveWrapForUser(ctx context.Context, requestID, wra
 	}
 
 	return s.wraps.RetrieveByUser(ctx, wrapID, userID)
+}
+
+// checkApproverScope enforces that approverID holds PermSecretApprove
+// effective on the request's project_id. Returns nil to allow the
+// vote, ErrOutOfScopeProject to refuse.
+//
+// No-op cases that pass through:
+//   - WithApproverScope not wired (legacy: tests + early installs).
+//   - Request has no project_id in TargetScope (pre-tenancy requests).
+//   - Approver holds the permission at global scope (admins).
+//   - Approver's grants expand (via team-scope subtree) to cover the
+//     request's project.
+//
+// Audit goes to the caller path so a single audit event captures the
+// approve/reject attempt + the reject. This keeps the gate stateless.
+func (s *RequestService) checkApproverScope(ctx context.Context, approverID string, req *storage.AccessRequest) error {
+	if s.approverResolver == nil {
+		return nil
+	}
+	pidStr, ok := req.TargetScope["project_id"].(string)
+	if !ok || pidStr == "" {
+		// Legacy unscoped request — no project coverage to enforce.
+		return nil
+	}
+	pid, err := uuid.Parse(pidStr)
+	if err != nil {
+		return nil
+	}
+	access, err := auth.EffectiveProjectAccess(ctx, approverID, auth.PermSecretApprove, s.approverResolver, s.approverTeamScope)
+	if err != nil {
+		return fmt.Errorf("services: resolve approver scope: %w", err)
+	}
+	if access.IsGlobal {
+		return nil
+	}
+	for _, allowed := range access.ProjectIDs {
+		if allowed == pid {
+			return nil
+		}
+	}
+	return ErrOutOfScopeProject
 }
 
 // refreshWrapsForRequest extends/shrinks every wrap tied to the
