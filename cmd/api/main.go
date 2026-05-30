@@ -303,6 +303,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	secretsH := handlers.NewSecrets(secretsSvc)
 	permissionsH := handlers.NewPermissions()
 	tenancyH := handlers.NewTenancy(projectRepo, environmentRepo)
+	projectSecretsRepo := storage.NewProjectSecrets(pool)
+	projectSecretsH := handlers.NewProjectSecrets(projectSecretsRepo, projectRepo, secretsRepo)
 
 	// RBAC resolver for the `auth.Require(perm)` middleware. Loads each
 	// caller's user_role assignments + the role catalog at request time.
@@ -387,6 +389,14 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Get("/projects/:id", tenancyH.GetProject)
 	v1.Put("/projects/:id/status", tenancyH.UpdateProjectStatus)
 	v1.Get("/projects/:id/environments", tenancyH.ListEnvironmentsForProject)
+
+	// Project ↔ secret bindings (multi-tenancy, api#43 Slice A).
+	// Admin scope today; once OIDC + RBAC route gating land (P0-1/P0-2)
+	// these will require a `projects.bind` permission.
+	v1.Post("/projects/:id/secrets", projectSecretsH.Bind)
+	v1.Get("/projects/:id/secrets", projectSecretsH.List)
+	v1.Put("/projects/:id/secrets/:secret_id", projectSecretsH.Update)
+	v1.Delete("/projects/:id/secrets/:secret_id", projectSecretsH.Unbind)
 
 	v1.Post("/environments", tenancyH.CreateEnvironment)
 	v1.Get("/environments", tenancyH.ListEnvironments)
