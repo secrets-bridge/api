@@ -317,7 +317,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// now refuse with `out_of_scope_project` when the approver's
 	// effective project access (PermSecretApprove, expanded through
 	// the team subtree) doesn't cover the request's project_id.
-	requestSvc = requestSvc.WithApproverScope(rbacResolver, teamScopeResolver)
+	// WithApproverScope mutates the pointer in place, so the handler
+	// built at the top of this block sees the change; no reassignment.
+	requestSvc.WithApproverScope(rbacResolver, teamScopeResolver)
 
 	// Project-scoped catalog (api#43 Slice B): GET /secrets restricts
 	// results to the caller's project bindings unless they hold
