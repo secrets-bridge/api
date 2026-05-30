@@ -23,18 +23,41 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
 // Requests is the HTTP layer over RequestService.
+//
+// When the multi-tenancy gate is wired (via WithTenancyGate), POST
+// /requests and POST /requests/read pre-flight every submission
+// against project_secrets: the caller must hold secret.request at a
+// scope covering the body's project_id, AND the secret_ref must be
+// bound to that project, AND every requested key must be in the
+// binding's allowed_keys (when allowed_keys is non-null), AND the
+// requested op (read|patch) must be in allowed_ops. See api#43 Slice C.
 type Requests struct {
-	svc *services.RequestService
+	svc       *services.RequestService
+	bindings  storage.ProjectSecretRepository
+	secrets   storage.SecretRepository
+	resolver  auth.Resolver
 }
 
 // NewRequests binds a handler to its service.
 func NewRequests(svc *services.RequestService) *Requests { return &Requests{svc: svc} }
+
+// WithTenancyGate wires the multi-tenancy gate. Pass non-nil values
+// for all three; passing nil for any disables the gate (preserves
+// legacy "any authenticated caller can submit any request" mode).
+func (h *Requests) WithTenancyGate(b storage.ProjectSecretRepository, s storage.SecretRepository, r auth.Resolver) *Requests {
+	h.bindings = b
+	h.secrets = s
+	h.resolver = r
+	return h
+}
 
 func requestErr(err error) error {
 	switch {
@@ -95,6 +118,14 @@ func (h *Requests) Submit(c fiber.Ctx) error {
 	// Best-effort drop the strings from the body map.
 	for k := range body.KeyValues {
 		delete(body.KeyValues, k)
+	}
+
+	keysForCheck := make([]string, 0, len(kv))
+	for k := range kv {
+		keysForCheck = append(keysForCheck, k)
+	}
+	if err := h.checkTenancy(c, body.ProjectID, body.TargetProviderType, body.TargetSecretRef, keysForCheck, storage.OpPatch); err != nil {
+		return err
 	}
 
 	req, err := h.svc.Submit(c.Context(), services.PatchInput{
@@ -223,6 +254,9 @@ func (h *Requests) SubmitRead(c fiber.Ctx) error {
 	var body SubmitReadRequestBody
 	if err := c.Bind().JSON(&body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
+	}
+	if err := h.checkTenancy(c, body.ProjectID, body.TargetProviderType, body.TargetSecretRef, body.TargetKeys, storage.OpRead); err != nil {
+		return err
 	}
 	req, err := h.svc.SubmitRead(c.Context(), services.ReadInput{
 		RequesterID:          body.RequesterID,
@@ -454,4 +488,100 @@ func approvalToBody(a *storage.Approval) ApprovalBody {
 		Comment:    a.Comment,
 		CreatedAt:  a.CreatedAt,
 	}
+}
+
+// checkTenancy is the multi-tenancy gate on POST /requests +
+// /requests/read. Returns nil when scoping isn't wired (legacy mode)
+// or when the request is in-scope; otherwise returns a fiber error
+// with the right status code + a generic message. The audit trail
+// records the specifics via the request lifecycle's existing audit
+// events; this handler stays terse on purpose.
+//
+// `op` is one of storage.OpRead / storage.OpPatch.
+//
+// Resolution model:
+//   - identity missing                 → 401
+//   - body.project_id missing/invalid  → 400
+//   - caller scoped but project_id not in their access set → 403
+//   - secret_ref not bound to project_id                    → 403
+//   - any requested key not in binding.allowed_keys         → 403
+//   - op not in binding.allowed_ops                         → 403
+//   - happy path                                            → nil
+func (h *Requests) checkTenancy(c fiber.Ctx, projectIDRaw, providerType, secretRef string, requestedKeys []string, op string) error {
+	if h.bindings == nil || h.secrets == nil || h.resolver == nil {
+		return nil
+	}
+	userID, ok := auth.IdentityFromContext(c.Context())
+	if !ok {
+		return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+	}
+	if projectIDRaw == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "project_id is required")
+	}
+	projectID, err := uuid.Parse(projectIDRaw)
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "project_id must be a UUID")
+	}
+
+	// Step 1: caller has secret.request at a scope covering this project?
+	access, err := auth.EffectiveProjectAccess(c.Context(), userID, auth.PermSecretRequest, h.resolver)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	if !access.IsGlobal {
+		if !containsUUID(access.ProjectIDs, projectID) {
+			return fiber.NewError(fiber.StatusForbidden, "out_of_scope_project")
+		}
+	}
+
+	// Step 2: find a binding for (project, provider_type, secret_ref).
+	//
+	// The catalog row identity is (cluster_name, provider_type, secret_ref);
+	// the same ref can exist on multiple clusters. Look up every match
+	// and accept the first row that has a binding to this project.
+	secrets, err := h.secrets.ListByRef(c.Context(), providerType, secretRef)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	if len(secrets) == 0 {
+		return fiber.NewError(fiber.StatusForbidden, "out_of_scope_project")
+	}
+	var binding *storage.ProjectSecret
+	for _, s := range secrets {
+		b, err := h.bindings.Get(c.Context(), projectID, s.ID)
+		if err == nil {
+			binding = b
+			break
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+		}
+	}
+	if binding == nil {
+		return fiber.NewError(fiber.StatusForbidden, "out_of_scope_project")
+	}
+
+	// Step 3: requested op allowed?
+	if !containsString(binding.AllowedOps, op) {
+		return fiber.NewError(fiber.StatusForbidden, "out_of_scope_op")
+	}
+
+	// Step 4: every requested key in allowed_keys (when non-null)?
+	if binding.AllowedKeys != nil {
+		for _, k := range requestedKeys {
+			if !containsString(binding.AllowedKeys, k) {
+				return fiber.NewError(fiber.StatusForbidden, "out_of_scope_key")
+			}
+		}
+	}
+	return nil
+}
+
+func containsString(set []string, target string) bool {
+	for _, s := range set {
+		if s == target {
+			return true
+		}
+	}
+	return false
 }

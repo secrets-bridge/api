@@ -48,14 +48,21 @@ const (
 // LabelEquals is an ANDed conjunction of {key, value} predicates. Each
 // pair is checked via the jsonb containment operator (labels @> '{k:v}'),
 // which makes the GIN index do the heavy lifting.
+//
+// SecretIDs, when non-nil, restricts results to that id set (intersected
+// with the other filters). A nil slice means "no id restriction" — every
+// secret can match. An EMPTY (non-nil) slice means "no rows" — useful
+// for the multi-tenancy filter at the handler layer when the caller
+// has zero project bindings.
 type SecretsListFilter struct {
-	ClusterName      string
-	ProviderType     string
-	SecretRefPrefix  string
-	Status           SecretStatus
-	LabelEquals      map[string]string
-	Limit            int
-	Offset           int
+	ClusterName     string
+	ProviderType    string
+	SecretRefPrefix string
+	Status          SecretStatus
+	LabelEquals     map[string]string
+	SecretIDs       []uuid.UUID
+	Limit           int
+	Offset          int
 }
 
 // SecretRepository is the read/write surface for the secrets table.
@@ -81,6 +88,12 @@ type SecretRepository interface {
 	// last_seen_at is older than `cutoff`. Returns the number of rows
 	// updated. Used by the background sweeper.
 	MarkStaleAsMissing(ctx context.Context, cutoff time.Time) (int64, error)
+
+	// ListByRef returns every catalog row matching the
+	// (provider_type, secret_ref) pair, across all clusters. Used by
+	// the submit-time multi-tenancy gate (api#43 Slice C) where the
+	// caller's body carries the ref but not the cluster.
+	ListByRef(ctx context.Context, providerType, secretRef string) ([]*Secret, error)
 }
 
 // Secrets is the Postgres implementation.
@@ -188,6 +201,24 @@ func (r *Secrets) Count(ctx context.Context, f SecretsListFilter) (int, error) {
 	return n, nil
 }
 
+func (r *Secrets) ListByRef(ctx context.Context, providerType, secretRef string) ([]*Secret, error) {
+	q := secretSelect + " WHERE provider_type = $1 AND secret_ref = $2 ORDER BY cluster_name"
+	rows, err := r.pool.Query(ctx, q, providerType, secretRef)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list secrets by ref: %w", err)
+	}
+	defer rows.Close()
+	var out []*Secret
+	for rows.Next() {
+		s, err := scanSecret(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 func (r *Secrets) MarkStaleAsMissing(ctx context.Context, cutoff time.Time) (int64, error) {
 	const q = `
 		UPDATE secrets
@@ -278,6 +309,12 @@ func buildSecretsQuery(base string, f SecretsListFilter) (string, []any) {
 		}
 		raw, _ := json.Marshal(merged)
 		add("labels @> $%d::jsonb", string(raw))
+	}
+	if f.SecretIDs != nil {
+		// Multi-tenancy gate: non-nil slice restricts results to this
+		// id set. An empty slice is a deliberate "no rows" — encode
+		// it as `id = ANY('{}'::uuid[])` which always evaluates false.
+		add("id = ANY($%d::uuid[])", f.SecretIDs)
 	}
 
 	q := base
