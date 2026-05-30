@@ -26,7 +26,9 @@ func bootstrapSecrets(t *testing.T) (*services.SecretsService, *storage.Pool, *s
 	}
 	t.Cleanup(pool.Close)
 
-	if _, err := pool.Exec(ctx, "TRUNCATE TABLE secrets RESTART IDENTITY"); err != nil {
+	// CASCADE: project_secrets (0014) FKs secret_id to secrets(id); without
+	// CASCADE, Postgres refuses TRUNCATE on the referenced parent table.
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE secrets RESTART IDENTITY CASCADE"); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	if _, err := pool.Exec(ctx, "TRUNCATE audit_events"); err != nil {
