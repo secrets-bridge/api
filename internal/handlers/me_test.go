@@ -135,7 +135,7 @@ func TestGetMe_HappyPath(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status %d: %s", resp.StatusCode, body)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var got handlers.MeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
