@@ -44,6 +44,7 @@ type Requests struct {
 	bindings  storage.ProjectSecretRepository
 	secrets   storage.SecretRepository
 	resolver  auth.Resolver
+	teamScope auth.TeamScopeResolver
 }
 
 // NewRequests binds a handler to its service.
@@ -56,6 +57,14 @@ func (h *Requests) WithTenancyGate(b storage.ProjectSecretRepository, s storage.
 	h.bindings = b
 	h.secrets = s
 	h.resolver = r
+	return h
+}
+
+// WithTeamScope optionally plumbs the team-aware access resolver so
+// team-scoped grants expand to the descendant project set on the
+// submit-time gate. When unset, only project-scoped grants are honoured.
+func (h *Requests) WithTeamScope(tr auth.TeamScopeResolver) *Requests {
+	h.teamScope = tr
 	return h
 }
 
@@ -524,7 +533,7 @@ func (h *Requests) checkTenancy(c fiber.Ctx, projectIDRaw, providerType, secretR
 	}
 
 	// Step 1: caller has secret.request at a scope covering this project?
-	access, err := auth.EffectiveProjectAccess(c.Context(), userID, auth.PermSecretRequest, h.resolver)
+	access, err := auth.EffectiveProjectAccess(c.Context(), userID, auth.PermSecretRequest, h.resolver, h.teamScope)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}

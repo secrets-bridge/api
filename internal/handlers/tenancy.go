@@ -56,19 +56,24 @@ func NewTenancy(p storage.ProjectRepository, e storage.EnvironmentRepository) *T
 // --- projects --------------------------------------------------------
 
 type projectBody struct {
-	ID          uuid.UUID `json:"id,omitempty"`
-	Name        string    `json:"name"`
-	OwnerTeamID string    `json:"owner_team_id,omitempty"`
-	Status      string    `json:"status,omitempty"`
-	CreatedAt   time.Time `json:"created_at,omitempty"`
-	UpdatedAt   time.Time `json:"updated_at,omitempty"`
+	ID          uuid.UUID  `json:"id,omitempty"`
+	Name        string     `json:"name"`
+	OwnerTeamID string     `json:"owner_team_id,omitempty"`
+	TeamID      *uuid.UUID `json:"team_id"`
+	Status      string     `json:"status,omitempty"`
+	CreatedAt   time.Time  `json:"created_at,omitempty"`
+	UpdatedAt   time.Time  `json:"updated_at,omitempty"`
 }
 
 func projectToBody(p *storage.Project) projectBody {
 	return projectBody{
-		ID: p.ID, Name: p.Name, OwnerTeamID: p.OwnerTeamID,
-		Status: string(p.Status),
-		CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
+		ID:          p.ID,
+		Name:        p.Name,
+		OwnerTeamID: p.OwnerTeamID,
+		TeamID:      p.TeamID,
+		Status:      string(p.Status),
+		CreatedAt:   p.CreatedAt,
+		UpdatedAt:   p.UpdatedAt,
 	}
 }
 
@@ -85,6 +90,7 @@ func (h *Tenancy) CreateProject(c fiber.Ctx) error {
 	p := &storage.Project{
 		Name:        body.Name,
 		OwnerTeamID: body.OwnerTeamID,
+		TeamID:      body.TeamID,
 		Status:      storage.ProjectStatusActive,
 	}
 	if body.Status != "" {
@@ -94,6 +100,29 @@ func (h *Tenancy) CreateProject(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 	return c.Status(fiber.StatusCreated).JSON(projectToBody(p))
+}
+
+// SetProjectTeam handles PUT /projects/:id/team — reassigns the
+// project's team_id (the typed FK introduced by 0018). Body shape:
+// `{"team_id": "<uuid>"}` or `{"team_id": null}` to un-scope.
+func (h *Tenancy) SetProjectTeam(c fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var body struct {
+		TeamID *uuid.UUID `json:"team_id"`
+	}
+	if err := c.Bind().JSON(&body); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
+	}
+	if err := h.projects.SetTeam(c.Context(), id, body.TeamID); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "not found")
+		}
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	return c.SendStatus(fiber.StatusNoContent)
 }
 
 // ListProjects handles GET /projects.

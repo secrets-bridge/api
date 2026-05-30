@@ -307,6 +307,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	projectSecretsH := handlers.NewProjectSecrets(projectSecretsRepo, projectRepo, secretsRepo)
 	teamRepo := storage.NewTeams(pool)
 	teamsH := handlers.NewTeams(teamRepo)
+	teamScopeResolver := auth.NewRepoTeamScopeResolver(teamRepo, projectRepo)
 
 	// RBAC resolver for the `auth.Require(perm)` middleware. Loads each
 	// caller's user_role assignments + the role catalog at request time.
@@ -314,17 +315,24 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 
 	// Project-scoped catalog (api#43 Slice B): GET /secrets restricts
 	// results to the caller's project bindings unless they hold
-	// secret.list at global scope.
-	secretsH = secretsH.WithProjectScoping(projectSecretsRepo, rbacResolver)
+	// secret.list at global scope. Team-scoped grants expand through
+	// the descendant team subtree via teamScopeResolver.
+	secretsH = secretsH.
+		WithProjectScoping(projectSecretsRepo, rbacResolver).
+		WithTeamScope(teamScopeResolver)
 
 	// Submit-time tenancy gate (api#43 Slice C): POST /requests +
 	// /requests/read refuse with 403 + error_kind when the caller's
-	// scope doesn't cover the project / op / key set.
-	requestsH = requestsH.WithTenancyGate(projectSecretsRepo, secretsRepo, rbacResolver)
+	// scope doesn't cover the project / op / key set. Team-scoped
+	// grants expand the same way as on the catalog read path.
+	requestsH = requestsH.
+		WithTenancyGate(projectSecretsRepo, secretsRepo, rbacResolver).
+		WithTeamScope(teamScopeResolver)
 
 	// "What are my projects?" projection (api#43 Slice D) — drives the
 	// UI project switcher.
-	meH := handlers.NewMe(projectRepo, rbacResolver)
+	meH := handlers.NewMe(projectRepo, rbacResolver).
+		WithTeamScope(teamScopeResolver)
 
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
@@ -404,6 +412,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Get("/projects", tenancyH.ListProjects)
 	v1.Get("/projects/:id", tenancyH.GetProject)
 	v1.Put("/projects/:id/status", tenancyH.UpdateProjectStatus)
+	v1.Put("/projects/:id/team", auth.Require(auth.PermTeamEdit, rbacResolver), tenancyH.SetProjectTeam)
 	v1.Get("/projects/:id/environments", tenancyH.ListEnvironmentsForProject)
 
 	// Project ↔ secret bindings (multi-tenancy, api#43 Slice A).
