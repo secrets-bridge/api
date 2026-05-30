@@ -67,7 +67,10 @@ func freshDB(t *testing.T) *storage.Pool {
 			agents,
 			provider_connections,
 			environments,
-			projects
+			projects,
+			team_members,
+			teams,
+			local_users
 		RESTART IDENTITY CASCADE`
 	if _, err := pool.Exec(ctx, truncate); err != nil {
 		t.Fatalf("truncate: %v", err)

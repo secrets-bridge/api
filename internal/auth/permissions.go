@@ -45,6 +45,9 @@ const (
 	PermRoleEdit     Permission = "role.edit"
 	PermUserRoleEdit Permission = "user_role.edit"
 
+	// Tenancy admin -----------------------------------------------------
+	PermTeamEdit Permission = "team.edit"
+
 	// Workflow / policy admin ------------------------------------------
 	PermWorkflowEdit Permission = "workflow.edit"
 	PermPolicyEdit   Permission = "policy.edit"
@@ -88,6 +91,8 @@ type Descriptor struct {
 var Catalog = []Descriptor{
 	{PermRoleEdit, "RBAC", "Create, update, delete roles. Manage seeded role permission lists."},
 	{PermUserRoleEdit, "RBAC", "Grant or revoke role assignments to users."},
+
+	{PermTeamEdit, "Tenancy", "Create, update, archive teams and manage team memberships. Role grants scoped to a team_id implicitly cover that team's entire subtree."},
 
 	{PermWorkflowEdit, "Workflows", "Create, update, delete approval workflow definitions."},
 	{PermPolicyEdit, "Workflows", "Create, update, delete policy rules that map request scope to a workflow."},

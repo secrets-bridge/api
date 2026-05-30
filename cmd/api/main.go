@@ -305,6 +305,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	tenancyH := handlers.NewTenancy(projectRepo, environmentRepo)
 	projectSecretsRepo := storage.NewProjectSecrets(pool)
 	projectSecretsH := handlers.NewProjectSecrets(projectSecretsRepo, projectRepo, secretsRepo)
+	teamRepo := storage.NewTeams(pool)
+	teamsH := handlers.NewTeams(teamRepo)
 
 	// RBAC resolver for the `auth.Require(perm)` middleware. Loads each
 	// caller's user_role assignments + the role catalog at request time.
@@ -420,6 +422,20 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Get("/environments", tenancyH.ListEnvironments)
 	v1.Get("/environments/:id", tenancyH.GetEnvironment)
 	v1.Delete("/environments/:id", tenancyH.DeleteEnvironment)
+
+	// Teams admin (api#43-followup). N-level hierarchy via
+	// parent_team_id. Membership is structural-only; role grants on a
+	// team_id scope expand to the subtree via auth.EffectiveTeamAccess
+	// (lands in a follow-up PR).
+	v1.Post("/teams", auth.Require(auth.PermTeamEdit, rbacResolver), teamsH.Create)
+	v1.Get("/teams", teamsH.List)
+	v1.Get("/teams/:id", teamsH.Get)
+	v1.Put("/teams/:id", auth.Require(auth.PermTeamEdit, rbacResolver), teamsH.Update)
+	v1.Put("/teams/:id/status", auth.Require(auth.PermTeamEdit, rbacResolver), teamsH.UpdateStatus)
+	v1.Delete("/teams/:id", auth.Require(auth.PermTeamEdit, rbacResolver), teamsH.Delete)
+	v1.Post("/teams/:id/members", auth.Require(auth.PermTeamEdit, rbacResolver), teamsH.AddMember)
+	v1.Get("/teams/:id/members", teamsH.ListMembers)
+	v1.Delete("/teams/:id/members/:user_id", auth.Require(auth.PermTeamEdit, rbacResolver), teamsH.RemoveMember)
 
 	// Patch-request lifecycle. Plaintext values arrive only via
 	// POST /requests, are envelope-encrypted by WrapService before
