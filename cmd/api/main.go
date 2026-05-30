@@ -310,6 +310,20 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// caller's user_role assignments + the role catalog at request time.
 	rbacResolver := auth.NewRepoResolver(userRoleRepo, roleRepo)
 
+	// Project-scoped catalog (api#43 Slice B): GET /secrets restricts
+	// results to the caller's project bindings unless they hold
+	// secret.list at global scope.
+	secretsH = secretsH.WithProjectScoping(projectSecretsRepo, rbacResolver)
+
+	// Submit-time tenancy gate (api#43 Slice C): POST /requests +
+	// /requests/read refuse with 403 + error_kind when the caller's
+	// scope doesn't cover the project / op / key set.
+	requestsH = requestsH.WithTenancyGate(projectSecretsRepo, secretsRepo, rbacResolver)
+
+	// "What are my projects?" projection (api#43 Slice D) — drives the
+	// UI project switcher.
+	meH := handlers.NewMe(projectRepo, rbacResolver)
+
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
 	// (issue #10).
@@ -397,6 +411,10 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Get("/projects/:id/secrets", projectSecretsH.List)
 	v1.Put("/projects/:id/secrets/:secret_id", projectSecretsH.Update)
 	v1.Delete("/projects/:id/secrets/:secret_id", projectSecretsH.Unbind)
+
+	// Slice D (api#43): caller-scoped projection used by the UI
+	// project switcher.
+	v1.Get("/users/me/projects", meH.ListProjects)
 
 	v1.Post("/environments", tenancyH.CreateEnvironment)
 	v1.Get("/environments", tenancyH.ListEnvironments)

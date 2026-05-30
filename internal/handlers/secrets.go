@@ -20,19 +20,40 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
 // Secrets is the HTTP layer over SecretsService.
+//
+// The catalog endpoint (GET /secrets) is scoped to the caller's
+// `secret.list` grants. A grant at empty scope (or with a scope that
+// doesn't constrain project_id) yields the admin view; a project_id-
+// scoped grant restricts results to that project's bindings. See
+// `internal/auth.EffectiveProjectAccess` + the `project_secrets`
+// repository (api#43 Slice A) for the join.
 type Secrets struct {
-	svc *services.SecretsService
+	svc            *services.SecretsService
+	bindings       storage.ProjectSecretRepository
+	scopeResolver  auth.Resolver
 }
 
-// NewSecrets binds the handler.
+// NewSecrets binds the handler. `bindings` and `scopeResolver` may be
+// nil to keep the legacy "everyone sees everything" behaviour — that
+// hatch will be removed once the UI is project-aware.
 func NewSecrets(svc *services.SecretsService) *Secrets { return &Secrets{svc: svc} }
+
+// WithProjectScoping wires the multi-tenancy filter. Pass both args
+// non-nil from main; passing nil disables scoping (admin-only mode).
+func (h *Secrets) WithProjectScoping(b storage.ProjectSecretRepository, r auth.Resolver) *Secrets {
+	h.bindings = b
+	h.scopeResolver = r
+	return h
+}
 
 func secretsErr(err error) error {
 	switch {
@@ -135,8 +156,20 @@ type ListResponse struct {
 }
 
 // List handles GET /api/v1/secrets.
+//
+// Project-scoped catalog: when both `bindings` and `scopeResolver` are
+// wired AND the caller is not a global admin for `secret.list`, the
+// returned rows are restricted to secrets bound to the caller's
+// projects via `project_secrets`. An optional `?project_id=<uuid>`
+// narrows further (admin can use this to inspect one project; a
+// scoped caller can only narrow within their own access set).
 func (h *Secrets) List(c fiber.Ctx) error {
 	f := filterFromQuery(c)
+
+	if err := h.applyProjectScope(c, &f); err != nil {
+		return err
+	}
+
 	rows, err := h.svc.List(c.Context(), f)
 	if err != nil {
 		return secretsErr(err)
@@ -150,6 +183,95 @@ func (h *Secrets) List(c fiber.Ctx) error {
 		out = append(out, secretToBody(r))
 	}
 	return c.JSON(ListResponse{Items: out, Total: total})
+}
+
+// applyProjectScope folds the caller's `secret.list` grants into the
+// list filter:
+//
+//   - bindings or scopeResolver unset → no scoping (legacy behaviour)
+//   - identity missing                → 401
+//   - global admin                    → no id restriction (unless
+//                                       ?project_id= is supplied)
+//   - scoped caller                   → restrict to the secrets bound
+//                                       to their projects; if a
+//                                       ?project_id= is supplied AND
+//                                       in their set, narrow further.
+//                                       Empty access set → empty
+//                                       result (encoded as a non-nil
+//                                       empty SecretIDs).
+func (h *Secrets) applyProjectScope(c fiber.Ctx, f *storage.SecretsListFilter) error {
+	if h.bindings == nil || h.scopeResolver == nil {
+		return nil
+	}
+	userID, ok := auth.IdentityFromContext(c.Context())
+	if !ok {
+		return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+	}
+
+	access, err := auth.EffectiveProjectAccess(c.Context(), userID, auth.PermSecretList, h.scopeResolver)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+
+	queryProject := c.Query("project_id")
+	var queryProjectID *uuid.UUID
+	if queryProject != "" {
+		u, err := uuid.Parse(queryProject)
+		if err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, "project_id must be a UUID")
+		}
+		queryProjectID = &u
+	}
+
+	if access.IsGlobal {
+		if queryProjectID == nil {
+			return nil
+		}
+		ids, err := h.bindings.ListSecretIDsForProjects(c.Context(), []uuid.UUID{*queryProjectID})
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+		}
+		f.SecretIDs = nonNilUUIDs(ids)
+		return nil
+	}
+
+	// Non-admin caller. They must hold at least one project_id-scoped
+	// grant — otherwise they see nothing. A ?project_id= narrows but
+	// must stay within their granted set.
+	if len(access.ProjectIDs) == 0 {
+		f.SecretIDs = []uuid.UUID{}
+		return nil
+	}
+	target := access.ProjectIDs
+	if queryProjectID != nil {
+		if !containsUUID(access.ProjectIDs, *queryProjectID) {
+			return fiber.NewError(fiber.StatusForbidden,
+				"project_id is not in caller's accessible projects")
+		}
+		target = []uuid.UUID{*queryProjectID}
+	}
+	ids, err := h.bindings.ListSecretIDsForProjects(c.Context(), target)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	f.SecretIDs = nonNilUUIDs(ids)
+	return nil
+}
+
+func nonNilUUIDs(in []uuid.UUID) []uuid.UUID {
+	if in == nil {
+		return []uuid.UUID{}
+	}
+	return in
+}
+
+func containsUUID(set []uuid.UUID, target uuid.UUID) bool {
+	for _, u := range set {
+		if u == target {
+			return true
+		}
+	}
+	return false
 }
 
 // Get handles GET /api/v1/secrets/:id.
