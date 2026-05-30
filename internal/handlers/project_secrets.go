@@ -58,9 +58,14 @@ func NewProjectSecrets(
 // --- request / response shapes --------------------------------------
 
 type bindingBody struct {
-	ProjectID   uuid.UUID `json:"project_id,omitempty"`
-	SecretID    uuid.UUID `json:"secret_id"`
-	AllowedKeys *[]string `json:"allowed_keys,omitempty"`
+	ProjectID uuid.UUID `json:"project_id,omitempty"`
+	SecretID  uuid.UUID `json:"secret_id"`
+	// AllowedKeys is intentionally NOT omitempty: nil → JSON null
+	// carries the "all keys allowed" semantic the field documents.
+	// An absent JSON key forces every client to handle
+	// undefined-vs-null ad-hoc; that gap caused ui#31 (TypeError on
+	// `.map(undefined)` → blank /admin/projects).
+	AllowedKeys *[]string `json:"allowed_keys"`
 	AllowedOps  []string  `json:"allowed_ops,omitempty"`
 	CreatedAt   time.Time `json:"created_at,omitempty"`
 	UpdatedAt   time.Time `json:"updated_at,omitempty"`
