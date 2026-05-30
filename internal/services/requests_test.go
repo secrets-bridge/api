@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/keymgmt"
 	"github.com/secrets-bridge/api/pkg/storage"
@@ -406,6 +407,195 @@ func policyRule(t *testing.T, ctx context.Context, h *requestHarness, name strin
 		Enabled:    true,
 	}); err != nil {
 		t.Fatalf("policy Create: %v", err)
+	}
+}
+
+// --- Slice 3: team-scoped approver gate (api#TBD) -------------------
+
+// stubResolver implements auth.Resolver from canned grants.
+type stubResolver struct{ grants []auth.Grant }
+
+func (s *stubResolver) Resolve(_ context.Context, _ string) ([]auth.Grant, error) {
+	return s.grants, nil
+}
+
+// stubTeamScope implements auth.TeamScopeResolver from canned maps.
+type stubTeamScope struct {
+	desc map[uuid.UUID][]uuid.UUID
+	proj map[uuid.UUID][]uuid.UUID
+}
+
+func (s *stubTeamScope) DescendantTeamIDs(_ context.Context, root uuid.UUID) ([]uuid.UUID, error) {
+	return s.desc[root], nil
+}
+func (s *stubTeamScope) ProjectIDsForTeams(_ context.Context, teamIDs []uuid.UUID) ([]uuid.UUID, error) {
+	seen := map[uuid.UUID]struct{}{}
+	var out []uuid.UUID
+	for _, t := range teamIDs {
+		for _, p := range s.proj[t] {
+			if _, ok := seen[p]; ok {
+				continue
+			}
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+// scopedPatch is samplePatch with a real UUID project_id so the
+// approver-scope gate kicks in (the legacy "billing" string fails
+// uuid.Parse and the check returns nil for back-compat).
+func scopedPatch(requester string, projectID uuid.UUID) services.PatchInput {
+	p := samplePatch(requester)
+	p.ProjectID = projectID.String()
+	return p
+}
+
+func TestApprove_OutOfScopeProject_Rejected(t *testing.T) {
+	h := bootstrapRequests(t)
+	ctx := t.Context()
+
+	allowedProject := uuid.New()
+	requestProject := uuid.New() // different — gate must refuse
+	h.requests.WithApproverScope(
+		&stubResolver{grants: []auth.Grant{
+			{Permission: string(auth.PermSecretApprove), Scope: map[string]string{"project_id": allowedProject.String()}},
+		}},
+		nil,
+	)
+
+	req, err := h.requests.Submit(ctx, scopedPatch("alice", requestProject))
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	_, err = h.requests.Approve(ctx, req.ID, "bob", "")
+	if !errors.Is(err, services.ErrOutOfScopeProject) {
+		t.Fatalf("expected ErrOutOfScopeProject, got %v", err)
+	}
+	// Approval row MUST NOT have been recorded.
+	approvals, err := h.requests.Approvals(ctx, req.ID)
+	if err != nil {
+		t.Fatalf("Approvals: %v", err)
+	}
+	if len(approvals) != 0 {
+		t.Fatalf("expected no vote recorded on rejected approve, got %+v", approvals)
+	}
+}
+
+func TestApprove_GlobalGrant_Passes(t *testing.T) {
+	h := bootstrapRequests(t)
+	ctx := t.Context()
+
+	h.requests.WithApproverScope(
+		&stubResolver{grants: []auth.Grant{
+			{Permission: string(auth.PermSecretApprove)}, // empty scope = global
+		}},
+		nil,
+	)
+
+	req, err := h.requests.Submit(ctx, scopedPatch("alice", uuid.New()))
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if _, err := h.requests.Approve(ctx, req.ID, "bob", ""); err != nil {
+		t.Fatalf("Approve (global grant): %v", err)
+	}
+}
+
+func TestApprove_TeamScopeCoversRequestProject(t *testing.T) {
+	h := bootstrapRequests(t)
+	ctx := t.Context()
+
+	team := uuid.New()
+	requestProject := uuid.New()
+	h.requests.WithApproverScope(
+		&stubResolver{grants: []auth.Grant{
+			{Permission: string(auth.PermSecretApprove), Scope: map[string]string{"team_id": team.String()}},
+		}},
+		&stubTeamScope{
+			desc: map[uuid.UUID][]uuid.UUID{team: {team}},
+			proj: map[uuid.UUID][]uuid.UUID{team: {requestProject}},
+		},
+	)
+
+	req, err := h.requests.Submit(ctx, scopedPatch("alice", requestProject))
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if _, err := h.requests.Approve(ctx, req.ID, "bob", ""); err != nil {
+		t.Fatalf("Approve (team-scope covers project): %v", err)
+	}
+}
+
+func TestApprove_TeamScopeDoesNotCover_Rejected(t *testing.T) {
+	h := bootstrapRequests(t)
+	ctx := t.Context()
+
+	team := uuid.New()
+	teamProject := uuid.New() // owned by team
+	requestProject := uuid.New() // unrelated to team
+	h.requests.WithApproverScope(
+		&stubResolver{grants: []auth.Grant{
+			{Permission: string(auth.PermSecretApprove), Scope: map[string]string{"team_id": team.String()}},
+		}},
+		&stubTeamScope{
+			desc: map[uuid.UUID][]uuid.UUID{team: {team}},
+			proj: map[uuid.UUID][]uuid.UUID{team: {teamProject}},
+		},
+	)
+
+	req, err := h.requests.Submit(ctx, scopedPatch("alice", requestProject))
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	_, err = h.requests.Approve(ctx, req.ID, "bob", "")
+	if !errors.Is(err, services.ErrOutOfScopeProject) {
+		t.Fatalf("expected ErrOutOfScopeProject, got %v", err)
+	}
+}
+
+func TestReject_OutOfScopeProject_Rejected(t *testing.T) {
+	h := bootstrapRequests(t)
+	ctx := t.Context()
+
+	h.requests.WithApproverScope(
+		&stubResolver{grants: []auth.Grant{
+			{Permission: string(auth.PermSecretApprove), Scope: map[string]string{"project_id": uuid.New().String()}},
+		}},
+		nil,
+	)
+
+	req, err := h.requests.Submit(ctx, scopedPatch("alice", uuid.New()))
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	_, err = h.requests.Reject(ctx, req.ID, "bob", "not allowed")
+	if !errors.Is(err, services.ErrOutOfScopeProject) {
+		t.Fatalf("expected ErrOutOfScopeProject on Reject, got %v", err)
+	}
+}
+
+func TestApprove_LegacyUnscopedRequest_Passes(t *testing.T) {
+	// A request whose TargetScope["project_id"] is a legacy string
+	// (not parseable as UUID) should bypass the gate so existing
+	// installs without scoped projects keep working.
+	h := bootstrapRequests(t)
+	ctx := t.Context()
+
+	h.requests.WithApproverScope(
+		&stubResolver{grants: []auth.Grant{
+			{Permission: string(auth.PermSecretApprove), Scope: map[string]string{"project_id": uuid.New().String()}},
+		}},
+		nil,
+	)
+
+	req, err := h.requests.Submit(ctx, samplePatch("alice")) // ProjectID = "billing" (not a UUID)
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if _, err := h.requests.Approve(ctx, req.ID, "bob", ""); err != nil {
+		t.Fatalf("legacy unscoped request should bypass gate: %v", err)
 	}
 }
 
