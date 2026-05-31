@@ -42,6 +42,7 @@ type SessionRepository interface {
 	Create(ctx context.Context, s *Session) error
 	GetByTokenHash(ctx context.Context, tokenHash []byte) (*Session, error)
 	TouchIdleExpiry(ctx context.Context, id uuid.UUID, idleExpiresAt time.Time) error
+	TouchLastMFA(ctx context.Context, id uuid.UUID, at time.Time) error
 	Revoke(ctx context.Context, id uuid.UUID, at time.Time) error
 	RevokeAllForUser(ctx context.Context, userID uuid.UUID, at time.Time) (int, error)
 	ListActiveForUser(ctx context.Context, userID uuid.UUID, now time.Time) ([]*Session, error)
@@ -120,6 +121,24 @@ func (r *Sessions) TouchIdleExpiry(ctx context.Context, id uuid.UUID, idleExpire
 	tag, err := r.pool.Exec(ctx, q, idleExpiresAt.UTC(), id)
 	if err != nil {
 		return fmt.Errorf("storage: touch session idle expiry: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// TouchLastMFA stamps `last_mfa_at = at` on a live session. Slice D
+// (step-up auth): the OIDC callback calls this when the ID token's
+// `amr` claim carries a strong factor (mfa / otp / hwk / fido / ...).
+// `RequireFreshMFA` later checks `now - last_mfa_at <= maxAge`.
+func (r *Sessions) TouchLastMFA(ctx context.Context, id uuid.UUID, at time.Time) error {
+	const q = `UPDATE sessions
+	           SET last_mfa_at = $1
+	           WHERE id = $2 AND revoked_at IS NULL`
+	tag, err := r.pool.Exec(ctx, q, at.UTC(), id)
+	if err != nil {
+		return fmt.Errorf("storage: touch session last_mfa_at: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound

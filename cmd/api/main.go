@@ -569,12 +569,21 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// Patch-request lifecycle. Plaintext values arrive only via
 	// POST /requests, are envelope-encrypted by WrapService before
 	// touching Postgres, and never appear in responses.
+	// Slice D — Tier 2 step-up gate. Approve / reject / reveal-wrap
+	// require an MFA-fresh session (architect Q6). The middleware
+	// 401s with `WWW-Authenticate: step-up max_age=900 acr_values=mfa`
+	// when `last_mfa_at` is older than the session policy's StepUpTTL.
+	// Sessions without an MFA stamp at all (local-admin sign-in, IdP
+	// without MFA) fail closed. Mounted as a route-level middleware
+	// AFTER AuthWith so the session pointer is in context.
+	requireMFA := middleware.RequireFreshMFA(sessionSvc)
+
 	v1.Post("/requests", requestsH.Submit)
 	v1.Post("/requests/read", requestsH.SubmitRead)
 	v1.Get("/requests", requestsH.List)
 	v1.Get("/requests/:id", requestsH.Get)
-	v1.Post("/requests/:id/approve", requestsH.Approve)
-	v1.Post("/requests/:id/reject", requestsH.Reject)
+	v1.Post("/requests/:id/approve", requireMFA, requestsH.Approve)
+	v1.Post("/requests/:id/reject", requireMFA, requestsH.Reject)
 	v1.Post("/requests/:id/cancel", requestsH.Cancel)
 	// Value-free wrap summaries for the request detail page. Lets the
 	// UI render the Wraps card (one row per key with a ready/consumed
@@ -597,6 +606,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 			Name: "wrap:retrieve", Bucket: middleware.ByQueryUserID(),
 			Limit: 20, Window: 60 * time.Second,
 		}),
+		// Slice D Tier 2: reveal requires fresh MFA. The wrap is
+		// single-shot at the service layer; gating step-up here means
+		// a stolen cookie can't burn a wrap unless it also carries
+		// fresh MFA proof.
+		requireMFA,
 		requestsH.RetrieveWrap,
 	)
 

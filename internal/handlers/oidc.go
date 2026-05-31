@@ -45,12 +45,29 @@ func NewOIDC(svc *services.OIDCService, sessions *services.SessionService, mode 
 // state + nonce, persists them in Redis under the state key, and
 // 302s the browser to the IdP's authorize endpoint.
 //
-// Query param `return_to` (optional) is preserved across the round
-// trip; the callback reads it back and includes it in the final
-// post-login redirect.
+// Query params:
+//   - `return_to` — post-login destination (preserved across the
+//     round-trip)
+//   - `step_up=mfa` — Slice D. Adds `prompt=login&max_age=0&
+//     acr_values=mfa` to the authorize call so the IdP re-prompts
+//     for a strong second factor even when a SSO session is alive.
+//     The SPA hits this path when a Tier 2 endpoint returned
+//     `401 step_up_required`.
 func (h *OIDC) Start(c fiber.Ctx) error {
 	returnTo := strings.TrimSpace(c.Query("return_to"))
-	authz, err := h.svc.StartAuthorize(c.Context(), returnTo)
+	stepUp := strings.TrimSpace(c.Query("step_up"))
+
+	var opts services.StepUpOptions
+	if stepUp == "mfa" {
+		opts = services.StepUpOptions{
+			Prompt:    "login",
+			MaxAgeSet: true,
+			MaxAge:    0,
+			ACRValues: "mfa",
+		}
+	}
+
+	authz, err := h.svc.StartAuthorizeWith(c.Context(), returnTo, opts)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "oidc start failed")
 	}
