@@ -96,6 +96,19 @@ type Config struct {
 	// session).
 	BootstrapAdminEmail    string
 	BootstrapAdminPassword string
+
+	// OIDC client config (Slice B). When OIDCIssuer is empty the OIDC
+	// routes are NOT mounted and the local-admin login path stays the
+	// only sign-in surface (compatible with A1 + A2 deployments).
+	//
+	// `Issuer` is the .well-known/openid-configuration root, e.g.
+	// `https://authentik.example.com/application/o/secrets-bridge/`.
+	OIDCIssuer       string
+	OIDCClientID     string
+	OIDCClientSecret string
+	OIDCRedirectURL  string // public callback URL, must match an IdP-registered redirect
+	OIDCScopes       string // space-separated; default "openid profile email"
+	OIDCPostLogout   string // public post-logout URL (where the IdP sends users after end_session)
 }
 
 func loadConfig() Config {
@@ -110,6 +123,12 @@ func loadConfig() Config {
 		BootstrapAdminEmail:    envOr("SB_BOOTSTRAP_ADMIN_EMAIL", ""),
 		BootstrapAdminPassword: envOr("SB_BOOTSTRAP_ADMIN_PASSWORD", ""),
 		DevSeedPassword:        envOr("SB_DEV_SEED_PASSWORD", ""),
+		OIDCIssuer:             envOr("SB_OIDC_ISSUER", ""),
+		OIDCClientID:           envOr("SB_OIDC_CLIENT_ID", ""),
+		OIDCClientSecret:       envOr("SB_OIDC_CLIENT_SECRET", ""),
+		OIDCRedirectURL:        envOr("SB_OIDC_REDIRECT_URL", ""),
+		OIDCScopes:             envOr("SB_OIDC_SCOPES", "openid profile email"),
+		OIDCPostLogout:         envOr("SB_OIDC_POST_LOGOUT_REDIRECT", ""),
 	}
 }
 
