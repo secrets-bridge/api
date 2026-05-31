@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -109,6 +110,16 @@ type Config struct {
 	OIDCRedirectURL  string // public callback URL, must match an IdP-registered redirect
 	OIDCScopes       string // space-separated; default "openid profile email"
 	OIDCPostLogout   string // public post-logout URL (where the IdP sends users after end_session)
+
+	// Slice E — group-claim → role mapping. When `OIDCGroupClaim` is
+	// empty the reconciler short-circuits and JIT users get no
+	// role grants (admin assigns from the UI). When set, the
+	// callback reads the configured claim and reconciles
+	// `user_roles` against `OIDCGroupMap` (the JSON parses at
+	// boot via `ValidateOIDCGroupMap` so a typo fails the boot
+	// rather than silently producing wrong access).
+	OIDCGroupClaim   string            // default "groups"
+	OIDCGroupMap     map[string]string // raw value via SB_OIDC_GROUP_MAP env (JSON object)
 }
 
 func loadConfig() Config {
@@ -129,7 +140,52 @@ func loadConfig() Config {
 		OIDCRedirectURL:        envOr("SB_OIDC_REDIRECT_URL", ""),
 		OIDCScopes:             envOr("SB_OIDC_SCOPES", "openid profile email"),
 		OIDCPostLogout:         envOr("SB_OIDC_POST_LOGOUT_REDIRECT", ""),
+		OIDCGroupClaim:         envOr("SB_OIDC_GROUP_CLAIM", "groups"),
+		OIDCGroupMap:           parseOIDCGroupMap(envOr("SB_OIDC_GROUP_MAP", "")),
 	}
+}
+
+// parseOIDCGroupMap accepts a JSON object string and returns the
+// parsed map. Empty input or a parse failure returns nil — the
+// reconciler interprets nil as "no mapping configured" and treats
+// JIT users as un-roled. Boot doesn't fail because some deployments
+// genuinely want OIDC sign-in WITHOUT group-derived grants (admin
+// assigns from the UI); failing the boot would force a useless
+// "{}" env-var on every such install.
+//
+// Parse errors are logged at INFO during loadConfig's first read by
+// the caller — `loadConfig` doesn't do logging today, so the
+// initial implementation is silent. Operators who want strictness
+// can validate via `ValidateOIDCGroupMap` from main.go at boot.
+func parseOIDCGroupMap(raw string) map[string]string {
+	if raw == "" {
+		return nil
+	}
+	var out map[string]string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// ValidateOIDCGroupMap returns a non-nil error when SB_OIDC_GROUP_MAP
+// was set but couldn't be parsed as a JSON object of {string:string}.
+// main.go calls this so operators get a fail-loud signal on typos.
+func (c Config) ValidateOIDCGroupMap() error {
+	raw, ok := os.LookupEnv("SB_OIDC_GROUP_MAP")
+	if !ok || raw == "" {
+		return nil
+	}
+	var out map[string]string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return fmt.Errorf("SB_OIDC_GROUP_MAP must be a JSON object of {string:string}: %w", err)
+	}
+	for group, role := range out {
+		if group == "" || role == "" {
+			return errors.New("SB_OIDC_GROUP_MAP must not contain empty group or role names")
+		}
+	}
+	return nil
 }
 
 // ValidateEnv returns an error when SB_ENV is set to an unknown

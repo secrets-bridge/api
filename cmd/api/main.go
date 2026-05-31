@@ -412,6 +412,10 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// All four endpoints are public — auth comes from the IdP / from
 	// the cookie set by Callback / from the logout_token signature.
 	if cfg.OIDCIssuer != "" {
+		if err := cfg.ValidateOIDCGroupMap(); err != nil {
+			logger.Error("oidc group map", "error", err)
+			os.Exit(1)
+		}
 		oidcCtx, oidcCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		oidcSvc, err := services.NewOIDCService(oidcCtx, services.OIDCConfig{
 			Issuer:        cfg.OIDCIssuer,
@@ -420,12 +424,20 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 			RedirectURL:   cfg.OIDCRedirectURL,
 			Scopes:        strings.Fields(cfg.OIDCScopes),
 			PostLogoutURL: cfg.OIDCPostLogout,
+			GroupClaim:    cfg.OIDCGroupClaim,
+			GroupMap:      cfg.OIDCGroupMap,
 		}, localUsersRepoInApp, sessionSvc, auditRepo, rdb)
 		oidcCancel()
 		if err != nil {
 			logger.Error("oidc bootstrap", "error", err)
 			os.Exit(1)
 		}
+		// Slice E — attach the role reconciler. Without this the
+		// reconciler short-circuits (JIT users have no grants). The
+		// reconciler ONLY touches rows with `granted_by=system:oidc`
+		// — admin assignments and the SB_BOOTSTRAP_ADMIN grant are
+		// invisible to it.
+		oidcSvc = oidcSvc.WithRoleReconciler(roleRepo, userRoleRepo)
 		oidcH := handlers.NewOIDC(oidcSvc, sessionSvc, cookieMode)
 		// /start gets the same NAT-aware per-IP cap as /auth/login —
 		// it's the public surface that can spawn IdP redirects.

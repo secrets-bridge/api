@@ -57,6 +57,25 @@ type OIDCConfig struct {
 	// trip can take. 5 minutes covers IdP redirect + user interaction
 	// + MFA challenge without leaving stale state in Redis.
 	StateTTL        time.Duration
+
+	// GroupClaim is the ID-token claim that carries the user's
+	// groups (architect Q5, Slice E). Default `groups`. When empty,
+	// group-mapping is disabled and JIT-provisioned users carry no
+	// role grants.
+	GroupClaim string
+
+	// GroupMap maps an IdP group name to a Secrets Bridge role
+	// name. Example: `{"sb-admins":"admin","sb-approvers":"approver"}`.
+	// On every OIDC sign-in the reconciler:
+	//   - ADDS a role grant when the user has the group but no
+	//     matching grant (carries `granted_by = "system:oidc"`).
+	//   - REMOVES a role grant when the user no longer has the
+	//     group BUT the row carries `granted_by = "system:oidc"`.
+	// Admin-assigned grants (`granted_by != "system:oidc"`) are
+	// left alone — the reconciler ONLY touches OIDC-provisioned
+	// rows. This protects break-glass admin assignments + the
+	// SB_BOOTSTRAP_ADMIN flow.
+	GroupMap map[string]string
 }
 
 // DefaultStateTTL is what cmd/api wires when SB_OIDC_STATE_TTL isn't
@@ -78,7 +97,23 @@ type OIDCService struct {
 	sessions     *SessionService
 	audit        storage.AuditEventRepository
 	rdb          *runtime.Client
+
+	// Slice E plumbing (group-claim → role mapping). Nil when
+	// GroupClaim is empty; the reconciler short-circuits.
+	reconciler *RoleReconciler
 }
+
+// WithRoleReconciler attaches the repositories the group-claim
+// reconciler needs. cmd/api wires it once the role + user_role
+// repos exist. Returns the receiver so wiring stays a one-liner.
+func (s *OIDCService) WithRoleReconciler(roles storage.RoleRepository, userRoles storage.UserRoleRepository) *OIDCService {
+	s.reconciler = NewRoleReconcilerForTest(s.cfg.GroupClaim, s.cfg.GroupMap, roles, userRoles, s.audit)
+	return s
+}
+
+// oidcGrantMarker is what the reconciler writes into `granted_by`
+// so future re-runs know which rows it owns vs admin-assigned ones.
+const oidcGrantMarker = "system:oidc"
 
 // NewOIDCService bootstraps the provider via discovery and wires the
 // stored deps. Discovery is a network call — pass a `ctx` with a
@@ -271,6 +306,10 @@ func (s *OIDCService) HandleCallback(ctx context.Context, state, code, ip, userA
 		return nil, fmt.Errorf("%w: nonce mismatch", ErrOIDC)
 	}
 
+	// `groups` is decoded as a generic []string by default. When
+	// `cfg.GroupClaim` overrides the claim name (e.g. `roles`), we
+	// re-decode that single key out of the raw map below — `oidc.Claims`
+	// always returns the whole token so this stays one round-trip.
 	var claims struct {
 		Sub      string   `json:"sub"`
 		Email    string   `json:"email"`
@@ -278,6 +317,7 @@ func (s *OIDCService) HandleCallback(ctx context.Context, state, code, ip, userA
 		AMR      []string `json:"amr"`
 		ACR      string   `json:"acr"`
 		Iss      string   `json:"iss"`
+		Groups   []string `json:"groups"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
 		s.auditFailure(ctx, "claims_decode", err)
@@ -291,6 +331,28 @@ func (s *OIDCService) HandleCallback(ctx context.Context, state, code, ip, userA
 	user, err := s.upsertLocalUser(ctx, claims.Sub, claims.Email, claims.Name)
 	if err != nil {
 		return nil, fmt.Errorf("%w: jit provision: %v", ErrOIDC, err)
+	}
+
+	// Slice E — reconcile OIDC-provisioned role grants against the
+	// configured GroupMap. Reads the configured claim out of the
+	// raw token so `SB_OIDC_GROUP_CLAIM=roles` (or similar) works
+	// without changing the typed struct.
+	groups := claims.Groups
+	if s.cfg.GroupClaim != "" && s.cfg.GroupClaim != "groups" {
+		groups = extractGroups(idToken, s.cfg.GroupClaim)
+	}
+	if s.reconciler != nil {
+		if err := s.reconciler.Reconcile(ctx, user.ID.String(), groups); err != nil {
+			// Don't fail the login — the user authenticated; we just
+			// couldn't sync grants. Audit and continue.
+			_ = s.audit.Append(ctx, &storage.AuditEvent{
+				Actor:    "system:oidc",
+				Action:   "auth.oidc.reconcile_failed",
+				Resource: "user:" + user.ID.String(),
+				Status:   storage.AuditStatusFailure,
+				Metadata: map[string]any{"error": err.Error(), "groups": groups},
+			})
+		}
 	}
 
 	issued, err := s.sessions.Issue(ctx, user.ID, ip, userAgent)
@@ -406,6 +468,163 @@ func (s *OIDCService) HandleBackchannelLogout(ctx context.Context, logoutTokenRa
 		Metadata: map[string]any{"sub": claims.Sub, "iss": claims.Iss},
 	})
 	return nil
+}
+
+// --- group-claim → role reconciler (Slice E) ------------------------
+
+// RoleReconciler reconciles `user_roles` against a group → role map.
+// Lives as its own type (rather than just a method on OIDCService) so
+// tests can construct it directly without booting a live OIDC
+// provider. OIDCService delegates to a RoleReconciler instance.
+type RoleReconciler struct {
+	groupClaim string
+	groupMap   map[string]string
+	roles      storage.RoleRepository
+	userRoles  storage.UserRoleRepository
+	audit      storage.AuditEventRepository
+}
+
+// NewRoleReconcilerForTest exposes the constructor for the
+// integration-test harness. Production code path constructs the
+// reconciler indirectly via OIDCService.WithRoleReconciler — the
+// `ForTest` suffix makes the intent explicit and surfaces in PR
+// review when a caller misuses it.
+func NewRoleReconcilerForTest(
+	groupClaim string,
+	groupMap map[string]string,
+	roles storage.RoleRepository,
+	userRoles storage.UserRoleRepository,
+	audit storage.AuditEventRepository,
+) *RoleReconciler {
+	return &RoleReconciler{
+		groupClaim: groupClaim,
+		groupMap:   groupMap,
+		roles:      roles,
+		userRoles:  userRoles,
+		audit:      audit,
+	}
+}
+
+// Reconcile adds + removes OIDC-provisioned grants for `userID` so the
+// set matches `groups` filtered through the group map. Idempotent
+// across repeated runs with identical inputs. Admin-assigned grants
+// (granted_by != "system:oidc") are left untouched.
+func (r *RoleReconciler) Reconcile(ctx context.Context, userID string, groups []string) error {
+	if r.groupClaim == "" || r.roles == nil || r.userRoles == nil {
+		return nil
+	}
+
+	desired := map[string]struct{}{}
+	for _, g := range groups {
+		if role, ok := r.groupMap[g]; ok && role != "" {
+			desired[role] = struct{}{}
+		}
+	}
+
+	current, err := r.userRoles.ListByUser(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("list user_roles: %w", err)
+	}
+
+	roleByName := map[string]uuid.UUID{}
+	for _, roleName := range r.groupMap {
+		if _, seen := roleByName[roleName]; seen {
+			continue
+		}
+		role, err := r.roles.GetByName(ctx, roleName)
+		if err == nil {
+			roleByName[roleName] = role.ID
+		}
+	}
+
+	oidcGrants := map[uuid.UUID]*storage.UserRole{}
+	for _, g := range current {
+		if g.GrantedBy == oidcGrantMarker {
+			oidcGrants[g.RoleID] = g
+		}
+	}
+
+	wantPresent := map[uuid.UUID]string{}
+	for roleName := range desired {
+		if roleID, ok := roleByName[roleName]; ok {
+			wantPresent[roleID] = roleName
+		}
+	}
+
+	added := []string{}
+	for roleID, roleName := range wantPresent {
+		if _, ok := oidcGrants[roleID]; ok {
+			continue
+		}
+		grant := &storage.UserRole{
+			UserID:    userID,
+			RoleID:    roleID,
+			Scope:     map[string]any{},
+			GrantedBy: oidcGrantMarker,
+		}
+		if err := r.userRoles.Grant(ctx, grant); err != nil {
+			return fmt.Errorf("grant role %q: %w", roleName, err)
+		}
+		added = append(added, roleName)
+	}
+
+	revoked := []string{}
+	for roleID, grant := range oidcGrants {
+		if _, keep := wantPresent[roleID]; keep {
+			continue
+		}
+		roleName := roleID.String()
+		if rr, err := r.roles.Get(ctx, roleID); err == nil {
+			roleName = rr.Name
+		}
+		if err := r.userRoles.Revoke(ctx, grant.ID); err != nil {
+			return fmt.Errorf("revoke role %q: %w", roleName, err)
+		}
+		revoked = append(revoked, roleName)
+	}
+
+	if len(added) > 0 || len(revoked) > 0 {
+		_ = r.audit.Append(ctx, &storage.AuditEvent{
+			Actor:    "system:oidc",
+			Action:   "auth.oidc.role_reconcile",
+			Resource: "user:" + userID,
+			Status:   storage.AuditStatusSuccess,
+			Metadata: map[string]any{
+				"groups":  groups,
+				"added":   added,
+				"revoked": revoked,
+			},
+		})
+	}
+	return nil
+}
+
+// extractGroups pulls a string-slice claim by name from the ID
+// token. Used when the operator overrides `SB_OIDC_GROUP_CLAIM`
+// away from the default `groups` (e.g. Authentik's `roles`).
+func extractGroups(idToken *oidc.IDToken, claimName string) []string {
+	if claimName == "" {
+		return nil
+	}
+	raw := map[string]any{}
+	if err := idToken.Claims(&raw); err != nil {
+		return nil
+	}
+	v, ok := raw[claimName]
+	if !ok {
+		return nil
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, x := range arr {
+		if s, ok := x.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // --- helpers --------------------------------------------------------
