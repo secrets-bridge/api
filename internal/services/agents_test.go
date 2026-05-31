@@ -203,14 +203,27 @@ func TestHeartbeat_CachesLastSeenInRedis(t *testing.T) {
 		t.Fatalf("Heartbeat: %v", err)
 	}
 
-	scanCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	// Poll for the cache write rather than scanning once. The
+	// production Heartbeat path discards its Redis Set error
+	// (best-effort), so under CI's race-detector slowdown the
+	// cache write occasionally races past a one-shot Scan. A
+	// bounded poll keeps the test as strict but stops flaking.
+	scanCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	keys, _, err := rdb.Raw().Scan(scanCtx, 0, "*:agent-lastseen:"+minted.ID.String(), 10).Result()
-	if err != nil {
-		t.Fatalf("Scan: %v", err)
-	}
-	if len(keys) == 0 {
-		t.Fatal("Heartbeat did not write last-seen to Redis")
+	pattern := "*:agent-lastseen:" + minted.ID.String()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		keys, _, err := rdb.Raw().Scan(scanCtx, 0, pattern, 50).Result()
+		if err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		if len(keys) > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Heartbeat did not write last-seen to Redis within 5s")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
