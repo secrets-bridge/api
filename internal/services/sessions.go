@@ -229,6 +229,28 @@ func (s *SessionService) Revoke(ctx context.Context, cookieValue string) error {
 	return nil
 }
 
+// RevokeAllForUser marks every live session owned by `userID` dead.
+// Returns the count of newly revoked sessions. Used by the OIDC
+// back-channel logout (RFC 8417) endpoint and the future "force
+// logout user" admin action.
+func (s *SessionService) RevokeAllForUser(ctx context.Context, userID uuid.UUID) (int, error) {
+	now := time.Now().UTC()
+	n, err := s.sessions.RevokeAllForUser(ctx, userID, now)
+	if err != nil {
+		return 0, fmt.Errorf("services: revoke user sessions: %w", err)
+	}
+	if n > 0 {
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:    "user:" + userID.String(),
+			Action:   "session.revoke_all",
+			Resource: "user:" + userID.String(),
+			Status:   storage.AuditStatusSuccess,
+			Metadata: map[string]any{"count": n},
+		})
+	}
+	return n, nil
+}
+
 // SubjectFromCookie satisfies the `middleware.SessionLooker` interface.
 // Returns the authenticated user's UUID string on success; surfaces
 // `ErrSessionInvalid` on any failure mode so the middleware falls

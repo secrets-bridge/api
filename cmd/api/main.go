@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -405,6 +406,65 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		}),
 		authH.Logout,
 	)
+
+	// OIDC (Slice B). Mounted only when SB_OIDC_ISSUER is set so
+	// existing local-admin-only deployments keep working unchanged.
+	// All four endpoints are public — auth comes from the IdP / from
+	// the cookie set by Callback / from the logout_token signature.
+	if cfg.OIDCIssuer != "" {
+		oidcCtx, oidcCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		oidcSvc, err := services.NewOIDCService(oidcCtx, services.OIDCConfig{
+			Issuer:        cfg.OIDCIssuer,
+			ClientID:      cfg.OIDCClientID,
+			ClientSecret:  cfg.OIDCClientSecret,
+			RedirectURL:   cfg.OIDCRedirectURL,
+			Scopes:        strings.Fields(cfg.OIDCScopes),
+			PostLogoutURL: cfg.OIDCPostLogout,
+		}, localUsersRepoInApp, sessionSvc, auditRepo, rdb)
+		oidcCancel()
+		if err != nil {
+			logger.Error("oidc bootstrap", "error", err)
+			os.Exit(1)
+		}
+		oidcH := handlers.NewOIDC(oidcSvc, sessionSvc, cookieMode)
+		// /start gets the same NAT-aware per-IP cap as /auth/login —
+		// it's the public surface that can spawn IdP redirects.
+		v1.Get("/auth/oidc/start",
+			middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
+				Name: "auth:oidc:start", Bucket: middleware.ByIP(),
+				Limit: 30, Window: 60 * time.Second,
+			}),
+			oidcH.Start,
+		)
+		// /callback gets the architect-pre-wired 60/60s — auth codes
+		// are single-use so the cap is purely anti-scan.
+		v1.Get("/auth/oidc/callback",
+			middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
+				Name: "auth:oidc:callback", Bucket: middleware.ByIP(),
+				Limit: 60, Window: 60 * time.Second,
+			}),
+			oidcH.Callback,
+		)
+		v1.Post("/auth/oidc/logout",
+			middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
+				Name: "auth:oidc:logout", Bucket: middleware.ByIP(),
+				Limit: 30, Window: 60 * time.Second,
+			}),
+			oidcH.Logout,
+		)
+		// Back-channel logout (RFC 8417). IdP-to-CP only; the cap is
+		// per-IP so a malicious IdP can't flood us.
+		v1.Post("/auth/oidc/backchannel",
+			middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
+				Name: "auth:oidc:backchannel", Bucket: middleware.ByIP(),
+				Limit: 60, Window: 60 * time.Second,
+			}),
+			oidcH.BackchannelLogout,
+		)
+		logger.Info("oidc client mounted", "issuer", cfg.OIDCIssuer)
+	} else {
+		logger.Info("oidc disabled (set SB_OIDC_ISSUER to enable)")
+	}
 	// OIDC callback bucket lands here once Slice B mounts the real
 	// route; pre-wiring the limiter keeps Slice A1 self-contained.
 	// Architect Q7 + NAT-aware: 60/60s per-IP (the auth code is
