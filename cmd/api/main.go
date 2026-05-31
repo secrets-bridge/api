@@ -346,11 +346,23 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		WithTeamScope(teamScopeResolver).
 		WithIdentity(localUsersRepoInApp, teamRepo)
 
+	// Session service (Slice A2). Owns the HttpOnly cookie auth path
+	// that replaces JWT-in-sessionStorage. Postgres is the source of
+	// truth — sessions revoke immediately on logout. A Redis cache
+	// layer is a future performance follow-up only if profiling shows
+	// the per-request validation lookup is a hot spot.
+	sessionSvc := services.NewSessionService(
+		storage.NewSessions(pool),
+		storage.NewAuditEvents(pool),
+	)
+
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
-	// (issue #10).
+	// (issue #10). `AuthWith` adds the cookie path at the front of
+	// the resolution chain (cookie -> Bearer JWT -> X-User-Id ->
+	// anonymous).
 	v1 := app.Group("/api/v1",
-		middleware.Auth(authSvc),
+		middleware.AuthWith(authSvc, sessionSvc),
 		middleware.RBAC(),
 		middleware.Audit(logger),
 	)
@@ -369,13 +381,29 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// measure; per-account brute force is defended durably in
 	// Postgres by `LockoutPolicy` (5 wrong → 15 min lock) which is
 	// IP-independent and therefore NAT-safe.
-	authH := handlers.NewAuth(authSvc)
+	cookieMode := handlers.CookieModeProd
+	if cfg.Env == ModeDev {
+		// SB_ENV=dev allows http://localhost (Vite dev server) so
+		// the Secure flag must come off; the SameSite=Strict +
+		// HttpOnly attributes stay on regardless of mode.
+		cookieMode = handlers.CookieModeDev
+	}
+	authH := handlers.NewAuth(authSvc).WithSessions(sessionSvc, cookieMode)
 	v1.Post("/auth/login",
 		middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
 			Name: "auth:login", Bucket: middleware.ByIP(),
 			Limit: 30, Window: 60 * time.Second,
 		}),
 		authH.Login,
+	)
+	// Logout is rate-limited at the same bucket as login — a malicious
+	// page can otherwise trigger session-revoke spam.
+	v1.Post("/auth/logout",
+		middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
+			Name: "auth:logout", Bucket: middleware.ByIP(),
+			Limit: 30, Window: 60 * time.Second,
+		}),
+		authH.Logout,
 	)
 	// OIDC callback bucket lands here once Slice B mounts the real
 	// route; pre-wiring the limiter keeps Slice A1 self-contained.

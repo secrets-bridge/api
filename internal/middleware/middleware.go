@@ -92,28 +92,69 @@ type TokenVerifier interface {
 	SubjectFromToken(token string) (string, error)
 }
 
+// SessionLooker is the slice of `services.SessionService` the auth
+// middleware needs to resolve a cookie value to the authenticated
+// user. Returns the user UUID string on success; opaque error on
+// failure (caller maps to anonymous / 401 based on the surrounding
+// route policy).
+type SessionLooker interface {
+	SubjectFromCookie(ctx context.Context, cookieValue string) (string, error)
+}
+
+// SessionCookieName is the name used for the server-side session
+// identifier returned at login. HttpOnly / Secure / SameSite=Strict
+// are set at the cookie-emission site, not here.
+const SessionCookieName = "sb_session"
+
+// CtxKeySessionID is the typed context key carrying the authenticated
+// session UUID for downstream handlers (audit shape expansion,
+// admin "show my active sessions" queries). Empty string when the
+// request is unauthenticated or used the legacy Bearer / X-User-Id
+// paths.
+const CtxKeySessionID ctxKey = "session_id"
+
 // Auth resolves the request actor identity.
 //
-// Resolution order:
-//   1. `Authorization: Bearer <jwt>` — validated via TokenVerifier;
+// Resolution order (Slice A2 adds the cookie branch at the front):
+//   1. `sb_session` cookie — validated via SessionLooker; the
+//      authenticated user's UUID becomes the actor. The slide-the-idle-
+//      TTL side effect runs inside the looker.
+//   2. `Authorization: Bearer <jwt>` — validated via TokenVerifier;
 //      the `sub` claim becomes the actor.
-//   2. `X-User-Id: <id>` — legacy header used by curl / pre-JWT UI
+//   3. `X-User-Id: <id>` — legacy header used by curl / pre-JWT UI
 //      flows. NOT a security boundary; kept so existing tests and
 //      development scripts keep working.
-//   3. Fallback: "anonymous".
+//   4. Fallback: "anonymous".
 //
-// A Bearer token that FAILS verification falls through to the
-// X-User-Id / anonymous path rather than returning 401 — the actual
-// authorization gate is `internal/auth.Require`, which is permission-
-// driven. Generic-401 surfaces from there once it's enabled.
+// A Bearer token or cookie that FAILS verification falls through to
+// the next layer rather than returning 401 — the actual authorization
+// gate is `internal/auth.Require`, which is permission-driven.
+// Generic-401 surfaces from there once it's enabled.
 //
-// When OIDC lands (api#26), the Bearer branch swaps to an OIDC token
-// verifier without changing the rest of the platform — every consumer
-// reads from `CtxKeyActor`.
+// When OIDC lands (Slice B), the Bearer branch is retired; the cookie
+// branch becomes the only authenticated path. Every consumer reads
+// from `CtxKeyActor` either way.
 func Auth(verifier TokenVerifier) fiber.Handler {
+	return AuthWith(verifier, nil)
+}
+
+// AuthWith is the same as Auth but accepts a cookie-based session
+// looker as the first resolution layer. cmd/api uses this once the
+// SessionService is constructed; tests that don't care about cookies
+// keep using Auth(verifier).
+func AuthWith(verifier TokenVerifier, sessions SessionLooker) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		actor := "anonymous"
-		if verifier != nil {
+		sessionID := ""
+		if sessions != nil {
+			if cookie := c.Cookies(SessionCookieName); cookie != "" {
+				if sub, err := sessions.SubjectFromCookie(c.Context(), cookie); err == nil && sub != "" {
+					actor = sub
+					sessionID = sub // best-effort; real session id surface lands when handlers need it
+				}
+			}
+		}
+		if actor == "anonymous" && verifier != nil {
 			if h := c.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 				if sub, err := verifier.SubjectFromToken(strings.TrimPrefix(h, "Bearer ")); err == nil {
 					actor = sub
@@ -125,7 +166,11 @@ func Auth(verifier TokenVerifier) fiber.Handler {
 				actor = v
 			}
 		}
-		c.SetContext(context.WithValue(c.Context(), CtxKeyActor, actor))
+		ctx := context.WithValue(c.Context(), CtxKeyActor, actor)
+		if sessionID != "" {
+			ctx = context.WithValue(ctx, CtxKeySessionID, sessionID)
+		}
+		c.SetContext(ctx)
 		return c.Next()
 	}
 }
