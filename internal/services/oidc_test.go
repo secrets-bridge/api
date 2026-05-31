@@ -82,6 +82,32 @@ func TestOIDCUserLookup_PrefersEmailFallsBackToSub(t *testing.T) {
 	}
 }
 
+func TestIsStrongAMR_RecognisesStandardFactors(t *testing.T) {
+	cases := []struct {
+		name string
+		amr  []string
+		want bool
+	}{
+		{"empty", nil, false},
+		{"password only", []string{"pwd"}, false},
+		{"knowledge based only", []string{"kba"}, false},
+		{"mfa present", []string{"pwd", "mfa"}, true},
+		{"otp present", []string{"pwd", "otp"}, true},
+		{"hwk present", []string{"hwk"}, true},
+		{"fido present", []string{"fido"}, true},
+		{"swk present", []string{"swk"}, true},
+		{"sc present", []string{"sc"}, true},
+		{"pop present", []string{"pop"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isStrongAMR(tc.amr); got != tc.want {
+				t.Fatalf("isStrongAMR(%v) = %v, want %v", tc.amr, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestOIDCStateKey_NamespacePrefix(t *testing.T) {
 	// Cheap shape check — the key should carry the runtime namespace +
 	// the "oidc:state" kind so redis-cli KEYS filters work.

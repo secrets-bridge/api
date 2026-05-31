@@ -31,16 +31,17 @@ import (
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
-// SessionPolicy controls the two TTLs the session lifecycle obeys.
-// Defaults match architect Q3:
+// SessionPolicy controls the TTLs the session lifecycle obeys.
+// Defaults match architect Q3 + Q6:
 //   - IdleTTL      = 30 minutes (slides forward on every request)
 //   - AbsoluteTTL  =  8 hours   (immutable from create time)
-//
-// Step-up auth (Slice D) adds a third TTL on `last_mfa_at`; that
-// concern stays out of A2.
+//   - StepUpTTL    = 15 minutes (`last_mfa_at` freshness window for
+//                                Tier 2 operations: approve/reject/
+//                                reveal/rotate/role-edit/provider-edit)
 type SessionPolicy struct {
 	IdleTTL     time.Duration
 	AbsoluteTTL time.Duration
+	StepUpTTL   time.Duration
 }
 
 // DefaultSessionPolicy is what cmd/api wires.
@@ -48,6 +49,7 @@ func DefaultSessionPolicy() SessionPolicy {
 	return SessionPolicy{
 		IdleTTL:     30 * time.Minute,
 		AbsoluteTTL: 8 * time.Hour,
+		StepUpTTL:   15 * time.Minute,
 	}
 }
 
@@ -74,9 +76,54 @@ func NewSessionService(
 // wiring stays a one-liner.
 func (s *SessionService) WithPolicy(p SessionPolicy) *SessionService {
 	if p.IdleTTL > 0 && p.AbsoluteTTL > 0 {
+		if p.StepUpTTL <= 0 {
+			p.StepUpTTL = s.policy.StepUpTTL
+		}
 		s.policy = p
 	}
 	return s
+}
+
+// MarkMFA stamps last_mfa_at on a session. Called from the OIDC
+// callback when the ID token's `amr` claim indicates a strong factor
+// (mfa / otp / hwk / fido / ...). Safe to call repeatedly; idempotent
+// at the user-visible level (the stamp moves forward).
+func (s *SessionService) MarkMFA(ctx context.Context, sessionID uuid.UUID, at time.Time) error {
+	if err := s.sessions.TouchLastMFA(ctx, sessionID, at); err != nil {
+		return fmt.Errorf("services: touch last_mfa_at: %w", err)
+	}
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "session:" + sessionID.String(),
+		Action:   "session.mfa_stamped",
+		Resource: "session:" + sessionID.String(),
+		Status:   storage.AuditStatusSuccess,
+		Metadata: map[string]any{"at": at.UTC().Format(time.RFC3339Nano)},
+	})
+	return nil
+}
+
+// HasFreshMFA reports whether the session's `last_mfa_at` is within
+// the configured step-up window. Sessions with a nil last_mfa_at
+// (local-admin sign-in, IdP without MFA) are NOT fresh.
+func (s *SessionService) HasFreshMFA(session *storage.Session) bool {
+	if session == nil || session.LastMFAAt == nil {
+		return false
+	}
+	return time.Since(*session.LastMFAAt) <= s.policy.StepUpTTL
+}
+
+// StepUpMaxAge exposes the configured window in seconds for the
+// WWW-Authenticate header.
+func (s *SessionService) StepUpMaxAge() int {
+	return int(s.policy.StepUpTTL.Seconds())
+}
+
+// SessionFromCookie returns the live session row associated with the
+// cookie. Wraps Validate so callers that need the session pointer
+// (e.g. the cookie auth middleware writing it into context) don't
+// have to repeat the GET-by-hash work.
+func (s *SessionService) SessionFromCookie(ctx context.Context, cookieValue string) (*storage.Session, error) {
+	return s.Validate(ctx, cookieValue)
 }
 
 // Policy exposes the current TTLs for cookie-side wiring (cmd/api

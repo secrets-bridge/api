@@ -148,12 +148,32 @@ type authorizeState struct {
 	ReturnTo string `json:"r"`
 }
 
+// StepUpOptions toggles the optional `prompt` / `max_age` /
+// `acr_values` params on the authorize URL. When zero-valued, the
+// regular sign-in flow is used. Slice D wires the step-up modal:
+// `{Prompt: "login", MaxAge: 0, ACRValues: "mfa"}` forces the IdP
+// to re-prompt for a strong second factor.
+type StepUpOptions struct {
+	Prompt    string // e.g. "login"
+	MaxAgeSet bool   // separate from MaxAge so 0 can be explicit
+	MaxAge    int    // seconds; 0 means "no session reuse"
+	ACRValues string // e.g. "mfa"
+}
+
 // StartAuthorize generates fresh PKCE + nonce + state, persists them
 // in Redis (single-use, 5-min TTL), and returns the IdP authorize URL
 // the caller should redirect the browser to. `returnTo` is the
 // post-login destination on the api's host — the callback redirects
 // there after the session cookie is set.
 func (s *OIDCService) StartAuthorize(ctx context.Context, returnTo string) (*AuthorizeStart, error) {
+	return s.StartAuthorizeWith(ctx, returnTo, StepUpOptions{})
+}
+
+// StartAuthorizeWith is the step-up-aware variant. The SPA's step-up
+// path calls this with `{Prompt: "login", MaxAgeSet: true, MaxAge: 0,
+// ACRValues: "mfa"}` so the IdP re-prompts for MFA even when a SSO
+// session is already alive.
+func (s *OIDCService) StartAuthorizeWith(ctx context.Context, returnTo string, stepUp StepUpOptions) (*AuthorizeStart, error) {
 	state, err := randomURLToken(32)
 	if err != nil {
 		return nil, fmt.Errorf("%w: state mint: %v", ErrOIDC, err)
@@ -180,11 +200,21 @@ func (s *OIDCService) StartAuthorize(ctx context.Context, returnTo string) (*Aut
 	}
 
 	challenge := pkceS256(verifier)
-	authURL := s.oauth.AuthCodeURL(state,
+	opts := []oauth2.AuthCodeOption{
 		oauth2.SetAuthURLParam("code_challenge", challenge),
 		oauth2.SetAuthURLParam("code_challenge_method", "S256"),
 		oidc.Nonce(nonce),
-	)
+	}
+	if stepUp.Prompt != "" {
+		opts = append(opts, oauth2.SetAuthURLParam("prompt", stepUp.Prompt))
+	}
+	if stepUp.MaxAgeSet {
+		opts = append(opts, oauth2.SetAuthURLParam("max_age", fmt.Sprintf("%d", stepUp.MaxAge)))
+	}
+	if stepUp.ACRValues != "" {
+		opts = append(opts, oauth2.SetAuthURLParam("acr_values", stepUp.ACRValues))
+	}
+	authURL := s.oauth.AuthCodeURL(state, opts...)
 	return &AuthorizeStart{RedirectURL: authURL, State: state}, nil
 }
 
@@ -266,6 +296,22 @@ func (s *OIDCService) HandleCallback(ctx context.Context, state, code, ip, userA
 	issued, err := s.sessions.Issue(ctx, user.ID, ip, userAgent)
 	if err != nil {
 		return nil, fmt.Errorf("%w: session issue: %v", ErrOIDC, err)
+	}
+
+	// Slice D — step-up gate input. Stamp `last_mfa_at` when the IdP
+	// asserted a strong factor in the `amr` claim. Failure of the
+	// stamp is audited but doesn't fail the login; the user just
+	// won't pass Tier 2 gates until they re-auth.
+	if isStrongAMR(claims.AMR) {
+		if mfaErr := s.sessions.MarkMFA(ctx, issued.Session.ID, time.Now().UTC()); mfaErr != nil {
+			_ = s.audit.Append(ctx, &storage.AuditEvent{
+				Actor:    "user:" + user.ID.String(),
+				Action:   "session.mfa_stamp_failed",
+				Resource: "session:" + issued.Session.ID.String(),
+				Status:   storage.AuditStatusFailure,
+				Metadata: map[string]any{"error": mfaErr.Error(), "amr": claims.AMR},
+			})
+		}
 	}
 
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
@@ -474,6 +520,24 @@ func randomURLToken(byteLen int) (string, error) {
 func pkceS256(verifier string) string {
 	sum := sha256.Sum256([]byte(verifier))
 	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+// isStrongAMR reports whether the `amr` claim asserts a factor
+// strong enough to justify stamping last_mfa_at. The OIDC spec
+// defines (RFC 8176): mfa, otp, hwk, fido, swk, sc, pop, ftp,
+// kba, mca, eye, geo, retina. We treat the multi-factor + hardware
+// + biometric subset as "strong"; `pwd` and `kba` alone are not.
+//
+// Operators wanting a stricter list can override by post-processing
+// the token in a custom IdP middleware before this code sees it.
+func isStrongAMR(amr []string) bool {
+	for _, a := range amr {
+		switch a {
+		case "mfa", "otp", "hwk", "fido", "swk", "sc", "pop", "eye", "fpt", "retina":
+			return true
+		}
+	}
+	return false
 }
 
 // Ensure imports referenced indirectly are kept (linter sweep).

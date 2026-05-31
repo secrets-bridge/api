@@ -237,6 +237,85 @@ func TestSession_RevokeAllForUserRevokesActiveOnly(t *testing.T) {
 	}
 }
 
+func TestSession_MarkMFA_StampsLastMFAAt(t *testing.T) {
+	svc, pool, owner := bootstrapSessions(t)
+	ctx := t.Context()
+
+	issued, err := svc.Issue(ctx, owner.ID, "", "")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if issued.Session.LastMFAAt != nil {
+		t.Fatalf("fresh session should start with LastMFAAt=nil, got %v", issued.Session.LastMFAAt)
+	}
+
+	now := time.Now().UTC()
+	if err := svc.MarkMFA(ctx, issued.Session.ID, now); err != nil {
+		t.Fatalf("MarkMFA: %v", err)
+	}
+
+	repo := storage.NewSessions(svcPool(t, svc))
+	got, err := repo.GetByTokenHash(ctx, issued.Session.TokenHash)
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	if got.LastMFAAt == nil {
+		t.Fatal("LastMFAAt nil after MarkMFA")
+	}
+	if got.LastMFAAt.Before(now.Add(-1*time.Minute)) || got.LastMFAAt.After(now.Add(1*time.Minute)) {
+		t.Fatalf("LastMFAAt = %v, want within 1m of %v", *got.LastMFAAt, now)
+	}
+
+	// Audit row written.
+	var n int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_events WHERE action = 'session.mfa_stamped'`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 session.mfa_stamped audit row, got %d", n)
+	}
+}
+
+func TestSession_HasFreshMFA(t *testing.T) {
+	svc, _, owner := bootstrapSessions(t)
+	svc = svc.WithPolicy(services.SessionPolicy{
+		IdleTTL:     30 * time.Minute,
+		AbsoluteTTL: 8 * time.Hour,
+		StepUpTTL:   15 * time.Minute,
+	})
+	ctx := t.Context()
+
+	issued, err := svc.Issue(ctx, owner.ID, "", "")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	// Brand new session has no MFA stamp → not fresh.
+	if svc.HasFreshMFA(issued.Session) {
+		t.Fatal("unstamped session should not be fresh")
+	}
+
+	// Stamp now → fresh.
+	now := time.Now().UTC()
+	if err := svc.MarkMFA(ctx, issued.Session.ID, now); err != nil {
+		t.Fatalf("MarkMFA: %v", err)
+	}
+	repo := storage.NewSessions(svcPool(t, svc))
+	got, err := repo.GetByTokenHash(ctx, issued.Session.TokenHash)
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	if !svc.HasFreshMFA(got) {
+		t.Fatal("freshly-stamped session should pass HasFreshMFA")
+	}
+
+	// StepUpMaxAge reflects the policy in seconds.
+	if got := svc.StepUpMaxAge(); got != 900 {
+		t.Fatalf("StepUpMaxAge = %d, want 900", got)
+	}
+}
+
 // svcPool exposes the SessionService's underlying pool via a fresh
 // connection so the test can talk to the Sessions repo without
 // re-bootstrapping the whole stack. Used only by the bulk-revoke

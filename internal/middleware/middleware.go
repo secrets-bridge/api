@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+
+	"github.com/secrets-bridge/api/pkg/storage"
 )
 
 type ctxKey string
@@ -97,8 +99,14 @@ type TokenVerifier interface {
 // user. Returns the user UUID string on success; opaque error on
 // failure (caller maps to anonymous / 401 based on the surrounding
 // route policy).
+//
+// `SessionFromCookie` returns the same lookup as a *storage.Session
+// pointer so middleware downstream of `AuthWith` can read
+// `last_mfa_at` for the step-up gate (Slice D) without doing a
+// second DB round-trip.
 type SessionLooker interface {
 	SubjectFromCookie(ctx context.Context, cookieValue string) (string, error)
+	SessionFromCookie(ctx context.Context, cookieValue string) (*storage.Session, error)
 }
 
 // SessionCookieName is the name used for the server-side session
@@ -142,15 +150,20 @@ func Auth(verifier TokenVerifier) fiber.Handler {
 // looker as the first resolution layer. cmd/api uses this once the
 // SessionService is constructed; tests that don't care about cookies
 // keep using Auth(verifier).
+//
+// When the cookie path resolves a session, the full Session pointer
+// is written to `CtxKeySession` so downstream middleware (Slice D's
+// `RequireFreshMFA`) can read `last_mfa_at` without a second DB
+// round-trip.
 func AuthWith(verifier TokenVerifier, sessions SessionLooker) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		actor := "anonymous"
-		sessionID := ""
+		var session *storage.Session
 		if sessions != nil {
 			if cookie := c.Cookies(SessionCookieName); cookie != "" {
-				if sub, err := sessions.SubjectFromCookie(c.Context(), cookie); err == nil && sub != "" {
-					actor = sub
-					sessionID = sub // best-effort; real session id surface lands when handlers need it
+				if s, err := sessions.SessionFromCookie(c.Context(), cookie); err == nil && s != nil {
+					actor = s.UserID.String()
+					session = s
 				}
 			}
 		}
@@ -167,8 +180,9 @@ func AuthWith(verifier TokenVerifier, sessions SessionLooker) fiber.Handler {
 			}
 		}
 		ctx := context.WithValue(c.Context(), CtxKeyActor, actor)
-		if sessionID != "" {
-			ctx = context.WithValue(ctx, CtxKeySessionID, sessionID)
+		if session != nil {
+			ctx = context.WithValue(ctx, CtxKeySessionID, session.ID.String())
+			ctx = context.WithValue(ctx, CtxKeySession, session)
 		}
 		c.SetContext(ctx)
 		return c.Next()
