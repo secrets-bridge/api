@@ -38,10 +38,17 @@ import (
 //   - StepUpTTL    = 15 minutes (`last_mfa_at` freshness window for
 //                                Tier 2 operations: approve/reject/
 //                                reveal/rotate/role-edit/provider-edit)
+//
+// DevAllowPwd is the interim unblock flag for app-level MFA (Slice H).
+// When true, HasFreshMFA returns true for any non-expired session,
+// bypassing the `last_mfa_at` check. cmd/api refuses to set this in
+// production — only SB_ENV=dev may opt in. Drop the flag once Slice H4
+// (real /auth/mfa/{challenge,verify}) is live.
 type SessionPolicy struct {
 	IdleTTL     time.Duration
 	AbsoluteTTL time.Duration
 	StepUpTTL   time.Duration
+	DevAllowPwd bool
 }
 
 // DefaultSessionPolicy is what cmd/api wires.
@@ -73,7 +80,9 @@ func NewSessionService(
 }
 
 // WithPolicy overrides the default TTLs. Returns the receiver so
-// wiring stays a one-liner.
+// wiring stays a one-liner. The DevAllowPwd flag is preserved across
+// merges — callers that only want to tune TTLs can leave it false and
+// it stays false.
 func (s *SessionService) WithPolicy(p SessionPolicy) *SessionService {
 	if p.IdleTTL > 0 && p.AbsoluteTTL > 0 {
 		if p.StepUpTTL <= 0 {
@@ -105,8 +114,21 @@ func (s *SessionService) MarkMFA(ctx context.Context, sessionID uuid.UUID, at ti
 // HasFreshMFA reports whether the session's `last_mfa_at` is within
 // the configured step-up window. Sessions with a nil last_mfa_at
 // (local-admin sign-in, IdP without MFA) are NOT fresh.
+//
+// Interim unblock for app-level MFA (Slice H): when DevAllowPwd is
+// true (only honored under SB_ENV=dev — enforced by cmd/api), a live
+// non-revoked session is treated as fresh even with a nil last_mfa_at.
+// This lets the dev/UAT pilot exercise Tier 2 paths while Slice H4
+// (real /auth/mfa/{challenge,verify}) is being built. The flag is
+// REFUSED in production at boot time.
 func (s *SessionService) HasFreshMFA(session *storage.Session) bool {
-	if session == nil || session.LastMFAAt == nil {
+	if session == nil {
+		return false
+	}
+	if s.policy.DevAllowPwd {
+		return true
+	}
+	if session.LastMFAAt == nil {
 		return false
 	}
 	return time.Since(*session.LastMFAAt) <= s.policy.StepUpTTL

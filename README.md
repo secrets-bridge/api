@@ -103,6 +103,7 @@ Tier 2 ops (approve / reject / reveal wrap) additionally require `last_mfa_at` w
 | `SB_OIDC_POST_LOGOUT_REDIRECT` | (unset) | Where the IdP sends users after `end_session_endpoint`. |
 | `SB_OIDC_GROUP_CLAIM` (open in #57) | `groups` | ID-token claim that carries the user's groups. Authentik / Keycloak / Okta default. |
 | `SB_OIDC_GROUP_MAP` (open in #57) | (unset) | JSON object `{"<idp-group>":"<sb-role>"}`. Empty → reconciler short-circuits; JIT users get no grants. Validated at boot — malformed JSON fails LOUD. |
+| `SB_MFA_DEV_ALLOW_PWD` | `false` | **Interim flag (Slice H).** When `true` AND `SB_ENV=dev`, every live session is treated as MFA-fresh — Tier 2 step-up is bypassed. **Refused at boot under `SB_ENV=production`.** Exists to unblock dev/UAT pilots while app-level MFA (`/auth/mfa/{challenge,verify}` + WebAuthn / TOTP enrolment) is being built. Drop once Slice H4 ships. |
 
 ### KMS / wrap envelope
 
