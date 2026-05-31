@@ -43,6 +43,22 @@ import (
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
+// LockoutPolicy governs the account-lockout state machine. The
+// architect-blessed defaults are 5 wrong-password attempts → 15 min
+// lock; constructors that take no policy use these.
+//
+// The threshold counts CONSECUTIVE wrong-password attempts. A
+// successful login resets the counter via ClearLockout.
+type LockoutPolicy struct {
+	Threshold int
+	Duration  time.Duration
+}
+
+// DefaultLockoutPolicy is what cmd/api wires.
+func DefaultLockoutPolicy() LockoutPolicy {
+	return LockoutPolicy{Threshold: 5, Duration: 15 * time.Minute}
+}
+
 // AuthService wires the local-users repo + JWT signer + audit pipe.
 type AuthService struct {
 	users     storage.LocalUserRepository
@@ -51,9 +67,12 @@ type AuthService struct {
 	audit     storage.AuditEventRepository
 	signer    *auth.Signer
 	tokenTTL  time.Duration
+	lockout   LockoutPolicy
 }
 
-// NewAuthService binds the dependencies.
+// NewAuthService binds the dependencies. Lockout policy defaults to
+// `DefaultLockoutPolicy()`; override via `WithLockoutPolicy` for
+// tests or operator overrides.
 func NewAuthService(
 	users storage.LocalUserRepository,
 	roles storage.RoleRepository,
@@ -69,7 +88,18 @@ func NewAuthService(
 		audit:     audit,
 		signer:    signer,
 		tokenTTL:  tokenTTL,
+		lockout:   DefaultLockoutPolicy(),
 	}
+}
+
+// WithLockoutPolicy overrides the default lockout policy. Mutates and
+// returns the receiver so the wiring stays a one-liner.
+func (s *AuthService) WithLockoutPolicy(p LockoutPolicy) *AuthService {
+	if p.Threshold <= 0 || p.Duration <= 0 {
+		return s
+	}
+	s.lockout = p
+	return s
 }
 
 // ErrInvalidCredentials is the only login failure exposed to callers.
@@ -92,8 +122,21 @@ type LoggedInUser struct {
 }
 
 // Login verifies email + password and returns a signed JWT on
-// success. Failure modes (unknown email / wrong password / disabled)
-// all return `ErrInvalidCredentials` with the same generic message.
+// success. Failure modes (unknown email / wrong password / disabled
+// / locked) all return `ErrInvalidCredentials` with the same generic
+// message — audit metadata carries the specific `error_kind` for
+// triage without disclosure on the wire.
+//
+// Lockout state machine: each wrong-password failure bumps
+// `local_users.failed_login_count`; reaching the configured threshold
+// pins `locked_until = now + Duration`. While locked, even a correct
+// password returns `ErrInvalidCredentials` and emits an
+// `account_locked` audit event.
+//
+// Successful login emits a `BREAK_GLASS_LOGIN` audit event with
+// `severity=CRITICAL` so operators monitoring for local-admin sign-ins
+// (architect Q1) can wire that one event into an alert pipeline even
+// before the OIDC swap lands.
 //
 // The `password` []byte is zeroed after the bcrypt compare regardless
 // of outcome.
@@ -122,9 +165,34 @@ func (s *AuthService) Login(ctx context.Context, email string, password []byte) 
 		return nil, ErrInvalidCredentials
 	}
 
-	if err := bcrypt.CompareHashAndPassword(user.PasswordHash, password); err != nil {
-		s.auditFailure(ctx, email, "wrong_password")
+	// Lockout check before the bcrypt compare. Burning bcrypt cost on
+	// a locked account would let an attacker keep an account locked
+	// indefinitely with negligible cost on their end.
+	if user.LockedUntil != nil && user.LockedUntil.After(time.Now().UTC()) {
+		_ = bcrypt.CompareHashAndPassword(user.PasswordHash, password)
+		s.auditLocked(ctx, user)
 		return nil, ErrInvalidCredentials
+	}
+
+	if err := bcrypt.CompareHashAndPassword(user.PasswordHash, password); err != nil {
+		s.recordFailedLogin(ctx, user)
+		return nil, ErrInvalidCredentials
+	}
+
+	// Clear the counter + any stale lock — happy path resets state.
+	if user.FailedLoginCount > 0 || user.LockedUntil != nil {
+		if clearErr := s.users.ClearLockout(ctx, user.ID); clearErr != nil {
+			// Don't fail the login because we couldn't reset state —
+			// audit and continue. The next failed attempt will simply
+			// see an over-threshold counter and re-lock immediately.
+			_ = s.audit.Append(ctx, &storage.AuditEvent{
+				Actor:    "user:" + user.ID.String(),
+				Action:   "auth.lockout.clear_failed",
+				Resource: "user:" + user.ID.String(),
+				Status:   storage.AuditStatusFailure,
+				Metadata: map[string]any{"error": clearErr.Error()},
+			})
+		}
 	}
 
 	claims := auth.Claims{
@@ -138,6 +206,7 @@ func (s *AuthService) Login(ctx context.Context, email string, password []byte) 
 	}
 
 	s.auditSuccess(ctx, user)
+	s.auditBreakGlass(ctx, user)
 
 	return &LoginResult{
 		Token:     token,
@@ -148,6 +217,59 @@ func (s *AuthService) Login(ctx context.Context, email string, password []byte) 
 			DisplayName: user.DisplayName,
 		},
 	}, nil
+}
+
+// recordFailedLogin atomically increments the wrong-password counter
+// and pins the account when the threshold is crossed. Errors are
+// audited but never bubbled — a Postgres flake must not silently
+// permit unbounded retries, but it also must not 5xx a wrong-password
+// path which is the most common failure on the login surface.
+func (s *AuthService) recordFailedLogin(ctx context.Context, user *storage.LocalUser) {
+	n, err := s.users.IncrementFailedLogins(ctx, user.ID)
+	if err != nil {
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:    "anonymous",
+			Action:   "auth.login",
+			Resource: "user:" + user.ID.String(),
+			Status:   storage.AuditStatusDenied,
+			Metadata: map[string]any{
+				"error_kind":     "wrong_password",
+				"increment_err":  err.Error(),
+				"email_length":   len(user.Email),
+				"user_id_redact": user.ID.String(),
+			},
+		})
+		return
+	}
+	s.auditFailureWithCount(ctx, user, "wrong_password", n)
+	if n >= s.lockout.Threshold {
+		until := time.Now().UTC().Add(s.lockout.Duration)
+		if lockErr := s.users.Lock(ctx, user.ID, until); lockErr != nil {
+			_ = s.audit.Append(ctx, &storage.AuditEvent{
+				Actor:    "anonymous",
+				Action:   "auth.lockout.apply_failed",
+				Resource: "user:" + user.ID.String(),
+				Status:   storage.AuditStatusFailure,
+				Metadata: map[string]any{
+					"error":              lockErr.Error(),
+					"failed_login_count": n,
+				},
+			})
+			return
+		}
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:    "anonymous",
+			Action:   "auth.lockout.applied",
+			Resource: "user:" + user.ID.String(),
+			Status:   storage.AuditStatusDenied,
+			Metadata: map[string]any{
+				"failed_login_count": n,
+				"locked_until":       until.Format(time.RFC3339Nano),
+				"threshold":          s.lockout.Threshold,
+				"duration_seconds":   int(s.lockout.Duration.Seconds()),
+			},
+		})
+	}
 }
 
 // BootstrapLocalAdmin creates the seed admin user if and only if NO
@@ -344,6 +466,59 @@ func (s *AuthService) auditFailure(ctx context.Context, email, kind string) {
 		Metadata: map[string]any{
 			"error_kind":   kind,
 			"email_length": len(email),
+		},
+	})
+}
+
+func (s *AuthService) auditFailureWithCount(ctx context.Context, u *storage.LocalUser, kind string, count int) {
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "anonymous",
+		Action:   "auth.login",
+		Resource: "user:" + u.ID.String(),
+		Status:   storage.AuditStatusDenied,
+		Metadata: map[string]any{
+			"error_kind":         kind,
+			"failed_login_count": count,
+		},
+	})
+}
+
+func (s *AuthService) auditLocked(ctx context.Context, u *storage.LocalUser) {
+	var until string
+	if u.LockedUntil != nil {
+		until = u.LockedUntil.UTC().Format(time.RFC3339Nano)
+	}
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "anonymous",
+		Action:   "auth.login",
+		Resource: "user:" + u.ID.String(),
+		Status:   storage.AuditStatusDenied,
+		Metadata: map[string]any{
+			"error_kind":   "account_locked",
+			"locked_until": until,
+		},
+	})
+}
+
+// auditBreakGlass emits the architect-mandated `BREAK_GLASS_LOGIN`
+// event (Q1) on every successful local sign-in. The
+// `severity=CRITICAL` metadata field lets log pipelines route this
+// stream into an alert without having to grep for the action string.
+//
+// Once OIDC lands (Slice B) this fires only when the local-admin
+// fallback path is used; right now every successful login flows
+// through this same surface, so every login is by definition
+// break-glass relative to the eventual OIDC primary.
+func (s *AuthService) auditBreakGlass(ctx context.Context, u *storage.LocalUser) {
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "user:" + u.ID.String(),
+		Action:   "BREAK_GLASS_LOGIN",
+		Resource: "user:" + u.ID.String(),
+		Status:   storage.AuditStatusSuccess,
+		Metadata: map[string]any{
+			"severity": "CRITICAL",
+			"path":     "local",
+			"email":    u.Email,
 		},
 	})
 }

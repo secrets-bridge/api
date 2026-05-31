@@ -360,8 +360,27 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// rest of the platform reads identity from `middleware.CtxKeyActor`
 	// which the upstream `middleware.Auth(authSvc)` populated from
 	// either the Bearer JWT or the legacy X-User-Id header.
+	//
+	// Rate limit per architect Q7 + NAT-aware tuning (Slice A1):
+	// 30 attempts / 60s per source IP. The architect's original
+	// 5/60s assumed each user has their own public IP; many ISPs
+	// (notably Iraqi CGNAT deployments) put dozens of legitimate
+	// users behind one egress. The per-IP layer is an anti-scan
+	// measure; per-account brute force is defended durably in
+	// Postgres by `LockoutPolicy` (5 wrong → 15 min lock) which is
+	// IP-independent and therefore NAT-safe.
 	authH := handlers.NewAuth(authSvc)
-	v1.Post("/auth/login", authH.Login)
+	v1.Post("/auth/login",
+		middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
+			Name: "auth:login", Bucket: middleware.ByIP(),
+			Limit: 30, Window: 60 * time.Second,
+		}),
+		authH.Login,
+	)
+	// OIDC callback bucket lands here once Slice B mounts the real
+	// route; pre-wiring the limiter keeps Slice A1 self-contained.
+	// Architect Q7 + NAT-aware: 60/60s per-IP (the auth code is
+	// single-use, so the cap is purely anti-scan).
 
 	// Admin-side endpoints.
 	//
@@ -479,7 +498,19 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// from a `user_id` query param today; swaps to a middleware-stashed
 	// identity once the auth design lands. Service-layer enforces
 	// requester==userID + request.type=read.
-	v1.Get("/requests/:id/wraps/:wrap_id", requestsH.RetrieveWrap)
+	//
+	// Rate limit per architect Q7 (Slice A1): 20 / 60s per user (or
+	// per IP for anonymous probes). The wrap is single-shot at the
+	// service layer; the rate limit blunts pre-approval probing and
+	// keeps a leaked `user_id` from being used to brute-discover wrap
+	// IDs against the 404/410/200 oracle.
+	v1.Get("/requests/:id/wraps/:wrap_id",
+		middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
+			Name: "wrap:retrieve", Bucket: middleware.ByQueryUserID(),
+			Limit: 20, Window: 60 * time.Second,
+		}),
+		requestsH.RetrieveWrap,
+	)
 
 	// GitOps observation panel + ArgoCD admin surface are mounted
 	// ONLY when SB_GITOPS_ENABLED=true. The flag is opt-in via Helm
@@ -522,7 +553,19 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// stashes the authenticated agent ID in the request context.
 	// Handlers downstream simply read it via middleware.AgentIDFromContext.
 	agentRoutes := v1.Group("/agents/:id", middleware.AgentAuth(agentSvc))
-	agentRoutes.Post("/heartbeat", agentsH.Heartbeat)
+	// Heartbeat rate limit per architect Q7: 6 / 60s per-agent. The
+	// limiter sits AFTER AgentAuth so the bucket key is the agent
+	// UUID (authenticated). Using the path id pre-auth would let an
+	// unauthenticated spammer burn through the bucket on a single
+	// agent — post-auth keeps the bucket tied to the authenticated
+	// actor.
+	agentRoutes.Post("/heartbeat",
+		middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
+			Name: "agent:heartbeat", Bucket: middleware.ByPathAgentID(),
+			Limit: 6, Window: 60 * time.Second,
+		}),
+		agentsH.Heartbeat,
+	)
 	// Agent self-registers its X25519 public key after generating
 	// the keypair at startup. Idempotent. Lets existing minted
 	// agents opt into the sealed-wire path without an admin re-mint.

@@ -28,14 +28,21 @@ import (
 
 // LocalUser mirrors a row in the local_users table. `PasswordHash` is
 // the raw bcrypt output (the algorithm marker `$2a$...` lives inside).
+//
+// `FailedLoginCount` + `LockedUntil` back the account-lockout state
+// machine: 5 consecutive wrong-password failures lock the account for
+// 15 minutes. State lives in Postgres so a Redis flush can't silently
+// re-enable a previously-locked account.
 type LocalUser struct {
-	ID           uuid.UUID
-	Email        string
-	PasswordHash []byte
-	DisplayName  string
-	Disabled     bool
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID               uuid.UUID
+	Email            string
+	PasswordHash     []byte
+	DisplayName      string
+	Disabled         bool
+	FailedLoginCount int
+	LockedUntil      *time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 // ErrLocalUserExists signals an email collision (unique-violation
@@ -51,6 +58,17 @@ type LocalUserRepository interface {
 	Count(ctx context.Context) (int, error)
 	SetPasswordHash(ctx context.Context, id uuid.UUID, hash []byte) error
 	SetDisabled(ctx context.Context, id uuid.UUID, disabled bool) error
+	// IncrementFailedLogins atomically bumps failed_login_count and
+	// returns the new value. Callers compare against the lockout
+	// threshold and call Lock once the threshold is crossed.
+	IncrementFailedLogins(ctx context.Context, id uuid.UUID) (int, error)
+	// Lock pins the account out until the given timestamp. Pass a
+	// future time to lock; pass time.Time{} via ClearLockout to
+	// clear it explicitly.
+	Lock(ctx context.Context, id uuid.UUID, until time.Time) error
+	// ClearLockout resets failed_login_count to 0 and clears
+	// locked_until. Called on every successful login.
+	ClearLockout(ctx context.Context, id uuid.UUID) error
 }
 
 // LocalUsers is the Postgres implementation of LocalUserRepository.
@@ -90,14 +108,16 @@ func (r *LocalUsers) Create(ctx context.Context, u *LocalUser) error {
 }
 
 func (r *LocalUsers) Get(ctx context.Context, id uuid.UUID) (*LocalUser, error) {
-	const q = `SELECT id, email, password_hash, display_name, disabled, created_at, updated_at
+	const q = `SELECT id, email, password_hash, display_name, disabled,
+	                  failed_login_count, locked_until, created_at, updated_at
 	           FROM local_users WHERE id = $1`
 	return r.scan(ctx, q, id)
 }
 
 func (r *LocalUsers) GetByEmail(ctx context.Context, email string) (*LocalUser, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
-	const q = `SELECT id, email, password_hash, display_name, disabled, created_at, updated_at
+	const q = `SELECT id, email, password_hash, display_name, disabled,
+	                  failed_login_count, locked_until, created_at, updated_at
 	           FROM local_users WHERE email = $1`
 	return r.scan(ctx, q, email)
 }
@@ -106,6 +126,7 @@ func (r *LocalUsers) scan(ctx context.Context, q string, arg any) (*LocalUser, e
 	var u LocalUser
 	if err := r.pool.QueryRow(ctx, q, arg).Scan(
 		&u.ID, &u.Email, &u.PasswordHash, &u.DisplayName, &u.Disabled,
+		&u.FailedLoginCount, &u.LockedUntil,
 		&u.CreatedAt, &u.UpdatedAt,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -117,7 +138,8 @@ func (r *LocalUsers) scan(ctx context.Context, q string, arg any) (*LocalUser, e
 }
 
 func (r *LocalUsers) List(ctx context.Context) ([]*LocalUser, error) {
-	const q = `SELECT id, email, password_hash, display_name, disabled, created_at, updated_at
+	const q = `SELECT id, email, password_hash, display_name, disabled,
+	                  failed_login_count, locked_until, created_at, updated_at
 	           FROM local_users
 	           ORDER BY email ASC`
 	rows, err := r.pool.Query(ctx, q)
@@ -130,6 +152,7 @@ func (r *LocalUsers) List(ctx context.Context) ([]*LocalUser, error) {
 		var u LocalUser
 		if err := rows.Scan(
 			&u.ID, &u.Email, &u.PasswordHash, &u.DisplayName, &u.Disabled,
+			&u.FailedLoginCount, &u.LockedUntil,
 			&u.CreatedAt, &u.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("storage: scan local user: %w", err)
@@ -168,6 +191,57 @@ func (r *LocalUsers) SetDisabled(ctx context.Context, id uuid.UUID, disabled boo
 	tag, err := r.pool.Exec(ctx, q, disabled, id)
 	if err != nil {
 		return fmt.Errorf("storage: set disabled: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// IncrementFailedLogins atomically bumps failed_login_count for `id`
+// and returns the post-update value. The single UPDATE RETURNING is
+// race-safe across concurrent failed-login attempts so the lockout
+// threshold check uses an authoritative counter.
+func (r *LocalUsers) IncrementFailedLogins(ctx context.Context, id uuid.UUID) (int, error) {
+	const q = `UPDATE local_users
+	           SET failed_login_count = failed_login_count + 1
+	           WHERE id = $1
+	           RETURNING failed_login_count`
+	var n int
+	if err := r.pool.QueryRow(ctx, q, id).Scan(&n); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, fmt.Errorf("storage: increment failed_login_count: %w", err)
+	}
+	return n, nil
+}
+
+// Lock pins the account out until the given timestamp. Passing a
+// past timestamp is allowed (callers that want to clear should use
+// ClearLockout instead — the application semantic is explicit).
+func (r *LocalUsers) Lock(ctx context.Context, id uuid.UUID, until time.Time) error {
+	const q = `UPDATE local_users SET locked_until = $1 WHERE id = $2`
+	tag, err := r.pool.Exec(ctx, q, until.UTC(), id)
+	if err != nil {
+		return fmt.Errorf("storage: lock local user: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ClearLockout resets failed_login_count to 0 and clears
+// locked_until. Called on every successful login so a recovered
+// account starts each session with a clean counter.
+func (r *LocalUsers) ClearLockout(ctx context.Context, id uuid.UUID) error {
+	const q = `UPDATE local_users
+	           SET failed_login_count = 0, locked_until = NULL
+	           WHERE id = $1`
+	tag, err := r.pool.Exec(ctx, q, id)
+	if err != nil {
+		return fmt.Errorf("storage: clear lockout: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
