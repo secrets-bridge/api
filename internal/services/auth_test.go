@@ -200,6 +200,190 @@ func TestBootstrapDevUsers_SkipsWhenAnyUserExists(t *testing.T) {
 	}
 }
 
+// --- Slice A1 — lockout + BREAK_GLASS_LOGIN audit ---------------------
+
+func mustCreateUser(t *testing.T, repo *storage.LocalUsers, email, password string) *storage.LocalUser {
+	t.Helper()
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), 10)
+	if err != nil {
+		t.Fatalf("bcrypt: %v", err)
+	}
+	u := &storage.LocalUser{
+		Email:        email,
+		PasswordHash: hash,
+		DisplayName:  "Test",
+	}
+	if err := repo.Create(t.Context(), u); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	return u
+}
+
+func TestLogin_LocksAfterFiveWrongPasswordAttempts(t *testing.T) {
+	svc, pool := bootstrapAuth(t)
+	svc = svc.WithLockoutPolicy(services.LockoutPolicy{Threshold: 5, Duration: 15 * time.Minute})
+	ctx := t.Context()
+
+	repo := storage.NewLocalUsers(pool)
+	user := mustCreateUser(t, repo, "alice@example.com", "ZZZ-canary-correct-ZZZ")
+
+	for i := 1; i <= 5; i++ {
+		if _, err := svc.Login(ctx, "alice@example.com", []byte("YYY-canary-badpw-YYY")); err == nil {
+			t.Fatalf("attempt %d: expected ErrInvalidCredentials", i)
+		}
+	}
+
+	got, err := repo.Get(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("Get user: %v", err)
+	}
+	if got.FailedLoginCount != 5 {
+		t.Fatalf("failed_login_count = %d, want 5", got.FailedLoginCount)
+	}
+	if got.LockedUntil == nil {
+		t.Fatal("locked_until is nil; expected the account to be locked")
+	}
+	if !got.LockedUntil.After(time.Now().UTC()) {
+		t.Fatalf("locked_until = %v is in the past; expected future lock", got.LockedUntil)
+	}
+
+	// Even the CORRECT password is rejected while locked.
+	if _, err := svc.Login(ctx, "alice@example.com", []byte("ZZZ-canary-correct-ZZZ")); err == nil {
+		t.Fatal("expected ErrInvalidCredentials while locked even with correct password")
+	}
+
+	// Audit trail: one `auth.lockout.applied` event with metadata
+	// carrying the threshold + duration; metadata MUST NOT include
+	// the user's password.
+	var lockApplied int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_events WHERE action = 'auth.lockout.applied'`,
+	).Scan(&lockApplied); err != nil {
+		t.Fatalf("count lockout audit: %v", err)
+	}
+	if lockApplied != 1 {
+		t.Fatalf("expected 1 auth.lockout.applied event, got %d", lockApplied)
+	}
+	var anyMeta string
+	if err := pool.QueryRow(ctx,
+		`SELECT string_agg(metadata::text, ' ') FROM audit_events`,
+	).Scan(&anyMeta); err != nil {
+		t.Fatalf("aggregate metadata: %v", err)
+	}
+	if strings.Contains(anyMeta, "ZZZ-canary-correct-ZZZ") || strings.Contains(anyMeta, "YYY-canary-badpw-YYY") {
+		t.Fatal("audit metadata leaked a password fragment")
+	}
+}
+
+func TestLogin_SuccessClearsCounter(t *testing.T) {
+	svc, pool := bootstrapAuth(t)
+	svc = svc.WithLockoutPolicy(services.LockoutPolicy{Threshold: 5, Duration: 15 * time.Minute})
+	ctx := t.Context()
+
+	repo := storage.NewLocalUsers(pool)
+	user := mustCreateUser(t, repo, "bob@example.com", "secret123")
+
+	// Two wrong attempts.
+	for i := 0; i < 2; i++ {
+		_, _ = svc.Login(ctx, "bob@example.com", []byte("nope"))
+	}
+	pre, err := repo.Get(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("Get pre: %v", err)
+	}
+	if pre.FailedLoginCount != 2 {
+		t.Fatalf("pre failed_login_count = %d, want 2", pre.FailedLoginCount)
+	}
+
+	// Correct login.
+	res, err := svc.Login(ctx, "bob@example.com", []byte("secret123"))
+	if err != nil {
+		t.Fatalf("Login success: %v", err)
+	}
+	if res.Token == "" {
+		t.Fatal("empty token on successful login")
+	}
+
+	got, err := repo.Get(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("Get post: %v", err)
+	}
+	if got.FailedLoginCount != 0 {
+		t.Fatalf("post failed_login_count = %d, want 0", got.FailedLoginCount)
+	}
+	if got.LockedUntil != nil {
+		t.Fatalf("post locked_until = %v, want nil", got.LockedUntil)
+	}
+}
+
+func TestLogin_EmitsBreakGlassAuditEvent(t *testing.T) {
+	svc, pool := bootstrapAuth(t)
+	ctx := t.Context()
+
+	repo := storage.NewLocalUsers(pool)
+	mustCreateUser(t, repo, "carol@example.com", "pw-c")
+
+	if _, err := svc.Login(ctx, "carol@example.com", []byte("pw-c")); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_events WHERE action = 'BREAK_GLASS_LOGIN'`,
+	).Scan(&count); err != nil {
+		t.Fatalf("count break-glass: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 BREAK_GLASS_LOGIN event, got %d", count)
+	}
+
+	var meta string
+	if err := pool.QueryRow(ctx,
+		`SELECT metadata::text FROM audit_events WHERE action = 'BREAK_GLASS_LOGIN'`,
+	).Scan(&meta); err != nil {
+		t.Fatalf("read metadata: %v", err)
+	}
+	if !strings.Contains(meta, `"severity"`) || !strings.Contains(meta, "CRITICAL") {
+		t.Fatalf("expected severity=CRITICAL in metadata, got %s", meta)
+	}
+	if strings.Contains(meta, "pw-c") {
+		t.Fatal("audit metadata contained the password")
+	}
+}
+
+func TestLogin_ExpiredLockoutAllowsNextSuccess(t *testing.T) {
+	svc, pool := bootstrapAuth(t)
+	svc = svc.WithLockoutPolicy(services.LockoutPolicy{Threshold: 3, Duration: 1 * time.Hour})
+	ctx := t.Context()
+
+	repo := storage.NewLocalUsers(pool)
+	user := mustCreateUser(t, repo, "dave@example.com", "pw-d")
+
+	// Trip the lock.
+	for i := 0; i < 3; i++ {
+		_, _ = svc.Login(ctx, "dave@example.com", []byte("nope"))
+	}
+
+	// Backdate the lock by hand to simulate expiry without sleeping.
+	past := time.Now().UTC().Add(-1 * time.Minute)
+	if err := repo.Lock(ctx, user.ID, past); err != nil {
+		t.Fatalf("Lock backdate: %v", err)
+	}
+
+	// Lock has expired -> correct password now succeeds and resets state.
+	if _, err := svc.Login(ctx, "dave@example.com", []byte("pw-d")); err != nil {
+		t.Fatalf("Login after expiry: %v", err)
+	}
+	got, err := repo.Get(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("Get post: %v", err)
+	}
+	if got.FailedLoginCount != 0 || got.LockedUntil != nil {
+		t.Fatalf("expected counter+lock cleared, got count=%d locked=%v",
+			got.FailedLoginCount, got.LockedUntil)
+	}
+}
+
 func TestBootstrapDevUsers_AuditEventsWritten(t *testing.T) {
 	svc, pool := bootstrapAuth(t)
 	ctx := t.Context()
