@@ -48,6 +48,10 @@ func main() {
 		logger.Error("config env", "error", err)
 		os.Exit(1)
 	}
+	if err := cfg.ValidateMFADevFlag(); err != nil {
+		logger.Error("config mfa-dev flag", "error", err)
+		os.Exit(1)
+	}
 	logger.Info("starting secrets-bridge api",
 		"version", buildVersion,
 		"addr", cfg.Addr,
@@ -56,6 +60,9 @@ func main() {
 	)
 	if cfg.Env == ModeDev {
 		logger.Warn("SB_ENV=dev — LocalKMS allowed, dev seeder will run if local_users is empty. Do NOT use this in production.")
+	}
+	if cfg.MFADevAllowPwd {
+		logger.Warn("SB_MFA_DEV_ALLOW_PWD=true — Tier 2 step-up is BYPASSED for all live sessions. Interim unblock only; remove before any production rollout.")
 	}
 
 	// Storage wiring. The pool is required; the api refuses to start
@@ -356,6 +363,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		storage.NewSessions(pool),
 		storage.NewAuditEvents(pool),
 	)
+	if cfg.MFADevAllowPwd {
+		p := sessionSvc.Policy()
+		p.DevAllowPwd = true
+		sessionSvc = sessionSvc.WithPolicy(p)
+	}
 
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow

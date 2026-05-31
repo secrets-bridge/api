@@ -316,6 +316,36 @@ func TestSession_HasFreshMFA(t *testing.T) {
 	}
 }
 
+// Interim Slice H unblock — the DevAllowPwd policy flag treats every
+// live session as MFA-fresh, even when last_mfa_at is nil. cmd/api
+// refuses to enable this outside SB_ENV=dev; the SessionService
+// itself is environment-agnostic, so this test only confirms the
+// behavioral switch flips correctly.
+func TestSession_HasFreshMFA_DevAllowPwd(t *testing.T) {
+	svc, _, owner := bootstrapSessions(t)
+	svc = svc.WithPolicy(services.SessionPolicy{
+		IdleTTL:     30 * time.Minute,
+		AbsoluteTTL: 8 * time.Hour,
+		StepUpTTL:   15 * time.Minute,
+		DevAllowPwd: true,
+	})
+	ctx := t.Context()
+
+	issued, err := svc.Issue(ctx, owner.ID, "", "")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	// Brand new session — no MFA stamp — flag bypasses the check.
+	if !svc.HasFreshMFA(issued.Session) {
+		t.Fatal("DevAllowPwd should treat unstamped sessions as fresh")
+	}
+
+	// Nil session still returns false even with the flag.
+	if svc.HasFreshMFA(nil) {
+		t.Fatal("nil session must remain not-fresh regardless of DevAllowPwd")
+	}
+}
+
 // svcPool exposes the SessionService's underlying pool via a fresh
 // connection so the test can talk to the Sessions repo without
 // re-bootstrapping the whole stack. Used only by the bulk-revoke

@@ -120,6 +120,17 @@ type Config struct {
 	// rather than silently producing wrong access).
 	OIDCGroupClaim   string            // default "groups"
 	OIDCGroupMap     map[string]string // raw value via SB_OIDC_GROUP_MAP env (JSON object)
+
+	// MFADevAllowPwd is the interim unblock for app-level MFA (Slice
+	// H). When true AND SB_ENV=dev, the SessionService treats any live
+	// non-revoked session as MFA-fresh, bypassing the `last_mfa_at`
+	// check. The IdP can return an empty `amr` (no MFA stage bound)
+	// and Tier 2 paths still work for pilot operators.
+	//
+	// REFUSED at boot when SB_ENV=production — see ValidateMFADevFlag.
+	// Drop the flag once Slice H4 (real /auth/mfa/{challenge,verify})
+	// is live and qi UAT operators have enrolled a real factor.
+	MFADevAllowPwd bool
 }
 
 func loadConfig() Config {
@@ -142,7 +153,20 @@ func loadConfig() Config {
 		OIDCPostLogout:         envOr("SB_OIDC_POST_LOGOUT_REDIRECT", ""),
 		OIDCGroupClaim:         envOr("SB_OIDC_GROUP_CLAIM", "groups"),
 		OIDCGroupMap:           parseOIDCGroupMap(envOr("SB_OIDC_GROUP_MAP", "")),
+		MFADevAllowPwd:         envBool("SB_MFA_DEV_ALLOW_PWD", false),
 	}
+}
+
+// ValidateMFADevFlag refuses to honor SB_MFA_DEV_ALLOW_PWD=true when
+// SB_ENV != "dev". The flag exists to unblock the qi UAT pilot while
+// Slice H4 is being built; it MUST NOT be set in production. main.go
+// calls this at boot so a forgotten flag fails the rollout loudly
+// instead of silently downgrading the step-up posture.
+func (c Config) ValidateMFADevFlag() error {
+	if c.MFADevAllowPwd && c.Env != ModeDev {
+		return fmt.Errorf("SB_MFA_DEV_ALLOW_PWD=true requires SB_ENV=%s (got %q)", ModeDev, c.Env)
+	}
+	return nil
 }
 
 // parseOIDCGroupMap accepts a JSON object string and returns the
