@@ -320,6 +320,20 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// caller's local_users row (email, display_name).
 	localUsersRepoInApp := storage.NewLocalUsers(pool)
 
+	// Slice H1 + H2: MFA factor storage + TOTP enrollment service.
+	// The handler covers /users/me/mfa/factors + /users/me/mfa/totp/*;
+	// WebAuthn (H3), challenge / verify (H4), and the mfa_enrolled
+	// flag (H5) attach to the same `mfaH` in subsequent slices.
+	mfaFactorRepo := storage.NewUserMFAFactors(pool)
+	totpSvc := services.NewTOTPService(
+		mfaFactorRepo,
+		km,
+		auditRepo,
+		rdb,
+		services.TOTPConfig{Issuer: cfg.MFATOTPIssuer},
+	)
+	mfaH := handlers.NewMFA(mfaFactorRepo, localUsersRepoInApp, totpSvc)
+
 	// RBAC resolver for the `auth.Require(perm)` middleware. Loads each
 	// caller's user_role assignments + the role catalog at request time.
 	rbacResolver := auth.NewRepoResolver(userRoleRepo, roleRepo)
@@ -570,6 +584,15 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// project switcher.
 	v1.Get("/users/me", meH.GetMe)
 	v1.Get("/users/me/projects", meH.ListProjects)
+
+	// Slice H2 (api#64): user-self MFA enrollment + management. No
+	// RBAC gate — every authenticated user manages their OWN factors.
+	// Handler derives the user id from the session, never from the
+	// body, so cross-user paths are structurally impossible.
+	v1.Get("/users/me/mfa/factors", mfaH.List)
+	v1.Delete("/users/me/mfa/factors/:id", mfaH.Delete)
+	v1.Post("/users/me/mfa/totp/enroll", mfaH.EnrollTOTP)
+	v1.Post("/users/me/mfa/totp/confirm", mfaH.ConfirmTOTP)
 
 	v1.Post("/environments", tenancyH.CreateEnvironment)
 	v1.Get("/environments", tenancyH.ListEnvironments)

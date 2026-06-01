@@ -131,6 +131,17 @@ type Config struct {
 	// Drop the flag once Slice H4 (real /auth/mfa/{challenge,verify})
 	// is live and qi UAT operators have enrolled a real factor.
 	MFADevAllowPwd bool
+
+	// MFATOTPIssuer is rendered in the otpauth:// URI's `issuer=` param
+	// and the label prefix (Slice H2). Authenticator apps display it
+	// under the user's account name — keep it stable across deployments
+	// or users see two entries on their phone for the same account.
+	//
+	// Defaults to "Secrets Bridge" when unset. Operators running an
+	// internal-only deployment commonly override to something like
+	// "Secrets Bridge (UAT)" so it doesn't shadow a prod account on the
+	// same authenticator app.
+	MFATOTPIssuer string
 }
 
 func loadConfig() Config {
@@ -154,6 +165,7 @@ func loadConfig() Config {
 		OIDCGroupClaim:         envOr("SB_OIDC_GROUP_CLAIM", "groups"),
 		OIDCGroupMap:           parseOIDCGroupMap(envOr("SB_OIDC_GROUP_MAP", "")),
 		MFADevAllowPwd:         envBool("SB_MFA_DEV_ALLOW_PWD", false),
+		MFATOTPIssuer:          envOr("SB_MFA_TOTP_ISSUER", "Secrets Bridge"),
 	}
 }
 
