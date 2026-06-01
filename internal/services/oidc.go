@@ -386,6 +386,7 @@ func (s *OIDCService) HandleCallback(ctx context.Context, state, code, ip, userA
 			"iss":        claims.Iss,
 			"acr":        claims.ACR,
 			"amr":        claims.AMR,
+			"groups":     groups,
 			"session_id": issued.Session.ID.String(),
 			"ip":         ip,
 			"user_agent": userAgent,
