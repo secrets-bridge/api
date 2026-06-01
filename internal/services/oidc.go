@@ -499,11 +499,34 @@ func NewRoleReconcilerForTest(
 ) *RoleReconciler {
 	return &RoleReconciler{
 		groupClaim: groupClaim,
-		groupMap:   groupMap,
+		groupMap:   normalizeGroupMap(groupMap),
 		roles:      roles,
 		userRoles:  userRoles,
 		audit:      audit,
 	}
+}
+
+// normalizeGroupMap lowercases every key in the configured group map so
+// `Reconcile` can match incoming IdP group names case-insensitively.
+// IdP group names often differ in case from the deployer's expectation
+// (`SB-Admins` from one IdP, `sb-admins` in the SB_OIDC_GROUP_MAP);
+// silent name mismatch is the most common cause of zero-grant SSO
+// users seen in the field (qi UAT 2026-06-01). Values are preserved
+// verbatim because they map to internal role names (admin / approver /
+// developer) that the api creates and so are always lowercase by
+// convention. If two configured keys collapse to the same lower-cased
+// form (e.g. `sb-admins` AND `SB-Admins`), the last-write wins; the
+// boot-time validator should catch this case, but the deterministic
+// behaviour is documented here for the rare race.
+func normalizeGroupMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return in
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[strings.ToLower(k)] = v
+	}
+	return out
 }
 
 // Reconcile adds + removes OIDC-provisioned grants for `userID` so the
@@ -515,9 +538,14 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, userID string, groups []
 		return nil
 	}
 
+	// Case-insensitive match: IdPs (Authentik in particular) emit group
+	// names in whatever case the operator typed them in the admin UI;
+	// the configured map is normalised to lower-case at construction so
+	// any case combination resolves to the same role. See
+	// `normalizeGroupMap` for the why.
 	desired := map[string]struct{}{}
 	for _, g := range groups {
-		if role, ok := r.groupMap[g]; ok && role != "" {
+		if role, ok := r.groupMap[strings.ToLower(g)]; ok && role != "" {
 			desired[role] = struct{}{}
 		}
 	}
@@ -594,6 +622,30 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, userID string, groups []
 				"groups":  groups,
 				"added":   added,
 				"revoked": revoked,
+			},
+		})
+	} else if len(groups) > 0 && len(desired) == 0 && len(r.groupMap) > 0 {
+		// Diagnostic signal — groups arrived in the ID token but NONE
+		// matched the configured map. Today this looks identical in the
+		// audit log to "user arrived with no groups at all" (no
+		// role_reconcile event in either case), so operators triaging
+		// zero-permission SSO users had no way to tell them apart.
+		// Emit an explicit "we saw groups but couldn't map any" event
+		// so the next operator sees the mismatch immediately and can
+		// fix SB_OIDC_GROUP_MAP or the IdP group names. Configured map
+		// keys included so the diff is obvious in one query.
+		mapKeys := make([]string, 0, len(r.groupMap))
+		for k := range r.groupMap {
+			mapKeys = append(mapKeys, k)
+		}
+		_ = r.audit.Append(ctx, &storage.AuditEvent{
+			Actor:    "system:oidc",
+			Action:   "auth.oidc.role_reconcile_zero_match",
+			Resource: "user:" + userID,
+			Status:   storage.AuditStatusFailure,
+			Metadata: map[string]any{
+				"groups":             groups,
+				"configured_map_keys": mapKeys,
 			},
 		})
 	}

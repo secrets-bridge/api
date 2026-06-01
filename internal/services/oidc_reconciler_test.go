@@ -246,6 +246,90 @@ func TestReconcile_DisabledByEmptyClaim(t *testing.T) {
 	}
 }
 
+// TestReconcile_CaseInsensitiveGroupMatch pins the robustness fix that
+// landed after the qi UAT 2026-06-01 group-name-mismatch incident.
+// Authentik (and many IdPs) emit group names in whatever case the
+// operator typed in the admin UI. The configured map is normalised at
+// construction so any case combination resolves to the same role.
+func TestReconcile_CaseInsensitiveGroupMatch(t *testing.T) {
+	rec, pool, owner, _ := bootstrapReconciler(t)
+	ctx := t.Context()
+
+	// IdP sends mixed-case names; configured map keys are the canonical
+	// lower-case `sb-admins` / `sb-approvers` from bootstrapReconciler.
+	if err := rec.Reconcile(ctx, owner.ID.String(), []string{"SB-Admins", "sb-APPROVERS"}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	rows, err := storage.NewUserRoles(pool).ListByUser(ctx, owner.ID.String())
+	if err != nil {
+		t.Fatalf("ListByUser: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 grants for mixed-case groups, got %d", len(rows))
+	}
+}
+
+// TestReconcile_EmitsZeroMatchAudit pins the diagnostic signal that
+// distinguishes "groups arrived but none matched" from "user arrived
+// with no groups at all". Without this audit row, both branches looked
+// identical from the audit table and operators had to dig through the
+// `auth.oidc.callback` row's `groups` field by hand to triage.
+func TestReconcile_EmitsZeroMatchAudit(t *testing.T) {
+	rec, pool, owner, _ := bootstrapReconciler(t)
+	ctx := t.Context()
+
+	if err := rec.Reconcile(ctx, owner.ID.String(), []string{"authentik Admins", "Admin"}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	rows, err := storage.NewUserRoles(pool).ListByUser(ctx, owner.ID.String())
+	if err != nil {
+		t.Fatalf("ListByUser: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("expected 0 grants when groups don't match the map, got %d", len(rows))
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM audit_events
+		WHERE action = 'auth.oidc.role_reconcile_zero_match'
+		  AND resource = $1
+		  AND status   = 'failure'
+	`, "user:"+owner.ID.String()).Scan(&count); err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 role_reconcile_zero_match event, got %d", count)
+	}
+}
+
+// TestReconcile_NoZeroMatchWhenGroupsEmpty confirms the zero-match
+// event is gated correctly: an empty `groups` slice (user not in any
+// IdP group at all) is a DIFFERENT diagnosis from "groups arrived but
+// none matched" — and emitting the zero-match event for empty groups
+// would crowd out the signal it's meant to carry.
+func TestReconcile_NoZeroMatchWhenGroupsEmpty(t *testing.T) {
+	rec, pool, owner, _ := bootstrapReconciler(t)
+	ctx := t.Context()
+
+	if err := rec.Reconcile(ctx, owner.ID.String(), nil); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM audit_events
+		WHERE action = 'auth.oidc.role_reconcile_zero_match'
+		  AND resource = $1
+	`, "user:"+owner.ID.String()).Scan(&count); err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected NO zero-match event for empty groups, got %d", count)
+	}
+}
+
 // Compile-time assertion that the package-level test build sees the
 // expected exported helper. If `NewRoleReconcilerForTest` is renamed
 // the test file fails to compile, surfacing the breakage in CI.
