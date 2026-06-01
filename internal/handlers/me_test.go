@@ -1,7 +1,9 @@
 package handlers_test
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -164,6 +166,85 @@ func TestGetMe_HappyPath(t *testing.T) {
 	if len(got.Projects) != 1 || got.Projects[0].ID != pID.String() {
 		t.Errorf("Projects unexpected: %+v", got.Projects)
 	}
+	// MFA lookup wasn't wired in bootstrapMe → safe default `false`.
+	if got.MFAEnrolled {
+		t.Errorf("MFAEnrolled default got true, want false (no lookup wired)")
+	}
+}
+
+// fakeMFAEnrollment satisfies handlers.MFAEnrollmentLookup so we can
+// drive the mfa_enrolled boolean without booting the verify service.
+type fakeMFAEnrollment struct {
+	enrolled bool
+	err      error
+}
+
+func (f fakeMFAEnrollment) AnyEnrolled(_ context.Context, _ uuid.UUID) (bool, error) {
+	return f.enrolled, f.err
+}
+
+func TestGetMe_MFAEnrolled_RoundTrip(t *testing.T) {
+	app, pool := bootstrapMe(t)
+	ctx := t.Context()
+
+	// Same seed as HappyPath, minus the role/project plumbing — we
+	// only care about the MFA boolean here.
+	uID := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO local_users (id, email, password_hash, display_name)
+		 VALUES ($1, $2, '\x00', $3)`,
+		uID, "bob@example.com", "Bob",
+	); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		lk   fakeMFAEnrollment
+		want bool
+	}{
+		{"enrolled", fakeMFAEnrollment{enrolled: true}, true},
+		{"not enrolled", fakeMFAEnrollment{enrolled: false}, false},
+		{"lookup errors → false", fakeMFAEnrollment{enrolled: true, err: errors.New("boom")}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// Rebuild meH with the lookup attached for this case.
+			users := storage.NewLocalUsers(pool)
+			teams := storage.NewTeams(pool)
+			projects := storage.NewProjects(pool)
+			roles := storage.NewRoles(pool)
+			userRoles := storage.NewUserRoles(pool)
+			resolver := auth.NewRepoResolver(userRoles, roles)
+			tsr := auth.NewRepoTeamScopeResolver(teams, projects)
+			meH := handlers.NewMe(projects, resolver).
+				WithTeamScope(tsr).
+				WithIdentity(users, teams).
+				WithMFAEnrollment(c.lk)
+			caseApp := fiber.New()
+			caseApp.Use(middleware.Auth(nil))
+			caseApp.Get("/api/v1/users/me", meH.GetMe)
+
+			req := httptest.NewRequest("GET", "/api/v1/users/me", nil)
+			req.Header.Set("X-User-Id", uID.String())
+			resp, err := caseApp.Test(req)
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			if resp.StatusCode != 200 {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status %d: %s", resp.StatusCode, body)
+			}
+			var got handlers.MeResponse
+			if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if got.MFAEnrolled != c.want {
+				t.Errorf("MFAEnrolled got %v want %v", got.MFAEnrolled, c.want)
+			}
+		})
+	}
+	_ = app // silence the bootstrap return — the per-case apps are what we use
 }
 
 func TestGetMe_NoUser_404(t *testing.T) {

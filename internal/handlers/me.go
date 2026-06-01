@@ -17,6 +17,7 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 
 	"github.com/gofiber/fiber/v3"
@@ -26,6 +27,14 @@ import (
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
+// MFAEnrollmentLookup reports whether a user has any factor enrolled.
+// Implemented by `services.MFAVerifyService.AnyEnrolled`. Optional —
+// when unset, `mfa_enrolled` is reported as `false` on /users/me
+// (safe default — the SPA will then route the user to /me/mfa).
+type MFAEnrollmentLookup interface {
+	AnyEnrolled(ctx context.Context, userID uuid.UUID) (bool, error)
+}
+
 // Me is the HTTP layer for "current user" projections.
 type Me struct {
 	projects  storage.ProjectRepository
@@ -33,6 +42,7 @@ type Me struct {
 	teamScope auth.TeamScopeResolver
 	users     storage.LocalUserRepository
 	teams     storage.TeamRepository
+	mfa       MFAEnrollmentLookup
 }
 
 // NewMe wires the handler. Both args required. Call WithTeamScope to
@@ -58,6 +68,15 @@ func (h *Me) WithTeamScope(tr auth.TeamScopeResolver) *Me {
 func (h *Me) WithIdentity(u storage.LocalUserRepository, t storage.TeamRepository) *Me {
 	h.users = u
 	h.teams = t
+	return h
+}
+
+// WithMFAEnrollment attaches the lookup that powers the
+// `mfa_enrolled` boolean on /users/me (Slice H5). Optional — when
+// nil, the field is always false, which is the safe default for
+// boot paths that haven't reached the MFA verification service yet.
+func (h *Me) WithMFAEnrollment(svc MFAEnrollmentLookup) *Me {
+	h.mfa = svc
 	return h
 }
 
@@ -96,6 +115,17 @@ type MeResponse struct {
 	// as GET /users/me/projects; inlined here so login hydration is
 	// one HTTP call.
 	Projects    []ProjectSummary `json:"projects"`
+	// MFAEnrolled — true when the user has at least one factor
+	// (TOTP or WebAuthn) enrolled. Slice H5. The SPA reads this
+	// after login to decide whether to:
+	//   - immediately route the user to /me/mfa (false = no
+	//     factor enrolled, app-MFA can't grant step-up)
+	//   - leave them on the Dashboard until they trigger a
+	//     Tier-2 op (true = at least one factor, the step-up
+	//     modal will have something to verify against)
+	// When the boot path hasn't wired the MFA service, the field
+	// is reported as false (safe default — pushes user to enroll).
+	MFAEnrolled bool `json:"mfa_enrolled"`
 }
 
 // GetMe handles GET /api/v1/users/me. Returns the bundle the UI needs
@@ -165,6 +195,16 @@ func (h *Me) GetMe(c fiber.Ctx) error {
 		return err
 	}
 
+	mfaEnrolled := false
+	if h.mfa != nil {
+		// Failure here shouldn't fail the whole hydration call —
+		// degrade to false (push user to /me/mfa) and let an admin
+		// see the audit row from the underlying CountForUser lookup.
+		if enrolled, err := h.mfa.AnyEnrolled(c.Context(), uid); err == nil {
+			mfaEnrolled = enrolled
+		}
+	}
+
 	return c.JSON(MeResponse{
 		ID:          user.ID.String(),
 		Email:       user.Email,
@@ -172,6 +212,7 @@ func (h *Me) GetMe(c fiber.Ctx) error {
 		Permissions: perms,
 		Teams:       teamsOut,
 		Projects:    projects,
+		MFAEnrolled: mfaEnrolled,
 	})
 }
 

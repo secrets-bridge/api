@@ -415,6 +415,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		services.MFAVerifyConfig{},
 	)
 	authMFAH := handlers.NewAuthMFA(mfaVerifySvc)
+	// Slice H5: /users/me carries `mfa_enrolled` so the SPA can route
+	// brand-new users to /me/mfa instead of leaving them stuck on a
+	// step-up modal with nothing to verify with. Single source of
+	// truth — same `AnyEnrolled` check the step-up middleware uses.
+	meH = meH.WithMFAEnrollment(mfaVerifySvc)
 
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
@@ -667,7 +672,10 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// Sessions without an MFA stamp at all (local-admin sign-in, IdP
 	// without MFA) fail closed. Mounted as a route-level middleware
 	// AFTER AuthWith so the session pointer is in context.
-	requireMFA := middleware.RequireFreshMFA(sessionSvc)
+	// Slice H5: pass the enrollment checker so stale-session-with-zero-
+	// factors returns 412 mfa_enrollment_required (SPA routes to
+	// /me/mfa) instead of an unreachable 401 step_up_required.
+	requireMFA := middleware.RequireFreshMFA(sessionSvc, mfaVerifySvc)
 
 	v1.Post("/requests", requestsH.Submit)
 	v1.Post("/requests/read", requestsH.SubmitRead)
