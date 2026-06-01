@@ -334,6 +334,25 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	)
 	mfaH := handlers.NewMFA(mfaFactorRepo, localUsersRepoInApp, totpSvc)
 
+	// Slice H3: WebAuthn enrollment. The RP only constructs when the
+	// operator sets BOTH RPID + RPOrigins — TOTP-only deployments
+	// leave the WebAuthn knobs unset and the matching routes 503.
+	if cfg.MFAWebAuthnRPID != "" && len(cfg.MFAWebAuthnRPOrigins) > 0 {
+		webauthnSvc, err := services.NewWebAuthnService(
+			mfaFactorRepo, localUsersRepoInApp, km, auditRepo, rdb,
+			services.WebAuthnConfig{
+				RPID:          cfg.MFAWebAuthnRPID,
+				RPDisplayName: cfg.MFAWebAuthnRPDisplayName,
+				RPOrigins:     cfg.MFAWebAuthnRPOrigins,
+			},
+		)
+		if err != nil {
+			logger.Error("webauthn: disabled", "err", err)
+		} else {
+			mfaH = mfaH.WithWebAuthn(webauthnSvc)
+		}
+	}
+
 	// RBAC resolver for the `auth.Require(perm)` middleware. Loads each
 	// caller's user_role assignments + the role catalog at request time.
 	rbacResolver := auth.NewRepoResolver(userRoleRepo, roleRepo)
@@ -593,6 +612,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Delete("/users/me/mfa/factors/:id", mfaH.Delete)
 	v1.Post("/users/me/mfa/totp/enroll", mfaH.EnrollTOTP)
 	v1.Post("/users/me/mfa/totp/confirm", mfaH.ConfirmTOTP)
+	v1.Post("/users/me/mfa/webauthn/register/start", mfaH.EnrollWebAuthnStart)
+	v1.Post("/users/me/mfa/webauthn/register/finish", mfaH.EnrollWebAuthnFinish)
 
 	v1.Post("/environments", tenancyH.CreateEnvironment)
 	v1.Get("/environments", tenancyH.ListEnvironments)
