@@ -544,7 +544,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// direct DB access can still see the chain of who-did-what to
 	// every resource. Filters: actor / action / resource /
 	// correlation_id / since / until / limit.
-	auditH := handlers.NewAudit(auditRepo)
+	auditH := handlers.NewAudit(auditRepo, localUsersRepoInApp, agentRepo)
 	v1.Get("/audit-events", auth.Require(auth.PermAuditRead, rbacResolver), auditH.List)
 
 	// Tenancy admin — projects + environments. Pre-existed in the
