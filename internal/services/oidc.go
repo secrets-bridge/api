@@ -76,6 +76,22 @@ type OIDCConfig struct {
 	// rows. This protects break-glass admin assignments + the
 	// SB_BOOTSTRAP_ADMIN flow.
 	GroupMap map[string]string
+
+	// TrustAMRForMFA — when true, the callback stamps `last_mfa_at`
+	// based on the ID token's `amr` claim (RFC 8176 strong factors).
+	// Slice D's behaviour.
+	//
+	// **Default false (post-Slice H4).** The architect pivot
+	// (2026-05-31) moved MFA enforcement into the Control Plane
+	// itself: /auth/mfa/{challenge,verify} is the ONLY path that
+	// stamps `last_mfa_at`. Operators with an IdP that genuinely
+	// owns MFA (Entra / Okta with enforced policy) flip this back
+	// to true via `SB_OIDC_TRUSTED_AMR_MFA=true` to keep the Slice D
+	// behaviour during a transition window.
+	//
+	// `amr` is still recorded in the `auth.oidc.callback` audit
+	// metadata either way — informational for forensic triage.
+	TrustAMRForMFA bool
 }
 
 // DefaultStateTTL is what cmd/api wires when SB_OIDC_STATE_TTL isn't
@@ -364,7 +380,15 @@ func (s *OIDCService) HandleCallback(ctx context.Context, state, code, ip, userA
 	// asserted a strong factor in the `amr` claim. Failure of the
 	// stamp is audited but doesn't fail the login; the user just
 	// won't pass Tier 2 gates until they re-auth.
-	if isStrongAMR(claims.AMR) {
+	//
+	// **Default OFF (Slice H4 architectural pivot).** The Control
+	// Plane now owns MFA via /auth/mfa/{challenge,verify}. The OIDC
+	// callback only stamps `last_mfa_at` when the operator
+	// deliberately opted back in to the IdP-trust model
+	// (`SB_OIDC_TRUSTED_AMR_MFA=true`). `amr` stays in the audit
+	// metadata regardless — forensic visibility doesn't depend on
+	// the trust knob.
+	if s.cfg.TrustAMRForMFA && isStrongAMR(claims.AMR) {
 		if mfaErr := s.sessions.MarkMFA(ctx, issued.Session.ID, time.Now().UTC()); mfaErr != nil {
 			_ = s.audit.Append(ctx, &storage.AuditEvent{
 				Actor:    "user:" + user.ID.String(),

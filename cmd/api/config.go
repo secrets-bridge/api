@@ -163,6 +163,23 @@ type Config struct {
 	MFAWebAuthnRPID          string
 	MFAWebAuthnRPDisplayName string
 	MFAWebAuthnRPOrigins     []string
+
+	// OIDCTrustAMRForMFA controls whether the OIDC callback stamps
+	// `last_mfa_at` based on the ID token's `amr` claim (Slice D
+	// behaviour). Slice H4 inverted the default:
+	//
+	//   * false (post-H4 default): Control Plane owns MFA via
+	//     /auth/mfa/{challenge,verify}. OIDC callback records `amr`
+	//     in audit only — does NOT stamp the session.
+	//   * true: legacy Slice D behaviour. Use when the IdP genuinely
+	//     enforces MFA (Entra / Okta with strong policy) and the
+	//     operator wants to skip the app-side step-up modal during a
+	//     transition window. `amr` is matched against RFC 8176's
+	//     strong-factor set.
+	//
+	// qi UAT defaults to false; operators flip via
+	// `SB_OIDC_TRUSTED_AMR_MFA=true` to opt into the legacy path.
+	OIDCTrustAMRForMFA bool
 }
 
 func loadConfig() Config {
@@ -190,6 +207,7 @@ func loadConfig() Config {
 		MFAWebAuthnRPID:          envOr("SB_MFA_WEBAUTHN_RP_ID", ""),
 		MFAWebAuthnRPDisplayName: envOr("SB_MFA_WEBAUTHN_RP_DISPLAY_NAME", "Secrets Bridge"),
 		MFAWebAuthnRPOrigins:     splitCommaTrim(envOr("SB_MFA_WEBAUTHN_RP_ORIGINS", "")),
+		OIDCTrustAMRForMFA:       envBool("SB_OIDC_TRUSTED_AMR_MFA", false),
 	}
 }
 
