@@ -14,7 +14,9 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
@@ -26,16 +28,25 @@ import (
 
 // MFA is the HTTP layer for /users/me/mfa/*.
 type MFA struct {
-	factors storage.UserMFAFactorRepository
-	users   storage.LocalUserRepository
-	totp    *services.TOTPService
+	factors  storage.UserMFAFactorRepository
+	users    storage.LocalUserRepository
+	totp     *services.TOTPService
+	webauthn *services.WebAuthnService
 }
 
-// NewMFA wires the handler. `totp` may be nil — endpoints under
-// /totp/* return 503 in that case (useful in tests that don't
-// instantiate the service).
+// NewMFA wires the handler. `totp` and `webauthn` may each be nil —
+// the matching endpoints return 503 when their service isn't wired
+// (useful in tests + when an operator deliberately disables WebAuthn
+// by leaving SB_MFA_WEBAUTHN_RP_ID empty).
 func NewMFA(factors storage.UserMFAFactorRepository, users storage.LocalUserRepository, totp *services.TOTPService) *MFA {
 	return &MFA{factors: factors, users: users, totp: totp}
+}
+
+// WithWebAuthn attaches the optional WebAuthn enrollment service.
+// Returns the handler for chained construction.
+func (h *MFA) WithWebAuthn(svc *services.WebAuthnService) *MFA {
+	h.webauthn = svc
+	return h
 }
 
 // MFAFactorBody is the public read shape — does NOT include the
@@ -198,6 +209,91 @@ func (h *MFA) ConfirmTOTP(c fiber.Ctx) error {
 	})
 }
 
+// --- WebAuthn --------------------------------------------------------
+
+// WebAuthnEnrollStartRequest is the body for POST /users/me/mfa/webauthn/register/start.
+type WebAuthnEnrollStartRequest struct {
+	Label string `json:"label"`
+}
+
+// WebAuthnEnrollStartResponse returns the challenge + the
+// PublicKeyCredentialCreationOptions the SPA hands to
+// `navigator.credentials.create()`.
+type WebAuthnEnrollStartResponse struct {
+	ChallengeID string `json:"challenge_id"`
+	Options     any    `json:"options"`
+}
+
+// WebAuthnEnrollFinishRequest is the body the SPA POSTs after the
+// authenticator returns. `Response` is the AuthenticatorAttestationResponse
+// JSON the library knows how to parse.
+type WebAuthnEnrollFinishRequest struct {
+	ChallengeID string          `json:"challenge_id"`
+	Response    json.RawMessage `json:"response"`
+}
+
+// EnrollWebAuthnStart handles POST /users/me/mfa/webauthn/register/start.
+func (h *MFA) EnrollWebAuthnStart(c fiber.Ctx) error {
+	if h.webauthn == nil {
+		return fiber.NewError(fiber.StatusServiceUnavailable, "webauthn not configured")
+	}
+	uid, err := h.userIDFromCtx(c)
+	if err != nil {
+		return err
+	}
+	var body WebAuthnEnrollStartRequest
+	if err := c.Bind().Body(&body); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	if strings.TrimSpace(body.Label) == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "label required")
+	}
+	out, err := h.webauthn.BeginEnrollment(c.Context(), uid, body.Label)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(WebAuthnEnrollStartResponse{
+		ChallengeID: out.ChallengeID,
+		Options:     out.Options,
+	})
+}
+
+// EnrollWebAuthnFinish handles POST /users/me/mfa/webauthn/register/finish.
+// Persists the factor on success (201). On any verification failure
+// the Redis challenge is gone (single-shot); the SPA must restart.
+func (h *MFA) EnrollWebAuthnFinish(c fiber.Ctx) error {
+	if h.webauthn == nil {
+		return fiber.NewError(fiber.StatusServiceUnavailable, "webauthn not configured")
+	}
+	uid, err := h.userIDFromCtx(c)
+	if err != nil {
+		return err
+	}
+	var body WebAuthnEnrollFinishRequest
+	if err := c.Bind().Body(&body); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	if body.ChallengeID == "" || len(body.Response) == 0 {
+		return fiber.NewError(fiber.StatusBadRequest, "challenge_id + response required")
+	}
+	factor, err := h.webauthn.FinishEnrollment(c.Context(), uid, body.ChallengeID, body.Response)
+	if err != nil {
+		return mapWebAuthnError(err)
+	}
+	var last *string
+	if factor.LastUsedAt != nil {
+		s := factor.LastUsedAt.UTC().Format("2006-01-02T15:04:05Z")
+		last = &s
+	}
+	return c.Status(fiber.StatusCreated).JSON(MFAFactorBody{
+		ID:         factor.ID.String(),
+		Kind:       string(factor.Kind),
+		Label:      factor.Label,
+		CreatedAt:  factor.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+		LastUsedAt: last,
+	})
+}
+
 // --- helpers ---------------------------------------------------------
 
 func (h *MFA) userIDFromCtx(c fiber.Ctx) (uuid.UUID, error) {
@@ -210,6 +306,24 @@ func (h *MFA) userIDFromCtx(c fiber.Ctx) (uuid.UUID, error) {
 		return uuid.Nil, fiber.NewError(fiber.StatusUnprocessableEntity, "identity is not a user id")
 	}
 	return uid, nil
+}
+
+func mapWebAuthnError(err error) error {
+	switch {
+	case errors.Is(err, services.ErrWebAuthnChallengeNotFound),
+		errors.Is(err, services.ErrWebAuthnChallengeUser):
+		// Same status either way so a probing attacker can't
+		// distinguish "wrong owner" from "challenge gone".
+		return fiber.NewError(fiber.StatusGone, "enrollment challenge expired or already used")
+	case errors.Is(err, services.ErrWebAuthnAttestation):
+		return fiber.NewError(fiber.StatusBadRequest, "attestation verification failed")
+	case errors.Is(err, storage.ErrMFALabelExists):
+		return fiber.NewError(fiber.StatusConflict, "label already used")
+	case errors.Is(err, storage.ErrMFACredentialExists):
+		return fiber.NewError(fiber.StatusConflict, "authenticator already registered")
+	default:
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
 }
 
 func mapTOTPError(err error) error {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -142,6 +143,26 @@ type Config struct {
 	// "Secrets Bridge (UAT)" so it doesn't shadow a prod account on the
 	// same authenticator app.
 	MFATOTPIssuer string
+
+	// WebAuthn relying-party config (Slice H3). The routes under
+	// /users/me/mfa/webauthn/* mount only when both `MFAWebAuthnRPID`
+	// AND `MFAWebAuthnRPOrigins` are non-empty — operators who want
+	// TOTP-only can leave the WebAuthn knobs unset and the service
+	// stays disabled at boot.
+	//
+	// `RPID` MUST be the effective domain of the origin (e.g.
+	// "sb.example.com"). Browsers reject the ceremony otherwise.
+	//
+	// `RPDisplayName` is rendered in the authenticator's enrollment
+	// dialog ("Add Secrets Bridge?"). Free text.
+	//
+	// `RPOrigins` is the comma-separated allowlist of fully qualified
+	// origins permitted to drive the ceremony. UAT typically lists
+	// both the production https host AND http://localhost:5173 for
+	// Vite dev work.
+	MFAWebAuthnRPID          string
+	MFAWebAuthnRPDisplayName string
+	MFAWebAuthnRPOrigins     []string
 }
 
 func loadConfig() Config {
@@ -166,7 +187,28 @@ func loadConfig() Config {
 		OIDCGroupMap:           parseOIDCGroupMap(envOr("SB_OIDC_GROUP_MAP", "")),
 		MFADevAllowPwd:         envBool("SB_MFA_DEV_ALLOW_PWD", false),
 		MFATOTPIssuer:          envOr("SB_MFA_TOTP_ISSUER", "Secrets Bridge"),
+		MFAWebAuthnRPID:          envOr("SB_MFA_WEBAUTHN_RP_ID", ""),
+		MFAWebAuthnRPDisplayName: envOr("SB_MFA_WEBAUTHN_RP_DISPLAY_NAME", "Secrets Bridge"),
+		MFAWebAuthnRPOrigins:     splitCommaTrim(envOr("SB_MFA_WEBAUTHN_RP_ORIGINS", "")),
 	}
+}
+
+// splitCommaTrim parses a comma-separated list, trims whitespace,
+// and drops empty entries. Used for env vars like
+// SB_MFA_WEBAUTHN_RP_ORIGINS that accept a list.
+func splitCommaTrim(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // ValidateMFADevFlag refuses to honor SB_MFA_DEV_ALLOW_PWD=true when
