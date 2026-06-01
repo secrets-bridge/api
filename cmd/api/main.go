@@ -337,8 +337,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// Slice H3: WebAuthn enrollment. The RP only constructs when the
 	// operator sets BOTH RPID + RPOrigins — TOTP-only deployments
 	// leave the WebAuthn knobs unset and the matching routes 503.
+	var webauthnSvc *services.WebAuthnService
 	if cfg.MFAWebAuthnRPID != "" && len(cfg.MFAWebAuthnRPOrigins) > 0 {
-		webauthnSvc, err := services.NewWebAuthnService(
+		built, err := services.NewWebAuthnService(
 			mfaFactorRepo, localUsersRepoInApp, km, auditRepo, rdb,
 			services.WebAuthnConfig{
 				RPID:          cfg.MFAWebAuthnRPID,
@@ -349,9 +350,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		if err != nil {
 			logger.Error("webauthn: disabled", "err", err)
 		} else {
+			webauthnSvc = built
 			mfaH = mfaH.WithWebAuthn(webauthnSvc)
 		}
 	}
+
 
 	// RBAC resolver for the `auth.Require(perm)` middleware. Loads each
 	// caller's user_role assignments + the role catalog at request time.
@@ -401,6 +404,17 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		p.DevAllowPwd = true
 		sessionSvc = sessionSvc.WithPolicy(p)
 	}
+
+	// Slice H4: /auth/mfa/{challenge,verify} verify orchestration.
+	// Dispatches to TOTP / WebAuthn under the hood + stamps
+	// `last_mfa_at` on the caller's session on success. This is the
+	// ONLY path that stamps last_mfa_at post-H4 (OIDC callback's
+	// amr-based stamping is gated behind SB_OIDC_TRUSTED_AMR_MFA).
+	mfaVerifySvc := services.NewMFAVerifyService(
+		mfaFactorRepo, totpSvc, webauthnSvc, sessionSvc, auditRepo, rdb,
+		services.MFAVerifyConfig{},
+	)
+	authMFAH := handlers.NewAuthMFA(mfaVerifySvc)
 
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
@@ -463,14 +477,15 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		}
 		oidcCtx, oidcCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		oidcSvc, err := services.NewOIDCService(oidcCtx, services.OIDCConfig{
-			Issuer:        cfg.OIDCIssuer,
-			ClientID:      cfg.OIDCClientID,
-			ClientSecret:  cfg.OIDCClientSecret,
-			RedirectURL:   cfg.OIDCRedirectURL,
-			Scopes:        strings.Fields(cfg.OIDCScopes),
-			PostLogoutURL: cfg.OIDCPostLogout,
-			GroupClaim:    cfg.OIDCGroupClaim,
-			GroupMap:      cfg.OIDCGroupMap,
+			Issuer:         cfg.OIDCIssuer,
+			ClientID:       cfg.OIDCClientID,
+			ClientSecret:   cfg.OIDCClientSecret,
+			RedirectURL:    cfg.OIDCRedirectURL,
+			Scopes:         strings.Fields(cfg.OIDCScopes),
+			PostLogoutURL:  cfg.OIDCPostLogout,
+			GroupClaim:     cfg.OIDCGroupClaim,
+			GroupMap:       cfg.OIDCGroupMap,
+			TrustAMRForMFA: cfg.OIDCTrustAMRForMFA,
 		}, localUsersRepoInApp, sessionSvc, auditRepo, rdb)
 		oidcCancel()
 		if err != nil {
@@ -614,6 +629,14 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Post("/users/me/mfa/totp/confirm", mfaH.ConfirmTOTP)
 	v1.Post("/users/me/mfa/webauthn/register/start", mfaH.EnrollWebAuthnStart)
 	v1.Post("/users/me/mfa/webauthn/register/finish", mfaH.EnrollWebAuthnFinish)
+
+	// Slice H4: step-up verification — the SOLE path post-H4 that
+	// stamps `last_mfa_at` on a session. /auth/mfa/challenge mints
+	// the per-kind nonce (TOTP ticket OR WebAuthn assertion options),
+	// /auth/mfa/verify consumes the user's response and stamps on
+	// success. Same cookie auth chain as /users/me/mfa/*.
+	v1.Post("/auth/mfa/challenge", authMFAH.Challenge)
+	v1.Post("/auth/mfa/verify", authMFAH.Verify)
 
 	v1.Post("/environments", tenancyH.CreateEnvironment)
 	v1.Get("/environments", tenancyH.ListEnvironments)

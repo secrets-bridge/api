@@ -75,14 +75,22 @@ const (
 	// usually finishes registration within ~30 seconds; 10 minutes is
 	// generous for users who get distracted between tabs.
 	webauthnEnrollTTL = 10 * time.Minute
+
+	// Assertion (login-time) is short: the user is sitting at the
+	// step-up modal with their key already plugged in. 5 minutes is
+	// generous; the spec recommends 60s. Short TTL also limits the
+	// window for an attacker who steals a challenge.
+	webauthnAssertTTL = 5 * time.Minute
 )
 
 // WebAuthn service sentinel errors.
 var (
-	ErrWebAuthnChallengeNotFound = errors.New("mfa/webauthn: enrollment challenge not found or expired")
-	ErrWebAuthnChallengeUser     = errors.New("mfa/webauthn: enrollment challenge does not belong to this user")
+	ErrWebAuthnChallengeNotFound = errors.New("mfa/webauthn: challenge not found or expired")
+	ErrWebAuthnChallengeUser     = errors.New("mfa/webauthn: challenge does not belong to this user")
 	ErrWebAuthnAttestation       = errors.New("mfa/webauthn: attestation verification failed")
+	ErrWebAuthnAssertion         = errors.New("mfa/webauthn: assertion verification failed")
 	ErrWebAuthnNotConfigured     = errors.New("mfa/webauthn: relying party not configured")
+	ErrWebAuthnNoFactors         = errors.New("mfa/webauthn: user has no enrolled webauthn factors")
 )
 
 // WebAuthnConfig is the boot-time config for the service.
@@ -317,6 +325,173 @@ func (s *WebAuthnService) FinishEnrollment(ctx context.Context, userID uuid.UUID
 		},
 	})
 	return factor, nil
+}
+
+// BeginAssertionResult is what BeginAssertion returns. `Options`
+// serialises to the W3C PublicKeyCredentialRequestOptions shape and
+// the SPA hands it to `navigator.credentials.get()`.
+type BeginAssertionResult struct {
+	ChallengeID string                        `json:"challenge_id"`
+	Options     *protocol.CredentialAssertion `json:"options"`
+}
+
+// pendingWebAuthnAssert is the Redis blob between BeginAssertion and
+// FinishAssertion. Holds the library's SessionData so we can pass it
+// back into ValidateLogin unchanged.
+type pendingWebAuthnAssert struct {
+	UserID  string                `json:"u"`
+	Session *webauthn.SessionData `json:"s"`
+}
+
+// BeginAssertion mints a PublicKeyCredentialRequestOptions challenge
+// scoped to the user's enrolled WebAuthn factors. Returns
+// ErrWebAuthnNoFactors when the user has zero WebAuthn factors — the
+// SPA falls back to TOTP or shows "enroll first".
+//
+// `allowedCredentials` is populated from the user's enrolled factor
+// set so the browser refuses to assert with a non-enrolled
+// authenticator. Same shape as enrollment's `excludeCredentials`,
+// different semantics.
+func (s *WebAuthnService) BeginAssertion(ctx context.Context, userID uuid.UUID) (*BeginAssertionResult, error) {
+	user, err := s.loadWebAuthnUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if len(user.creds) == 0 {
+		return nil, ErrWebAuthnNoFactors
+	}
+	assertion, session, err := s.rp.BeginLogin(user)
+	if err != nil {
+		return nil, fmt.Errorf("mfa/webauthn: begin login: %w", err)
+	}
+	pending := pendingWebAuthnAssert{
+		UserID:  userID.String(),
+		Session: session,
+	}
+	payload, err := json.Marshal(pending)
+	if err != nil {
+		return nil, fmt.Errorf("mfa/webauthn: encode pending: %w", err)
+	}
+	challenge := newChallengeID()
+	if err := s.rdb.Raw().Set(ctx, webauthnAssertKey(s.rdb, challenge), payload, webauthnAssertTTL).Err(); err != nil {
+		return nil, fmt.Errorf("mfa/webauthn: persist pending: %w", err)
+	}
+	return &BeginAssertionResult{ChallengeID: challenge, Options: assertion}, nil
+}
+
+// FinishAssertion verifies the authenticator's response. On success:
+// the factor's `last_used_at` is stamped, the `sign_count` is updated
+// (monotonic enforcement via IncrementSignCount), and the matched
+// factor row is returned. The caller is responsible for stamping
+// `last_mfa_at` on the SESSION — that decision belongs to the verify
+// orchestration layer (SessionService.MarkMFA).
+//
+// `ErrSignCountRegression` from the repo signals a possible cloned
+// authenticator (WebAuthn spec's only reliable clone signal). The
+// caller MUST treat this as a Tier-1 incident: revoke all sessions
+// for the user and emit an audit row above this layer.
+func (s *WebAuthnService) FinishAssertion(ctx context.Context, userID uuid.UUID, challengeID string, body []byte) (*storage.UserMFAFactor, error) {
+	raw, err := s.consumePendingWebAuthnAssert(ctx, challengeID)
+	if err != nil {
+		s.auditAssertFailure(ctx, userID, "challenge_missing")
+		return nil, ErrWebAuthnChallengeNotFound
+	}
+	var pending pendingWebAuthnAssert
+	if err := json.Unmarshal(raw, &pending); err != nil {
+		s.auditAssertFailure(ctx, userID, "challenge_decode")
+		return nil, fmt.Errorf("mfa/webauthn: decode pending: %w", err)
+	}
+	if pending.UserID != userID.String() {
+		s.auditAssertFailure(ctx, userID, "challenge_user_mismatch")
+		return nil, ErrWebAuthnChallengeUser
+	}
+	parsed, err := protocol.ParseCredentialRequestResponseBytes(body)
+	if err != nil {
+		s.auditAssertFailure(ctx, userID, "response_parse")
+		return nil, fmt.Errorf("%w: %v", ErrWebAuthnAssertion, err)
+	}
+	user, err := s.loadWebAuthnUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	cred, err := s.rp.ValidateLogin(user, *pending.Session, parsed)
+	if err != nil {
+		s.auditAssertFailure(ctx, userID, "assertion_verify")
+		return nil, fmt.Errorf("%w: %v", ErrWebAuthnAssertion, err)
+	}
+
+	// Resolve the factor row this credential id belongs to so we can
+	// update its sign_count + last_used_at.
+	factor, err := s.factors.GetByWebAuthnCredentialID(ctx, cred.ID)
+	if err != nil {
+		s.auditAssertFailure(ctx, userID, "factor_lookup")
+		return nil, fmt.Errorf("mfa/webauthn: lookup factor: %w", err)
+	}
+	// Defence in depth: the library validated the credential against
+	// user.creds, but assert that the resolved factor belongs to the
+	// claimed user. A mismatch here would be a bug in the User adapter
+	// or storage layer.
+	if factor.UserID != userID {
+		s.auditAssertFailure(ctx, userID, "factor_user_mismatch")
+		return nil, ErrWebAuthnAssertion
+	}
+
+	// Sign-count update. WebAuthn spec §7.2 step 17: a non-increasing
+	// counter is the clone-detection trip. The repo enforces strict
+	// monotonic increase atomically.
+	if err := s.factors.IncrementSignCount(ctx, factor.ID, int64(cred.Authenticator.SignCount)); err != nil {
+		if errors.Is(err, storage.ErrSignCountRegression) {
+			s.auditAssertFailure(ctx, userID, "sign_count_regression")
+		} else {
+			s.auditAssertFailure(ctx, userID, "sign_count_update")
+		}
+		return nil, err
+	}
+	if err := s.factors.TouchLastUsed(ctx, factor.ID, s.clock()); err != nil {
+		// Verification succeeded; don't block the user. Audit it as
+		// a soft warning like TOTP does.
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:    "user:" + userID.String(),
+			Action:   "mfa.webauthn.touch_last_used_failed",
+			Resource: "user_mfa_factor:" + factor.ID.String(),
+			Status:   storage.AuditStatusFailure,
+			Metadata: map[string]any{"error": err.Error()},
+		})
+	}
+
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "user:" + userID.String(),
+		Action:   "mfa.webauthn.verify",
+		Resource: "user_mfa_factor:" + factor.ID.String(),
+		Status:   storage.AuditStatusSuccess,
+	})
+	return factor, nil
+}
+
+func (s *WebAuthnService) consumePendingWebAuthnAssert(ctx context.Context, challengeID string) ([]byte, error) {
+	key := webauthnAssertKey(s.rdb, challengeID)
+	val, err := s.rdb.Raw().GetDel(ctx, key).Bytes()
+	if err != nil {
+		return nil, err
+	}
+	if len(val) == 0 {
+		return nil, errors.New("empty")
+	}
+	return val, nil
+}
+
+func (s *WebAuthnService) auditAssertFailure(ctx context.Context, userID uuid.UUID, kind string) {
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "user:" + userID.String(),
+		Action:   "mfa.webauthn.verify",
+		Resource: "user:" + userID.String(),
+		Status:   storage.AuditStatusFailure,
+		Metadata: map[string]any{"error_kind": kind},
+	})
+}
+
+func webauthnAssertKey(rdb *runtime.Client, challenge string) string {
+	return rdb.Key("mfa:webauthn:assert", challenge)
 }
 
 // --- helpers ---------------------------------------------------------
