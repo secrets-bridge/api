@@ -17,6 +17,16 @@ import (
 type SecretWrap struct {
 	ID                uuid.UUID
 	RequestID         *uuid.UUID
+	// EnvironmentID is the authoritative env binding added by Slice L3.
+	// For request-flow wraps it's copied from the parent access_request;
+	// for direct_reveal wraps it's set inline at issue time. Nullable
+	// during migration.
+	EnvironmentID *uuid.UUID
+	// IssuedVia distinguishes wraps issued through the access-request
+	// lifecycle (`request`) from those issued by the Slice L4 dev
+	// direct-reveal endpoint (`direct_reveal`). Schema CHECK pins the
+	// allowed values.
+	IssuedVia         WrapIssuedVia
 	KeyName           string
 	EncryptedValue    []byte
 	Nonce             []byte
@@ -31,6 +41,15 @@ type SecretWrap struct {
 	ConsumedByAgent   *uuid.UUID
 	ConsumedByUser    string
 }
+
+// WrapIssuedVia is constrained by the schema CHECK on
+// secret_wraps.issued_via.
+type WrapIssuedVia string
+
+const (
+	WrapIssuedViaRequest      WrapIssuedVia = "request"
+	WrapIssuedViaDirectReveal WrapIssuedVia = "direct_reveal"
+)
 
 // SecretWrapRepository is the read/write surface for secret_wraps.
 type SecretWrapRepository interface {
@@ -118,28 +137,35 @@ func (r *SecretWraps) Create(ctx context.Context, w *SecretWrap) error {
 	if w.ExpiresAt.IsZero() {
 		return errors.New("storage: expires_at is required")
 	}
+	if w.IssuedVia == "" {
+		w.IssuedVia = WrapIssuedViaRequest
+	}
 
 	const insertGenerated = `
 		INSERT INTO secret_wraps
-		  (request_id, key_name, encrypted_value, nonce, data_key_ciphertext,
+		  (request_id, environment_id, issued_via, key_name,
+		   encrypted_value, nonce, data_key_ciphertext,
 		   kms_key_id, algorithm, content_hash, byte_length, expires_at)
-		VALUES ($1, NULLIF($2, ''), $3, $4, $5, $6, $7, $8, $9, $10)
+		VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING id, created_at`
 	const insertWithID = `
 		INSERT INTO secret_wraps
-		  (id, request_id, key_name, encrypted_value, nonce, data_key_ciphertext,
+		  (id, request_id, environment_id, issued_via, key_name,
+		   encrypted_value, nonce, data_key_ciphertext,
 		   kms_key_id, algorithm, content_hash, byte_length, expires_at)
-		VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, $7, $8, $9, $10, $11)
+		VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING created_at`
 
 	if w.ID == uuid.Nil {
 		return r.pool.QueryRow(ctx, insertGenerated,
-			w.RequestID, w.KeyName, w.EncryptedValue, w.Nonce, w.DataKeyCiphertext,
+			w.RequestID, w.EnvironmentID, w.IssuedVia, w.KeyName,
+			w.EncryptedValue, w.Nonce, w.DataKeyCiphertext,
 			w.KMSKeyID, w.Algorithm, w.ContentHash, w.ByteLength, w.ExpiresAt,
 		).Scan(&w.ID, &w.CreatedAt)
 	}
 	return r.pool.QueryRow(ctx, insertWithID,
-		w.ID, w.RequestID, w.KeyName, w.EncryptedValue, w.Nonce, w.DataKeyCiphertext,
+		w.ID, w.RequestID, w.EnvironmentID, w.IssuedVia, w.KeyName,
+		w.EncryptedValue, w.Nonce, w.DataKeyCiphertext,
 		w.KMSKeyID, w.Algorithm, w.ContentHash, w.ByteLength, w.ExpiresAt,
 	).Scan(&w.CreatedAt)
 }
@@ -147,7 +173,8 @@ func (r *SecretWraps) Create(ctx context.Context, w *SecretWrap) error {
 // Get returns the wrap by id.
 func (r *SecretWraps) Get(ctx context.Context, id uuid.UUID) (*SecretWrap, error) {
 	const q = `
-		SELECT id, request_id, COALESCE(key_name, ''),
+		SELECT id, request_id, environment_id, issued_via,
+		       COALESCE(key_name, ''),
 		       encrypted_value, nonce, data_key_ciphertext,
 		       kms_key_id, algorithm, content_hash, byte_length,
 		       created_at, expires_at, consumed_at, consumed_by_agent,
@@ -303,11 +330,12 @@ func scanSecretWrap(row interface {
 	var (
 		w               SecretWrap
 		requestID       *uuid.UUID
+		envID           *uuid.UUID
 		consumedAt      *time.Time
 		consumedByAgent *uuid.UUID
 	)
 	err := row.Scan(
-		&w.ID, &requestID, &w.KeyName,
+		&w.ID, &requestID, &envID, &w.IssuedVia, &w.KeyName,
 		&w.EncryptedValue, &w.Nonce, &w.DataKeyCiphertext,
 		&w.KMSKeyID, &w.Algorithm, &w.ContentHash, &w.ByteLength,
 		&w.CreatedAt, &w.ExpiresAt, &consumedAt, &consumedByAgent,
@@ -320,6 +348,7 @@ func scanSecretWrap(row interface {
 		return nil, fmt.Errorf("storage: scan secret_wrap: %w", err)
 	}
 	w.RequestID = requestID
+	w.EnvironmentID = envID
 	w.ConsumedAt = consumedAt
 	w.ConsumedByAgent = consumedByAgent
 	return &w, nil

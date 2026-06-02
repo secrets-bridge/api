@@ -25,13 +25,19 @@ const (
 // allowed" (which would make the binding meaningless — reject in the
 // repository).
 type ProjectSecret struct {
-	ProjectID   uuid.UUID
-	SecretID    uuid.UUID
-	AllowedKeys []string // nil = all
-	AllowedOps  []string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	CreatedBy   string
+	ProjectID uuid.UUID
+	SecretID  uuid.UUID
+	// EnvironmentID is the authoritative project+env+secret binding
+	// added by Slice L3. Nullable while existing rows backfill from
+	// the `secrets.labels.Env` label bridge; new bindings written by
+	// L4 set it directly. Auth in the dev-page hot path joins through
+	// THIS column, not through labels.
+	EnvironmentID *uuid.UUID
+	AllowedKeys   []string // nil = all
+	AllowedOps    []string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	CreatedBy     string
 }
 
 // ErrEmptyAllowedKeys is returned when a caller hands the repository
@@ -99,12 +105,12 @@ func (r *ProjectSecrets) Bind(ctx context.Context, b *ProjectSecret) error {
 
 	const q = `
 		INSERT INTO project_secrets (
-		    project_id, secret_id, allowed_keys, allowed_ops, created_by
-		) VALUES ($1, $2, $3, $4, NULLIF($5, ''))
+		    project_id, secret_id, environment_id, allowed_keys, allowed_ops, created_by
+		) VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''))
 		RETURNING created_at, updated_at`
 
 	err := r.pool.QueryRow(ctx, q,
-		b.ProjectID, b.SecretID, b.AllowedKeys, b.AllowedOps, b.CreatedBy,
+		b.ProjectID, b.SecretID, b.EnvironmentID, b.AllowedKeys, b.AllowedOps, b.CreatedBy,
 	).Scan(&b.CreatedAt, &b.UpdatedAt)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -155,7 +161,7 @@ func (r *ProjectSecrets) Unbind(ctx context.Context, projectID, secretID uuid.UU
 // Get returns the binding for one (project, secret) pair.
 func (r *ProjectSecrets) Get(ctx context.Context, projectID, secretID uuid.UUID) (*ProjectSecret, error) {
 	const q = `
-		SELECT project_id, secret_id, allowed_keys, allowed_ops,
+		SELECT project_id, secret_id, environment_id, allowed_keys, allowed_ops,
 		       created_at, updated_at, COALESCE(created_by, '')
 		FROM project_secrets
 		WHERE project_id = $1 AND secret_id = $2`
@@ -167,7 +173,7 @@ func (r *ProjectSecrets) Get(ctx context.Context, projectID, secretID uuid.UUID)
 // the secret's creation time.
 func (r *ProjectSecrets) ListByProject(ctx context.Context, projectID uuid.UUID) ([]*ProjectSecret, error) {
 	const q = `
-		SELECT project_id, secret_id, allowed_keys, allowed_ops,
+		SELECT project_id, secret_id, environment_id, allowed_keys, allowed_ops,
 		       created_at, updated_at, COALESCE(created_by, '')
 		FROM project_secrets
 		WHERE project_id = $1
@@ -222,9 +228,12 @@ func (r *ProjectSecrets) ListSecretIDsForProjects(ctx context.Context, projectID
 func scanProjectSecret(row interface {
 	Scan(dest ...any) error
 }) (*ProjectSecret, error) {
-	var b ProjectSecret
+	var (
+		b     ProjectSecret
+		envID *uuid.UUID
+	)
 	err := row.Scan(
-		&b.ProjectID, &b.SecretID, &b.AllowedKeys, &b.AllowedOps,
+		&b.ProjectID, &b.SecretID, &envID, &b.AllowedKeys, &b.AllowedOps,
 		&b.CreatedAt, &b.UpdatedAt, &b.CreatedBy,
 	)
 	if err != nil {
@@ -233,5 +242,6 @@ func scanProjectSecret(row interface {
 		}
 		return nil, fmt.Errorf("storage: scan project secret: %w", err)
 	}
+	b.EnvironmentID = envID
 	return &b, nil
 }

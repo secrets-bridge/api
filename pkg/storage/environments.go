@@ -89,6 +89,12 @@ func DeriveKindFromType(t EnvironmentType) EnvironmentKind {
 type EnvironmentRepository interface {
 	Create(ctx context.Context, e *Environment) error
 	Get(ctx context.Context, id uuid.UUID) (*Environment, error)
+	// GetByProjectAndName resolves the (project_id, name) tuple to the
+	// env row. The schema's UNIQUE (project_id, name) makes this a
+	// single-row lookup. Slice L3 callers (RequestService.Submit /
+	// SubmitRead) use it to populate Scope.EnvironmentKind from the
+	// operator-chosen env name on the wire.
+	GetByProjectAndName(ctx context.Context, projectID uuid.UUID, name string) (*Environment, error)
 	ListByProject(ctx context.Context, projectID uuid.UUID) ([]*Environment, error)
 	List(ctx context.Context) ([]*Environment, error)
 	Update(ctx context.Context, id uuid.UUID, description string, riskLevel int) error
@@ -202,6 +208,18 @@ func (r *Environments) Get(ctx context.Context, id uuid.UUID) (*Environment, err
 		FROM environments
 		WHERE id = $1`
 	return scanEnvironment(r.pool.QueryRow(ctx, q, id))
+}
+
+// GetByProjectAndName resolves the (project_id, name) tuple. Returns
+// ErrNotFound when no row matches.
+func (r *Environments) GetByProjectAndName(ctx context.Context, projectID uuid.UUID, name string) (*Environment, error) {
+	const q = `
+		SELECT id, project_id, name, type, kind, risk_level,
+		       COALESCE(description, ''),
+		       created_at, updated_at
+		FROM environments
+		WHERE project_id = $1 AND name = $2`
+	return scanEnvironment(r.pool.QueryRow(ctx, q, projectID, name))
 }
 
 // ListByProject returns every environment under a project, ordered by
