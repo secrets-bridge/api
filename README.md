@@ -17,21 +17,24 @@
 
 | Concern | Status | Where |
 |---|---|---|
-| Postgres schema + migrations | Live | `pkg/storage/migrations/0001`-`0020_*.sql` |
+| Postgres schema + migrations | Live | `pkg/storage/migrations/0001`-`0026_*.sql` |
 | Redis runtime (idempotency, locks, rate-limit, pub-sub) | Live | `pkg/runtime/` |
 | Agent registration + heartbeat (single-credential model) | Live | `internal/services/agents.go` |
 | Agent job claim → complete loop | Live | `internal/services/jobs.go` |
 | Patch + read-flow request lifecycle | Live | `internal/services/requests.go` |
 | KMS-envelope-encrypted secret wraps | Live | `pkg/keymgmt/` — backends: local / vault-transit / aws-kms |
 | Wire-envelope encryption (X25519 sealing CP→Agent, KMS DEK Agent→CP) | Live | `pkg/sealing/` + `pkg/keymgmt/` |
-| Dynamic policy + workflow engine | Live | `internal/services/policy.go` |
+| Dynamic policy + workflow engine — `PolicyDecision` with PROD invariant | Live | `internal/services/policy.go` (Slice L2) |
+| First-class environment model (`kind=non_prod/prod` classification, `risk_level`) | Live | `pkg/storage/environments.go` + migrations 0022/0024 (Slice L1+L3) |
+| Dev-facing per-env endpoints + `secret.reveal.direct` permission | Live | `internal/handlers/dev_secrets.go` + `internal/services/requests.go::SubmitDirectReveal` (Slice L4) |
 | RBAC + permission catalog | Live | `internal/auth/` |
 | Team hierarchy + section-head pattern | Live | `internal/auth/scope_projects.go` + migration 0018 |
 | GitOps observation panel (ArgoCD, read-only) | Live (opt-in) | `pkg/argocd/` — `SB_GITOPS_ENABLED=true` |
 | Cookie auth + server-side sessions | Live | `pkg/storage/sessions.go` + `internal/services/sessions.go` |
 | Account lockout + login rate limit | Live | `internal/services/auth.go` (5 wrong → 15min lock; per-IP rate limit) |
 | OIDC client (PKCE + back-channel logout) | Live (opt-in via `SB_OIDC_ISSUER`) | `internal/services/oidc.go` |
-| MFA enforcement + step-up auth on Tier 2 ops | Live | `internal/middleware/stepup.go` |
+| App-MFA enrollment (TOTP + WebAuthn) + step-up on Tier 2 ops | Live | `internal/services/mfa_*.go` + `internal/middleware/stepup.go` (Slices H–I) |
+| Login-time MFA gate (opt-in) | Live | `internal/middleware/requirestamped.go` — `SB_REQUIRE_MFA_AT_LOGIN=true` (Slice K) |
 | Group-claim → role mapping at JIT | Open ([#57](https://github.com/secrets-bridge/api/pull/57)) | `RoleReconciler` in oidc.go |
 
 ## Layout
