@@ -86,7 +86,7 @@ func bootstrapRequests(t *testing.T) *requestHarness {
 	jobsR := storage.NewSyncJobs(pool)
 
 	wrapSvc := services.NewWrapService(wrapsR, auditR, km)
-	policy := services.NewPolicyEngine(policiesR, workflowsR)
+	policy := services.NewPolicyEngine(policiesR, workflowsR, auditR)
 	jobSvc := services.NewJobService(jobsR, auditR)
 	reqSvc := services.NewRequestService(requestsR, approvalsR, wrapSvc, workflowsR, policy, auditR, jobSvc)
 	jobSvc.OnCompleted(reqSvc.OnJobCompleted)
