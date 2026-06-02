@@ -683,6 +683,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Post("/environments", tenancyH.CreateEnvironment)
 	v1.Get("/environments", tenancyH.ListEnvironments)
 	v1.Get("/environments/:id", tenancyH.GetEnvironment)
+	v1.Put("/environments/:id", tenancyH.UpdateEnvironment)
 	v1.Delete("/environments/:id", tenancyH.DeleteEnvironment)
 
 	// Teams admin (api#43-followup). N-level hierarchy via
