@@ -231,6 +231,27 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
+		// JSON error body shape — the SPA (and any other typed client)
+		// expects `{"error":"<message>"}` so a parsed body has the field
+		// the client extracts the message from. Fiber v3's default
+		// handler emits plain text, which the SPA's `client.ts` then
+		// shows as the literal `HTTP <status>` placeholder because
+		// JSON.parse fails. Override the handler to JSON so the
+		// step-up modal + every other error path can display the real
+		// reason. Discovered during a Slice K pilot rollout where the
+		// SPA surfaced "401: HTTP 401" instead of the step-up modal's
+		// human message.
+		ErrorHandler: func(c fiber.Ctx, err error) error {
+			code := fiber.StatusInternalServerError
+			var fe *fiber.Error
+			if errors.As(err, &fe) {
+				code = fe.Code
+			}
+			// Preserve any headers the route handler set (e.g.
+			// RequireFreshMFA's `WWW-Authenticate: step-up` challenge).
+			c.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
+			return c.Status(code).JSON(fiber.Map{"error": err.Error()})
+		},
 	})
 
 	// Middleware order is intentional: request ID first so every other
