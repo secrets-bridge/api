@@ -367,6 +367,152 @@ func (s *RequestService) SubmitRead(ctx context.Context, in ReadInput) (*storage
 	return req, nil
 }
 
+// DirectRevealInput is the data the L4 dev endpoint POSTs to skip
+// the approval workflow on a non-prod env. The handler resolves the
+// env_id from the URL and hands the resulting Environment to the
+// service so the kind check happens before any policy lookup.
+type DirectRevealInput struct {
+	RequesterID          string
+	Environment          *storage.Environment // already loaded by the handler
+	TargetProviderType   string
+	TargetProviderConfig map[string]any
+	TargetSecretRef      string
+	TargetKeys           []string
+	Justification        string
+}
+
+// ErrDirectRevealOnProd is returned when SubmitDirectReveal is called
+// against a prod-classified environment. The check fires BEFORE the
+// PolicyEngine lookup — operator misconfiguration cannot un-block it.
+var ErrDirectRevealOnProd = errors.New("services: direct reveal not permitted on prod environment")
+
+// ErrDirectRevealNotAllowed is returned when the matched policy_rule
+// does not have direct_reveal_allowed=true. Maps to 403 at the handler.
+var ErrDirectRevealNotAllowed = errors.New("services: matched policy does not permit direct reveal")
+
+// SubmitDirectReveal creates a read access_request that BYPASSES the
+// approval workflow. Used by the L4 dev endpoint when the matched
+// policy + non-prod env classification both green-light the path.
+//
+// Gates (defence in depth, in order):
+//   1. `Environment.Kind != EnvironmentKindProd` — server-side hard
+//      check; even an operator-set policy with
+//      `direct_reveal_allowed=true` on a prod env cannot reach the
+//      auto-execute path.
+//   2. PolicyEngine returns `DirectRevealAllowed=true` — the policy
+//      rule explicitly opts in for this scope.
+//   3. (Permission `secret.reveal.direct` is enforced by the handler
+//       layer via `auth.Require` BEFORE the request reaches this
+//       method — service stays unaware of identity perms.)
+//
+// On success the access_request lands with `status=approved` (skipping
+// pending) and the read job is enqueued. The agent picks up the job
+// through the normal claim loop; the user polls
+// `/requests/:id/wraps/:wrap_id` for the wraps as they arrive.
+//
+// The synchronous "click reveal → see plaintext" UX is Slice M's
+// concern (bulk reveal session page); L4 ships the auto-execute
+// path that makes that UX possible.
+func (s *RequestService) SubmitDirectReveal(ctx context.Context, in DirectRevealInput) (*storage.AccessRequest, error) {
+	if in.RequesterID == "" || in.TargetProviderType == "" || in.TargetSecretRef == "" {
+		return nil, fmt.Errorf("%w: requester_id, target_provider_type, target_secret_ref required", ErrInvalidInput)
+	}
+	if in.Environment == nil {
+		return nil, fmt.Errorf("%w: environment is required for direct reveal", ErrInvalidInput)
+	}
+	if in.Justification == "" {
+		return nil, fmt.Errorf("%w: justification required", ErrInvalidInput)
+	}
+
+	// Gate 1 — env.kind hard check (defence in depth).
+	if in.Environment.Kind == storage.EnvironmentKindProd {
+		return nil, ErrDirectRevealOnProd
+	}
+
+	dec, err := s.policy.Resolve(ctx, Scope{
+		ProjectID:       in.Environment.ProjectID.String(),
+		Environment:     in.Environment.Name,
+		EnvironmentKind: in.Environment.Kind,
+		ProviderType:    in.TargetProviderType,
+		SecretRefPrefix: in.TargetSecretRef,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("services: resolve workflow: %w", err)
+	}
+
+	// Gate 2 — policy must explicitly opt in.
+	if !dec.DirectRevealAllowed {
+		return nil, ErrDirectRevealNotAllowed
+	}
+
+	keys := in.TargetKeys
+	if keys == nil {
+		keys = []string{}
+	}
+
+	wfID := dec.Workflow.ID
+	envID := in.Environment.ID
+	req := &storage.AccessRequest{
+		RequesterID:          in.RequesterID,
+		Type:                 storage.AccessRequestTypeRead,
+		Justification:        in.Justification,
+		Status:               storage.AccessRequestStatusApproved, // auto-execute
+		WorkflowID:           &wfID,
+		EnvironmentID:        &envID,
+		TargetProviderType:   in.TargetProviderType,
+		TargetProviderConfig: in.TargetProviderConfig,
+		TargetSecretRef:      in.TargetSecretRef,
+		TargetKeys:           keys,
+		TargetScope: map[string]any{
+			"project_id":  in.Environment.ProjectID.String(),
+			"environment": in.Environment.Name,
+		},
+	}
+	if err := s.requests.Create(ctx, req); err != nil {
+		return nil, fmt.Errorf("services: create direct-reveal request: %w", err)
+	}
+
+	// Enqueue the read job synchronously — no Approve step to wait
+	// for. Failure to enqueue is audited but not bubbled (same posture
+	// as the approval-flow enqueue: a 200 here with a missing job is
+	// still a real, durable request; operators retry via admin tools).
+	if s.jobs != nil {
+		if err := s.enqueueRequestJob(ctx, req); err != nil {
+			_ = s.audit.Append(ctx, &storage.AuditEvent{
+				Actor:         "user:" + in.RequesterID,
+				Action:        "request.direct_reveal.enqueue_failed",
+				Resource:      "request:" + req.ID.String(),
+				Status:        storage.AuditStatusFailure,
+				CorrelationID: req.ID,
+				Metadata:      map[string]any{"error": err.Error()},
+			})
+		}
+	}
+
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:         "user:" + in.RequesterID,
+		Action:        "secret.reveal.direct.issued",
+		Resource:      "request:" + req.ID.String(),
+		Status:        storage.AuditStatusSuccess,
+		CorrelationID: req.ID,
+		Metadata: map[string]any{
+			"workflow_id":          dec.Workflow.ID.String(),
+			"environment_id":       envID.String(),
+			"environment_kind":     string(in.Environment.Kind),
+			"target_provider_type": in.TargetProviderType,
+			"target_secret_ref":    in.TargetSecretRef,
+			"key_count":            len(keys),
+			"policy_rule_id": func() string {
+				if dec.MatchedRule != nil {
+					return dec.MatchedRule.ID.String()
+				}
+				return ""
+			}(),
+		},
+	})
+	return req, nil
+}
+
 // Approve records an approval vote. When the vote count crosses the
 // workflow threshold the request transitions to approved and all
 // associated wraps get their TTL refreshed to WrapTTLApproved.

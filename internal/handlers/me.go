@@ -37,12 +37,22 @@ type MFAEnrollmentLookup interface {
 
 // Me is the HTTP layer for "current user" projections.
 type Me struct {
-	projects  storage.ProjectRepository
-	resolver  auth.Resolver
-	teamScope auth.TeamScopeResolver
-	users     storage.LocalUserRepository
-	teams     storage.TeamRepository
-	mfa       MFAEnrollmentLookup
+	projects     storage.ProjectRepository
+	environments storage.EnvironmentRepository // Slice L4 — nullable
+	resolver     auth.Resolver
+	teamScope    auth.TeamScopeResolver
+	users        storage.LocalUserRepository
+	teams        storage.TeamRepository
+	mfa          MFAEnrollmentLookup
+}
+
+// WithEnvironments wires the EnvironmentRepository so the projection
+// endpoints include each project's environments in the response.
+// Slice L4. When nil, the `environments` field stays omitted via
+// omitempty — back-compat for callers that pre-date L1.
+func (h *Me) WithEnvironments(e storage.EnvironmentRepository) *Me {
+	h.environments = e
+	return h
 }
 
 // NewMe wires the handler. Both args required. Call WithTeamScope to
@@ -81,10 +91,28 @@ func (h *Me) WithMFAEnrollment(svc MFAEnrollmentLookup) *Me {
 }
 
 // ProjectSummary is the wire shape for the user-projects projection.
+//
+// Slice L4 added the `Environments` field so the dev-facing sidebar
+// can render a "My Projects" tree with per-project env drilldown.
+// The list comes from `project_environments` (Slice L1) ordered by
+// name ascending. Empty when the project has no environments
+// configured.
 type ProjectSummary struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
+	ID           string               `json:"id"`
+	Name         string               `json:"name"`
+	Status       string               `json:"status"`
+	Environments []EnvironmentSummary `json:"environments,omitempty"`
+}
+
+// EnvironmentSummary is the per-env shape returned alongside a
+// project. Carries the load-bearing `kind` field so the SPA can
+// render a badge + pick the right CTA (Reveal vs Request) without
+// a per-env round trip.
+type EnvironmentSummary struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Kind      string `json:"kind"`
+	RiskLevel int    `json:"risk_level"`
 }
 
 // TeamSummary is the slim shape returned for each team in the user's
@@ -247,11 +275,27 @@ func (h *Me) projectsForUser(c fiber.Ctx, userID string) ([]ProjectSummary, erro
 				continue
 			}
 		}
-		out = append(out, ProjectSummary{
+		summary := ProjectSummary{
 			ID:     p.ID.String(),
 			Name:   p.Name,
 			Status: string(p.Status),
-		})
+		}
+		if h.environments != nil {
+			envs, err := h.environments.ListByProject(c.Context(), p.ID)
+			if err != nil {
+				return nil, fiber.NewError(fiber.StatusInternalServerError, err.Error())
+			}
+			summary.Environments = make([]EnvironmentSummary, 0, len(envs))
+			for _, env := range envs {
+				summary.Environments = append(summary.Environments, EnvironmentSummary{
+					ID:        env.ID.String(),
+					Name:      env.Name,
+					Kind:      string(env.Kind),
+					RiskLevel: env.RiskLevel,
+				})
+			}
+		}
+		out = append(out, summary)
 	}
 	return out, nil
 }
