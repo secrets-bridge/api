@@ -426,11 +426,27 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// (issue #10). `AuthWith` adds the cookie path at the front of
 	// the resolution chain (cookie -> Bearer JWT -> X-User-Id ->
 	// anonymous).
-	v1 := app.Group("/api/v1",
+	// Slice K — login-time MFA gate. When enabled, every authenticated
+	// route requires the session to have been MFA-verified at least
+	// once. The middleware has its own carve-out list for the routes
+	// that MUST stay reachable to satisfy the gate (logout, /users/me,
+	// /users/me/mfa/*, /auth/mfa/*). When the knob is off the
+	// middleware is nil-passed and degrades to pass-through, so
+	// existing step-up-only deployments are byte-for-byte unchanged.
+	var requireStamped fiber.Handler
+	if cfg.RequireMFAAtLogin {
+		requireStamped = middleware.RequireMFAStamped(sessionSvc, mfaVerifySvc)
+	}
+
+	v1Middlewares := []any{
 		middleware.AuthWith(authSvc, sessionSvc),
 		middleware.RBAC(),
 		middleware.Audit(logger),
-	)
+	}
+	if requireStamped != nil {
+		v1Middlewares = append(v1Middlewares, requireStamped)
+	}
+	v1 := app.Group("/api/v1", v1Middlewares...)
 
 	// Authentication — public route, no auth gating. The UI POSTs
 	// email + password here and receives a signed JWT in return. The

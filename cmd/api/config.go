@@ -177,9 +177,24 @@ type Config struct {
 	//     transition window. `amr` is matched against RFC 8176's
 	//     strong-factor set.
 	//
-	// qi UAT defaults to false; operators flip via
-	// `SB_OIDC_TRUSTED_AMR_MFA=true` to opt into the legacy path.
+	// Default false; operators flip via `SB_OIDC_TRUSTED_AMR_MFA=true`
+	// to opt into the legacy path.
 	OIDCTrustAMRForMFA bool
+
+	// RequireMFAAtLogin (Slice K) enforces MFA on EVERY authenticated
+	// route, not just Tier-2 step-up. When false (default), Tier-1
+	// browsing (lists, dashboards) only needs a session cookie; the
+	// existing Slice D + H model. When true, a freshly-issued session
+	// with no MFA stamp returns 401 step_up_required on every route
+	// except a small carve-out set (logout, /users/me, /users/me/mfa/*,
+	// /auth/mfa/{challenge,verify}). The SPA's existing onError
+	// interceptor handles both the 401 (modal opens) and 412
+	// mfa_enrollment_required (route to /me/mfa) flavours.
+	//
+	// Operators who want login-time MFA on every sign-in (the
+	// "AWS-console / GitHub-org-with-2FA-required" posture) flip this
+	// on; deployments comfortable with step-up-only leave it off.
+	RequireMFAAtLogin bool
 }
 
 func loadConfig() Config {
@@ -208,6 +223,7 @@ func loadConfig() Config {
 		MFAWebAuthnRPDisplayName: envOr("SB_MFA_WEBAUTHN_RP_DISPLAY_NAME", "Secrets Bridge"),
 		MFAWebAuthnRPOrigins:     splitCommaTrim(envOr("SB_MFA_WEBAUTHN_RP_ORIGINS", "")),
 		OIDCTrustAMRForMFA:       envBool("SB_OIDC_TRUSTED_AMR_MFA", false),
+		RequireMFAAtLogin:        envBool("SB_REQUIRE_MFA_AT_LOGIN", false),
 	}
 }
 
