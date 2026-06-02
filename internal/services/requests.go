@@ -180,7 +180,7 @@ func (s *RequestService) Submit(ctx context.Context, in PatchInput) (*storage.Ac
 		return nil, fmt.Errorf("%w: justification required", ErrInvalidInput)
 	}
 
-	wf, _, err := s.policy.Resolve(ctx, Scope{
+	dec, err := s.policy.Resolve(ctx, Scope{
 		ProjectID:       in.ProjectID,
 		Environment:     in.Environment,
 		ProviderType:    in.TargetProviderType,
@@ -189,6 +189,7 @@ func (s *RequestService) Submit(ctx context.Context, in PatchInput) (*storage.Ac
 	if err != nil {
 		return nil, fmt.Errorf("services: resolve workflow: %w", err)
 	}
+	wf := dec.Workflow
 
 	keys := make([]string, 0, len(in.KeyValues))
 	for k := range in.KeyValues {
@@ -267,7 +268,7 @@ func (s *RequestService) SubmitRead(ctx context.Context, in ReadInput) (*storage
 		return nil, fmt.Errorf("%w: justification required", ErrInvalidInput)
 	}
 
-	wf, _, err := s.policy.Resolve(ctx, Scope{
+	dec, err := s.policy.Resolve(ctx, Scope{
 		ProjectID:       in.ProjectID,
 		Environment:     in.Environment,
 		ProviderType:    in.TargetProviderType,
@@ -276,6 +277,7 @@ func (s *RequestService) SubmitRead(ctx context.Context, in ReadInput) (*storage
 	if err != nil {
 		return nil, fmt.Errorf("services: resolve workflow: %w", err)
 	}
+	wf := dec.Workflow
 
 	keys := in.TargetKeys
 	if keys == nil {

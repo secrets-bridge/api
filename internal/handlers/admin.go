@@ -402,16 +402,26 @@ func (h *Admin) DeleteWorkflow(c fiber.Ctx) error {
 // ---- policy_rules ---------------------------------------------------
 
 // PolicyBody is the request/response JSON shape.
+//
+// Slice L2 added the access-decision fields: direct_reveal_allowed,
+// requires_mfa, reveal_ttl_seconds. The route-level PolicyEngine
+// applies its PROD invariant after Resolve — operators may write
+// direct_reveal_allowed=true on a rule that targets a prod env, but
+// the engine zeroes it (and writes a `policy.invariant.violated`
+// audit row) so the response surface never honours it.
 type PolicyBody struct {
-	ID         uuid.UUID      `json:"id,omitempty"`
-	Name       string         `json:"name"`
-	Selector   map[string]any `json:"selector"`
-	WorkflowID uuid.UUID      `json:"workflow_id"`
-	Priority   int            `json:"priority"`
-	Enabled    bool           `json:"enabled"`
-	IsSystem   bool           `json:"is_system,omitempty"`
-	CreatedAt  time.Time      `json:"created_at,omitempty"`
-	UpdatedAt  time.Time      `json:"updated_at,omitempty"`
+	ID                  uuid.UUID      `json:"id,omitempty"`
+	Name                string         `json:"name"`
+	Selector            map[string]any `json:"selector"`
+	WorkflowID          uuid.UUID      `json:"workflow_id"`
+	Priority            int            `json:"priority"`
+	Enabled             bool           `json:"enabled"`
+	IsSystem            bool           `json:"is_system,omitempty"`
+	DirectRevealAllowed bool           `json:"direct_reveal_allowed,omitempty"`
+	RequiresMFA         bool           `json:"requires_mfa,omitempty"`
+	RevealTTLSeconds    int            `json:"reveal_ttl_seconds,omitempty"`
+	CreatedAt           time.Time      `json:"created_at,omitempty"`
+	UpdatedAt           time.Time      `json:"updated_at,omitempty"`
 }
 
 func policyToBody(p *storage.PolicyRule) PolicyBody {
@@ -419,8 +429,22 @@ func policyToBody(p *storage.PolicyRule) PolicyBody {
 		ID: p.ID, Name: p.Name, Selector: p.Selector,
 		WorkflowID: p.WorkflowID, Priority: p.Priority,
 		Enabled: p.Enabled, IsSystem: p.IsSystem,
-		CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
+		DirectRevealAllowed: p.DirectRevealAllowed,
+		RequiresMFA:         p.RequiresMFA,
+		RevealTTLSeconds:    p.RevealTTLSeconds,
+		CreatedAt:           p.CreatedAt, UpdatedAt: p.UpdatedAt,
 	}
+}
+
+// validatePolicyAccessFields rejects RevealTTLSeconds outside the
+// 10..300 range (matching the schema CHECK) when the field is
+// non-zero. Zero means "use the schema default 60" so the operator
+// can omit the field for default behaviour.
+func validatePolicyAccessFields(body PolicyBody) error {
+	if body.RevealTTLSeconds != 0 && (body.RevealTTLSeconds < 10 || body.RevealTTLSeconds > 300) {
+		return fiber.NewError(fiber.StatusBadRequest, "reveal_ttl_seconds must be between 10 and 300")
+	}
+	return nil
 }
 
 // CreatePolicy handles POST /policies.
@@ -432,12 +456,18 @@ func (h *Admin) CreatePolicy(c fiber.Ctx) error {
 	if body.Name == "" || body.WorkflowID == uuid.Nil {
 		return fiber.NewError(fiber.StatusBadRequest, "name and workflow_id are required")
 	}
+	if err := validatePolicyAccessFields(body); err != nil {
+		return err
+	}
 	p := &storage.PolicyRule{
-		Name:     body.Name,
-		Selector: body.Selector,
-		WorkflowID: body.WorkflowID,
-		Priority:   body.Priority,
-		Enabled:    body.Enabled,
+		Name:                body.Name,
+		Selector:            body.Selector,
+		WorkflowID:          body.WorkflowID,
+		Priority:            body.Priority,
+		Enabled:             body.Enabled,
+		DirectRevealAllowed: body.DirectRevealAllowed,
+		RequiresMFA:         body.RequiresMFA,
+		RevealTTLSeconds:    body.RevealTTLSeconds,
 	}
 	if err := h.policies.Create(c.Context(), p); err != nil {
 		return adminErr(err)
@@ -481,13 +511,19 @@ func (h *Admin) UpdatePolicy(c fiber.Ctx) error {
 	if err := c.Bind().JSON(&body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
 	}
+	if err := validatePolicyAccessFields(body); err != nil {
+		return err
+	}
 	p := &storage.PolicyRule{
-		ID:       id,
-		Name:     body.Name,
-		Selector: body.Selector,
-		WorkflowID: body.WorkflowID,
-		Priority:   body.Priority,
-		Enabled:    body.Enabled,
+		ID:                  id,
+		Name:                body.Name,
+		Selector:            body.Selector,
+		WorkflowID:          body.WorkflowID,
+		Priority:            body.Priority,
+		Enabled:             body.Enabled,
+		DirectRevealAllowed: body.DirectRevealAllowed,
+		RequiresMFA:         body.RequiresMFA,
+		RevealTTLSeconds:    body.RevealTTLSeconds,
 	}
 	if err := h.policies.Update(c.Context(), p); err != nil {
 		return adminErr(err)

@@ -295,7 +295,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	agentSvc := services.NewAgentService(agentRepo, auditRepo, rdb)
 	jobSvc := services.NewJobService(jobRepo, auditRepo)
 	wrapSvc := services.NewWrapService(wrapRepo, auditRepo, km)
-	policyEng := services.NewPolicyEngine(policyRepo, workflowRepo)
+	policyEng := services.NewPolicyEngine(policyRepo, workflowRepo, auditRepo)
 	requestSvc := services.NewRequestService(requestRepo, approvalRepo, wrapSvc, workflowRepo, policyEng, auditRepo, jobSvc)
 	secretsSvc := services.NewSecretsService(secretsRepo, auditRepo)
 

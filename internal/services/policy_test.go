@@ -47,7 +47,8 @@ func bootstrapPolicy(t *testing.T) (*services.PolicyEngine, *storage.Pool, *stor
 
 	policies := storage.NewPolicies(pool)
 	workflows := storage.NewWorkflows(pool)
-	engine := services.NewPolicyEngine(policies, workflows)
+	audit := storage.NewAuditEvents(pool)
+	engine := services.NewPolicyEngine(policies, workflows, audit)
 	return engine, pool, policies, workflows
 }
 
@@ -57,15 +58,15 @@ func bootstrapPolicy(t *testing.T) (*services.PolicyEngine, *storage.Pool, *stor
 func TestResolve_FallsBackToSystemDefault(t *testing.T) {
 	engine, _, _, _ := bootstrapPolicy(t)
 
-	w, rule, err := engine.Resolve(t.Context(), services.Scope{})
+	dec, err := engine.Resolve(t.Context(), services.Scope{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if w == nil || w.Name != "standard" {
-		t.Fatalf("default workflow: got %+v", w)
+	if dec.Workflow == nil || dec.Workflow.Name != "standard" {
+		t.Fatalf("default workflow: got %+v", dec.Workflow)
 	}
-	if rule == nil || rule.Name != "match-all (system default)" {
-		t.Fatalf("matched rule: got %+v", rule)
+	if dec.MatchedRule == nil || dec.MatchedRule.Name != "match-all (system default)" {
+		t.Fatalf("matched rule: got %+v", dec.MatchedRule)
 	}
 }
 
@@ -97,24 +98,24 @@ func TestResolve_ExactMatchPolicyTakesPrecedence(t *testing.T) {
 	}
 
 	// prod scope → strict workflow.
-	w, matched, err := engine.Resolve(ctx, services.Scope{Environment: "prod"})
+	dec, err := engine.Resolve(ctx, services.Scope{Environment: "prod"})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if w.Name != "strict-prod" {
-		t.Fatalf("prod scope: got workflow %q want strict-prod", w.Name)
+	if dec.Workflow.Name != "strict-prod" {
+		t.Fatalf("prod scope: got workflow %q want strict-prod", dec.Workflow.Name)
 	}
-	if matched.Name != "prod-only" {
-		t.Fatalf("matched rule: %+v", matched)
+	if dec.MatchedRule.Name != "prod-only" {
+		t.Fatalf("matched rule: %+v", dec.MatchedRule)
 	}
 
 	// dev scope → falls through to system default.
-	w2, _, err := engine.Resolve(ctx, services.Scope{Environment: "dev"})
+	dec2, err := engine.Resolve(ctx, services.Scope{Environment: "dev"})
 	if err != nil {
 		t.Fatalf("Resolve dev: %v", err)
 	}
-	if w2.Name != "standard" {
-		t.Fatalf("dev scope: got %q want standard", w2.Name)
+	if dec2.Workflow.Name != "standard" {
+		t.Fatalf("dev scope: got %q want standard", dec2.Workflow.Name)
 	}
 }
 
@@ -152,15 +153,15 @@ func TestResolve_HigherPriorityWins(t *testing.T) {
 		t.Fatalf("high rule: %v", err)
 	}
 
-	w, matched, err := engine.Resolve(ctx, services.Scope{Environment: "prod"})
+	dec, err := engine.Resolve(ctx, services.Scope{Environment: "prod"})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if w.Name != "high-prio-wf" {
-		t.Fatalf("priority resolution: got %q want high-prio-wf", w.Name)
+	if dec.Workflow.Name != "high-prio-wf" {
+		t.Fatalf("priority resolution: got %q want high-prio-wf", dec.Workflow.Name)
 	}
-	if matched.Name != "high-prio-match" {
-		t.Fatalf("matched rule: got %+v", matched)
+	if dec.MatchedRule.Name != "high-prio-match" {
+		t.Fatalf("matched rule: got %+v", dec.MatchedRule)
 	}
 }
 
@@ -183,15 +184,15 @@ func TestResolve_PartialMatchDoesNotApply(t *testing.T) {
 
 	// Scope matches only one of the two selector keys → rule doesn't
 	// apply. Falls through to default.
-	w, _, err := engine.Resolve(ctx, services.Scope{
+	dec, err := engine.Resolve(ctx, services.Scope{
 		Environment:  "prod",
 		ProviderType: "aws-sm", // ← mismatched
 	})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if w.Name != "standard" {
-		t.Fatalf("partial match should fall through to default, got %q", w.Name)
+	if dec.Workflow.Name != "standard" {
+		t.Fatalf("partial match should fall through to default, got %q", dec.Workflow.Name)
 	}
 }
 
@@ -213,14 +214,14 @@ func TestResolve_SecretRefPrefixMatch(t *testing.T) {
 	})
 
 	// Matching prefix → custom workflow.
-	w1, _, _ := engine.Resolve(ctx, services.Scope{SecretRefPrefix: "myapp/db-password"})
-	if w1.Name != "myapp-wf" {
-		t.Fatalf("prefix match: got %q", w1.Name)
+	d1, _ := engine.Resolve(ctx, services.Scope{SecretRefPrefix: "myapp/db-password"})
+	if d1.Workflow.Name != "myapp-wf" {
+		t.Fatalf("prefix match: got %q", d1.Workflow.Name)
 	}
 	// Non-matching prefix → default.
-	w2, _, _ := engine.Resolve(ctx, services.Scope{SecretRefPrefix: "otherapp/api-key"})
-	if w2.Name != "standard" {
-		t.Fatalf("prefix non-match: got %q", w2.Name)
+	d2, _ := engine.Resolve(ctx, services.Scope{SecretRefPrefix: "otherapp/api-key"})
+	if d2.Workflow.Name != "standard" {
+		t.Fatalf("prefix non-match: got %q", d2.Workflow.Name)
 	}
 }
 
@@ -238,9 +239,9 @@ func TestResolve_DisabledRuleSkipped(t *testing.T) {
 		WorkflowID: wf.ID, Priority: 999, Enabled: false,
 	})
 
-	w, _, _ := engine.Resolve(ctx, services.Scope{Environment: "prod"})
-	if w.Name != "standard" {
-		t.Fatalf("disabled rule must be skipped, got workflow %q", w.Name)
+	dec, _ := engine.Resolve(ctx, services.Scope{Environment: "prod"})
+	if dec.Workflow.Name != "standard" {
+		t.Fatalf("disabled rule must be skipped, got workflow %q", dec.Workflow.Name)
 	}
 }
 
@@ -258,9 +259,190 @@ func TestResolve_DisabledWorkflowFalsThrough(t *testing.T) {
 		WorkflowID: wf.ID, Priority: 999, Enabled: true,
 	})
 
-	w, _, _ := engine.Resolve(ctx, services.Scope{Environment: "prod"})
-	if w.Name != "standard" {
-		t.Fatalf("rule points at disabled workflow; should fall through, got %q", w.Name)
+	dec, _ := engine.Resolve(ctx, services.Scope{Environment: "prod"})
+	if dec.Workflow.Name != "standard" {
+		t.Fatalf("rule points at disabled workflow; should fall through, got %q", dec.Workflow.Name)
+	}
+}
+
+// Slice L2 — the PolicyDecision carries the rule's access-control
+// fields verbatim when the scope is NOT prod (or kind is unset).
+func TestResolve_DecisionCarriesAccessFields(t *testing.T) {
+	engine, _, policies, workflows := bootstrapPolicy(t)
+	ctx := t.Context()
+
+	wf := &storage.WorkflowDefinition{
+		Name: "uat-direct-wf", MinApprovers: 0, AllowSelfApproval: true,
+		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
+		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
+	}
+	if err := workflows.Create(ctx, wf); err != nil {
+		t.Fatalf("Create workflow: %v", err)
+	}
+	rule := &storage.PolicyRule{
+		Name:     "uat-direct-rule",
+		Selector: map[string]any{"environment": "uat"},
+		WorkflowID: wf.ID, Priority: 100, Enabled: true,
+		DirectRevealAllowed: true,
+		RequiresMFA:         false,
+		RevealTTLSeconds:    120,
+	}
+	if err := policies.Create(ctx, rule); err != nil {
+		t.Fatalf("Create policy: %v", err)
+	}
+
+	dec, err := engine.Resolve(ctx, services.Scope{
+		Environment:     "uat",
+		EnvironmentKind: storage.EnvironmentKindNonProd,
+	})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if !dec.DirectRevealAllowed {
+		t.Error("DirectRevealAllowed should be true on non_prod kind")
+	}
+	if dec.RequiresMFA {
+		t.Error("RequiresMFA should be false")
+	}
+	if dec.RevealTTLSeconds != 120 {
+		t.Errorf("RevealTTLSeconds: got %d want 120", dec.RevealTTLSeconds)
+	}
+	if dec.InvariantViolated {
+		t.Error("InvariantViolated should be false")
+	}
+}
+
+// PROD invariant — even when the operator writes
+// direct_reveal_allowed=true and the rule matches a prod env, the
+// decision flips the flag back to false AND a
+// `policy.invariant.violated` audit event is written.
+func TestResolve_ProdInvariantZerosDirectReveal(t *testing.T) {
+	engine, pool, policies, workflows := bootstrapPolicy(t)
+	ctx := t.Context()
+
+	wf := &storage.WorkflowDefinition{
+		Name: "lax-wf-on-prod", MinApprovers: 1, AllowSelfApproval: true,
+		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
+		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
+	}
+	if err := workflows.Create(ctx, wf); err != nil {
+		t.Fatalf("Create workflow: %v", err)
+	}
+
+	// Operator misconfigures: a prod-targeted rule with
+	// direct_reveal_allowed=true.
+	rule := &storage.PolicyRule{
+		Name:     "misconfigured-prod-direct",
+		Selector: map[string]any{"environment": "prod"},
+		WorkflowID: wf.ID, Priority: 200, Enabled: true,
+		DirectRevealAllowed: true,
+		RequiresMFA:         true,
+		RevealTTLSeconds:    60,
+	}
+	if err := policies.Create(ctx, rule); err != nil {
+		t.Fatalf("Create policy: %v", err)
+	}
+
+	dec, err := engine.Resolve(ctx, services.Scope{
+		Environment:     "prod",
+		EnvironmentKind: storage.EnvironmentKindProd,
+	})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	// The rule on disk still says true; the engine zeroes it in
+	// the decision because env kind is prod.
+	if dec.DirectRevealAllowed {
+		t.Error("DirectRevealAllowed should have been zeroed by PROD invariant")
+	}
+	if !dec.InvariantViolated {
+		t.Error("InvariantViolated should be true")
+	}
+	if !dec.RequiresMFA {
+		t.Error("RequiresMFA should still carry through")
+	}
+	if dec.MatchedRule == nil || dec.MatchedRule.DirectRevealAllowed != true {
+		t.Error("rule on disk should still report direct_reveal_allowed=true")
+	}
+
+	// Audit event written.
+	var actionCount int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_events WHERE action = 'policy.invariant.violated' AND resource = $1`,
+		"policy_rule:"+rule.ID.String(),
+	).Scan(&actionCount); err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	if actionCount != 1 {
+		t.Errorf("audit row count: got %d want 1", actionCount)
+	}
+}
+
+// When scope.EnvironmentKind is unset (caller hasn't looked up the
+// env), the invariant cannot fire — the engine can't know it's prod.
+// This is the back-compat path for callers that haven't been
+// updated to populate Kind. The rule's flags carry through verbatim.
+func TestResolve_KindUnsetSkipsInvariant(t *testing.T) {
+	engine, _, policies, workflows := bootstrapPolicy(t)
+	ctx := t.Context()
+
+	wf := &storage.WorkflowDefinition{
+		Name: "kind-unset-wf", MinApprovers: 1, AllowSelfApproval: true,
+		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
+		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
+	}
+	_ = workflows.Create(ctx, wf)
+	_ = policies.Create(ctx, &storage.PolicyRule{
+		Name:     "matches-prod-env",
+		Selector: map[string]any{"environment": "prod"},
+		WorkflowID: wf.ID, Priority: 50, Enabled: true,
+		DirectRevealAllowed: true,
+	})
+
+	dec, err := engine.Resolve(ctx, services.Scope{Environment: "prod"})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if !dec.DirectRevealAllowed {
+		t.Error("invariant should NOT have fired without EnvironmentKind set")
+	}
+	if dec.InvariantViolated {
+		t.Error("InvariantViolated should be false when kind unset")
+	}
+}
+
+// Default workflow fallback path doesn't carry access fields — there
+// is no matched rule. Operators relying on the strict default get a
+// safe baseline (no direct reveal, no policy-level MFA opt-in).
+func TestResolve_FallbackDecisionHasNoAccessFields(t *testing.T) {
+	engine, _, _, _ := bootstrapPolicy(t)
+
+	// Empty scope → no rule matches → fall back to default workflow.
+	// The seed match-all rule on priority 0 still matches first,
+	// though, so we test the *true* fallback by giving an empty
+	// scope that the seed rule's selector also matches.
+	//
+	// The seed rule's selector is empty (matches everything), so
+	// it matches our empty scope — meaning we expect a populated
+	// MatchedRule pointing at the seed. To exercise the no-rule
+	// fallback we'd need to delete the seed, but tests share state.
+	// Instead, verify the seed rule's defaults DON'T leak unexpected
+	// access fields.
+	dec, err := engine.Resolve(t.Context(), services.Scope{})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if dec.MatchedRule == nil {
+		t.Fatal("expected seed match-all rule to match")
+	}
+	if dec.DirectRevealAllowed {
+		t.Error("seed rule should default DirectRevealAllowed=false")
+	}
+	if dec.RequiresMFA {
+		t.Error("seed rule should default RequiresMFA=false")
+	}
+	if dec.RevealTTLSeconds != 60 {
+		t.Errorf("seed rule reveal_ttl_seconds: got %d want 60 (schema default)", dec.RevealTTLSeconds)
 	}
 }
 

@@ -14,16 +14,32 @@ import (
 // PolicyRule maps a request scope to the workflow that should govern
 // it. Resolution: PolicyEngine walks enabled rules in priority DESC
 // order; the first whose selector fully matches the scope wins.
+//
+// Slice L2 fields carry the access DECISION (separate from the
+// approval CEREMONY which stays on the workflow):
+//
+//   - DirectRevealAllowed: when true AND the matched environment is
+//     non_prod, the API bypasses access_requests and issues a
+//     single-shot wrap. The PolicyEngine ZEROES this whenever the
+//     scope's environment.kind is 'prod', regardless of what the
+//     operator wrote.
+//   - RequiresMFA: when true, the API attaches RequireFreshMFA
+//     middleware on the matched route.
+//   - RevealTTLSeconds: server-enforced reveal-session/wrap TTL.
+//     CHECK constraint pins to 10..300.
 type PolicyRule struct {
-	ID         uuid.UUID
-	Name       string
-	Selector   map[string]any
-	WorkflowID uuid.UUID
-	Priority   int
-	Enabled    bool
-	IsSystem   bool
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	ID                  uuid.UUID
+	Name                string
+	Selector            map[string]any
+	WorkflowID          uuid.UUID
+	Priority            int
+	Enabled             bool
+	IsSystem            bool
+	DirectRevealAllowed bool
+	RequiresMFA         bool
+	RevealTTLSeconds    int
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
 
 // PolicyRepository is the read/write surface for policy_rules.
@@ -61,12 +77,23 @@ func (r *Policies) Create(ctx context.Context, p *PolicyRule) error {
 	if err != nil {
 		return fmt.Errorf("storage: marshal policy selector: %w", err)
 	}
+	// Defaults that mirror the schema so a Create with zero values
+	// for the L2 columns still lands a usable row. RevealTTLSeconds=0
+	// would be rejected by the CHECK; default to 60 (the schema default
+	// too) so the test column matches what a bare INSERT would produce.
+	if p.RevealTTLSeconds == 0 {
+		p.RevealTTLSeconds = 60
+	}
 	const q = `
-		INSERT INTO policy_rules (name, selector, workflow_id, priority, enabled, is_system)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO policy_rules (
+			name, selector, workflow_id, priority, enabled, is_system,
+			direct_reveal_allowed, requires_mfa, reveal_ttl_seconds
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING id, created_at, updated_at`
 	return r.pool.QueryRow(ctx, q,
 		p.Name, selector, p.WorkflowID, p.Priority, p.Enabled, p.IsSystem,
+		p.DirectRevealAllowed, p.RequiresMFA, p.RevealTTLSeconds,
 	).Scan(&p.ID, &p.CreatedAt, &p.UpdatedAt)
 }
 
@@ -120,11 +147,18 @@ func (r *Policies) Update(ctx context.Context, p *PolicyRule) error {
 	if err != nil {
 		return fmt.Errorf("storage: marshal policy selector: %w", err)
 	}
+	if p.RevealTTLSeconds == 0 {
+		p.RevealTTLSeconds = 60
+	}
 	const q = `
 		UPDATE policy_rules
-		SET name = $2, selector = $3, workflow_id = $4, priority = $5, enabled = $6
+		SET name = $2, selector = $3, workflow_id = $4, priority = $5, enabled = $6,
+		    direct_reveal_allowed = $7, requires_mfa = $8, reveal_ttl_seconds = $9
 		WHERE id = $1`
-	tag, err := r.pool.Exec(ctx, q, p.ID, p.Name, selector, p.WorkflowID, p.Priority, p.Enabled)
+	tag, err := r.pool.Exec(ctx, q,
+		p.ID, p.Name, selector, p.WorkflowID, p.Priority, p.Enabled,
+		p.DirectRevealAllowed, p.RequiresMFA, p.RevealTTLSeconds,
+	)
 	if err != nil {
 		return fmt.Errorf("storage: update policy: %w", err)
 	}
@@ -155,6 +189,7 @@ func (r *Policies) Delete(ctx context.Context, id uuid.UUID) error {
 
 const policySelect = `
 	SELECT id, name, selector, workflow_id, priority, enabled, is_system,
+	       direct_reveal_allowed, requires_mfa, reveal_ttl_seconds,
 	       created_at, updated_at
 	FROM policy_rules`
 
@@ -167,6 +202,7 @@ func scanPolicy(row interface {
 	)
 	err := row.Scan(
 		&p.ID, &p.Name, &selectorRaw, &p.WorkflowID, &p.Priority, &p.Enabled, &p.IsSystem,
+		&p.DirectRevealAllowed, &p.RequiresMFA, &p.RevealTTLSeconds,
 		&p.CreatedAt, &p.UpdatedAt,
 	)
 	if err != nil {
