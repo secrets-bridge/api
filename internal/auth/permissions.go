@@ -60,6 +60,15 @@ const (
 	// Developer / approver ---------------------------------------------
 	PermSecretRequest Permission = "secret.request"
 	PermSecretApprove Permission = "secret.approve"
+	// PermSecretRevealDirect (Slice L4) is an env-agnostic capability
+	// to skip the approval workflow on a Tier-2 reveal. It is GATED in
+	// EVERY callsite by: (a) the matched policy_rule must have
+	// direct_reveal_allowed=true (Slice L2), AND (b) the matched
+	// environment must have kind != 'prod' (Slice L1/L2 PROD invariant).
+	// Without all three, the user is routed through the request flow
+	// regardless of the permission. PROD direct-reveal is impossible
+	// by construction.
+	PermSecretRevealDirect Permission = "secret.reveal.direct"
 
 	// Read-only observability ------------------------------------------
 	PermSecretList Permission = "secret.list"

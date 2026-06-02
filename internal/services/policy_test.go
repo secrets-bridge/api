@@ -33,11 +33,20 @@ func bootstrapPolicy(t *testing.T) (*services.PolicyEngine, *storage.Pool, *stor
 	// workflow + match-all policy) — tests rely on them. So we
 	// DELETE only non-system rows from the workflow-engine tables,
 	// and TRUNCATE audit_events (which has a no-DELETE trigger).
+	// Wipe in FK-dependency order so workflow_definitions/policy_rules
+	// can be deleted even after request-creating tests (L3/L4 wiring)
+	// have left access_requests rows around.
 	const wipeWorkflow = `
+		DELETE FROM secret_wraps;
+		DELETE FROM approvals;
+		DELETE FROM sync_jobs;
+		DELETE FROM access_requests;
 		DELETE FROM policy_rules WHERE is_system = false;
 		DELETE FROM workflow_definitions WHERE is_system = false;
 		DELETE FROM user_roles;
-		DELETE FROM roles WHERE is_system = false;`
+		DELETE FROM roles WHERE is_system = false;
+		DELETE FROM environments;
+		DELETE FROM projects;`
 	if _, err := pool.Exec(ctx, wipeWorkflow); err != nil {
 		t.Fatalf("wipe workflow tables: %v", err)
 	}

@@ -410,7 +410,16 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// UI project switcher.
 	meH := handlers.NewMe(projectRepo, rbacResolver).
 		WithTeamScope(teamScopeResolver).
-		WithIdentity(localUsersRepoInApp, teamRepo)
+		WithIdentity(localUsersRepoInApp, teamRepo).
+		WithEnvironments(environmentRepo)
+
+	// Slice L4 — per-env dev endpoints. Sits next to meH; consumes the
+	// project + env model + project_secrets binding + RequestService's
+	// SubmitDirectReveal path.
+	devSecretsH := handlers.NewDevSecrets(
+		projectRepo, environmentRepo, projectSecretsRepo, secretsRepo,
+		requestSvc,
+	)
 
 	// Session service (Slice A2). Owns the HttpOnly cookie auth path
 	// that replaces JWT-in-sessionStorage. Postgres is the source of
@@ -661,6 +670,13 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// project switcher.
 	v1.Get("/users/me", meH.GetMe)
 	v1.Get("/users/me/projects", meH.ListProjects)
+
+	// Slice L4 — dev-facing per-env endpoints.
+	v1.Get("/projects/:id/environments/:env_id/secrets", devSecretsH.ListEnvSecrets)
+	v1.Post("/projects/:id/environments/:env_id/request",
+		auth.Require(auth.PermSecretRequest, rbacResolver), devSecretsH.SubmitEnvRequest)
+	v1.Post("/projects/:id/environments/:env_id/direct-reveal",
+		auth.Require(auth.PermSecretRevealDirect, rbacResolver), devSecretsH.DirectReveal)
 
 	// Slice H2 (api#64): user-self MFA enrollment + management. No
 	// RBAC gate — every authenticated user manages their OWN factors.
