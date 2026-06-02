@@ -194,7 +194,7 @@ func TestGitOpsService_Start_CreatesObservationPerMapping(t *testing.T) {
 		t.Fatalf("project: %v", err)
 	}
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO environments (project_id, name, type) VALUES ($1, 'prod', 'prod') RETURNING id`,
+		`INSERT INTO environments (project_id, name, type, kind) VALUES ($1, 'prod', 'prod', 'prod') RETURNING id`,
 		projectID,
 	).Scan(&envID); err != nil {
 		t.Fatalf("env: %v", err)
@@ -282,7 +282,7 @@ func TestGitOpsObservations_ClaimNextActive_TransitionsQueuedToActive(t *testing
 	// Build the minimum schema chain.
 	var projectID, envID, providerID, mappingID uuid.UUID
 	_ = pool.QueryRow(ctx, `INSERT INTO projects (name) VALUES ('p-' || gen_random_uuid()::text) RETURNING id`).Scan(&projectID)
-	_ = pool.QueryRow(ctx, `INSERT INTO environments (project_id, name, type) VALUES ($1, 'prod', 'prod') RETURNING id`, projectID).Scan(&envID)
+	_ = pool.QueryRow(ctx, `INSERT INTO environments (project_id, name, type, kind) VALUES ($1, 'prod', 'prod', 'prod') RETURNING id`, projectID).Scan(&envID)
 	_ = pool.QueryRow(ctx, `INSERT INTO provider_connections (name, type, auth_method, scope) VALUES ('v-' || gen_random_uuid()::text, 'vault', 'token', '{}'::jsonb) RETURNING id`).Scan(&providerID)
 	_ = pool.QueryRow(ctx, `INSERT INTO secret_mappings (source_provider_id, destination_provider_id, secret_ref, policy) VALUES ($1, $1, 'x', '{}'::jsonb) RETURNING id`, providerID).Scan(&mappingID)
 
@@ -340,7 +340,7 @@ func TestGitOpsObservations_Transition_Idempotent(t *testing.T) {
 
 	var projectID, envID, providerID, mappingID uuid.UUID
 	_ = pool.QueryRow(ctx, `INSERT INTO projects (name) VALUES ('p-' || gen_random_uuid()::text) RETURNING id`).Scan(&projectID)
-	_ = pool.QueryRow(ctx, `INSERT INTO environments (project_id, name, type) VALUES ($1, 'prod', 'prod') RETURNING id`, projectID).Scan(&envID)
+	_ = pool.QueryRow(ctx, `INSERT INTO environments (project_id, name, type, kind) VALUES ($1, 'prod', 'prod', 'prod') RETURNING id`, projectID).Scan(&envID)
 	_ = pool.QueryRow(ctx, `INSERT INTO provider_connections (name, type, auth_method, scope) VALUES ('v-' || gen_random_uuid()::text, 'vault', 'token', '{}'::jsonb) RETURNING id`).Scan(&providerID)
 	_ = pool.QueryRow(ctx, `INSERT INTO secret_mappings (source_provider_id, destination_provider_id, secret_ref, policy) VALUES ($1, $1, 'x', '{}'::jsonb) RETURNING id`, providerID).Scan(&mappingID)
 

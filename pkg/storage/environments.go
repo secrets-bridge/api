@@ -17,13 +17,29 @@ import (
 //
 // The (project_id, name) tuple is UNIQUE per the schema, so two
 // environments inside one project cannot share a name.
+//
+// Two enums describe a row:
+//
+//   - Type — operator-chosen lifecycle label (dev / staging / uat /
+//     prod / other). Free to evolve with the team's conventions.
+//   - Kind — the hard safety boundary (non_prod / prod). Slice L2's
+//     PolicyEngine refuses to honour `direct_reveal_allowed=true`
+//     against `kind='prod'` regardless of policy or permission.
+//
+// Operators typically pick Kind to follow Type, but the two are
+// independently mutable for the case where Type is, say, "staging"
+// but the environment carries real customer data — Kind=prod still
+// blocks direct reveal.
 type Environment struct {
-	ID        uuid.UUID
-	ProjectID uuid.UUID
-	Name      string
-	Type      EnvironmentType
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID          uuid.UUID
+	ProjectID   uuid.UUID
+	Name        string
+	Type        EnvironmentType
+	Kind        EnvironmentKind
+	RiskLevel   int
+	Description string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 // EnvironmentType is constrained by a CHECK in the schema. Values are
@@ -39,14 +55,43 @@ const (
 	EnvironmentTypeOther   EnvironmentType = "other"
 )
 
+// EnvironmentKind is the hard safety boundary (Slice L1). The
+// PolicyEngine never permits direct reveal against kind='prod'.
+// Stored as a Postgres ENUM `environment_kind` (`non_prod` | `prod`).
+type EnvironmentKind string
+
+const (
+	EnvironmentKindNonProd EnvironmentKind = "non_prod"
+	EnvironmentKindProd    EnvironmentKind = "prod"
+)
+
+// DeriveKindFromType returns the canonical Kind for a given Type when
+// the operator hasn't set Kind explicitly. The only mapping that
+// auto-elevates to `prod` is Type=="prod"; everything else lands in
+// `non_prod`. Operators who want a staging-labelled environment
+// treated as PROD must set Kind explicitly at Create time.
+func DeriveKindFromType(t EnvironmentType) EnvironmentKind {
+	if t == EnvironmentTypeProd {
+		return EnvironmentKindProd
+	}
+	return EnvironmentKindNonProd
+}
+
 // EnvironmentRepository is the read/write surface for the environments
 // table. Same testability split as ProjectRepository — handler tests
 // inject a fake.
+//
+// Update is intentionally narrow: only description + risk_level may
+// be mutated post-creation. Kind and Name are immutable so the
+// PolicyEngine (Slice L2) can cache resolution results keyed off the
+// environment without invalidation churn, and so an operator can't
+// silently flip a `prod` row to `non_prod` after grants exist.
 type EnvironmentRepository interface {
 	Create(ctx context.Context, e *Environment) error
 	Get(ctx context.Context, id uuid.UUID) (*Environment, error)
 	ListByProject(ctx context.Context, projectID uuid.UUID) ([]*Environment, error)
 	List(ctx context.Context) ([]*Environment, error)
+	Update(ctx context.Context, id uuid.UUID, description string, riskLevel int) error
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 
@@ -66,6 +111,14 @@ func NewEnvironments(pool *Pool) *Environments { return &Environments{pool: pool
 // Create inserts a new environment. ID is assigned by the database
 // when e.ID is uuid.Nil; otherwise the caller-supplied UUID is used.
 // Returns ErrDuplicateName when (ProjectID, Name) already exists.
+//
+// Kind defaults: an empty Kind is derived from Type via
+// DeriveKindFromType. Operators who want to override (e.g. mark a
+// `staging` lifecycle env as `kind=prod` because it carries customer
+// data) set Kind explicitly.
+//
+// RiskLevel defaults to 1 (lowest non-zero) when 0; the DB CHECK
+// rejects values outside 0-4.
 func (r *Environments) Create(ctx context.Context, e *Environment) error {
 	if e.ProjectID == uuid.Nil {
 		return errors.New("storage: environment ProjectID is required")
@@ -76,23 +129,34 @@ func (r *Environments) Create(ctx context.Context, e *Environment) error {
 	if e.Type == "" {
 		e.Type = EnvironmentTypeOther
 	}
+	if e.Kind == "" {
+		e.Kind = DeriveKindFromType(e.Type)
+	}
+	if e.RiskLevel == 0 {
+		// Mirror the schema DEFAULT so the test column matches what a
+		// raw INSERT would produce. Highest is reserved for explicit
+		// risk_level=4 set by the operator.
+		e.RiskLevel = 1
+	}
 
 	const insertGenerated = `
-		INSERT INTO environments (project_id, name, type)
-		VALUES ($1, $2, $3)
+		INSERT INTO environments (project_id, name, type, kind, risk_level, description)
+		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''))
 		RETURNING id, created_at, updated_at`
 	const insertWithID = `
-		INSERT INTO environments (id, project_id, name, type)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO environments (id, project_id, name, type, kind, risk_level, description)
+		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''))
 		RETURNING created_at, updated_at`
 
 	var err error
 	if e.ID == uuid.Nil {
-		err = r.pool.QueryRow(ctx, insertGenerated, e.ProjectID, e.Name, e.Type).
-			Scan(&e.ID, &e.CreatedAt, &e.UpdatedAt)
+		err = r.pool.QueryRow(ctx, insertGenerated,
+			e.ProjectID, e.Name, e.Type, e.Kind, e.RiskLevel, e.Description,
+		).Scan(&e.ID, &e.CreatedAt, &e.UpdatedAt)
 	} else {
-		err = r.pool.QueryRow(ctx, insertWithID, e.ID, e.ProjectID, e.Name, e.Type).
-			Scan(&e.CreatedAt, &e.UpdatedAt)
+		err = r.pool.QueryRow(ctx, insertWithID,
+			e.ID, e.ProjectID, e.Name, e.Type, e.Kind, e.RiskLevel, e.Description,
+		).Scan(&e.CreatedAt, &e.UpdatedAt)
 	}
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -104,11 +168,37 @@ func (r *Environments) Create(ctx context.Context, e *Environment) error {
 	return nil
 }
 
+// Update mutates the description + risk_level of an existing row.
+// Kind and Name are intentionally NOT mutable — see the
+// EnvironmentRepository doc for why.
+//
+// Returns ErrNotFound when no row matches. The schema's CHECK on
+// risk_level rejects out-of-range values with pgError code 23514;
+// callers can surface that as 400.
+func (r *Environments) Update(ctx context.Context, id uuid.UUID, description string, riskLevel int) error {
+	const q = `
+		UPDATE environments
+		SET description = NULLIF($1, ''),
+		    risk_level  = $2,
+		    updated_at  = now()
+		WHERE id = $3`
+	tag, err := r.pool.Exec(ctx, q, description, riskLevel, id)
+	if err != nil {
+		return fmt.Errorf("storage: update environment: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // Get fetches one environment by ID. Returns ErrNotFound when no row
 // matches.
 func (r *Environments) Get(ctx context.Context, id uuid.UUID) (*Environment, error) {
 	const q = `
-		SELECT id, project_id, name, type, created_at, updated_at
+		SELECT id, project_id, name, type, kind, risk_level,
+		       COALESCE(description, ''),
+		       created_at, updated_at
 		FROM environments
 		WHERE id = $1`
 	return scanEnvironment(r.pool.QueryRow(ctx, q, id))
@@ -119,7 +209,9 @@ func (r *Environments) Get(ctx context.Context, id uuid.UUID) (*Environment, err
 // environments yet.
 func (r *Environments) ListByProject(ctx context.Context, projectID uuid.UUID) ([]*Environment, error) {
 	const q = `
-		SELECT id, project_id, name, type, created_at, updated_at
+		SELECT id, project_id, name, type, kind, risk_level,
+		       COALESCE(description, ''),
+		       created_at, updated_at
 		FROM environments
 		WHERE project_id = $1
 		ORDER BY name ASC`
@@ -145,7 +237,9 @@ func (r *Environments) ListByProject(ctx context.Context, projectID uuid.UUID) (
 // wants a flat view.
 func (r *Environments) List(ctx context.Context) ([]*Environment, error) {
 	const q = `
-		SELECT id, project_id, name, type, created_at, updated_at
+		SELECT id, project_id, name, type, kind, risk_level,
+		       COALESCE(description, ''),
+		       created_at, updated_at
 		FROM environments
 		ORDER BY project_id ASC, name ASC`
 	rows, err := r.pool.Query(ctx, q)
@@ -186,7 +280,10 @@ func scanEnvironment(row interface {
 	Scan(dest ...any) error
 }) (*Environment, error) {
 	var e Environment
-	err := row.Scan(&e.ID, &e.ProjectID, &e.Name, &e.Type, &e.CreatedAt, &e.UpdatedAt)
+	err := row.Scan(
+		&e.ID, &e.ProjectID, &e.Name, &e.Type, &e.Kind, &e.RiskLevel, &e.Description,
+		&e.CreatedAt, &e.UpdatedAt,
+	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
