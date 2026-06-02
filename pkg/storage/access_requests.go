@@ -25,6 +25,11 @@ type AccessRequest struct {
 	Status               AccessRequestStatus
 	WorkflowID           *uuid.UUID
 	SecretMappingID      *uuid.UUID
+	// EnvironmentID is the authoritative binding to environments(id)
+	// added by Slice L3. Nullable while the codepath migrates off the
+	// free-string `TargetScope["environment"]` join; a later migration
+	// flips it NOT NULL once all callers populate it.
+	EnvironmentID        *uuid.UUID
 	TargetProviderType   string
 	TargetProviderConfig map[string]any
 	TargetSecretRef      string
@@ -122,13 +127,13 @@ func (r *AccessRequests) Create(ctx context.Context, req *AccessRequest) error {
 	const q = `
 		INSERT INTO access_requests (
 		    requester_id, type, justification, status, workflow_id,
-		    secret_mapping_id, target_provider_type, target_provider_config,
+		    secret_mapping_id, environment_id, target_provider_type, target_provider_config,
 		    target_secret_ref, target_keys, target_scope
-		) VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8, NULLIF($9, ''), $10, $11)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''), $9, NULLIF($10, ''), $11, $12)
 		RETURNING id, created_at, updated_at`
 	return r.pool.QueryRow(ctx, q,
 		req.RequesterID, req.Type, req.Justification, req.Status, req.WorkflowID,
-		req.SecretMappingID, req.TargetProviderType, providerCfg,
+		req.SecretMappingID, req.EnvironmentID, req.TargetProviderType, providerCfg,
 		req.TargetSecretRef, keys, scope,
 	).Scan(&req.ID, &req.CreatedAt, &req.UpdatedAt)
 }
@@ -220,7 +225,7 @@ func (r *AccessRequests) SetRejectReason(ctx context.Context, id uuid.UUID, reas
 
 const accessRequestSelect = `
 	SELECT id, requester_id, type, COALESCE(justification, ''), status,
-	       workflow_id, secret_mapping_id,
+	       workflow_id, secret_mapping_id, environment_id,
 	       COALESCE(target_provider_type, ''), target_provider_config,
 	       COALESCE(target_secret_ref, ''), target_keys, target_scope,
 	       job_id, COALESCE(reject_reason, ''), created_at, updated_at
@@ -233,6 +238,7 @@ func scanAccessRequest(row interface {
 		ar             AccessRequest
 		workflowID     *uuid.UUID
 		mappingID      *uuid.UUID
+		envID          *uuid.UUID
 		providerCfg    []byte
 		keys           []byte
 		scope          []byte
@@ -240,7 +246,7 @@ func scanAccessRequest(row interface {
 	)
 	err := row.Scan(
 		&ar.ID, &ar.RequesterID, &ar.Type, &ar.Justification, &ar.Status,
-		&workflowID, &mappingID,
+		&workflowID, &mappingID, &envID,
 		&ar.TargetProviderType, &providerCfg,
 		&ar.TargetSecretRef, &keys, &scope,
 		&jobID, &ar.RejectReason, &ar.CreatedAt, &ar.UpdatedAt,
@@ -253,6 +259,7 @@ func scanAccessRequest(row interface {
 	}
 	ar.WorkflowID = workflowID
 	ar.SecretMappingID = mappingID
+	ar.EnvironmentID = envID
 	ar.JobID = jobID
 	if len(providerCfg) > 0 {
 		_ = json.Unmarshal(providerCfg, &ar.TargetProviderConfig)

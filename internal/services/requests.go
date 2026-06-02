@@ -56,7 +56,13 @@ type RequestService struct {
 	audit     storage.AuditEventRepository
 	jobs      JobEnqueuer
 	gitops    GitOpsStarter
-	now       func() time.Time
+	// envs is optional. When non-nil, Submit / SubmitRead look up the
+	// environment row by (project_id, name) and populate both
+	// AccessRequest.EnvironmentID and Scope.EnvironmentKind. Slice L3
+	// wires this so the PolicyEngine's PROD invariant fires in
+	// production code paths; back-compat tests can leave it nil.
+	envs storage.EnvironmentRepository
+	now  func() time.Time
 
 	// Approver-side scope check. Both nil = legacy behaviour (no
 	// project-coverage check on approve/reject). Wire via
@@ -96,6 +102,38 @@ func NewRequestService(
 func (s *RequestService) WithGitOps(g GitOpsStarter) *RequestService {
 	s.gitops = g
 	return s
+}
+
+// WithEnvironments wires the EnvironmentRepository so Submit /
+// SubmitRead can resolve (project_id, environment name) → environment
+// row. When set, the resolved environment_id lands on the
+// AccessRequest and the environment.kind is passed to the
+// PolicyEngine — that's what makes the Slice L2 PROD invariant fire
+// in production. Pass nil to keep the back-compat path (legacy tests
+// that haven't seeded environment rows continue to pass through).
+func (s *RequestService) WithEnvironments(envs storage.EnvironmentRepository) *RequestService {
+	s.envs = envs
+	return s
+}
+
+// resolveEnvironment looks up the env by (project_id, name) when the
+// repo is wired AND both fields are present. Returns (envID,
+// envKind, true) on a hit. A miss (env not found, or repo nil, or
+// inputs unparseable) returns ok=false — callers fall back to the
+// back-compat path (no env binding, empty kind).
+func (s *RequestService) resolveEnvironment(ctx context.Context, projectID, envName string) (*uuid.UUID, storage.EnvironmentKind, bool) {
+	if s.envs == nil || projectID == "" || envName == "" {
+		return nil, "", false
+	}
+	pid, err := uuid.Parse(projectID)
+	if err != nil {
+		return nil, "", false
+	}
+	env, err := s.envs.GetByProjectAndName(ctx, pid, envName)
+	if err != nil {
+		return nil, "", false
+	}
+	return &env.ID, env.Kind, true
 }
 
 // WithApproverScope wires the auth-resolver pair that gates Approve +
@@ -180,9 +218,12 @@ func (s *RequestService) Submit(ctx context.Context, in PatchInput) (*storage.Ac
 		return nil, fmt.Errorf("%w: justification required", ErrInvalidInput)
 	}
 
+	envID, envKind, _ := s.resolveEnvironment(ctx, in.ProjectID, in.Environment)
+
 	dec, err := s.policy.Resolve(ctx, Scope{
 		ProjectID:       in.ProjectID,
 		Environment:     in.Environment,
+		EnvironmentKind: envKind,
 		ProviderType:    in.TargetProviderType,
 		SecretRefPrefix: in.TargetSecretRef,
 	})
@@ -202,6 +243,7 @@ func (s *RequestService) Submit(ctx context.Context, in PatchInput) (*storage.Ac
 		Type:                 storage.AccessRequestTypePatch,
 		Justification:        in.Justification,
 		WorkflowID:           &wfID,
+		EnvironmentID:        envID,
 		TargetProviderType:   in.TargetProviderType,
 		TargetProviderConfig: in.TargetProviderConfig,
 		TargetSecretRef:      in.TargetSecretRef,
@@ -268,9 +310,12 @@ func (s *RequestService) SubmitRead(ctx context.Context, in ReadInput) (*storage
 		return nil, fmt.Errorf("%w: justification required", ErrInvalidInput)
 	}
 
+	envID, envKind, _ := s.resolveEnvironment(ctx, in.ProjectID, in.Environment)
+
 	dec, err := s.policy.Resolve(ctx, Scope{
 		ProjectID:       in.ProjectID,
 		Environment:     in.Environment,
+		EnvironmentKind: envKind,
 		ProviderType:    in.TargetProviderType,
 		SecretRefPrefix: in.TargetSecretRef,
 	})
@@ -290,6 +335,7 @@ func (s *RequestService) SubmitRead(ctx context.Context, in ReadInput) (*storage
 		Type:                 storage.AccessRequestTypeRead,
 		Justification:        in.Justification,
 		WorkflowID:           &wfID,
+		EnvironmentID:        envID,
 		TargetProviderType:   in.TargetProviderType,
 		TargetProviderConfig: in.TargetProviderConfig,
 		TargetSecretRef:      in.TargetSecretRef,

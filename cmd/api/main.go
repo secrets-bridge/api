@@ -296,7 +296,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	jobSvc := services.NewJobService(jobRepo, auditRepo)
 	wrapSvc := services.NewWrapService(wrapRepo, auditRepo, km)
 	policyEng := services.NewPolicyEngine(policyRepo, workflowRepo, auditRepo)
-	requestSvc := services.NewRequestService(requestRepo, approvalRepo, wrapSvc, workflowRepo, policyEng, auditRepo, jobSvc)
+	requestSvc := services.NewRequestService(requestRepo, approvalRepo, wrapSvc, workflowRepo, policyEng, auditRepo, jobSvc).
+		WithEnvironments(environmentRepo)
 	secretsSvc := services.NewSecretsService(secretsRepo, auditRepo)
 
 	// GitOps observation integration (BRD §26) is OFF by default. The
