@@ -59,6 +59,7 @@ func freshDB(t *testing.T) *storage.Pool {
 	const truncate = `
 		TRUNCATE TABLE
 			audit_events,
+			reveal_sessions,
 			sync_runs,
 			sync_jobs,
 			approvals,
