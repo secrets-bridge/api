@@ -35,8 +35,11 @@ func bootstrapPolicy(t *testing.T) (*services.PolicyEngine, *storage.Pool, *stor
 	// and TRUNCATE audit_events (which has a no-DELETE trigger).
 	// Wipe in FK-dependency order so workflow_definitions/policy_rules
 	// can be deleted even after request-creating tests (L3/L4 wiring)
-	// have left access_requests rows around.
+	// have left access_requests rows around. reveal_sessions (Slice M1)
+	// goes first since it FK-cascades into environments + projects +
+	// access_requests.
 	const wipeWorkflow = `
+		DELETE FROM reveal_sessions;
 		DELETE FROM secret_wraps;
 		DELETE FROM approvals;
 		DELETE FROM sync_jobs;
