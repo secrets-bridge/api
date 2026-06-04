@@ -219,6 +219,14 @@ func (s *WrapService) Refresh(ctx context.Context, id uuid.UUID, newTTL time.Dur
 	return s.wraps.SetExpiry(ctx, id, s.now().Add(newTTL).UTC())
 }
 
+// Expire shoves the wrap's expires_at to "now" so any further retrieve
+// returns ErrExpired. Used by reveal-session expiry (Slice M2) to
+// close the window the moment the SPA stops needing the value — the
+// underlying wrap row stays for the audit trail and the M3 sweeper.
+func (s *WrapService) Expire(ctx context.Context, id uuid.UUID) error {
+	return s.wraps.SetExpiry(ctx, id, s.now().UTC())
+}
+
 // ListIDsForRequest exposes the storage-layer enumeration so the
 // RequestService can bulk-refresh TTLs without reaching past the
 // service-layer boundary.
