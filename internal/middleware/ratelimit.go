@@ -150,3 +150,4 @@ func ByQueryUserID() BucketFunc {
 		return "user:" + u, true
 	}
 }
+

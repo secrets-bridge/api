@@ -37,11 +37,23 @@ func bootstrapAdmin(t *testing.T) (*fiber.App, *storage.Pool, *handlers.Admin) {
 	}
 	t.Cleanup(pool.Close)
 
+	// FK-ordered wipe matching bootstrapPolicy in the services tests.
+	// Earlier-running tests in other packages may have left
+	// access_requests + reveal_sessions rows that reference
+	// workflow_definitions; delete them first so the workflow / policy
+	// wipe doesn't trip the FK.
 	const wipe = `
+		DELETE FROM reveal_sessions;
+		DELETE FROM secret_wraps;
+		DELETE FROM approvals;
+		DELETE FROM sync_jobs;
+		DELETE FROM access_requests;
 		DELETE FROM policy_rules WHERE is_system = false;
 		DELETE FROM workflow_definitions WHERE is_system = false;
 		DELETE FROM user_roles;
-		DELETE FROM roles WHERE is_system = false;`
+		DELETE FROM roles WHERE is_system = false;
+		DELETE FROM environments;
+		DELETE FROM projects;`
 	if _, err := pool.Exec(ctx, wipe); err != nil {
 		t.Fatalf("wipe: %v", err)
 	}

@@ -291,6 +291,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	secretsRepo := storage.NewSecrets(pool)
 	projectRepo := storage.NewProjects(pool)
 	environmentRepo := storage.NewEnvironments(pool)
+	revealSessionRepo := storage.NewRevealSessions(pool)
 
 	agentSvc := services.NewAgentService(agentRepo, auditRepo, rdb)
 	jobSvc := services.NewJobService(jobRepo, auditRepo)
@@ -330,6 +331,10 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	adminH := handlers.NewAdmin(roleRepo, userRoleRepo, workflowRepo, policyRepo)
 	requestsH := handlers.NewRequests(requestSvc)
 	wrapsH := handlers.NewWraps(requestSvc, wrapSvc, agentRepo, km)
+	revealSessionSvc := services.NewRevealSessionService(
+		revealSessionRepo, requestRepo, wrapSvc, policyEng, auditRepo,
+	).WithEnvironments(environmentRepo)
+	revealSessionsH := handlers.NewRevealSessions(revealSessionSvc)
 	secretsH := handlers.NewSecrets(secretsSvc)
 	permissionsH := handlers.NewPermissions()
 	tenancyH := handlers.NewTenancy(projectRepo, environmentRepo)
@@ -767,6 +772,33 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		requireMFA,
 		requestsH.RetrieveWrap,
 	)
+
+	// Slice M2 — bulk reveal sessions. Open + Expire require fresh MFA
+	// (same Tier-2 gate as the single-wrap reveal path); ListActive is
+	// session-auth only because it returns value-free summaries only.
+	// Open is rate-limited per user (same shape as RetrieveWrap) to
+	// blunt a stolen-cookie attacker from burning through every
+	// approved request the user has open.
+	revealOpenBucket := func(c fiber.Ctx) (string, bool) {
+		if u, ok := auth.IdentityFromContext(c.Context()); ok && u != "" {
+			return "user:" + u, true
+		}
+		ip := c.IP()
+		if ip == "" {
+			return "", false
+		}
+		return "anon:" + ip, true
+	}
+	v1.Post("/reveal-sessions",
+		middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
+			Name: "reveal-session:open", Bucket: revealOpenBucket,
+			Limit: 20, Window: 60 * time.Second,
+		}),
+		requireMFA,
+		revealSessionsH.Open,
+	)
+	v1.Get("/reveal-sessions/me/active", revealSessionsH.ListActive)
+	v1.Post("/reveal-sessions/:id/expire", revealSessionsH.Expire)
 
 	// GitOps observation panel + ArgoCD admin surface are mounted
 	// ONLY when SB_GITOPS_ENABLED=true. The flag is opt-in via Helm

@@ -40,12 +40,16 @@ func bootstrapMe(t *testing.T) (*fiber.App, *storage.Pool) {
 	t.Cleanup(pool.Close)
 
 	const wipe = `
+		DELETE FROM reveal_sessions;
+		DELETE FROM secret_wraps;
 		DELETE FROM approvals;
+		DELETE FROM sync_jobs;
 		DELETE FROM access_requests;
 		DELETE FROM team_members;
 		DELETE FROM teams;
 		DELETE FROM user_roles;
 		DELETE FROM roles WHERE is_system = false;
+		DELETE FROM environments;
 		DELETE FROM projects;
 		DELETE FROM local_users;`
 	if _, err := pool.Exec(ctx, wipe); err != nil {
