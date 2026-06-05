@@ -343,6 +343,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	teamRepo := storage.NewTeams(pool)
 	teamsH := handlers.NewTeams(teamRepo)
 	teamScopeResolver := auth.NewRepoTeamScopeResolver(teamRepo, projectRepo)
+	// Slice N3: wire the cross-team validators onto RequestService now
+	// that teams + projects + envs repos exist in scope. The
+	// repositories' Get / Exists methods already satisfy the narrow
+	// CrossTeam*Lookup interfaces defined in services.
+	provConnRepo := storage.NewProviderConnections(pool)
+	requestSvc.WithCrossTeamRepos(teamRepo, projectRepo, environmentRepo, provConnRepo)
 	// Reused by meH.WithIdentity to hydrate GET /users/me with the
 	// caller's local_users row (email, display_name).
 	localUsersRepoInApp := storage.NewLocalUsers(pool)
@@ -386,6 +392,10 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// RBAC resolver for the `auth.Require(perm)` middleware. Loads each
 	// caller's user_role assignments + the role catalog at request time.
 	rbacResolver := auth.NewRepoResolver(userRoleRepo, roleRepo)
+
+	// Slice N3: cross-team HTTP handler. Constructed here so it gets
+	// the resolver pair already in scope.
+	crossTeamH := handlers.NewCrossTeam(requestSvc, rbacResolver, teamScopeResolver)
 
 	// Slice 3 of the team-hierarchy work: the approve / reject paths
 	// now refuse with `out_of_scope_project` when the approver's
@@ -744,6 +754,27 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Post("/requests/:id/approve", requireMFA, requestsH.Approve)
 	v1.Post("/requests/:id/reject", requireMFA, requestsH.Reject)
 	v1.Post("/requests/:id/cancel", requestsH.Cancel)
+
+	// Slice N3 — cross-team flow. Inbox routes come BEFORE :id routes
+	// so Fiber's match order picks the literal path.
+	v1.Get("/requests/inbox", crossTeamH.Inbox)
+	v1.Get("/requests/inbox/count", crossTeamH.InboxCount)
+	v1.Post("/requests/cross-team",
+		auth.Require(auth.PermSecretRequest, rbacResolver),
+		crossTeamH.Submit,
+	)
+	v1.Post("/requests/:id/fill",
+		auth.Require(auth.PermSecretValueProvide, rbacResolver),
+		crossTeamH.Fill,
+	)
+	v1.Post("/requests/:id/refuse",
+		auth.Require(auth.PermSecretValueProvide, rbacResolver),
+		crossTeamH.Refuse,
+	)
+	v1.Post("/requests/:id/verify",
+		requireMFA,
+		crossTeamH.Verify,
+	)
 	// Value-free wrap summaries for the request detail page. Lets the
 	// UI render the Wraps card (one row per key with a ready/consumed
 	// pill) without ever fetching plaintext until the user clicks
