@@ -71,18 +71,26 @@ func TestIsKnown(t *testing.T) {
 // is small and the test fails loudly the moment they drift.
 func TestSeedMigrationStringsAreInCatalog(t *testing.T) {
 	seedPermissions := []string{
-		// admin (lines 135-138 of the migration)
+		// admin (0005_workflow_engine.up.sql lines 135-138)
 		"role.edit", "user_role.edit",
 		"workflow.edit", "policy.edit",
 		"agent.mint", "agent.revoke",
 		"secret.request", "secret.approve",
 		"audit.read",
 
-		// approver (line 140)
+		// approver (0005 line 140)
 		"secret.approve", "audit.read",
 
-		// developer (line 143)
+		// developer (0005 line 143) — and Slice L4 adds
+		// secret.reveal.direct via 0026_seed_secret_reveal_direct.up.sql.
 		"secret.request", "audit.read",
+		"secret.reveal.direct",
+
+		// value_provider (0029_cross_team_roles.up.sql) — Slice N2.
+		"secret.value.provide",
+
+		// security_approver (0029_cross_team_roles.up.sql) — Slice N2.
+		"secret.security.approve",
 	}
 	for _, p := range seedPermissions {
 		if !IsKnown(p) {
