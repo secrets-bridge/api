@@ -69,6 +69,14 @@ type RequestService struct {
 	// WithApproverScope from main.
 	approverResolver  auth.Resolver
 	approverTeamScope auth.TeamScopeResolver
+
+	// Cross-team validators (Slice N3). All nil = no target-chain /
+	// destination existence checks (legacy tests). Wire via
+	// WithCrossTeamRepos.
+	ctTeams     CrossTeamTeamLookup
+	ctProjects  CrossTeamProjectLookup
+	ctEnvs      CrossTeamEnvLookup
+	ctProvConns CrossTeamProviderConnectionLookup
 }
 
 // NewRequestService wires a RequestService to its dependencies. The
@@ -714,7 +722,15 @@ func (s *RequestService) Cancel(ctx context.Context, requestID uuid.UUID, actorI
 	if err != nil {
 		return nil, err
 	}
-	if req.Status != storage.AccessRequestStatusPending {
+	// Allowed states for cancel: legacy 'pending' for patch/read AND
+	// the new cross_team in-flight states (Slice N3). All other
+	// states are terminal or post-decision — no operator-side undo.
+	switch req.Status {
+	case storage.AccessRequestStatusPending,
+		storage.AccessRequestStatusPendingValues,
+		storage.AccessRequestStatusPendingVerification:
+		// proceed
+	default:
 		return nil, ErrRequestNotPending
 	}
 	if actorID != req.RequesterID {

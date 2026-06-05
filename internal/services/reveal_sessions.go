@@ -146,7 +146,10 @@ func (s *RevealSessionService) Open(ctx context.Context, in OpenInput) (*RevealS
 	if req.RequesterID != in.UserID {
 		return nil, ErrNotRequestOwner
 	}
-	if req.Type != storage.AccessRequestTypeRead {
+	// Slice N3 — Open accepts type=read AND type=cross_team. Patch
+	// requests are still refused (they're approver-side write flows;
+	// the bulk reveal page is for issuer-side retrieval).
+	if req.Type != storage.AccessRequestTypeRead && req.Type != storage.AccessRequestTypeCrossTeam {
 		return nil, ErrWrongRequest
 	}
 	switch req.Status {

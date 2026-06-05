@@ -28,8 +28,16 @@ type WorkflowDefinition struct {
 	IsDefault            bool
 	Enabled              bool
 	IsSystem             bool
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+
+	// Slice N1 knobs. fill_ttl_seconds bounds how long Team B has to
+	// fill a cross_team request before the sweeper expires it.
+	// requires_security_approval flips on the third-vote requirement
+	// for cross_team requests in PROD.
+	FillTTLSeconds           int
+	RequiresSecurityApproval bool
+
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // WorkflowRepository is the read/write surface for workflow_definitions.
@@ -63,17 +71,22 @@ func (r *Workflows) Create(ctx context.Context, w *WorkflowDefinition) error {
 		return fmt.Errorf("storage: marshal notification channels: %w", err)
 	}
 
+	if w.FillTTLSeconds == 0 {
+		w.FillTTLSeconds = 86400 // matches the DB DEFAULT for safety
+	}
 	const q = `
 		INSERT INTO workflow_definitions (
 		    name, description, min_approvers, approver_role_id,
 		    wrap_ttl_created, wrap_ttl_approved, wrap_ttl_claimed,
 		    request_ttl, require_justification, allow_self_approval,
-		    notification_channels, is_default, enabled, is_system
+		    notification_channels, is_default, enabled, is_system,
+		    fill_ttl_seconds, requires_security_approval
 		) VALUES (
 		    $1, $2, $3, $4,
 		    $5::interval, $6::interval, $7::interval,
 		    $8::interval, $9, $10,
-		    $11, $12, $13, $14
+		    $11, $12, $13, $14,
+		    $15, $16
 		)
 		RETURNING id, created_at, updated_at`
 	return r.pool.QueryRow(ctx, q,
@@ -82,6 +95,7 @@ func (r *Workflows) Create(ctx context.Context, w *WorkflowDefinition) error {
 		intervalString(w.WrapTTLClaimed),
 		intervalString(w.RequestTTL), w.RequireJustification, w.AllowSelfApproval,
 		channels, w.IsDefault, w.Enabled, w.IsSystem,
+		w.FillTTLSeconds, w.RequiresSecurityApproval,
 	).Scan(&w.ID, &w.CreatedAt, &w.UpdatedAt)
 }
 
@@ -123,6 +137,9 @@ func (r *Workflows) Update(ctx context.Context, w *WorkflowDefinition) error {
 	if err != nil {
 		return fmt.Errorf("storage: marshal notification channels: %w", err)
 	}
+	if w.FillTTLSeconds == 0 {
+		w.FillTTLSeconds = 86400
+	}
 	const q = `
 		UPDATE workflow_definitions SET
 		    description = $2,
@@ -135,7 +152,9 @@ func (r *Workflows) Update(ctx context.Context, w *WorkflowDefinition) error {
 		    require_justification = $9,
 		    allow_self_approval = $10,
 		    notification_channels = $11,
-		    enabled = $12
+		    enabled = $12,
+		    fill_ttl_seconds = $13,
+		    requires_security_approval = $14
 		WHERE id = $1`
 	tag, err := r.pool.Exec(ctx, q,
 		w.ID, w.Description, w.MinApprovers, w.ApproverRoleID,
@@ -143,6 +162,7 @@ func (r *Workflows) Update(ctx context.Context, w *WorkflowDefinition) error {
 		intervalString(w.WrapTTLClaimed),
 		intervalString(w.RequestTTL), w.RequireJustification, w.AllowSelfApproval,
 		channels, w.Enabled,
+		w.FillTTLSeconds, w.RequiresSecurityApproval,
 	)
 	if err != nil {
 		return fmt.Errorf("storage: update workflow: %w", err)
@@ -180,6 +200,7 @@ const workflowSelect = `
 	       EXTRACT(EPOCH FROM request_ttl)::bigint,
 	       require_justification, allow_self_approval,
 	       notification_channels, is_default, enabled, is_system,
+	       fill_ttl_seconds, requires_security_approval,
 	       created_at, updated_at
 	FROM workflow_definitions`
 
@@ -198,6 +219,7 @@ func scanWorkflow(row interface {
 		&wrapCreated, &wrapApproved, &wrapClaim, &requestTTL,
 		&w.RequireJustification, &w.AllowSelfApproval,
 		&channelsRaw, &w.IsDefault, &w.Enabled, &w.IsSystem,
+		&w.FillTTLSeconds, &w.RequiresSecurityApproval,
 		&w.CreatedAt, &w.UpdatedAt,
 	)
 	if err != nil {
