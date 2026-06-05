@@ -70,6 +70,29 @@ const (
 	// by construction.
 	PermSecretRevealDirect Permission = "secret.reveal.direct"
 
+	// PermSecretValueProvide (Slice N1) is the capability to fill or
+	// refuse a cross-team integration request scoped to a team's
+	// inbox. Scope-bearing: holders are typically granted with
+	// scope={"team_id": "<uuid>"} so the fill / refuse / inbox
+	// endpoints only allow access to that team's pending requests.
+	// Operators who want a platform-wide "value-provider" grant the
+	// role at global scope (scope IS NULL) — covers every team's
+	// inbox.
+	PermSecretValueProvide Permission = "secret.value.provide"
+
+	// PermSecretSecurityApprove (Slice N1) is the third-vote
+	// permission for cross_team requests in PROD environments. When
+	// the matched workflow has requires_security_approval=true,
+	// RequestService.Verify requires at least one approver holding
+	// this permission to transition the request to 'approved'.
+	// Strictly separate from secret.approve — operators must
+	// explicitly assign both for a user to act as both regular and
+	// security approver. Even when a user holds both, the same actor
+	// cannot satisfy BOTH the source approval AND the security
+	// approval on the same request (SoD enforced in Verify).
+	// NOT scope-bearing in v1: security votes apply globally.
+	PermSecretSecurityApprove Permission = "secret.security.approve"
+
 	// Read-only observability ------------------------------------------
 	PermSecretList Permission = "secret.list"
 	PermAuditRead  Permission = "audit.read"
@@ -112,6 +135,9 @@ var Catalog = []Descriptor{
 
 	{PermSecretRequest, "Secrets", "Submit a patch or read request against a provider secret."},
 	{PermSecretApprove, "Secrets", "Approve or reject pending secret requests."},
+	{PermSecretRevealDirect, "Secrets", "Skip the approval workflow on a Tier-2 reveal; gated by policy direct_reveal_allowed + env.kind != prod. PROD direct-reveal is impossible by construction."},
+	{PermSecretValueProvide, "Secrets", "Fill or refuse an open cross-team integration request scoped to a team's inbox. Typically granted with a team_id scope."},
+	{PermSecretSecurityApprove, "Secrets", "Cast the security-approval vote required for cross-team requests in PROD environments. Strict separation — does NOT include normal approve. Same actor cannot also cast the source vote on the same request."},
 
 	{PermSecretList, "Observability", "List discovered secrets (metadata only, never values)."},
 	{PermAuditRead, "Observability", "Read the immutable audit event log."},
