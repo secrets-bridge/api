@@ -314,6 +314,21 @@ func mapServiceErr(c fiber.Ctx, err error) error {
 		return stableErr(c, fiber.StatusBadRequest,
 			"environment_not_in_project",
 			"environment does not belong to project", nil)
+
+	// EPIC Q (api#101) — scoped bind / unbind sentinels.
+	case errors.Is(err, services.ErrOutOfScopeBinding):
+		return stableErr(c, fiber.StatusForbidden,
+			"out_of_scope_binding",
+			"you don't have integration.bind on this project/environment", nil)
+	case errors.Is(err, services.ErrProdBindingNotAllowedForScope):
+		return stableErr(c, fiber.StatusForbidden,
+			"prod_binding_not_allowed_for_scope",
+			"scoped users cannot bind provider connections to production environments",
+			map[string]any{"env_kind": "prod"})
+	case errors.Is(err, services.ErrConnectionNotSelfServiceBindable):
+		return stableErr(c, fiber.StatusForbidden,
+			"connection_not_self_service_bindable",
+			"this connection is not enabled for self-service binding", nil)
 	}
 
 	// Unknown — caller bubbles as a 500.
@@ -561,23 +576,34 @@ func (h *ProviderConnections) DeleteBinding(c fiber.Ctx) error {
 
 // ---- shared GET (admin list OR developer dropdown) ----------------
 
-// ListOrDropdown branches on `project_id` query string per §4.B:
+// ListOrDropdown is the 4-way branching shared GET. Branches by
+// (project_id, environment_id, for_binding) per the §4 matrix:
 //
-//   project_id absent + environment_id absent → admin list
-//   project_id absent + environment_id present → 400 project_id_required
-//   project_id present → dropdown projection (env-specific OR project-wide)
+//   no project_id, no environment_id, any for_binding   → admin list
+//                                                          (integration.edit)
+//   no project_id, environment_id present, *            → 400 project_id_required
+//   no project_id, *, for_binding=true                  → 400 project_id_required
+//   project_id, *, for_binding empty/false              → developer dropdown
+//                                                          (secret.request scoped)
+//   project_id, no environment_id, for_binding=true     → 400 environment_id_required
+//   project_id, environment_id, for_binding=true        → binder picker
+//                                                          (integration.bind scoped)
+//                                                          + 403 prod_binding_not_allowed_for_scope
+//                                                          when env.kind=prod
 //
-// Auth is checked inline because the same URL has two permission
-// paths.
+// Auth is inline because the same URL has three permission paths.
+// markResponded/responded prevents the load-bearing "fall-through past
+// auth into success body" bug caught during P3.
 func (h *ProviderConnections) ListOrDropdown(c fiber.Ctx) error {
 	projectIDStr := c.Query("project_id")
 	envIDStr := c.Query("environment_id")
+	forBinding := isTruthyQuery(c.Query("for_binding"))
 
 	if projectIDStr == "" {
-		if envIDStr != "" {
+		if envIDStr != "" || forBinding {
 			return stableErr(c, fiber.StatusBadRequest,
 				"project_id_required",
-				"environment_id requires project_id", nil)
+				"this list shape requires project_id", nil)
 		}
 		// Admin path. Require integration.edit at global scope.
 		if err := h.requirePermission(c, auth.PermIntegrationEdit); err != nil || responded(c) {
@@ -609,7 +635,54 @@ func (h *ProviderConnections) ListOrDropdown(c fiber.Ctx) error {
 		}
 	}
 
-	// Dropdown path. Require secret.request scoped to the
+	if forBinding {
+		// Binder picker. Requires integration.bind scoped to
+		// (project, environment). Environment is REQUIRED — scoped
+		// users only create env-specific bindings per §4.
+		if envID == uuid.Nil {
+			return stableErr(c, fiber.StatusBadRequest,
+				"environment_id_required",
+				"the binder picker requires environment_id", nil)
+		}
+		if h.envs == nil {
+			return stableErr(c, fiber.StatusInternalServerError,
+				"server_error", "environments not wired", nil)
+		}
+		env, err := h.envs.Get(c.Context(), envID)
+		if err != nil || env == nil || env.ProjectID != projectID {
+			return stableErr(c, fiber.StatusBadRequest,
+				"environment_not_in_project",
+				"environment does not belong to project", nil)
+		}
+		reqScope := map[string]string{
+			"project_id":  projectID.String(),
+			"environment": env.Name,
+		}
+		if err := h.requireScoped(c, auth.PermIntegrationBind, reqScope); err != nil || responded(c) {
+			return err
+		}
+		// Scoped users cannot bind to prod envs — refuse here before
+		// even returning the picker list. Matches the §4 rule and
+		// gives the SPA a stable 403 to render the "managed by
+		// platform" copy verbatim.
+		if env.Kind == storage.EnvironmentKindProd {
+			return stableErr(c, fiber.StatusForbidden,
+				"prod_binding_not_allowed_for_scope",
+				"scoped users cannot bind provider connections to production environments",
+				map[string]any{"env_kind": "prod"})
+		}
+		rows, err := h.svc.ListBindableForProjectEnv(c.Context(), projectID, envID)
+		if err != nil {
+			return mapServiceErr(c, err)
+		}
+		out := make([]dropdownProjection, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, dropdownProjection{ID: r.ID, Name: r.Name, Type: string(r.Type)})
+		}
+		return c.JSON(out)
+	}
+
+	// Developer dropdown. Require secret.request scoped to the
 	// (project, environment) chain. Resolve env name when present.
 	envName := ""
 	if envID != uuid.Nil && h.envs != nil {
@@ -637,6 +710,17 @@ func (h *ProviderConnections) ListOrDropdown(c fiber.Ctx) error {
 		out = append(out, dropdownProjection{ID: r.ID, Name: r.Name, Type: string(r.Type)})
 	}
 	return c.JSON(out)
+}
+
+// isTruthyQuery returns true for values the api accepts as opt-in
+// boolean query string flags. Conservative — only "true" / "1" /
+// "yes" hit. Empty + "false" + anything else is false.
+func isTruthyQuery(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1", "yes":
+		return true
+	}
+	return false
 }
 
 // requirePermission runs the global-scope check inline. Mirrors

@@ -59,6 +59,24 @@ type ProviderConnectionSummary struct {
 	Type ProviderConnectionType
 }
 
+// ProjectBindingDetail is the joined row the EPIC Q (api#99) project-
+// anchored list endpoint returns. Joins to environments + provider
+// connections so the SPA's per-project Provider Connections card
+// renders in one round trip. NO scope, NO auth_method, NO discovery
+// fields — same sanitized posture as ProviderConnectionSummary.
+type ProjectBindingDetail struct {
+	ID                   uuid.UUID
+	ProviderConnectionID uuid.UUID
+	ProjectID            uuid.UUID
+	EnvironmentID        *uuid.UUID
+	EnvironmentName      string
+	EnvironmentKind      EnvironmentKind
+	ConnectionName       string
+	ConnectionType       ProviderConnectionType
+	Purpose              ProjectProviderConnectionPurpose
+	CreatedAt            time.Time
+}
+
 // ProviderConnectionBindingRepository is the read/write surface for
 // the project_provider_connections join table.
 type ProviderConnectionBindingRepository interface {
@@ -73,6 +91,23 @@ type ProviderConnectionBindingRepository interface {
 	// uuid.Nil to filter to project-wide only. Used by the developer
 	// dropdown — strictly sanitized projection.
 	ListForProjectEnv(ctx context.Context, projectID uuid.UUID, envID uuid.UUID) ([]ProviderConnectionSummary, error)
+
+	// ListForProject is the EPIC Q (api#99) project-anchored list.
+	// Returns every binding row that belongs to the project (env-
+	// specific AND project-wide) joined with environment + connection
+	// metadata for the SPA's per-project card. envID filter narrows
+	// to env-specific + project-wide for ONE env when non-nil; nil
+	// envID returns every binding for the project.
+	ListForProject(ctx context.Context, projectID uuid.UUID, envID *uuid.UUID) ([]ProjectBindingDetail, error)
+
+	// ListBindableForProjectEnv powers the binder picker
+	// (GET /provider-connections?for_binding=true). Returns
+	// {id, name, type} of connections that are active AND
+	// self_service_bindable=true AND NOT already bound to the (project,
+	// env) pair — env-specific binding OR project-wide binding both
+	// disqualify the row, per §5 Q13 "exclude project-wide already-
+	// effective connections" correction.
+	ListBindableForProjectEnv(ctx context.Context, projectID uuid.UUID, envID uuid.UUID) ([]ProviderConnectionSummary, error)
 }
 
 // ProjectProviderConnections is the Postgres implementation.
@@ -236,6 +271,113 @@ ORDER BY pc.name
 		var s ProviderConnectionSummary
 		if err := rows.Scan(&s.ID, &s.Name, &s.Type); err != nil {
 			return nil, fmt.Errorf("storage: scan summary: %w", err)
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// ListForProject is the EPIC Q project-anchored list endpoint's
+// storage call. Joins to environments + provider_connections so the
+// SPA's per-project card renders in one round trip.
+//
+// envID filter (when non-nil) narrows to env-specific bindings on
+// that env + project-wide bindings for the project. nil envID
+// returns every binding for the project.
+func (r *ProjectProviderConnections) ListForProject(ctx context.Context, projectID uuid.UUID, envID *uuid.UUID) ([]ProjectBindingDetail, error) {
+	var q string
+	var args []any
+	if envID == nil {
+		q = `
+SELECT b.id, b.provider_connection_id, b.project_id, b.environment_id,
+	COALESCE(e.name, ''),
+	COALESCE(e.kind::text, ''),
+	pc.name, pc.type,
+	b.purpose, b.created_at
+FROM project_provider_connections b
+JOIN provider_connections pc ON pc.id = b.provider_connection_id
+LEFT JOIN environments e ON e.id = b.environment_id
+WHERE b.project_id = $1
+ORDER BY pc.name, b.environment_id NULLS LAST, b.created_at
+`
+		args = []any{projectID}
+	} else {
+		q = `
+SELECT b.id, b.provider_connection_id, b.project_id, b.environment_id,
+	COALESCE(e.name, ''),
+	COALESCE(e.kind::text, ''),
+	pc.name, pc.type,
+	b.purpose, b.created_at
+FROM project_provider_connections b
+JOIN provider_connections pc ON pc.id = b.provider_connection_id
+LEFT JOIN environments e ON e.id = b.environment_id
+WHERE b.project_id = $1
+  AND (b.environment_id = $2 OR b.environment_id IS NULL)
+ORDER BY pc.name, b.environment_id NULLS LAST, b.created_at
+`
+		args = []any{projectID, *envID}
+	}
+	rows, err := r.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list bindings for project: %w", err)
+	}
+	defer rows.Close()
+	out := []ProjectBindingDetail{}
+	for rows.Next() {
+		var d ProjectBindingDetail
+		var envIDOpt *uuid.UUID
+		var envName, envKind string
+		if err := rows.Scan(
+			&d.ID, &d.ProviderConnectionID, &d.ProjectID, &envIDOpt,
+			&envName, &envKind, &d.ConnectionName, &d.ConnectionType,
+			&d.Purpose, &d.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("storage: scan project binding: %w", err)
+		}
+		d.EnvironmentID = envIDOpt
+		d.EnvironmentName = envName
+		d.EnvironmentKind = EnvironmentKind(envKind)
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// ListBindableForProjectEnv returns sanitized summaries for the EPIC Q
+// binder picker (GET /provider-connections?for_binding=true). A
+// connection appears iff:
+//
+//   - status = 'active'
+//   - self_service_bindable = true
+//   - no existing binding for this (project, envID) — env-specific
+//   - no existing project-wide binding for this project
+//
+// The §5 Q13 correction: both kinds of existing binding disqualify
+// the row, so the picker never offers a connection that's already
+// effective for the env.
+func (r *ProjectProviderConnections) ListBindableForProjectEnv(ctx context.Context, projectID uuid.UUID, envID uuid.UUID) ([]ProviderConnectionSummary, error) {
+	const q = `
+SELECT pc.id, pc.name, pc.type
+FROM provider_connections pc
+WHERE pc.status = 'active'
+  AND pc.self_service_bindable = true
+  AND NOT EXISTS (
+    SELECT 1 FROM project_provider_connections b
+    WHERE b.provider_connection_id = pc.id
+      AND b.project_id = $1
+      AND (b.environment_id = $2 OR b.environment_id IS NULL)
+  )
+ORDER BY pc.name
+`
+	rows, err := r.pool.Query(ctx, q, projectID, envID)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list bindable for project/env: %w", err)
+	}
+	defer rows.Close()
+	out := []ProviderConnectionSummary{}
+	for rows.Next() {
+		var s ProviderConnectionSummary
+		if err := rows.Scan(&s.ID, &s.Name, &s.Type); err != nil {
+			return nil, fmt.Errorf("storage: scan bindable summary: %w", err)
 		}
 		out = append(out, s)
 	}
