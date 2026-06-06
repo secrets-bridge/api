@@ -38,8 +38,16 @@ type PolicyRule struct {
 	DirectRevealAllowed bool
 	RequiresMFA         bool
 	RevealTTLSeconds    int
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+
+	// EPIC R (api#108) — NULL means platform-owned (admin only via
+	// policy.edit). Non-nil means scoped to a specific project; the
+	// scoped service path (policy.author) gates writes; the resolver
+	// gates matching so a project-A rule never resolves for a request
+	// against project B.
+	ProjectID *uuid.UUID
+
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // PolicyRepository is the read/write surface for policy_rules.
@@ -50,9 +58,21 @@ type PolicyRepository interface {
 	// ListEnabledOrderedByPriority returns enabled rules ordered for
 	// resolution: highest priority first, then oldest first as
 	// tiebreaker. PolicyEngine.Resolve iterates this list.
-	ListEnabledOrderedByPriority(ctx context.Context) ([]*PolicyRule, error)
+	//
+	// EPIC R (api#108) — applicability filter: when projectID is the
+	// zero uuid, return platform-owned rules only (project_id IS NULL).
+	// When projectID is set, return both platform-owned AND that
+	// project's scoped rules. Per §2 correction 1: this is the
+	// rule-matching boundary, not just an authorization boundary.
+	ListEnabledOrderedByPriority(ctx context.Context, projectID uuid.UUID) ([]*PolicyRule, error)
 	Update(ctx context.Context, p *PolicyRule) error
 	Delete(ctx context.Context, id uuid.UUID) error
+
+	// ListForProject returns platform-owned + project-scoped rules for
+	// the given project, ordered by priority DESC. Used by the EPIC R
+	// project-anchored list endpoint (R2). Includes disabled rules so
+	// the SPA can render their state.
+	ListForProject(ctx context.Context, projectID uuid.UUID) ([]*PolicyRule, error)
 }
 
 // Policies is the Postgres implementation.
@@ -77,23 +97,21 @@ func (r *Policies) Create(ctx context.Context, p *PolicyRule) error {
 	if err != nil {
 		return fmt.Errorf("storage: marshal policy selector: %w", err)
 	}
-	// Defaults that mirror the schema so a Create with zero values
-	// for the L2 columns still lands a usable row. RevealTTLSeconds=0
-	// would be rejected by the CHECK; default to 60 (the schema default
-	// too) so the test column matches what a bare INSERT would produce.
 	if p.RevealTTLSeconds == 0 {
 		p.RevealTTLSeconds = 60
 	}
 	const q = `
 		INSERT INTO policy_rules (
 			name, selector, workflow_id, priority, enabled, is_system,
-			direct_reveal_allowed, requires_mfa, reveal_ttl_seconds
+			direct_reveal_allowed, requires_mfa, reveal_ttl_seconds,
+			project_id
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		RETURNING id, created_at, updated_at`
 	return r.pool.QueryRow(ctx, q,
 		p.Name, selector, p.WorkflowID, p.Priority, p.Enabled, p.IsSystem,
 		p.DirectRevealAllowed, p.RequiresMFA, p.RevealTTLSeconds,
+		p.ProjectID,
 	).Scan(&p.ID, &p.CreatedAt, &p.UpdatedAt)
 }
 
@@ -119,12 +137,54 @@ func (r *Policies) List(ctx context.Context) ([]*PolicyRule, error) {
 	return out, rows.Err()
 }
 
-func (r *Policies) ListEnabledOrderedByPriority(ctx context.Context) ([]*PolicyRule, error) {
-	rows, err := r.pool.Query(ctx, policySelect+`
-		WHERE enabled = true
-		ORDER BY priority DESC, created_at ASC`)
+func (r *Policies) ListEnabledOrderedByPriority(ctx context.Context, projectID uuid.UUID) ([]*PolicyRule, error) {
+	// EPIC R applicability filter:
+	//   projectID == uuid.Nil → platform-owned only (project_id IS NULL)
+	//   projectID != uuid.Nil → platform-owned OR project's scoped rules
+	//
+	// The §2 correction made this a rule-matching boundary: a request
+	// with no project_id in scope must never see scoped rules from any
+	// project; otherwise a scoped policy could resolve for the wrong
+	// request shape.
+	var q string
+	var args []any
+	if projectID == uuid.Nil {
+		q = policySelect + `
+			WHERE enabled = true AND project_id IS NULL
+			ORDER BY priority DESC, created_at ASC`
+	} else {
+		q = policySelect + `
+			WHERE enabled = true
+			  AND (project_id IS NULL OR project_id = $1)
+			ORDER BY priority DESC, created_at ASC`
+		args = []any{projectID}
+	}
+	rows, err := r.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("storage: list enabled policies: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*PolicyRule
+	for rows.Next() {
+		p, err := scanPolicy(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ListForProject returns platform-owned rules + the project's scoped
+// rules (both enabled and disabled), ordered by priority DESC. Used by
+// R2's project-anchored list handler.
+func (r *Policies) ListForProject(ctx context.Context, projectID uuid.UUID) ([]*PolicyRule, error) {
+	rows, err := r.pool.Query(ctx, policySelect+`
+		WHERE project_id IS NULL OR project_id = $1
+		ORDER BY priority DESC, created_at ASC`, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list policies for project: %w", err)
 	}
 	defer rows.Close()
 
@@ -190,6 +250,7 @@ func (r *Policies) Delete(ctx context.Context, id uuid.UUID) error {
 const policySelect = `
 	SELECT id, name, selector, workflow_id, priority, enabled, is_system,
 	       direct_reveal_allowed, requires_mfa, reveal_ttl_seconds,
+	       project_id,
 	       created_at, updated_at
 	FROM policy_rules`
 
@@ -203,6 +264,7 @@ func scanPolicy(row interface {
 	err := row.Scan(
 		&p.ID, &p.Name, &selectorRaw, &p.WorkflowID, &p.Priority, &p.Enabled, &p.IsSystem,
 		&p.DirectRevealAllowed, &p.RequiresMFA, &p.RevealTTLSeconds,
+		&p.ProjectID,
 		&p.CreatedAt, &p.UpdatedAt,
 	)
 	if err != nil {

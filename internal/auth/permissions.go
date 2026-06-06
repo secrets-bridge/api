@@ -52,6 +52,13 @@ const (
 	PermWorkflowEdit Permission = "workflow.edit"
 	PermPolicyEdit   Permission = "policy.edit"
 
+	// EPIC R (api#108) — scoped project-level policy authoring. Granted
+	// via the policy_author seed role (or any custom role carrying it).
+	// Strictly NOT auto-covered by policy.edit server-side — the SPA's
+	// capability helper unifies them in the UI but the api treats each
+	// permission as distinct.
+	PermPolicyAuthor Permission = "policy.author"
+
 	// Agent admin -------------------------------------------------------
 	PermAgentMint   Permission = "agent.mint"
 	PermAgentRevoke Permission = "agent.revoke"
@@ -134,7 +141,8 @@ var Catalog = []Descriptor{
 	{PermTeamEdit, "Tenancy", "Create, update, archive teams and manage team memberships. Role grants scoped to a team_id implicitly cover that team's entire subtree."},
 
 	{PermWorkflowEdit, "Workflows", "Create, update, delete approval workflow definitions."},
-	{PermPolicyEdit, "Workflows", "Create, update, delete policy rules that map request scope to a workflow."},
+	{PermPolicyEdit, "Workflows", "Create, update, delete policy rules that map request scope to a workflow. Global scope — affects every project's rules. Does NOT auto-cover policy.author server-side (EPIC R, api#108)."},
+	{PermPolicyAuthor, "Workflows", "Author project-scoped policy rules for non-prod environments (EPIC R, api#108). Scoped via the existing team-aware resolver. Refuses prod env selectors, priority >= 9000, and edits to platform global rules. Granted via the policy_author system seed role."},
 
 	{PermAgentMint, "Agents", "Mint a new agent identity and return its credentials."},
 	{PermAgentRevoke, "Agents", "Revoke an agent — heartbeats stop being accepted."},

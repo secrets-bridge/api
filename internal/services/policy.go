@@ -29,6 +29,9 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/google/uuid"
+
+	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
@@ -84,7 +87,8 @@ type PolicyDecision struct {
 // surface should return a loud 500 so the misconfig gets noticed.
 var ErrNoDefaultWorkflow = errors.New("services: no policy matched and no default workflow exists")
 
-// PolicyEngine resolves Scope → PolicyDecision.
+// PolicyEngine resolves Scope → PolicyDecision and (EPIC R) hosts the
+// scoped policy authoring service.
 type PolicyEngine struct {
 	policies  storage.PolicyRepository
 	workflows storage.WorkflowRepository
@@ -92,6 +96,14 @@ type PolicyEngine struct {
 	// invariant but skips the audit emit. Production wiring always
 	// supplies audit; tests that don't care can pass nil.
 	audit storage.AuditEventRepository
+
+	// EPIC R (api#108) — populated by WithAuthorScope + WithEnvironments
+	// so CreateForScopedAuthor / UpdateForScopedAuthor /
+	// DeleteForScopedAuthor can compute project coverage + validate
+	// selector.environment_id against the project + non-prod constraint.
+	authorResolver  auth.Resolver
+	authorTeamScope auth.TeamScopeResolver
+	environments    storage.EnvironmentRepository
 }
 
 // NewPolicyEngine binds an engine to its repositories. audit may be
@@ -113,7 +125,18 @@ func NewPolicyEngine(p storage.PolicyRepository, w storage.WorkflowRepository, a
 // is unchanged on disk; the violation surfaces as the discrepancy
 // between rule.DirectRevealAllowed and decision.DirectRevealAllowed.
 func (e *PolicyEngine) Resolve(ctx context.Context, scope Scope) (*PolicyDecision, error) {
-	rules, err := e.policies.ListEnabledOrderedByPriority(ctx)
+	// EPIC R applicability filter — pass scope.ProjectID through to the
+	// repository so scoped rules from project A NEVER reach a request
+	// against project B. When scope.ProjectID is empty / unparseable,
+	// projectUUID stays uuid.Nil and the repo returns platform-owned
+	// rules only (per §2 correction 1).
+	var projectUUID uuid.UUID
+	if scope.ProjectID != "" {
+		if parsed, err := uuid.Parse(scope.ProjectID); err == nil {
+			projectUUID = parsed
+		}
+	}
+	rules, err := e.policies.ListEnabledOrderedByPriority(ctx, projectUUID)
 	if err != nil {
 		return nil, fmt.Errorf("services: load policies: %w", err)
 	}
