@@ -56,6 +56,25 @@ func bootstrapPolicy(t *testing.T) (*services.PolicyEngine, *storage.Pool, *stor
 	if _, err := pool.Exec(ctx, "TRUNCATE audit_events"); err != nil {
 		t.Fatalf("truncate audit_events: %v", err)
 	}
+	// EPIC R (api#108) — migration 0033 added a FK from policy_rules
+	// to projects with ON DELETE CASCADE. That means TRUNCATE projects
+	// CASCADE (used by other tests in this package) silently wipes the
+	// seed match-all rule from migration 0005. Re-seed it here so
+	// resolver tests always see the platform default fallback.
+	const reseedSystemPolicy = `
+		INSERT INTO policy_rules
+			(name, selector, workflow_id, priority, is_system)
+		SELECT
+			'match-all (system default)',
+			'{}'::jsonb,
+			(SELECT id FROM workflow_definitions WHERE name = 'standard'),
+			0,
+			true
+		WHERE NOT EXISTS (SELECT 1 FROM policy_rules WHERE name = 'match-all (system default)');
+	`
+	if _, err := pool.Exec(ctx, reseedSystemPolicy); err != nil {
+		t.Fatalf("reseed match-all: %v", err)
+	}
 
 	policies := storage.NewPolicies(pool)
 	workflows := storage.NewWorkflows(pool)

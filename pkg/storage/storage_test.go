@@ -76,6 +76,25 @@ func freshDB(t *testing.T) *storage.Pool {
 	if _, err := pool.Exec(ctx, truncate); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
+	// EPIC R (api#108) — migration 0033 added a FK from policy_rules to
+	// projects with ON DELETE CASCADE. TRUNCATE projects CASCADE walks
+	// that FK and wipes the seed match-all rule from migration 0005.
+	// Re-seed it so storage tests that depend on the platform default
+	// (e.g. cross_team_test's snap_policy_rule_id) always see it.
+	const reseedSystemPolicy = `
+		INSERT INTO policy_rules
+			(name, selector, workflow_id, priority, is_system)
+		SELECT
+			'match-all (system default)',
+			'{}'::jsonb,
+			(SELECT id FROM workflow_definitions WHERE name = 'standard'),
+			0,
+			true
+		WHERE NOT EXISTS (SELECT 1 FROM policy_rules WHERE name = 'match-all (system default)');
+	`
+	if _, err := pool.Exec(ctx, reseedSystemPolicy); err != nil {
+		t.Fatalf("reseed match-all: %v", err)
+	}
 	return pool
 }
 

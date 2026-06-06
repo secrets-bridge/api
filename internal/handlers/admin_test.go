@@ -60,6 +60,24 @@ func bootstrapAdmin(t *testing.T) (*fiber.App, *storage.Pool, *handlers.Admin) {
 	if _, err := pool.Exec(ctx, "TRUNCATE audit_events"); err != nil {
 		t.Fatalf("truncate audit_events: %v", err)
 	}
+	// EPIC R (api#108) — migration 0033 added a FK from policy_rules
+	// to projects with ON DELETE CASCADE. Sibling tests that TRUNCATE
+	// projects CASCADE silently wipe the seed match-all rule from
+	// migration 0005. Re-seed it here so admin tests always see it.
+	const reseedSystemPolicy = `
+		INSERT INTO policy_rules
+			(name, selector, workflow_id, priority, is_system)
+		SELECT
+			'match-all (system default)',
+			'{}'::jsonb,
+			(SELECT id FROM workflow_definitions WHERE name = 'standard'),
+			0,
+			true
+		WHERE NOT EXISTS (SELECT 1 FROM policy_rules WHERE name = 'match-all (system default)');
+	`
+	if _, err := pool.Exec(ctx, reseedSystemPolicy); err != nil {
+		t.Fatalf("reseed match-all: %v", err)
+	}
 
 	h := handlers.NewAdmin(
 		storage.NewRoles(pool),
