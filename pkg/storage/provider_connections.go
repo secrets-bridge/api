@@ -38,6 +38,11 @@ type ProviderConnection struct {
 	LastDiscoverStartedAt   *time.Time
 	LastDiscoverFinishedAt  *time.Time
 
+	// EPIC Q (api#99) — platform admins opt-in per connection so
+	// integration.bind callers can self-serve binds. Default-deny:
+	// existing rows stay at false until platform flips.
+	SelfServiceBindable bool
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -83,6 +88,10 @@ type ProviderConnectionInput struct {
 	Description             string
 	DiscoverEnabled         bool
 	DiscoverIntervalSeconds int
+	// SelfServiceBindable is `nil` on Update to mean "don't touch" so
+	// callers that don't know about EPIC Q can't accidentally flip it.
+	// Create reads the dereferenced value (nil → false).
+	SelfServiceBindable *bool
 }
 
 // ProviderConnectionListFilter narrows List results. Empty values
@@ -125,6 +134,13 @@ type ProviderConnectionRepository interface {
 
 	CountBindings(ctx context.Context, id uuid.UUID) (int, error)
 	CountOpenRequests(ctx context.Context, id uuid.UUID) (int, error)
+
+	// Bindable is the narrow read the EPIC Q scoped bind gate uses to
+	// decide between connection_disabled and
+	// connection_not_self_service_bindable without paying for the full
+	// row scan + scope JSON unmarshal. Returns ErrConnectionNotFound
+	// when the id doesn't exist.
+	Bindable(ctx context.Context, id uuid.UUID) (active bool, selfServiceBindable bool, err error)
 }
 
 // ProviderConnections is the Postgres implementation.
@@ -159,21 +175,29 @@ func (r *ProviderConnections) Create(ctx context.Context, in ProviderConnectionI
 	if status == "" {
 		status = ProviderConnectionStatusActive
 	}
+	selfServiceBindable := false
+	if in.SelfServiceBindable != nil {
+		selfServiceBindable = *in.SelfServiceBindable
+	}
 	const q = `
 INSERT INTO provider_connections
 	(name, type, auth_method, scope, status,
-	 cluster_name, description, discover_enabled, discover_interval_seconds)
+	 cluster_name, description, discover_enabled, discover_interval_seconds,
+	 self_service_bindable)
 VALUES ($1, $2, $3, $4, $5,
-	NULLIF($6, ''), NULLIF($7, ''), $8, $9)
+	NULLIF($6, ''), NULLIF($7, ''), $8, $9,
+	$10)
 RETURNING id, name, type, auth_method, scope, status,
 	cluster_name, description, discover_enabled, discover_interval_seconds,
 	last_discover_at, last_discover_status, last_discover_error,
 	last_discover_started_at, last_discover_finished_at,
+	self_service_bindable,
 	created_at, updated_at
 `
 	row := r.pool.QueryRow(ctx, q,
 		in.Name, in.Type, in.AuthMethod, scopeJSON, status,
 		in.ClusterName, in.Description, in.DiscoverEnabled, in.DiscoverIntervalSeconds,
+		selfServiceBindable,
 	)
 	pc, err := scanProviderConnection(row)
 	if err != nil {
@@ -267,6 +291,9 @@ func (r *ProviderConnections) Update(ctx context.Context, id uuid.UUID, in Provi
 	if err != nil {
 		return nil, fmt.Errorf("storage: marshal scope: %w", err)
 	}
+	// EPIC Q: nil means "don't touch" — Update keeps the existing
+	// value via COALESCE. This lets P3 handler bodies omit the flag
+	// without flipping it back to false.
 	const q = `
 UPDATE provider_connections
 SET name = $2,
@@ -276,17 +303,20 @@ SET name = $2,
 	cluster_name = NULLIF($6, ''),
 	description = NULLIF($7, ''),
 	discover_enabled = $8,
-	discover_interval_seconds = $9
+	discover_interval_seconds = $9,
+	self_service_bindable = COALESCE($10, self_service_bindable)
 WHERE id = $1
 RETURNING id, name, type, auth_method, scope, status,
 	cluster_name, description, discover_enabled, discover_interval_seconds,
 	last_discover_at, last_discover_status, last_discover_error,
 	last_discover_started_at, last_discover_finished_at,
+	self_service_bindable,
 	created_at, updated_at
 `
 	row := r.pool.QueryRow(ctx, q, id,
 		in.Name, in.AuthMethod, scopeJSON, in.Status,
 		in.ClusterName, in.Description, in.DiscoverEnabled, in.DiscoverIntervalSeconds,
+		in.SelfServiceBindable,
 	)
 	pc, err := scanProviderConnection(row)
 	if err != nil {
@@ -336,6 +366,24 @@ func (r *ProviderConnections) Exists(ctx context.Context, id uuid.UUID) (bool, e
 		return false, nil
 	}
 	return false, fmt.Errorf("storage: provider_connection exists: %w", err)
+}
+
+// Bindable returns the narrow (status='active', self_service_bindable)
+// tuple the EPIC Q scoped bind gate needs at step 5 + step 6. Avoids
+// the full row scan + scope JSON unmarshal at the cost of one round
+// trip. Caller uses ErrConnectionNotFound to distinguish a missing
+// row from a row that's just disabled.
+func (r *ProviderConnections) Bindable(ctx context.Context, id uuid.UUID) (bool, bool, error) {
+	const q = `SELECT status, self_service_bindable FROM provider_connections WHERE id = $1`
+	var status string
+	var selfServiceBindable bool
+	if err := r.pool.QueryRow(ctx, q, id).Scan(&status, &selfServiceBindable); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, false, ErrConnectionNotFound
+		}
+		return false, false, fmt.Errorf("storage: provider_connection bindable: %w", err)
+	}
+	return status == string(ProviderConnectionStatusActive), selfServiceBindable, nil
 }
 
 // ListDueForDiscovery returns up to 100 connections that are
@@ -472,6 +520,7 @@ SELECT id, name, type, auth_method, scope, status,
 	cluster_name, description, discover_enabled, discover_interval_seconds,
 	last_discover_at, last_discover_status, last_discover_error,
 	last_discover_started_at, last_discover_finished_at,
+	self_service_bindable,
 	created_at, updated_at
 FROM provider_connections
 `
@@ -490,6 +539,7 @@ func scanProviderConnection(row interface {
 		&clusterName, &description, &pc.DiscoverEnabled, &pc.DiscoverIntervalSeconds,
 		&pc.LastDiscoverAt, &lastDiscoverStatus, &lastDiscoverError,
 		&pc.LastDiscoverStartedAt, &pc.LastDiscoverFinishedAt,
+		&pc.SelfServiceBindable,
 		&pc.CreatedAt, &pc.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -519,6 +569,15 @@ var (
 	ErrConnectionNotFound  = errors.New("storage: provider_connection not found")
 	ErrConnectionNameTaken = errors.New("storage: provider_connection name already taken")
 	ErrConnectionInUse     = errors.New("storage: provider_connection is in use")
+
+	// EPIC Q (api#99). Reserved here so any caller (service, worker)
+	// can route via errors.Is without depending on the service layer.
+	// ErrConnectionDisabled mirrors the cross-team flow's sentinel
+	// from N3 — see services.ErrConnectionDisabled. Kept duplicated
+	// at the storage layer for symmetry with the others.
+	ErrConnectionNotSelfServiceBindable = errors.New("storage: provider_connection is not self-service bindable")
+	ErrProdBindingNotAllowedForScope    = errors.New("storage: scoped binders cannot bind to prod environments")
+	ErrOutOfScopeBinding                = errors.New("storage: actor does not cover the target project/environment")
 )
 
 // isUniqueViolation returns true when err wraps a PG unique-violation
