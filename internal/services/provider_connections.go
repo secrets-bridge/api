@@ -19,6 +19,9 @@
 
 package services
 
+// Import sites used by both the existing service surface and the
+// EPIC Q scoped bind methods in provider_connections_binding.go.
+
 import (
 	"context"
 	"errors"
@@ -29,6 +32,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/pkg/sanitize"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
@@ -49,6 +53,18 @@ type ProviderConnectionsService struct {
 	// allowInsecureVaultAddr permits http:// vault URLs. Hard-off
 	// for v1; the deployment-level override is audited at boot.
 	allowInsecureVaultAddr bool
+
+	// EPIC Q (api#99) — populated by main via WithBinderScope so the
+	// scoped bind/unbind methods can compute the project coverage gate
+	// at call time. Nil disables the scoped path (the admin Bind path
+	// is unaffected). Mirrors RequestService.WithApproverScope.
+	binderResolver  auth.Resolver
+	binderTeamScope auth.TeamScopeResolver
+
+	// environments is the L1 source of truth for env.kind. Lazy-injected
+	// via WithEnvironments so scoped bind/unbind can refuse env.kind=prod
+	// without dragging the env repo into NewProviderConnections.
+	environments storage.EnvironmentRepository
 }
 
 // NewProviderConnections constructs the service with safe defaults:
@@ -83,6 +99,23 @@ func (s *ProviderConnectionsService) WithAllowInsecureVaultAddr(v bool) *Provide
 	return s
 }
 
+// WithBinderScope wires the resolver pair the EPIC Q scoped bind/unbind
+// path uses to compute project coverage for integration.bind callers.
+// Pass nil to disable the scoped path — main always wires both in
+// production.
+func (s *ProviderConnectionsService) WithBinderScope(r auth.Resolver, tr auth.TeamScopeResolver) *ProviderConnectionsService {
+	s.binderResolver = r
+	s.binderTeamScope = tr
+	return s
+}
+
+// WithEnvironments lets the scoped bind/unbind path validate
+// env.kind != 'prod' without baking the env repo into the constructor.
+func (s *ProviderConnectionsService) WithEnvironments(r storage.EnvironmentRepository) *ProviderConnectionsService {
+	s.environments = r
+	return s
+}
+
 // ---- input shapes --------------------------------------------------
 
 // CreateInput is the shape the HTTP handler hands the service after
@@ -97,6 +130,10 @@ type CreateInput struct {
 	Status                  storage.ProviderConnectionStatus
 	DiscoverEnabled         bool
 	DiscoverIntervalSeconds int
+
+	// EPIC Q (api#99): default-deny on Create. Caller can flip to true
+	// via the admin SPA toggle; scoped binders never reach Create.
+	SelfServiceBindable bool
 
 	// Actor + correlation_id for audit emission.
 	ActorID       string
@@ -115,6 +152,10 @@ type UpdateInput struct {
 	Status                  storage.ProviderConnectionStatus
 	DiscoverEnabled         bool
 	DiscoverIntervalSeconds int
+
+	// EPIC Q (api#99): nil = leave untouched. Lets P3 handler bodies
+	// omit the flag without flipping it back to false.
+	SelfServiceBindable *bool
 
 	ActorID       string
 	CorrelationID uuid.UUID
@@ -154,6 +195,13 @@ var (
 	ErrInvalidAuthMethod        = errors.New("services: invalid auth_method for provider type")
 	ErrInvalidClusterName       = errors.New("services: invalid cluster_name")
 	ErrTypeImmutable            = errors.New("services: provider connection type is immutable")
+
+	// EPIC Q (api#99) — scoped binder sentinels mapped to stable
+	// 403 codes in api#101 (Q2). See provider_connections_binding.go
+	// for the gate chain.
+	ErrConnectionNotSelfServiceBindable = errors.New("services: connection is not enabled for self-service binding")
+	ErrProdBindingNotAllowedForScope    = errors.New("services: scoped binders cannot bind to prod environments")
+	ErrOutOfScopeBinding                = errors.New("services: actor does not cover the target project/environment")
 )
 
 // ValidationDetail enriches a wrapped sentinel with metadata the
@@ -500,6 +548,7 @@ func (s *ProviderConnectionsService) Create(ctx context.Context, in CreateInput)
 	if status == "" {
 		status = storage.ProviderConnectionStatusActive
 	}
+	ssb := in.SelfServiceBindable
 	created, err := s.repo.Create(ctx, storage.ProviderConnectionInput{
 		Name:                    in.Name,
 		Type:                    in.Type,
@@ -510,6 +559,7 @@ func (s *ProviderConnectionsService) Create(ctx context.Context, in CreateInput)
 		Description:             strings.TrimSpace(in.Description),
 		DiscoverEnabled:         in.DiscoverEnabled,
 		DiscoverIntervalSeconds: in.DiscoverIntervalSeconds,
+		SelfServiceBindable:     &ssb,
 	})
 	if err != nil {
 		return nil, err
@@ -557,6 +607,7 @@ func (s *ProviderConnectionsService) Update(ctx context.Context, id uuid.UUID, i
 		Description:             strings.TrimSpace(in.Description),
 		DiscoverEnabled:         in.DiscoverEnabled,
 		DiscoverIntervalSeconds: in.DiscoverIntervalSeconds,
+		SelfServiceBindable:     in.SelfServiceBindable,
 	})
 	if err != nil {
 		return nil, err

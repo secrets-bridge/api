@@ -99,6 +99,13 @@ const (
 
 	// Integrations (gated by SB_GITOPS_ENABLED) ------------------------
 	PermIntegrationEdit Permission = "integration.edit"
+
+	// EPIC Q (api#99) — scoped self-service binding of platform-approved
+	// provider connections to projects + environments the caller covers
+	// via the team-aware resolver. Strictly NOT covered by
+	// integration.edit server-side — the SPA's capability helper
+	// unifies them in the UI; the api treats them as distinct.
+	PermIntegrationBind Permission = "integration.bind"
 )
 
 // Descriptor is the JSON shape returned by GET /api/v1/permissions.
@@ -142,7 +149,8 @@ var Catalog = []Descriptor{
 	{PermSecretList, "Observability", "List discovered secrets (metadata only, never values)."},
 	{PermAuditRead, "Observability", "Read the immutable audit event log."},
 
-	{PermIntegrationEdit, "Integrations", "Manage ArgoCD endpoints and gitops application mappings (when SB_GITOPS_ENABLED)."},
+	{PermIntegrationEdit, "Integrations", "Manage ArgoCD endpoints and gitops application mappings (when SB_GITOPS_ENABLED). Also gates provider connection lifecycle (create/update/delete/discover-now/bindings) per EPIC P."},
+	{PermIntegrationBind, "Integrations", "Bind or unbind self-service-bindable provider connections on projects and environments you cover. NOT auto-covered by integration.edit server-side; grant explicitly (e.g. via the provider_connection_binder seed role)."},
 }
 
 // Keys returns the set of every permission key in the catalog. Useful
