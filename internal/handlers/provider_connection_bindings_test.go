@@ -215,8 +215,8 @@ func doSBJSON(t *testing.T, app *fiber.App, method, path string, body any) (*htt
 	if err != nil {
 		t.Fatalf("app.Test: %v", err)
 	}
-	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
 	return resp, respBody
 }
 
