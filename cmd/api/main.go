@@ -323,8 +323,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// Wire the back-edge: when a patch job terminates, RequestService
 	// transitions the owning access_request to executed/failed AND,
 	// when GitOps is enabled, fans out observation rows for the
-	// request's configured app mappings.
-	jobSvc.OnCompleted(requestSvc.OnJobCompleted)
+	// request's configured app mappings. The multiplexer that adds
+	// pcSvc.OnDiscoverJobCompleted is installed AFTER pcSvc is built
+	// below.
 
 	agentsH := handlers.NewAgents(agentSvc)
 	jobsH := handlers.NewJobs(jobSvc)
@@ -348,7 +349,29 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// repositories' Get / Exists methods already satisfy the narrow
 	// CrossTeam*Lookup interfaces defined in services.
 	provConnRepo := storage.NewProviderConnections(pool)
+	bindingRepo := storage.NewProjectProviderConnections(pool)
 	requestSvc.WithCrossTeamRepos(teamRepo, projectRepo, environmentRepo, provConnRepo)
+
+	// Slice P2/P3: ProviderConnectionsService for admin CRUD + the
+	// developer dropdown + the discover-finished JobService hook.
+	pcSvc := services.NewProviderConnections(provConnRepo, bindingRepo, auditRepo)
+	if cfg.AllowInsecureVaultAddr {
+		pcSvc = pcSvc.WithAllowInsecureVaultAddr(true)
+		logger.Warn("SB_ALLOW_INSECURE_VAULT_ADDR=true — http:// vault.address values will be accepted")
+	}
+	if !cfg.ProviderConnRejectSecretValues {
+		pcSvc = pcSvc.WithRejectSecretValues(false)
+		logger.Warn("SB_PROVIDER_CONN_REJECT_SECRETS=false — secret-shaped value detection is OFF")
+	}
+
+	// Multiplex the JobService completion hook: RequestService handles
+	// patch/read/cross_team transitions; ProviderConnectionsService
+	// handles discover jobs (Slice P3). OnCompleted accepts a single
+	// callback, so wire both through a wrapper.
+	jobSvc.OnCompleted(func(ctx context.Context, job *storage.SyncJob) {
+		requestSvc.OnJobCompleted(ctx, job)
+		pcSvc.OnDiscoverJobCompleted(ctx, job)
+	})
 	// Reused by meH.WithIdentity to hydrate GET /users/me with the
 	// caller's local_users row (email, display_name).
 	localUsersRepoInApp := storage.NewLocalUsers(pool)
@@ -860,6 +883,22 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		v1.Get("/gitops-app-mappings", gitopsH.ListGitOpsMappings)
 		v1.Delete("/gitops-app-mappings/:id", auth.Require(auth.PermIntegrationEdit, rbacResolver), gitopsH.DeleteGitOpsMapping)
 	}
+
+	// EPIC P (Provider Connections) — admin CRUD + bindings + the
+	// developer dropdown. Shared GET /provider-connections branches
+	// on query string: admin path requires integration.edit, dropdown
+	// path requires secret.request scoped to (project, env).
+	pcH := handlers.NewProviderConnections(pcSvc, jobSvc, rdb, rbacResolver, environmentRepo)
+	v1.Post("/provider-connections", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.Create)
+	v1.Get("/provider-connections/:id", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.Get)
+	v1.Put("/provider-connections/:id", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.Update)
+	v1.Delete("/provider-connections/:id", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.Delete)
+	v1.Post("/provider-connections/:id/discover-now", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.DiscoverNow)
+	v1.Post("/provider-connections/:id/bindings", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.CreateBinding)
+	v1.Get("/provider-connections/:id/bindings", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.ListBindings)
+	v1.Delete("/provider-connection-bindings/:binding_id", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.DeleteBinding)
+	// Shared GET — handler does inline auth branching on query string.
+	v1.Get("/provider-connections", pcH.ListOrDropdown)
 
 	// Discovery surface. Admins search the cache via GET; the agent's
 	// DiscoverExecutor upserts batches via the bulk endpoint (under

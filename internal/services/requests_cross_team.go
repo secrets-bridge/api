@@ -166,11 +166,14 @@ type CrossTeamEnvLookup interface {
 	Get(ctx context.Context, id uuid.UUID) (*storage.Environment, error)
 }
 
-// CrossTeamProviderConnectionLookup is just an existence check on the
-// destination provider_connection_id. Returns ErrNotFound when the
-// row doesn't exist.
+// CrossTeamProviderConnectionLookup is the destination-side check on
+// the provider_connection_id. Returns ErrNotFound when the row
+// doesn't exist; Get returns the full row so the submit path can
+// also refuse status='disabled' destinations (Slice P3 — fence
+// against in-flight requests pointing at a disabled connection).
 type CrossTeamProviderConnectionLookup interface {
 	Exists(ctx context.Context, id uuid.UUID) (bool, error)
+	Get(ctx context.Context, id uuid.UUID) (*storage.ProviderConnection, error)
 }
 
 // WithCrossTeamRepos wires the three extra repositories cross_team
@@ -339,12 +342,15 @@ func (s *RequestService) validateCrossTeamDestination(ctx context.Context, id uu
 	if s.ctProvConns == nil {
 		return nil
 	}
-	ok, err := s.ctProvConns.Exists(ctx, id)
+	row, err := s.ctProvConns.Get(ctx, id)
 	if err != nil {
+		if errors.Is(err, storage.ErrConnectionNotFound) {
+			return ErrCrossTeamDestinationUnbound
+		}
 		return fmt.Errorf("services: check destination provider connection: %w", err)
 	}
-	if !ok {
-		return ErrCrossTeamDestinationUnbound
+	if row.Status == storage.ProviderConnectionStatusDisabled {
+		return ErrConnectionDisabled
 	}
 	return nil
 }

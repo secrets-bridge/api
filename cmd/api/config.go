@@ -195,6 +195,17 @@ type Config struct {
 	// "AWS-console / GitHub-org-with-2FA-required" posture) flip this
 	// on; deployments comfortable with step-up-only leave it off.
 	RequireMFAAtLogin bool
+
+	// EPIC P (Provider Connections):
+	// AllowInsecureVaultAddr=true permits http:// vault.address values
+	// on provider_connections — the deployment-level override for
+	// dev clusters. Audited at boot if true.
+	AllowInsecureVaultAddr bool
+	// ProviderConnRejectSecretValues=true (default) enforces the
+	// AKIA / hvs. / JWT / OAuth regex check on scope values. The
+	// deployment-level override (false) disables that pass; the
+	// credential-shaped key refusal still runs unconditionally.
+	ProviderConnRejectSecretValues bool
 }
 
 func loadConfig() Config {
@@ -203,7 +214,9 @@ func loadConfig() Config {
 		ShutdownGrace:          envDuration("API_SHUTDOWN_GRACE", 15*time.Second),
 		Env:                    envOr("SB_ENV", ModeProduction),
 		GitOpsEnabled:          envBool("SB_GITOPS_ENABLED", false),
-		BootstrapAdminUserID:   envOr("SB_BOOTSTRAP_ADMIN_USER_ID", ""),
+		AllowInsecureVaultAddr:         envBool("SB_ALLOW_INSECURE_VAULT_ADDR", false),
+		ProviderConnRejectSecretValues: envBool("SB_PROVIDER_CONN_REJECT_SECRETS", true),
+		BootstrapAdminUserID:           envOr("SB_BOOTSTRAP_ADMIN_USER_ID", ""),
 		JWTSecret:              loadJWTSecret(),
 		JWTTokenTTL:            envDuration("SB_JWT_TOKEN_TTL", 8*time.Hour),
 		BootstrapAdminEmail:    envOr("SB_BOOTSTRAP_ADMIN_EMAIL", ""),
