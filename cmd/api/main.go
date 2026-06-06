@@ -363,6 +363,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		pcSvc = pcSvc.WithRejectSecretValues(false)
 		logger.Warn("SB_PROVIDER_CONN_REJECT_SECRETS=false — secret-shaped value detection is OFF")
 	}
+	// EPIC Q (Slice Q1 + Q2): scoped self-service binding path. The
+	// environment repo is available here; the rbacResolver +
+	// teamScopeResolver wiring is finalized below after rbacResolver
+	// is constructed (via pcSvc.WithBinderScope).
+	pcSvc = pcSvc.WithEnvironments(environmentRepo)
 
 	// Multiplex the JobService completion hook: RequestService handles
 	// patch/read/cross_team transitions; ProviderConnectionsService
@@ -427,6 +432,10 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// WithApproverScope mutates the pointer in place, so the handler
 	// built at the top of this block sees the change; no reassignment.
 	requestSvc.WithApproverScope(rbacResolver, teamScopeResolver)
+
+	// EPIC Q (api#101): scoped binder resolver pair finalizes here
+	// because rbacResolver is constructed above.
+	pcSvc.WithBinderScope(rbacResolver, teamScopeResolver)
 
 	// Project-scoped catalog (api#43 Slice B): GET /secrets restricts
 	// results to the caller's project bindings unless they hold
@@ -898,7 +907,20 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Get("/provider-connections/:id/bindings", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.ListBindings)
 	v1.Delete("/provider-connection-bindings/:binding_id", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.DeleteBinding)
 	// Shared GET — handler does inline auth branching on query string.
+	// 4-way per §4: admin list / dropdown / binder picker / 400
+	// project_id_required / 400 environment_id_required.
 	v1.Get("/provider-connections", pcH.ListOrDropdown)
+
+	// EPIC Q (api#101) — project-anchored scoped binding routes. URL
+	// hierarchy expresses the §3 mental model: scoped binding is
+	// project-ownership work, not platform registry administration.
+	// The existing admin routes above stay on integration.edit;
+	// these are integration.bind scoped to (project, env) (handler
+	// runs the locked 7-gate / 3-gate chains inline).
+	pcbH := handlers.NewProjectProviderConnectionBindings(pcSvc)
+	v1.Post("/projects/:projectID/provider-connection-bindings", pcbH.Create)
+	v1.Get("/projects/:projectID/provider-connection-bindings", pcbH.List)
+	v1.Delete("/projects/:projectID/provider-connection-bindings/:bindingID", pcbH.Delete)
 
 	// Discovery surface. Admins search the cache via GET; the agent's
 	// DiscoverExecutor upserts batches via the bulk endpoint (under

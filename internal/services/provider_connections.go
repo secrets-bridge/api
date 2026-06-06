@@ -758,6 +758,24 @@ func (s *ProviderConnectionsService) ListForProjectEnv(ctx context.Context, proj
 	return s.bindings.ListForProjectEnv(ctx, projectID, envID)
 }
 
+// ListForProject is the EPIC Q (api#101) project-anchored list. Used
+// by the SPA's per-project Provider Connections card. The handler
+// gates with integration.bind OR integration.edit; both perms map to
+// the same projection.
+//
+// NO audit event — list reads aren't audited.
+func (s *ProviderConnectionsService) ListForProject(ctx context.Context, projectID uuid.UUID, envID *uuid.UUID) ([]storage.ProjectBindingDetail, error) {
+	return s.bindings.ListForProject(ctx, projectID, envID)
+}
+
+// ListBindableForProjectEnv powers the binder picker (?for_binding=true).
+// Returns sanitized {id, name, type} of active + self_service_bindable
+// connections that are NOT already bound (env-specific or project-wide)
+// to (project, env).
+func (s *ProviderConnectionsService) ListBindableForProjectEnv(ctx context.Context, projectID uuid.UUID, envID uuid.UUID) ([]storage.ProviderConnectionSummary, error) {
+	return s.bindings.ListBindableForProjectEnv(ctx, projectID, envID)
+}
+
 // ListDueForDiscovery is the worker scheduler surface. Returns the
 // value-free DiscoverTarget projection.
 func (s *ProviderConnectionsService) ListDueForDiscovery(ctx context.Context, now time.Time) ([]storage.DiscoverTarget, error) {
