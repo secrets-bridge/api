@@ -296,7 +296,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	agentSvc := services.NewAgentService(agentRepo, auditRepo, rdb)
 	jobSvc := services.NewJobService(jobRepo, auditRepo)
 	wrapSvc := services.NewWrapService(wrapRepo, auditRepo, km)
-	policyEng := services.NewPolicyEngine(policyRepo, workflowRepo, auditRepo)
+	policyEng := services.NewPolicyEngine(policyRepo, workflowRepo, auditRepo).
+		WithEnvironments(environmentRepo)
 	requestSvc := services.NewRequestService(requestRepo, approvalRepo, wrapSvc, workflowRepo, policyEng, auditRepo, jobSvc).
 		WithEnvironments(environmentRepo)
 	secretsSvc := services.NewSecretsService(secretsRepo, auditRepo)
@@ -436,6 +437,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// EPIC Q (api#101): scoped binder resolver pair finalizes here
 	// because rbacResolver is constructed above.
 	pcSvc.WithBinderScope(rbacResolver, teamScopeResolver)
+
+	// EPIC R (api#108) Slice R2: scoped policy author resolver pair
+	// finalizes here for the same reason. The PolicyEngine handles
+	// admin Resolve unchanged; the new *ForScopedAuthor methods need
+	// this to compute project coverage.
+	policyEng.WithAuthorScope(rbacResolver, teamScopeResolver)
 
 	// Project-scoped catalog (api#43 Slice B): GET /secrets restricts
 	// results to the caller's project bindings unless they hold
@@ -921,6 +928,20 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Post("/projects/:projectID/provider-connection-bindings", pcbH.Create)
 	v1.Get("/projects/:projectID/provider-connection-bindings", pcbH.List)
 	v1.Delete("/projects/:projectID/provider-connection-bindings/:bindingID", pcbH.Delete)
+
+	// EPIC R (api#108) — project-anchored scoped policy.author routes.
+	// URL hierarchy expresses the §3 mental model: scoped policy
+	// authoring is project-ownership work, not platform policy
+	// administration. The existing /policies admin routes stay on
+	// policy.edit; these are policy.author scoped to projectID (handler
+	// runs the locked 6/8/5-gate chains inline through the service's
+	// *ForScopedAuthor methods).
+	pprH := handlers.NewProjectPolicyRules(policyEng, policyRepo)
+	v1.Post("/projects/:projectID/policy-rules", pprH.Create)
+	v1.Get("/projects/:projectID/policy-rules", pprH.List)
+	v1.Get("/projects/:projectID/policy-rules/:ruleID", pprH.Get)
+	v1.Put("/projects/:projectID/policy-rules/:ruleID", pprH.Update)
+	v1.Delete("/projects/:projectID/policy-rules/:ruleID", pprH.Delete)
 
 	// Discovery surface. Admins search the cache via GET; the agent's
 	// DiscoverExecutor upserts batches via the bulk endpoint (under
