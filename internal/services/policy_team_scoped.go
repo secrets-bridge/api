@@ -400,6 +400,26 @@ func (e *PolicyEngine) DeleteForTeamScopedAuthor(ctx context.Context, in DeleteT
 	return nil
 }
 
+// ---- handler accessors --------------------------------------------
+
+// AuthorResolver returns the resolver the team-scoped handler needs
+// for its gate-1 coverage check. Slice 1c's requireTeamPolicyScope
+// helper calls it inline so the denial path stays in the handler
+// (preserves audit + counter emission alongside the rest of the gate
+// chain — middleware would lose that).
+func (e *PolicyEngine) AuthorResolver() auth.Resolver { return e.authorResolver }
+
+// AuthorTeamScope returns the team-scope resolver wired alongside
+// AuthorResolver. Used by handler's gate-1 helper.
+func (e *PolicyEngine) AuthorTeamScope() auth.TeamScopeResolver { return e.authorTeamScope }
+
+// EmitPolicyDeniedOutOfTeamScope exposes the centralised denial
+// audit emission to the handler so requireTeamPolicyScope doesn't
+// duplicate the audit shape. Safe no-op when audit is nil.
+func (e *PolicyEngine) EmitPolicyDeniedOutOfTeamScope(ctx context.Context, actorID string, teamID uuid.UUID, correlationID uuid.UUID) {
+	e.auditPolicyDeniedOutOfTeamScope(ctx, actorID, teamID, correlationID)
+}
+
 // ---- helpers ------------------------------------------------------
 
 // teamAccessCoversPolicy returns whether the resolved TeamAccess

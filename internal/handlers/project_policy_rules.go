@@ -272,19 +272,28 @@ type scopedPolicyUpdateBody struct {
 // policyRuleProjection is the wire shape for GET responses. Carries
 // the §4 lock: inherited platform rules omit selector VALUES (only
 // selector_keys) and stamp is_platform_inherited=true.
+//
+// R-follow-up #3 (api#126) extension — `is_team_inherited` + `team_id`
+// + `team_name` + `workflow_name` surface team-cascaded rules in the
+// project view. Inherited team rows are sanitized identically to
+// inherited platform rows (selector omitted; selector_keys only).
 type policyRuleProjection struct {
-	ID                    uuid.UUID      `json:"id"`
-	Name                  string         `json:"name"`
-	ProjectID             *string        `json:"project_id"`
-	IsPlatformInherited   bool           `json:"is_platform_inherited"`
-	SelectorKeys          []string       `json:"selector_keys"`
-	Selector              map[string]any `json:"selector,omitempty"`
-	Priority              int            `json:"priority"`
-	WorkflowID            uuid.UUID      `json:"workflow_id"`
-	Enabled               bool           `json:"enabled"`
-	IsSystem              bool           `json:"is_system"`
-	CreatedAt             string         `json:"created_at,omitempty"`
-	UpdatedAt             string         `json:"updated_at,omitempty"`
+	ID                  uuid.UUID      `json:"id"`
+	Name                string         `json:"name"`
+	ProjectID           *string        `json:"project_id"`
+	TeamID              *string        `json:"team_id,omitempty"`
+	TeamName            string         `json:"team_name,omitempty"`
+	WorkflowID          uuid.UUID      `json:"workflow_id"`
+	WorkflowName        string         `json:"workflow_name,omitempty"`
+	IsPlatformInherited bool           `json:"is_platform_inherited"`
+	IsTeamInherited     bool           `json:"is_team_inherited"`
+	SelectorKeys        []string       `json:"selector_keys"`
+	Selector            map[string]any `json:"selector,omitempty"`
+	Priority            int            `json:"priority"`
+	Enabled             bool           `json:"enabled"`
+	IsSystem            bool           `json:"is_system"`
+	CreatedAt           string         `json:"created_at,omitempty"`
+	UpdatedAt           string         `json:"updated_at,omitempty"`
 }
 
 // toScopedProjection emits the FULL projection (with selector values)
@@ -300,11 +309,42 @@ func toScopedProjection(p *storage.PolicyRule) policyRuleProjection {
 		ID:                  p.ID,
 		Name:                p.Name,
 		ProjectID:           projectIDPtr,
+		WorkflowID:          p.WorkflowID,
+		WorkflowName:        p.WorkflowName,
 		IsPlatformInherited: false,
+		IsTeamInherited:     false,
 		SelectorKeys:        selectorKeysOf(p.Selector),
 		Selector:            p.Selector,
 		Priority:            p.Priority,
+		Enabled:             p.Enabled,
+		IsSystem:            p.IsSystem,
+		CreatedAt:           p.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+		UpdatedAt:           p.UpdatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+	}
+}
+
+// toTeamInheritedProjectionForProject emits the sanitized projection
+// for a team-anchored rule cascading down into a project's view.
+// Surfaces team_id + team_name (from the JOIN) for the SPA's
+// `[team]` badge tooltip. Selector OMITTED — defense against selector
+// leakage across sibling projects under the same parent team.
+func toTeamInheritedProjectionForProject(p *storage.PolicyRule) policyRuleProjection {
+	var teamIDPtr *string
+	if p.TeamID != nil {
+		s := p.TeamID.String()
+		teamIDPtr = &s
+	}
+	return policyRuleProjection{
+		ID:                  p.ID,
+		Name:                p.Name,
+		TeamID:              teamIDPtr,
+		TeamName:            p.TeamName,
 		WorkflowID:          p.WorkflowID,
+		WorkflowName:        p.WorkflowName,
+		IsPlatformInherited: false,
+		IsTeamInherited:     true,
+		SelectorKeys:        selectorKeysOf(p.Selector),
+		Priority:            p.Priority,
 		Enabled:             p.Enabled,
 		IsSystem:            p.IsSystem,
 		CreatedAt:           p.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
@@ -321,15 +361,17 @@ func toInheritedProjection(p *storage.PolicyRule) policyRuleProjection {
 		ID:                  p.ID,
 		Name:                p.Name,
 		ProjectID:           nil,
+		WorkflowID:          p.WorkflowID,
+		WorkflowName:        p.WorkflowName,
 		IsPlatformInherited: true,
+		IsTeamInherited:     false,
 		SelectorKeys:        selectorKeysOf(p.Selector),
 		// Selector deliberately omitted.
-		Priority:   p.Priority,
-		WorkflowID: p.WorkflowID,
-		Enabled:    p.Enabled,
-		IsSystem:   p.IsSystem,
-		CreatedAt:  p.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
-		UpdatedAt:  p.UpdatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+		Priority:  p.Priority,
+		Enabled:   p.Enabled,
+		IsSystem:  p.IsSystem,
+		CreatedAt: p.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+		UpdatedAt: p.UpdatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
 	}
 }
 
@@ -415,14 +457,19 @@ func (h *ProjectPolicyRules) List(c fiber.Ctx) error {
 	}
 	out := make([]policyRuleProjection, 0, len(rules))
 	for _, r := range rules {
-		if r.ProjectID == nil {
-			out = append(out, toInheritedProjection(r))
-		} else if *r.ProjectID == projectID {
+		switch {
+		case r.ProjectID != nil && *r.ProjectID == projectID:
 			out = append(out, toScopedProjection(r))
+		case r.TeamID != nil:
+			// R-follow-up #3 — team rule cascading into this
+			// project's view. Sanitized projection.
+			out = append(out, toTeamInheritedProjectionForProject(r))
+		case r.ProjectID == nil && r.TeamID == nil:
+			out = append(out, toInheritedProjection(r))
 		}
-		// Defense-in-depth: rules with project_id != projectID should
-		// never come back from ListForProject (its WHERE clause filters
-		// to NULL OR == projectID), but skip them just in case.
+		// Defense-in-depth: rules with project_id != projectID and no
+		// team anchor should never reach here from ListForProject's
+		// WHERE clause filter, but skip them just in case.
 	}
 	return c.JSON(out)
 }
@@ -451,18 +498,19 @@ func (h *ProjectPolicyRules) Get(c fiber.Ctx) error {
 		}
 		return mapPolicyServiceErr(c, err)
 	}
-	// Sanitized projection for platform rules; full for scoped.
-	if rule.ProjectID == nil {
+	switch {
+	case rule.ProjectID != nil && *rule.ProjectID == projectID:
+		return c.JSON(toScopedProjection(rule))
+	case rule.TeamID != nil:
+		// R-follow-up #3 — team rule via project URL. Sanitized.
+		return c.JSON(toTeamInheritedProjectionForProject(rule))
+	case rule.ProjectID == nil && rule.TeamID == nil:
 		return c.JSON(toInheritedProjection(rule))
 	}
-	// Scoped rule must belong to URL projectID; mismatch → not_found
-	// (§4 lock: never leak existence under another project).
-	if *rule.ProjectID != projectID {
-		return stableErr(c, fiber.StatusNotFound,
-			"policy_not_found",
-			"policy rule not found", nil)
-	}
-	return c.JSON(toScopedProjection(rule))
+	// Scoped rule from a different project — §4 lock returns not_found.
+	return stableErr(c, fiber.StatusNotFound,
+		"policy_not_found",
+		"policy rule not found", nil)
 }
 
 // Update handles PUT /projects/:projectID/policy-rules/:ruleID. The

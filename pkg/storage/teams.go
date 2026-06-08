@@ -217,6 +217,150 @@ func (r *Teams) Update(ctx context.Context, id uuid.UUID, name, description stri
 	return nil
 }
 
+// UpdateWithLineageAudit is the transactional sibling of Update used
+// when an operator changes a team's parent_team_id. Per §2 C6 the
+// lineage-change audit event MUST commit in the SAME transaction as
+// the parent update — an audit append that fails must roll back the
+// parent change, and a successful parent change MUST emit the audit.
+//
+// When the parent change is a no-op (old parent == new parent), no
+// audit event is emitted (idempotent — matches the project-side
+// audit's "changed_keys" preserve semantic).
+//
+// The lineage audit metadata mirrors the user-locked spec:
+//
+//	{
+//	  team_id, old_parent_team_id, new_parent_team_id,
+//	  team_policy_rule_count, affected_project_count
+//	}
+//
+// Counts are computed inside the same transaction so the operator
+// sees the blast radius captured against the pre-change topology.
+func (r *Teams) UpdateWithLineageAudit(
+	ctx context.Context,
+	id uuid.UUID,
+	name, description string,
+	parent *uuid.UUID,
+	actor string,
+	audit *AuditEvents,
+) error {
+	if name == "" {
+		return errors.New("storage: team Name is required")
+	}
+	if parent != nil && *parent != uuid.Nil {
+		desc, err := r.DescendantIDs(ctx, id)
+		if err != nil {
+			return fmt.Errorf("teams.UpdateWithLineageAudit cycle check: %w", err)
+		}
+		for _, d := range desc {
+			if d == *parent {
+				return ErrCyclicParent
+			}
+		}
+	}
+	var parentArg interface{}
+	if parent != nil && *parent != uuid.Nil {
+		parentArg = *parent
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("teams.UpdateWithLineageAudit: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Load existing parent FOR UPDATE so concurrent edits serialise.
+	var oldParent *uuid.UUID
+	if err := tx.QueryRow(ctx,
+		`SELECT parent_team_id FROM teams WHERE id = $1 FOR UPDATE`, id,
+	).Scan(&oldParent); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("teams.UpdateWithLineageAudit: load: %w", err)
+	}
+
+	// Apply the UPDATE.
+	if _, err := tx.Exec(ctx, `
+		UPDATE teams
+		   SET name = $1,
+		       description = NULLIF($2, ''),
+		       parent_team_id = $3
+		 WHERE id = $4`, name, description, parentArg, id,
+	); err != nil {
+		return mapTeamErr(err)
+	}
+
+	// Determine whether parent actually changed.
+	var newParent *uuid.UUID
+	if parent != nil && *parent != uuid.Nil {
+		v := *parent
+		newParent = &v
+	}
+	parentChanged := !uuidPtrEqual(oldParent, newParent)
+
+	if parentChanged && audit != nil {
+		// Compute affected counts INSIDE the same transaction so the
+		// audit sees the pre-change topology by SQL semantics — the
+		// UPDATE above changed the team's parent, but `descendants`
+		// here walks rows in the CURRENT (post-update) state. For
+		// the §2 C6 spec, the operator wants the blast radius of
+		// the new lineage. Both readings are useful; we pick the
+		// new lineage because it answers "how many projects will
+		// now see different resolution results."
+		var ruleCount, projectCount int
+		if err := tx.QueryRow(ctx, `
+			WITH RECURSIVE descendants AS (
+			    SELECT id FROM teams WHERE id = $1
+			    UNION ALL
+			    SELECT t.id FROM teams t JOIN descendants d ON t.parent_team_id = d.id
+			)
+			SELECT
+			    (SELECT COUNT(*) FROM policy_rules WHERE team_id = $1),
+			    (SELECT COUNT(*) FROM projects WHERE team_id IN (SELECT id FROM descendants))`,
+			id,
+		).Scan(&ruleCount, &projectCount); err != nil {
+			return fmt.Errorf("teams.UpdateWithLineageAudit: counts: %w", err)
+		}
+
+		oldParentStr := ""
+		if oldParent != nil {
+			oldParentStr = oldParent.String()
+		}
+		newParentStr := ""
+		if newParent != nil {
+			newParentStr = newParent.String()
+		}
+		if err := audit.AppendTx(ctx, tx, &AuditEvent{
+			Actor:    actorOrSystem(actor),
+			Action:   "policy.team_lineage_changed",
+			Resource: "team:" + id.String(),
+			Status:   AuditStatusSuccess,
+			Metadata: map[string]any{
+				"team_id":                id.String(),
+				"old_parent_team_id":     oldParentStr,
+				"new_parent_team_id":     newParentStr,
+				"team_policy_rule_count": ruleCount,
+				"affected_project_count": projectCount,
+			},
+		}); err != nil {
+			return fmt.Errorf("teams.UpdateWithLineageAudit: audit append: %w", err)
+		}
+	}
+
+	return tx.Commit(ctx)
+}
+
+// actorOrSystem returns "system" when actor is empty, mirroring the
+// services package's actorOrAdmin helper. Avoids a "" actor that the
+// audit_events CHECK constraint would reject.
+func actorOrSystem(actor string) string {
+	if actor == "" {
+		return "system"
+	}
+	return actor
+}
+
 // UpdateStatus toggles active ↔ archived.
 func (r *Teams) UpdateStatus(ctx context.Context, id uuid.UUID, status TeamStatus) error {
 	if status != TeamStatusActive && status != TeamStatusArchived {

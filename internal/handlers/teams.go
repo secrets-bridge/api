@@ -46,10 +46,25 @@ import (
 // Teams bundles the team repository behind one HTTP handler.
 type Teams struct {
 	teams storage.TeamRepository
+	// R-follow-up #3 (api#126) §2 C6 — concrete *Teams + concrete
+	// *AuditEvents both needed for transactional lineage-change audit
+	// emission on Update. When nil the handler falls back to the
+	// non-transactional Update; production main always wires both.
+	teamsConcrete *storage.Teams
+	audit         *storage.AuditEvents
 }
 
 // NewTeams wires the handler.
 func NewTeams(t storage.TeamRepository) *Teams { return &Teams{teams: t} }
+
+// WithLineageAudit enables the R-follow-up #3 §2 C6 transactional
+// lineage-change audit. Both args required. main wires this after
+// teamsRepo + auditEvents are available.
+func (h *Teams) WithLineageAudit(t *storage.Teams, a *storage.AuditEvents) *Teams {
+	h.teamsConcrete = t
+	h.audit = a
+	return h
+}
 
 // --- request / response shapes --------------------------------------
 
@@ -166,8 +181,21 @@ func (h *Teams) Update(c fiber.Ctx) error {
 	if body.Name == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "name is required")
 	}
-	if err := h.teams.Update(c.Context(), id, body.Name, body.Description, body.ParentTeamID); err != nil {
-		return mapTeamErr(err)
+	// R-follow-up #3 §2 C6 — when the lineage-audit-aware path is
+	// wired, use it so a parent change emits the transactional
+	// policy.team_lineage_changed event in the same transaction as
+	// the team UPDATE.
+	if h.teamsConcrete != nil && h.audit != nil {
+		if err := h.teamsConcrete.UpdateWithLineageAudit(c.Context(), id,
+			body.Name, body.Description, body.ParentTeamID,
+			identityFromCtx(c), h.audit,
+		); err != nil {
+			return mapTeamErr(err)
+		}
+	} else {
+		if err := h.teams.Update(c.Context(), id, body.Name, body.Description, body.ParentTeamID); err != nil {
+			return mapTeamErr(err)
+		}
 	}
 	t, err := h.teams.Get(c.Context(), id)
 	if err != nil {
