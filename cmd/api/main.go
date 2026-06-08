@@ -490,6 +490,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// admin Resolve unchanged; the new *ForScopedAuthor methods need
 	// this to compute project coverage.
 	policyEng.WithAuthorScope(rbacResolver, teamScopeResolver)
+	// R-follow-up #3 (api#126) — the team-scoped author surface needs
+	// the TeamRepository for its gate-2 team-exists check.
+	policyEng.WithTeams(teamRepo)
+	// R-follow-up #3 §2 C6 — enable the transactional lineage-change
+	// audit for PUT /teams/:id when parent_team_id changes.
+	teamsH.WithLineageAudit(teamRepo, auditRepo)
 
 	// Project-scoped catalog (api#43 Slice B): GET /secrets restricts
 	// results to the caller's project bindings unless they hold
@@ -1009,6 +1015,25 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Get("/projects/:projectID/policy-rules/:ruleID", pprH.Get)
 	v1.Put("/projects/:projectID/policy-rules/:ruleID", pprH.Update)
 	v1.Delete("/projects/:projectID/policy-rules/:ruleID", pprH.Delete)
+
+	// R-follow-up #3 (api#126) — team-anchored scoped policy.author
+	// routes. Mirror of the project family above; both share the same
+	// envelope contract via mapPolicyServiceErr (shared codes) +
+	// mapTeamPolicyServiceErr (team-specific codes). The team scope's
+	// coverage gate (requireTeamPolicyScope) runs inline in each
+	// handler — NOT middleware — so denial emits the same audit +
+	// counter signal as the rest of the gate chain.
+	tprH := handlers.NewTeamPolicyRules(policyEng, policyRepo, settingsSvc)
+	v1.Post("/teams/:teamID/policy-rules", tprH.Create)
+	v1.Get("/teams/:teamID/policy-rules", tprH.List)
+	v1.Get("/teams/:teamID/policy-rules/:ruleID", tprH.Get)
+	v1.Put("/teams/:teamID/policy-rules/:ruleID", tprH.Update)
+	v1.Delete("/teams/:teamID/policy-rules/:ruleID", tprH.Delete)
+
+	// R-follow-up #3 — small /me coverage endpoint for the SPA
+	// sidebar + canAuthorTeamPolicy capability helper.
+	patcH := handlers.NewPolicyAuthorTeamCoverage(rbacResolver, teamScopeResolver)
+	v1.Get("/users/me/policy-author-team-coverage", patcH.Get)
 
 	// Discovery surface. Admins search the cache via GET; the agent's
 	// DiscoverExecutor upserts batches via the bulk endpoint (under

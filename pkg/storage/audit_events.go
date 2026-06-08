@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // AuditEvent mirrors a row in the audit_events table. The metadata
@@ -62,6 +63,40 @@ type AuditEvents struct {
 
 // NewAuditEvents binds an AuditEvents repository to the given pool.
 func NewAuditEvents(pool *Pool) *AuditEvents { return &AuditEvents{pool: pool} }
+
+// AppendTx is the transactional sibling of Append. Inserts the event
+// using the caller's pgx.Tx so audit emission can ride the same
+// transaction as a domain mutation (used by teams.UpdateWithLineageAudit
+// for R-follow-up #3's transactional lineage-change audit per §2 C6).
+//
+// If the caller commits → both the domain UPDATE and the audit row
+// commit. If the caller rolls back (e.g. audit insert failed) → both
+// roll back together.
+func (r *AuditEvents) AppendTx(ctx context.Context, tx pgx.Tx, evt *AuditEvent) error {
+	if evt.Actor == "" || evt.Action == "" || evt.Resource == "" {
+		return errors.New("storage: audit event requires actor, action, and resource")
+	}
+	if evt.Status == "" {
+		evt.Status = AuditStatusSuccess
+	}
+	if evt.CorrelationID == uuid.Nil {
+		evt.CorrelationID = uuid.New()
+	}
+	if evt.Metadata == nil {
+		evt.Metadata = map[string]any{}
+	}
+	metadataJSON, err := json.Marshal(evt.Metadata)
+	if err != nil {
+		return fmt.Errorf("storage: marshal audit metadata: %w", err)
+	}
+	const q = `
+		INSERT INTO audit_events (actor, action, resource, status, correlation_id, metadata)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, occurred_at`
+	row := tx.QueryRow(ctx, q,
+		evt.Actor, evt.Action, evt.Resource, evt.Status, evt.CorrelationID, metadataJSON)
+	return row.Scan(&evt.ID, &evt.OccurredAt)
+}
 
 // Append inserts one event. If CorrelationID is uuid.Nil a fresh one
 // is generated so every audit row has a traceable correlation.
