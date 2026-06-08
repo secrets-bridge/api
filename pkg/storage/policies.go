@@ -27,6 +27,13 @@ import (
 //     middleware on the matched route.
 //   - RevealTTLSeconds: server-enforced reveal-session/wrap TTL.
 //     CHECK constraint pins to 10..300.
+//
+// EPIC R + R-follow-up #3 anchor model:
+//
+//	ProjectID NULL,  TeamID NULL    → platform-owned (admin policy.edit)
+//	ProjectID set,   TeamID NULL    → project-scoped (EPIC R, api#108)
+//	ProjectID NULL,  TeamID set     → team-scoped (R-follow-up #3, api#114)
+//	ProjectID set,   TeamID set     → INVALID (CHECK constraint)
 type PolicyRule struct {
 	ID                  uuid.UUID
 	Name                string
@@ -46,9 +53,61 @@ type PolicyRule struct {
 	// against project B.
 	ProjectID *uuid.UUID
 
+	// R-follow-up #3 (api#114) — NULL means platform OR project anchor.
+	// Non-nil means team-scoped; the rule cascades down to every
+	// descendant project of the team subtree at resolution time.
+	// Mutually exclusive with ProjectID — the DB CHECK
+	// policy_rules_one_anchor enforces.
+	TeamID *uuid.UUID
+
+	// WorkflowName is populated by ListForProject / ListForTeam /
+	// ListForAdmin via a server-side JOIN on workflow_definitions.
+	// Get / Create / Update leave it empty. Callers that need a
+	// workflow name on a single-row response should do their own
+	// lookup (or wait for the next slice that extends Get).
+	WorkflowName string
+
+	// TeamName is populated by ListForProject for team-inherited rows
+	// (TeamID set) and by ListForTeam for ancestor-inherited rows. The
+	// envelope projection at the handler layer surfaces it on the
+	// `[team]` badge tooltip. Leave empty everywhere else.
+	TeamName string
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
+
+// Anchor is the 3-anchor classification of a PolicyRule used for the
+// resolver's tie-break specificity rank (project > team > platform).
+type Anchor int
+
+const (
+	// AnchorPlatform — ProjectID NULL AND TeamID NULL.
+	AnchorPlatform Anchor = iota
+	// AnchorTeam — TeamID set; rule cascades to descendant projects.
+	AnchorTeam
+	// AnchorProject — ProjectID set; rule applies only to that project.
+	AnchorProject
+)
+
+// Anchor returns the rule's anchor classification. Integer ordering
+// (platform=0, team=1, project=2) matches the SQL specificity rank
+// embedded in ListEnabledOrderedByPriority's ORDER BY.
+func (r *PolicyRule) Anchor() Anchor {
+	switch {
+	case r.ProjectID != nil:
+		return AnchorProject
+	case r.TeamID != nil:
+		return AnchorTeam
+	default:
+		return AnchorPlatform
+	}
+}
+
+// ErrAnchorImmutable is returned by Update when a caller attempts to
+// flip a rule's anchor (project ↔ team, or null ↔ non-null). Changing
+// the anchor changes resolver semantics; force delete-and-recreate.
+var ErrAnchorImmutable = errors.New("storage: policy rule anchor is immutable; delete and re-create with the new anchor")
 
 // PolicyRepository is the read/write surface for policy_rules.
 type PolicyRepository interface {
@@ -56,23 +115,38 @@ type PolicyRepository interface {
 	Get(ctx context.Context, id uuid.UUID) (*PolicyRule, error)
 	List(ctx context.Context) ([]*PolicyRule, error)
 	// ListEnabledOrderedByPriority returns enabled rules ordered for
-	// resolution: highest priority first, then oldest first as
-	// tiebreaker. PolicyEngine.Resolve iterates this list.
+	// resolution: deterministic 5-clause tie-break chain:
 	//
-	// EPIC R (api#108) — applicability filter: when projectID is the
-	// zero uuid, return platform-owned rules only (project_id IS NULL).
-	// When projectID is set, return both platform-owned AND that
-	// project's scoped rules. Per §2 correction 1: this is the
-	// rule-matching boundary, not just an authorization boundary.
+	//   priority DESC
+	//   anchor specificity DESC (project=2, team=1, platform=0)
+	//   team distance ASC NULLS LAST (closer ancestor = smaller = wins)
+	//   created_at ASC
+	//   id ASC
+	//
+	// EPIC R + R-follow-up #3 applicability filter: when projectID is
+	// the zero uuid, return platform-owned rules only. When projectID
+	// is set, return platform + project-scoped + team-scoped rules
+	// where the team is in the project's ancestor chain. Subtree-down
+	// cascade is computed by walking projects.team_id up via
+	// parent_team_id inside an inline recursive CTE.
 	ListEnabledOrderedByPriority(ctx context.Context, projectID uuid.UUID) ([]*PolicyRule, error)
 	Update(ctx context.Context, p *PolicyRule) error
 	Delete(ctx context.Context, id uuid.UUID) error
 
-	// ListForProject returns platform-owned + project-scoped rules for
-	// the given project, ordered by priority DESC. Used by the EPIC R
-	// project-anchored list endpoint (R2). Includes disabled rules so
-	// the SPA can render their state.
+	// ListForProject returns rows visible from a project's policies
+	// page: own project-scoped rules (any enabled state) + platform
+	// inherited (enabled only) + team inherited (enabled only). The
+	// C4 filter on inherited rows belongs to the SQL layer so the
+	// handler doesn't have to re-filter post-fetch. WorkflowName +
+	// TeamName populated via JOIN.
 	ListForProject(ctx context.Context, projectID uuid.UUID) ([]*PolicyRule, error)
+
+	// ListForTeam returns rows visible from a team's policies page:
+	// own team-scoped rules (any enabled state) + ancestor-team
+	// inherited (enabled only) + platform inherited (enabled only).
+	// NEVER includes project-scoped rules under the team subtree —
+	// that's a different mental model. WorkflowName populated via JOIN.
+	ListForTeam(ctx context.Context, teamID uuid.UUID) ([]*PolicyRule, error)
 }
 
 // Policies is the Postgres implementation.
@@ -104,14 +178,14 @@ func (r *Policies) Create(ctx context.Context, p *PolicyRule) error {
 		INSERT INTO policy_rules (
 			name, selector, workflow_id, priority, enabled, is_system,
 			direct_reveal_allowed, requires_mfa, reveal_ttl_seconds,
-			project_id
+			project_id, team_id
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING id, created_at, updated_at`
 	return r.pool.QueryRow(ctx, q,
 		p.Name, selector, p.WorkflowID, p.Priority, p.Enabled, p.IsSystem,
 		p.DirectRevealAllowed, p.RequiresMFA, p.RevealTTLSeconds,
-		p.ProjectID,
+		p.ProjectID, p.TeamID,
 	).Scan(&p.ID, &p.CreatedAt, &p.UpdatedAt)
 }
 
@@ -120,7 +194,7 @@ func (r *Policies) Get(ctx context.Context, id uuid.UUID) (*PolicyRule, error) {
 }
 
 func (r *Policies) List(ctx context.Context) ([]*PolicyRule, error) {
-	rows, err := r.pool.Query(ctx, policySelect+` ORDER BY priority DESC, created_at ASC`)
+	rows, err := r.pool.Query(ctx, policySelect+` ORDER BY priority DESC, created_at ASC, id ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("storage: list policies: %w", err)
 	}
@@ -137,66 +211,190 @@ func (r *Policies) List(ctx context.Context) ([]*PolicyRule, error) {
 	return out, rows.Err()
 }
 
+// resolverSelect carries the same column set policySelect does plus a
+// computed `team_distance` from the team_chain CTE used by
+// ListEnabledOrderedByPriority. The distance is hops UP from the
+// project's owning team to the rule's team_id; smaller = closer
+// ancestor = wins on tie. NULL for project + platform rows (kept out
+// of the team-depth comparison via NULLS LAST in the ORDER BY).
+const policyResolverColumns = `
+	pr.id, pr.name, pr.selector, pr.workflow_id, pr.priority, pr.enabled, pr.is_system,
+	pr.direct_reveal_allowed, pr.requires_mfa, pr.reveal_ttl_seconds,
+	pr.project_id, pr.team_id,
+	pr.created_at, pr.updated_at`
+
 func (r *Policies) ListEnabledOrderedByPriority(ctx context.Context, projectID uuid.UUID) ([]*PolicyRule, error) {
-	// EPIC R applicability filter:
-	//   projectID == uuid.Nil → platform-owned only (project_id IS NULL)
-	//   projectID != uuid.Nil → platform-owned OR project's scoped rules
-	//
-	// The §2 correction made this a rule-matching boundary: a request
-	// with no project_id in scope must never see scoped rules from any
-	// project; otherwise a scoped policy could resolve for the wrong
-	// request shape.
-	var q string
-	var args []any
+	// Platform-only path stays simple — no project context means no
+	// team_chain to walk. Cheaper than the CTE; identical to today's
+	// behavior for callers that pass uuid.Nil.
 	if projectID == uuid.Nil {
-		q = policySelect + `
-			WHERE enabled = true AND project_id IS NULL
-			ORDER BY priority DESC, created_at ASC`
-	} else {
-		q = policySelect + `
-			WHERE enabled = true
-			  AND (project_id IS NULL OR project_id = $1)
-			ORDER BY priority DESC, created_at ASC`
-		args = []any{projectID}
+		const q = `
+			SELECT id, name, selector, workflow_id, priority, enabled, is_system,
+			       direct_reveal_allowed, requires_mfa, reveal_ttl_seconds,
+			       project_id, team_id,
+			       created_at, updated_at
+			  FROM policy_rules
+			 WHERE enabled = TRUE
+			   AND project_id IS NULL
+			   AND team_id IS NULL
+			 ORDER BY priority DESC, created_at ASC, id ASC`
+		rows, err := r.pool.Query(ctx, q)
+		if err != nil {
+			return nil, fmt.Errorf("storage: list enabled platform policies: %w", err)
+		}
+		defer rows.Close()
+		return collectPolicies(rows)
 	}
-	rows, err := r.pool.Query(ctx, q, args...)
+
+	// Project context — single inline recursive CTE walks ancestor
+	// teams of the project's owning team. Deterministic 5-clause
+	// tie-break per §1 C2. The LEFT JOIN team_chain populates
+	// team_distance for team rows; project + platform rows get NULL
+	// (kept out of the team-depth tie-break via NULLS LAST).
+	const q = `
+		WITH RECURSIVE team_chain(id, distance) AS (
+		    -- Distance 0 = the project's owning team. Projects with
+		    -- team_id IS NULL (pre-0018 backfill, or unassigned) yield
+		    -- an empty CTE; no team rules will match — graceful fallback
+		    -- to project + platform only.
+		    SELECT p.team_id, 0
+		      FROM projects p
+		     WHERE p.id = $1 AND p.team_id IS NOT NULL
+		    UNION ALL
+		    SELECT t.parent_team_id, tc.distance + 1
+		      FROM teams t
+		      JOIN team_chain tc ON t.id = tc.id
+		     WHERE t.parent_team_id IS NOT NULL
+		)
+		SELECT ` + policyResolverColumns + `
+		  FROM policy_rules pr
+		  LEFT JOIN team_chain tc ON tc.id = pr.team_id
+		 WHERE pr.enabled = TRUE
+		   AND (
+		        pr.project_id = $1                                  -- project rule
+		        OR (pr.project_id IS NULL AND pr.team_id IS NULL)   -- platform rule
+		        OR pr.team_id IN (SELECT id FROM team_chain)        -- team rule (cascading down)
+		   )
+		 ORDER BY
+		    pr.priority DESC,
+		    CASE
+		        WHEN pr.project_id IS NOT NULL THEN 2
+		        WHEN pr.team_id    IS NOT NULL THEN 1
+		        ELSE 0
+		    END DESC,
+		    tc.distance ASC NULLS LAST,
+		    pr.created_at ASC,
+		    pr.id ASC`
+	rows, err := r.pool.Query(ctx, q, projectID)
 	if err != nil {
-		return nil, fmt.Errorf("storage: list enabled policies: %w", err)
+		return nil, fmt.Errorf("storage: list enabled policies for project: %w", err)
 	}
 	defer rows.Close()
-
-	var out []*PolicyRule
-	for rows.Next() {
-		p, err := scanPolicy(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, p)
-	}
-	return out, rows.Err()
+	return collectPolicies(rows)
 }
 
-// ListForProject returns platform-owned rules + the project's scoped
-// rules (both enabled and disabled), ordered by priority DESC. Used by
-// R2's project-anchored list handler.
+// ListForProject — own rows (any enabled state) + inherited
+// platform (enabled only) + inherited team (enabled only). The C4
+// filter on inherited rows lives in the WHERE clause so the handler
+// doesn't re-filter. JOINs populate WorkflowName + TeamName.
 func (r *Policies) ListForProject(ctx context.Context, projectID uuid.UUID) ([]*PolicyRule, error) {
-	rows, err := r.pool.Query(ctx, policySelect+`
-		WHERE project_id IS NULL OR project_id = $1
-		ORDER BY priority DESC, created_at ASC`, projectID)
+	const q = `
+		WITH RECURSIVE team_chain(id, distance) AS (
+		    SELECT p.team_id, 0
+		      FROM projects p
+		     WHERE p.id = $1 AND p.team_id IS NOT NULL
+		    UNION ALL
+		    SELECT t.parent_team_id, tc.distance + 1
+		      FROM teams t
+		      JOIN team_chain tc ON t.id = tc.id
+		     WHERE t.parent_team_id IS NOT NULL
+		)
+		SELECT pr.id, pr.name, pr.selector, pr.workflow_id, pr.priority, pr.enabled, pr.is_system,
+		       pr.direct_reveal_allowed, pr.requires_mfa, pr.reveal_ttl_seconds,
+		       pr.project_id, pr.team_id,
+		       pr.created_at, pr.updated_at,
+		       COALESCE(wd.name, '') AS workflow_name,
+		       COALESCE(t.name, '')  AS team_name
+		  FROM policy_rules pr
+		  LEFT JOIN workflow_definitions wd ON wd.id = pr.workflow_id
+		  LEFT JOIN teams t ON t.id = pr.team_id
+		  LEFT JOIN team_chain tc ON tc.id = pr.team_id
+		 WHERE (
+		       pr.project_id = $1                                    -- own (any enabled state)
+		       OR (
+		           pr.enabled = TRUE                                  -- C4: inherited enabled-only
+		           AND (
+		               (pr.project_id IS NULL AND pr.team_id IS NULL) -- platform inherited
+		               OR pr.team_id IN (SELECT id FROM team_chain)   -- team inherited (subtree-down)
+		           )
+		       )
+		   )
+		 ORDER BY pr.priority DESC,
+		          CASE WHEN pr.project_id IS NOT NULL THEN 2
+		               WHEN pr.team_id    IS NOT NULL THEN 1
+		               ELSE 0 END DESC,
+		          tc.distance ASC NULLS LAST,
+		          pr.created_at ASC,
+		          pr.id ASC`
+	rows, err := r.pool.Query(ctx, q, projectID)
 	if err != nil {
 		return nil, fmt.Errorf("storage: list policies for project: %w", err)
 	}
 	defer rows.Close()
+	return collectPoliciesWithNames(rows)
+}
 
-	var out []*PolicyRule
-	for rows.Next() {
-		p, err := scanPolicy(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, p)
+// ListForTeam — own team rows (any enabled state) + ancestor-team
+// inherited (enabled only) + platform inherited (enabled only). Does
+// NOT include project-scoped rules under the team subtree (per §1
+// Q3 lock — team page is the team's authoring surface, not a
+// project-aggregate report). JOIN populates WorkflowName; TeamName
+// stays empty for own rows (URL teamID is implicit) and ancestor
+// rows surface the ancestor team's name.
+func (r *Policies) ListForTeam(ctx context.Context, teamID uuid.UUID) ([]*PolicyRule, error) {
+	const q = `
+		WITH RECURSIVE team_chain(id, distance) AS (
+		    SELECT $1::uuid, 0
+		    UNION ALL
+		    SELECT t.parent_team_id, tc.distance + 1
+		      FROM teams t
+		      JOIN team_chain tc ON t.id = tc.id
+		     WHERE t.parent_team_id IS NOT NULL
+		)
+		SELECT pr.id, pr.name, pr.selector, pr.workflow_id, pr.priority, pr.enabled, pr.is_system,
+		       pr.direct_reveal_allowed, pr.requires_mfa, pr.reveal_ttl_seconds,
+		       pr.project_id, pr.team_id,
+		       pr.created_at, pr.updated_at,
+		       COALESCE(wd.name, '') AS workflow_name,
+		       COALESCE(t.name, '')  AS team_name
+		  FROM policy_rules pr
+		  LEFT JOIN workflow_definitions wd ON wd.id = pr.workflow_id
+		  LEFT JOIN teams t ON t.id = pr.team_id
+		  LEFT JOIN team_chain tc ON tc.id = pr.team_id
+		 WHERE (
+		       pr.team_id = $1                                        -- own (any enabled state)
+		       OR (
+		           pr.enabled = TRUE
+		           AND (
+		               (pr.project_id IS NULL AND pr.team_id IS NULL) -- platform inherited
+		               OR pr.team_id IN (SELECT id FROM team_chain WHERE id <> $1)
+		               -- ancestor-team inherited (excludes the URL team itself)
+		           )
+		       )
+		   )
+		 ORDER BY pr.priority DESC,
+		          CASE WHEN pr.project_id IS NOT NULL THEN 2
+		               WHEN pr.team_id    IS NOT NULL THEN 1
+		               ELSE 0 END DESC,
+		          tc.distance ASC NULLS LAST,
+		          pr.created_at ASC,
+		          pr.id ASC`
+	rows, err := r.pool.Query(ctx, q, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list policies for team: %w", err)
 	}
-	return out, rows.Err()
+	defer rows.Close()
+	return collectPoliciesWithNames(rows)
 }
 
 func (r *Policies) Update(ctx context.Context, p *PolicyRule) error {
@@ -209,6 +407,19 @@ func (r *Policies) Update(ctx context.Context, p *PolicyRule) error {
 	}
 	if p.RevealTTLSeconds == 0 {
 		p.RevealTTLSeconds = 60
+	}
+	// Anchor immutability — load the existing row to compare. A flip
+	// of project_id ↔ team_id, or NULL ↔ set on either, is rejected.
+	// Mirrors the pattern EPIC R established for project_id (which is
+	// also de-facto immutable — the service-layer UpdateForScopedAuthor
+	// path doesn't expose it). With the team_id addition the immutability
+	// check has to be explicit since admin paths COULD attempt it.
+	existing, getErr := r.Get(ctx, p.ID)
+	if getErr != nil {
+		return getErr
+	}
+	if !uuidPtrEqual(existing.ProjectID, p.ProjectID) || !uuidPtrEqual(existing.TeamID, p.TeamID) {
+		return ErrAnchorImmutable
 	}
 	const q = `
 		UPDATE policy_rules
@@ -250,7 +461,7 @@ func (r *Policies) Delete(ctx context.Context, id uuid.UUID) error {
 const policySelect = `
 	SELECT id, name, selector, workflow_id, priority, enabled, is_system,
 	       direct_reveal_allowed, requires_mfa, reveal_ttl_seconds,
-	       project_id,
+	       project_id, team_id,
 	       created_at, updated_at
 	FROM policy_rules`
 
@@ -264,7 +475,7 @@ func scanPolicy(row interface {
 	err := row.Scan(
 		&p.ID, &p.Name, &selectorRaw, &p.WorkflowID, &p.Priority, &p.Enabled, &p.IsSystem,
 		&p.DirectRevealAllowed, &p.RequiresMFA, &p.RevealTTLSeconds,
-		&p.ProjectID,
+		&p.ProjectID, &p.TeamID,
 		&p.CreatedAt, &p.UpdatedAt,
 	)
 	if err != nil {
@@ -279,4 +490,69 @@ func scanPolicy(row interface {
 		}
 	}
 	return &p, nil
+}
+
+// scanPolicyWithNames extends scanPolicy with the trailing
+// workflow_name + team_name columns from the envelope JOINs in
+// ListForProject + ListForTeam.
+func scanPolicyWithNames(row interface {
+	Scan(dest ...any) error
+}) (*PolicyRule, error) {
+	var (
+		p           PolicyRule
+		selectorRaw []byte
+	)
+	err := row.Scan(
+		&p.ID, &p.Name, &selectorRaw, &p.WorkflowID, &p.Priority, &p.Enabled, &p.IsSystem,
+		&p.DirectRevealAllowed, &p.RequiresMFA, &p.RevealTTLSeconds,
+		&p.ProjectID, &p.TeamID,
+		&p.CreatedAt, &p.UpdatedAt,
+		&p.WorkflowName, &p.TeamName,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("storage: scan policy with names: %w", err)
+	}
+	if len(selectorRaw) > 0 {
+		if err := json.Unmarshal(selectorRaw, &p.Selector); err != nil {
+			return nil, fmt.Errorf("storage: unmarshal policy selector: %w", err)
+		}
+	}
+	return &p, nil
+}
+
+func collectPolicies(rows pgx.Rows) ([]*PolicyRule, error) {
+	var out []*PolicyRule
+	for rows.Next() {
+		p, err := scanPolicy(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func collectPoliciesWithNames(rows pgx.Rows) ([]*PolicyRule, error) {
+	var out []*PolicyRule
+	for rows.Next() {
+		p, err := scanPolicyWithNames(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func uuidPtrEqual(a, b *uuid.UUID) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
 }
