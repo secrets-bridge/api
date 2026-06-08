@@ -49,14 +49,17 @@ import (
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
-// PlatformReservedPriority is the floor of the priority range reserved
-// for platform (policy.edit) rules. Scoped policy.author rules MUST
-// have priority < PlatformReservedPriority so platform's policy always
-// outranks scoped overrides for the same selector.
+// PlatformReservedPriority is retained as the fallback constant for
+// seed migration values + test scaffolding + documentation. R-follow-up
+// #2 (api#121) made this admin-configurable via SettingsService —
+// RUNTIME callers go through `e.settings.GetInt(ctx,
+// KeyPlatformReservedPriority)` so the cap reflects the live admin
+// value, NOT this hardcode.
 //
-// Hardcoded for v1 per EPIC R §1 sign-off. R-follow-up #2 tracks
-// making this admin-configurable when real demand surfaces.
-const PlatformReservedPriority = 9000
+// DO NOT use this constant in service-layer gate chains or handler
+// envelopes. The new code paths that surface the cap must read from
+// SettingsService so an admin edit propagates without a redeploy.
+const PlatformReservedPriority = DefaultPlatformReservedPriority
 
 // ---- sentinels mapped to stable HTTP codes in R2 -------------------
 
@@ -129,6 +132,31 @@ func (e *PolicyEngine) WithEnvironments(r storage.EnvironmentRepository) *Policy
 	return e
 }
 
+// WithSettings binds the SettingsService that scoped policy gates use
+// to read the live PlatformReservedPriority. R-follow-up #2 (api#121).
+// When nil, the gates fall back to the PlatformReservedPriority
+// constant — test scaffold convenience only; production main always
+// wires this so an admin edit propagates without a redeploy.
+func (e *PolicyEngine) WithSettings(s *SettingsService) *PolicyEngine {
+	e.settings = s
+	return e
+}
+
+// reservedPriorityCap returns the LIVE cap from SettingsService when
+// wired; falls back to the test constant when not. Surfaces
+// ErrPlatformSettingUnavailable so callers can fail closed per §3
+// correction 2.
+func (e *PolicyEngine) reservedPriorityCap(ctx context.Context) (int, error) {
+	if e.settings == nil {
+		return PlatformReservedPriority, nil
+	}
+	v, err := e.settings.GetInt(ctx, KeyPlatformReservedPriority)
+	if err != nil {
+		return 0, err
+	}
+	return v, nil
+}
+
 // ---- input shapes --------------------------------------------------
 
 // CreateScopedPolicyInput is the shape the R2 handler hands the
@@ -189,8 +217,12 @@ func (e *PolicyEngine) CreateForScopedAuthor(ctx context.Context, in CreateScope
 		return nil, ErrOutOfScopePolicy
 	}
 
-	// Gate 2 — priority < 9000.
-	if in.Priority >= PlatformReservedPriority {
+	// Gate 2 — priority < live cap (R-follow-up #2).
+	cap, err := e.reservedPriorityCap(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if in.Priority >= cap {
 		return nil, ErrPolicyPriorityReserved
 	}
 
@@ -313,8 +345,15 @@ func (e *PolicyEngine) UpdateForScopedAuthor(ctx context.Context, in UpdateScope
 		changedKeys = append(changedKeys, "selector")
 	}
 
-	// Gate 6 — priority < 9000.
-	if patched.Priority >= PlatformReservedPriority {
+	// Gate 6 — priority < live cap (R-follow-up #2). Even when the
+	// caller isn't changing priority, the merged final value must
+	// satisfy the LIVE cap — admin may have lowered the cap since
+	// the rule was authored. §1 update-time revalidation lock.
+	cap, err := e.reservedPriorityCap(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if patched.Priority >= cap {
 		return nil, ErrPolicyPriorityReserved
 	}
 

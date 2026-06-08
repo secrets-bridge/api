@@ -104,6 +104,13 @@ const (
 
 const scopeProject = "project"
 
+// policyEnvelopeCapKey is a Fiber Locals key the handlers set BEFORE
+// calling mapPolicyServiceErr so the envelope can carry the live cap
+// without re-reading the settings cache. The pre-call lookup is one
+// in-memory map read; doing it inside mapPolicyServiceErr would mean
+// every code path that returns the mapper also has to plumb settings.
+const policyEnvelopeCapKey = "sb:policy:cap"
+
 // policyDenialReasonFor maps a service-layer sentinel to its
 // low-cardinality counter reason. Returns empty string when the error
 // doesn't map (caller skips the counter increment).
@@ -181,10 +188,22 @@ func mapPolicyServiceErr(c fiber.Ctx, err error) error {
 			"scoped policy authors cannot create rules that match production environments",
 			map[string]any{"env_kind": "prod"})
 	case errors.Is(err, services.ErrPolicyPriorityReserved):
+		// R-follow-up #2 (api#121) — cap reads the LIVE admin-set
+		// value, not the EPIC R hardcode. Falls back to the test
+		// constant only when settings isn't wired (which production
+		// main never allows).
+		cap := services.PlatformReservedPriority
+		if mp, ok := c.Locals(policyEnvelopeCapKey).(int); ok {
+			cap = mp
+		}
 		return stableErr(c, fiber.StatusBadRequest,
 			"policy_priority_reserved",
 			"priority is reserved for platform policy rules. Use a value below the cap.",
-			map[string]any{"cap": services.PlatformReservedPriority})
+			map[string]any{"cap": cap})
+	case errors.Is(err, services.ErrPlatformSettingUnavailable):
+		return stableErr(c, fiber.StatusServiceUnavailable,
+			"platform_setting_unavailable",
+			"the platform setting required to evaluate this request is currently unavailable", nil)
 	case errors.Is(err, services.ErrPolicyEnvironmentNotInProject):
 		return stableErr(c, fiber.StatusBadRequest,
 			"policy_environment_not_in_project",
@@ -212,13 +231,19 @@ func mapPolicyServiceErr(c fiber.Ctx, err error) error {
 type ProjectPolicyRules struct {
 	engine   *services.PolicyEngine
 	policies storage.PolicyRepository
+	// R-follow-up #2 (api#121) — settings is consulted so the
+	// policy_priority_reserved envelope's `cap` field reflects the
+	// live admin-set value, NOT the EPIC R hardcode.
+	settings *services.SettingsService
 }
 
 // NewProjectPolicyRules constructs the handler. The PolicyEngine must
-// already have WithAuthorScope + WithEnvironments wired (main does this
-// after rbacResolver + environmentRepo are available).
-func NewProjectPolicyRules(engine *services.PolicyEngine, policies storage.PolicyRepository) *ProjectPolicyRules {
-	return &ProjectPolicyRules{engine: engine, policies: policies}
+// already have WithAuthorScope + WithEnvironments + WithSettings wired
+// (main does this after rbacResolver, environmentRepo, and settingsSvc
+// are available). settings may be nil — the envelope falls back to the
+// EPIC R hardcode constant. Production main always wires this.
+func NewProjectPolicyRules(engine *services.PolicyEngine, policies storage.PolicyRepository, settings *services.SettingsService) *ProjectPolicyRules {
+	return &ProjectPolicyRules{engine: engine, policies: policies, settings: settings}
 }
 
 // ---- request / response shapes ------------------------------------
@@ -359,6 +384,7 @@ func (h *ProjectPolicyRules) Create(c fiber.Ctx) error {
 		if reason := policyDenialReasonFor(err); reason != "" {
 			policyRulesDeniedTotal.WithLabelValues(reason).Inc()
 		}
+		h.stashLiveCap(c)
 		return mapPolicyServiceErr(c, err)
 	}
 
@@ -484,6 +510,7 @@ func (h *ProjectPolicyRules) Update(c fiber.Ctx) error {
 		if reason := policyDenialReasonFor(err); reason != "" {
 			policyRulesDeniedTotal.WithLabelValues(reason).Inc()
 		}
+		h.stashLiveCap(c)
 		return mapPolicyServiceErr(c, err)
 	}
 
@@ -518,6 +545,7 @@ func (h *ProjectPolicyRules) Delete(c fiber.Ctx) error {
 		if reason := policyDenialReasonFor(err); reason != "" {
 			policyRulesDeniedTotal.WithLabelValues(reason).Inc()
 		}
+		h.stashLiveCap(c)
 		return mapPolicyServiceErr(c, err)
 	}
 
@@ -526,4 +554,21 @@ func (h *ProjectPolicyRules) Delete(c fiber.Ctx) error {
 		scopeProject,
 	).Inc()
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+
+// stashLiveCap pre-reads the live PlatformReservedPriority and stashes
+// it in Fiber Locals so mapPolicyServiceErr can populate the
+// policy_priority_reserved envelope without re-reading the settings
+// cache. Best-effort — if the read fails, the envelope falls back to
+// the EPIC R hardcode constant.
+func (h *ProjectPolicyRules) stashLiveCap(c fiber.Ctx) {
+	if h.settings == nil {
+		return
+	}
+	cap, err := h.settings.GetInt(c.Context(), services.KeyPlatformReservedPriority)
+	if err != nil {
+		return
+	}
+	c.Locals(policyEnvelopeCapKey, cap)
 }

@@ -296,8 +296,55 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	agentSvc := services.NewAgentService(agentRepo, auditRepo, rdb)
 	jobSvc := services.NewJobService(jobRepo, auditRepo)
 	wrapSvc := services.NewWrapService(wrapRepo, auditRepo, km)
+
+	// R-follow-up #2 (api#121) — SettingsService backs the live
+	// PlatformReservedPriority cap. Load cache from DB at boot;
+	// subscribe to Redis pub/sub for cross-pod invalidation. If
+	// Redis is unavailable, the per-pod TTL backstop still keeps
+	// values fresh.
+	platformSettingsRepo := storage.NewPlatformSettings(pool)
+	settingsSvc := services.NewSettingsService(
+		pool, platformSettingsRepo, auditRepo, rdb, logger,
+	)
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := settingsSvc.LoadCache(ctx); err != nil {
+			logger.Warn("settings: initial cache load failed; falling back to on-demand reads",
+				"err", err)
+		}
+		cancel()
+	}
+
+	// Subscribe to settings:<key>:changed for cross-pod invalidation.
+	// Per §2 Q9 lock the receiver doesn't trust the message payload;
+	// it re-fetches from the DB. The TTL backstop inside SettingsService
+	// also catches missed messages within 5 minutes.
+	for _, key := range services.Whitelist {
+		key := key
+		go func() {
+			ctx := context.Background()
+			channel := services.Channel(key)
+			sub, err := rdb.Subscribe(ctx, channel)
+			if err != nil {
+				logger.Warn("settings: pub/sub subscribe failed; pod will rely on TTL backstop",
+					"channel", channel, "err", err)
+				return
+			}
+			defer func() { _ = sub.Close() }()
+			for {
+				if _, err := sub.Receive(ctx); err != nil {
+					logger.Warn("settings: pub/sub receive failed; ending subscriber",
+						"channel", channel, "err", err)
+					return
+				}
+				settingsSvc.OnInvalidationMessage(ctx, key)
+			}
+		}()
+	}
+
 	policyEng := services.NewPolicyEngine(policyRepo, workflowRepo, auditRepo).
-		WithEnvironments(environmentRepo)
+		WithEnvironments(environmentRepo).
+		WithSettings(settingsSvc)
 	requestSvc := services.NewRequestService(requestRepo, approvalRepo, wrapSvc, workflowRepo, policyEng, auditRepo, jobSvc).
 		WithEnvironments(environmentRepo)
 	secretsSvc := services.NewSecretsService(secretsRepo, auditRepo)
@@ -692,6 +739,20 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Put("/policies/:id", auth.Require(auth.PermPolicyEdit, rbacResolver), adminH.UpdatePolicy)
 	v1.Delete("/policies/:id", auth.Require(auth.PermPolicyEdit, rbacResolver), adminH.DeletePolicy)
 
+	// R-follow-up #2 (api#121) — platform_settings admin surface.
+	// All three routes gated by policy.edit per §2 lock; broader
+	// settings surface gets its own dedicated permission later.
+	platformSettingsH := handlers.NewPlatformSettings(settingsSvc)
+	v1.Get("/platform-settings",
+		auth.Require(auth.PermPolicyEdit, rbacResolver),
+		platformSettingsH.List)
+	v1.Get("/platform-settings/:key",
+		auth.Require(auth.PermPolicyEdit, rbacResolver),
+		platformSettingsH.Get)
+	v1.Put("/platform-settings/:key",
+		auth.Require(auth.PermPolicyEdit, rbacResolver),
+		platformSettingsH.Put)
+
 	// Canonical permission catalog. Read by the Roles admin UI to
 	// hydrate its permission picker, replacing the interim "union of
 	// permissions across existing roles" client-side discovery
@@ -942,7 +1003,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// policy.edit; these are policy.author scoped to projectID (handler
 	// runs the locked 6/8/5-gate chains inline through the service's
 	// *ForScopedAuthor methods).
-	pprH := handlers.NewProjectPolicyRules(policyEng, policyRepo)
+	pprH := handlers.NewProjectPolicyRules(policyEng, policyRepo, settingsSvc)
 	v1.Post("/projects/:projectID/policy-rules", pprH.Create)
 	v1.Get("/projects/:projectID/policy-rules", pprH.List)
 	v1.Get("/projects/:projectID/policy-rules/:ruleID", pprH.Get)
