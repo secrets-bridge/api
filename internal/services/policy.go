@@ -110,6 +110,12 @@ type PolicyEngine struct {
 	// PlatformReservedPriority constant (test scaffold convenience only;
 	// production main always wires this).
 	settings *SettingsService
+
+	// R-follow-up #3 (api#125) — team repository for the team-scoped
+	// path's gate 2 (team exists + active). The team scope path is
+	// disabled when nil; CreateForTeamScopedAuthor returns a wiring
+	// error if called without it.
+	teams storage.TeamRepository
 }
 
 // NewPolicyEngine binds an engine to its repositories. audit may be
