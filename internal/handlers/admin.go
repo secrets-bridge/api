@@ -49,11 +49,28 @@ type Admin struct {
 	userRoles storage.UserRoleRepository
 	workflows storage.WorkflowRepository
 	policies  storage.PolicyRepository
+
+	// R-follow-up #3 (api#127) — audit emission for admin policy
+	// mutations. Optional — when nil, the counter still fires but
+	// no audit row is written. Production main always wires this so
+	// admin actions are visible in the audit log alongside scoped
+	// authoring actions.
+	audit storage.AuditEventRepository
 }
 
 // NewAdmin constructs an Admin handler bound to its repositories.
 func NewAdmin(roles storage.RoleRepository, userRoles storage.UserRoleRepository, workflows storage.WorkflowRepository, policies storage.PolicyRepository) *Admin {
 	return &Admin{roles: roles, userRoles: userRoles, workflows: workflows, policies: policies}
+}
+
+// WithAudit enables audit emission for admin policy mutations per the
+// §4 C2 normalization (policy.create / .update / .delete with
+// actor_permission_used: "policy.edit" + scope reflecting the actual
+// anchor). When nil, mutations still succeed but no audit event is
+// written. Returns the handler so callers can chain.
+func (h *Admin) WithAudit(a storage.AuditEventRepository) *Admin {
+	h.audit = a
+	return h
 }
 
 // ---- helpers shared across the four entities -------------------------
@@ -478,8 +495,17 @@ type PolicyBody struct {
 	DirectRevealAllowed bool           `json:"direct_reveal_allowed,omitempty"`
 	RequiresMFA         bool           `json:"requires_mfa,omitempty"`
 	RevealTTLSeconds    int            `json:"reveal_ttl_seconds,omitempty"`
-	CreatedAt           time.Time      `json:"created_at,omitempty"`
-	UpdatedAt           time.Time      `json:"updated_at,omitempty"`
+
+	// R-follow-up #3 (api#127) — anchor fields. Admin can author a
+	// rule with EXACTLY ONE of {project_id, team_id} set (or both
+	// NULL for platform rules). The DB CHECK constraint
+	// policy_rules_one_anchor is the backstop; we validate at the
+	// handler so the error envelope is friendly.
+	ProjectID *uuid.UUID `json:"project_id,omitempty"`
+	TeamID    *uuid.UUID `json:"team_id,omitempty"`
+
+	CreatedAt time.Time `json:"created_at,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
 func policyToBody(p *storage.PolicyRule) PolicyBody {
@@ -490,7 +516,66 @@ func policyToBody(p *storage.PolicyRule) PolicyBody {
 		DirectRevealAllowed: p.DirectRevealAllowed,
 		RequiresMFA:         p.RequiresMFA,
 		RevealTTLSeconds:    p.RevealTTLSeconds,
+		ProjectID:           p.ProjectID,
+		TeamID:              p.TeamID,
 		CreatedAt:           p.CreatedAt, UpdatedAt: p.UpdatedAt,
+	}
+}
+
+// validatePolicyAnchor enforces the §1 D2 mutually-exclusive anchor
+// rule + the §5 C5 server-side team-rule selector safety. The DB
+// CHECK constraints from migration 0037 catch most of these
+// post-hoc; the handler validation gives a friendly envelope before
+// the storage round-trip.
+func validatePolicyAnchor(body PolicyBody) error {
+	if body.ProjectID != nil && body.TeamID != nil {
+		return fiber.NewError(fiber.StatusBadRequest,
+			"project_id and team_id cannot both be set (a rule attaches to exactly one anchor)")
+	}
+	// Platform + project anchors don't carry team-specific selector
+	// safety rules (project-anchored rules CAN pin
+	// selector.environment_id since they're already tied to one
+	// project; platform rules are global). Only team-anchored rules
+	// need the §1 C1 safety check.
+	if body.TeamID == nil {
+		return nil
+	}
+	sel := body.Selector
+	if _, ok := sel["project_id"]; ok {
+		return fiber.NewError(fiber.StatusBadRequest,
+			"team-anchored rule cannot pin selector.project_id")
+	}
+	if _, ok := sel["environment_id"]; ok {
+		return fiber.NewError(fiber.StatusBadRequest,
+			"team-anchored rule cannot pin selector.environment_id")
+	}
+	if _, ok := sel["team_id"]; ok {
+		return fiber.NewError(fiber.StatusBadRequest,
+			"team-anchored rule cannot pin selector.team_id (v1 lock)")
+	}
+	kind, hasKind := sel["environment_kind"]
+	if !hasKind {
+		return fiber.NewError(fiber.StatusBadRequest,
+			"team-anchored rule selector must include environment_kind=non_prod")
+	}
+	kindStr, ok := kind.(string)
+	if !ok || kindStr != "non_prod" {
+		return fiber.NewError(fiber.StatusBadRequest,
+			"team-anchored rule selector.environment_kind must equal \"non_prod\"")
+	}
+	return nil
+}
+
+// adminPolicyScope returns the counter label value for an admin
+// mutation based on the rule's anchor.
+func adminPolicyScope(p *storage.PolicyRule) string {
+	switch {
+	case p.ProjectID != nil:
+		return "project"
+	case p.TeamID != nil:
+		return "team"
+	default:
+		return "platform"
 	}
 }
 
@@ -517,6 +602,9 @@ func (h *Admin) CreatePolicy(c fiber.Ctx) error {
 	if err := validatePolicyAccessFields(body); err != nil {
 		return err
 	}
+	if err := validatePolicyAnchor(body); err != nil {
+		return err
+	}
 	p := &storage.PolicyRule{
 		Name:                body.Name,
 		Selector:            body.Selector,
@@ -526,10 +614,15 @@ func (h *Admin) CreatePolicy(c fiber.Ctx) error {
 		DirectRevealAllowed: body.DirectRevealAllowed,
 		RequiresMFA:         body.RequiresMFA,
 		RevealTTLSeconds:    body.RevealTTLSeconds,
+		ProjectID:           body.ProjectID,
+		TeamID:              body.TeamID,
 	}
 	if err := h.policies.Create(c.Context(), p); err != nil {
 		return adminErr(err)
 	}
+	scope := adminPolicyScope(p)
+	policyRulesCreatedTotal.WithLabelValues("policy.edit", scope).Inc()
+	h.auditAdminPolicy(c, "policy.create", p, scope, nil)
 	return c.Status(fiber.StatusCreated).JSON(policyToBody(p))
 }
 
@@ -560,6 +653,12 @@ func (h *Admin) GetPolicy(c fiber.Ctx) error {
 }
 
 // UpdatePolicy handles PUT /policies/:id.
+//
+// R-follow-up #3: Update reads the existing row and preserves its
+// anchor — `team_id` and `project_id` from the body are IGNORED to
+// keep anchor immutability consistent with the storage layer's
+// `ErrAnchorImmutable`. Admin who wants to change a rule's anchor
+// deletes and re-creates.
 func (h *Admin) UpdatePolicy(c fiber.Ctx) error {
 	id, err := parseID(c, "id")
 	if err != nil {
@@ -572,6 +671,20 @@ func (h *Admin) UpdatePolicy(c fiber.Ctx) error {
 	if err := validatePolicyAccessFields(body); err != nil {
 		return err
 	}
+	// Load the existing row so we can preserve the anchor (and run
+	// team-rule selector safety if the row is team-anchored, since
+	// the body may rewrite selector keys).
+	existing, err := h.policies.Get(c.Context(), id)
+	if err != nil {
+		return adminErr(err)
+	}
+	// Anchor immutability — apply existing anchor to validation +
+	// the patched rule.
+	body.ProjectID = existing.ProjectID
+	body.TeamID = existing.TeamID
+	if err := validatePolicyAnchor(body); err != nil {
+		return err
+	}
 	p := &storage.PolicyRule{
 		ID:                  id,
 		Name:                body.Name,
@@ -582,10 +695,15 @@ func (h *Admin) UpdatePolicy(c fiber.Ctx) error {
 		DirectRevealAllowed: body.DirectRevealAllowed,
 		RequiresMFA:         body.RequiresMFA,
 		RevealTTLSeconds:    body.RevealTTLSeconds,
+		ProjectID:           existing.ProjectID,
+		TeamID:              existing.TeamID,
 	}
 	if err := h.policies.Update(c.Context(), p); err != nil {
 		return adminErr(err)
 	}
+	scope := adminPolicyScope(p)
+	policyRulesUpdatedTotal.WithLabelValues("policy.edit", scope).Inc()
+	h.auditAdminPolicy(c, "policy.update", p, scope, nil)
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
@@ -595,8 +713,62 @@ func (h *Admin) DeletePolicy(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	// Load before delete so the counter + audit can record the
+	// rule's anchor.
+	existing, getErr := h.policies.Get(c.Context(), id)
 	if err := h.policies.Delete(c.Context(), id); err != nil {
 		return adminErr(err)
 	}
+	if getErr == nil && existing != nil {
+		scope := adminPolicyScope(existing)
+		policyRulesDeletedTotal.WithLabelValues("policy.edit", scope).Inc()
+		h.auditAdminPolicy(c, "policy.delete", existing, scope, nil)
+	}
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// auditAdminPolicy emits the normalized policy.create/.update/.delete
+// audit event for an admin mutation per §4 C2. Safe no-op when the
+// audit repository isn't wired (WithAudit not called). Metadata
+// mirrors the scoped paths' shape for cross-cohort triage queries.
+func (h *Admin) auditAdminPolicy(c fiber.Ctx, action string, p *storage.PolicyRule, scope string, changedKeys []string) {
+	if h.audit == nil {
+		return
+	}
+	keys := make([]string, 0, len(p.Selector))
+	for k := range p.Selector {
+		keys = append(keys, k)
+	}
+	projectIDMeta := any(nil)
+	if p.ProjectID != nil {
+		projectIDMeta = p.ProjectID.String()
+	}
+	teamIDMeta := any(nil)
+	if p.TeamID != nil {
+		teamIDMeta = p.TeamID.String()
+	}
+	meta := map[string]any{
+		"policy_rule_id":        p.ID.String(),
+		"project_id":            projectIDMeta,
+		"team_id":               teamIDMeta,
+		"scope":                 scope,
+		"priority":              p.Priority,
+		"selector_keys":         keys,
+		"workflow_id":           p.WorkflowID.String(),
+		"actor_permission_used": "policy.edit",
+	}
+	if len(changedKeys) > 0 {
+		meta["changed_keys"] = changedKeys
+	}
+	actor := identityFromCtx(c)
+	if actor == "" {
+		actor = "admin"
+	}
+	_ = h.audit.Append(c.Context(), &storage.AuditEvent{
+		Actor:    actor,
+		Action:   action,
+		Resource: "policy_rule:" + p.ID.String(),
+		Status:   storage.AuditStatusSuccess,
+		Metadata: meta,
+	})
 }
