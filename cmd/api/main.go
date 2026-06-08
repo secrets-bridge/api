@@ -676,6 +676,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 
 	v1.Post("/workflows", auth.Require(auth.PermWorkflowEdit, rbacResolver), adminH.CreateWorkflow)
 	v1.Get("/workflows", adminH.ListWorkflows)
+	// R-follow-up #1 (api#118): static path MUST come BEFORE the
+	// dynamic /workflows/:id route below — otherwise "scoped-policy-
+	// authorable" would match the :id parameter.
+	v1.Get("/workflows/scoped-policy-authorable",
+		auth.RequireAny(auth.PermPolicyAuthor, rbacResolver),
+		adminH.ListScopedAuthorableWorkflows)
 	v1.Get("/workflows/:id", adminH.GetWorkflow)
 	v1.Put("/workflows/:id", auth.Require(auth.PermWorkflowEdit, rbacResolver), adminH.UpdateWorkflow)
 	v1.Delete("/workflows/:id", auth.Require(auth.PermWorkflowEdit, rbacResolver), adminH.DeleteWorkflow)

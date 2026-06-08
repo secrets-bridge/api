@@ -69,6 +69,16 @@ func setupScopedPolicyEnv(t *testing.T) scopedPolicyEnv {
 	if _, err := pool.Exec(ctx, reseed); err != nil {
 		t.Fatalf("reseed: %v", err)
 	}
+	// R-follow-up #1 (api#118) — the seed `standard` workflow is
+	// default-deny under migration 0035. EPIC R tests use it as the
+	// scoped author's workflow; flip the flag so Create gate 5b
+	// (workflow_authorable) passes. Real deployments expect platform
+	// admin to do this explicitly via /admin/workflows.
+	if _, err := pool.Exec(ctx,
+		`UPDATE workflow_definitions SET scoped_policy_authorable=true WHERE name='standard'`,
+	); err != nil {
+		t.Fatalf("flip scoped_policy_authorable on seed: %v", err)
+	}
 
 	// Seed: one project, one non_prod env, one prod env, one workflow.
 	var projectID uuid.UUID

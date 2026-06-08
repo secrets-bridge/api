@@ -88,14 +88,18 @@ var (
 // Fixed reason set §6 locked. Anything outside this table is bucketed
 // to "other" to keep cardinality bounded.
 const (
-	policyDenialOutOfScope        = "out_of_scope"
-	policyDenialPlatformOwned     = "platform_owned"
-	policyDenialProdBlocked       = "prod_blocked"
-	policyDenialScopeTooBroad     = "scope_too_broad"
-	policyDenialPriorityReserved  = "priority_reserved"
-	policyDenialSelectorMismatch  = "selector_mismatch"
-	policyDenialEnvNotInProject   = "env_not_in_project"
-	policyDenialNotFound          = "not_found"
+	policyDenialOutOfScope         = "out_of_scope"
+	policyDenialPlatformOwned      = "platform_owned"
+	policyDenialProdBlocked        = "prod_blocked"
+	policyDenialScopeTooBroad      = "scope_too_broad"
+	policyDenialPriorityReserved   = "priority_reserved"
+	policyDenialSelectorMismatch   = "selector_mismatch"
+	policyDenialEnvNotInProject    = "env_not_in_project"
+	policyDenialNotFound           = "not_found"
+	// R-follow-up #1 (api#118) — 9th value in the fixed reason set.
+	// The LOW-CARDINALITY LOCK stays intact; no workflow_id label is
+	// ever attached to the counter.
+	policyDenialWorkflowNotAuthorable = "workflow_not_authorable"
 )
 
 const scopeProject = "project"
@@ -122,6 +126,8 @@ func policyDenialReasonFor(err error) string {
 		return policyDenialEnvNotInProject
 	case errors.Is(err, services.ErrPolicyNotFound):
 		return policyDenialNotFound
+	case errors.Is(err, services.ErrWorkflowNotAuthorable):
+		return policyDenialWorkflowNotAuthorable
 	}
 	return ""
 }
@@ -140,6 +146,16 @@ func mapPolicyServiceErr(c fiber.Ctx, err error) error {
 			"policy_scope_too_broad",
 			"scoped policy rules must constrain to a non-prod environment",
 			map[string]any{"reason": stb.Reason})
+	}
+	// WorkflowNotAuthorableDetail carries the workflow_id the actor
+	// selected (R-follow-up #1). Surfaced in the envelope for the SPA
+	// toast; NOT attached as a Prometheus label.
+	var wfn *services.WorkflowNotAuthorableDetail
+	if errors.As(err, &wfn) {
+		return stableErr(c, fiber.StatusForbidden,
+			"workflow_not_authorable_for_scope",
+			"the selected workflow is not enabled for scoped policy authoring",
+			map[string]any{"workflow_id": wfn.WorkflowID.String()})
 	}
 
 	switch {

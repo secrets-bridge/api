@@ -86,6 +86,15 @@ func bootstrapScopedPolicies(t *testing.T) *scopedPolicyHarness {
 	if _, err := pool.Exec(ctx, reseed); err != nil {
 		t.Fatalf("reseed: %v", err)
 	}
+	// R-follow-up #1 (api#118) — flip the seed `standard` workflow's
+	// scoped_policy_authorable flag so the EPIC R handler tests can
+	// drive Create through gate 5b. See the storage-layer test for
+	// the explicit authorable-check coverage.
+	if _, err := pool.Exec(ctx,
+		`UPDATE workflow_definitions SET scoped_policy_authorable=true WHERE name='standard'`,
+	); err != nil {
+		t.Fatalf("flip scoped_policy_authorable on seed: %v", err)
+	}
 
 	var projectID, otherProject, nonProdEnvID, prodEnvID uuid.UUID
 	if err := pool.QueryRow(ctx,

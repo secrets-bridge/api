@@ -36,6 +36,13 @@ type WorkflowDefinition struct {
 	FillTTLSeconds           int
 	RequiresSecurityApproval bool
 
+	// R-follow-up #1 (api#118) — opt-in flag exposing this workflow
+	// to scoped policy authors (policy.author on /projects/:id/policy-
+	// rules). Default false; platform admin flips explicitly via the
+	// admin Workflows page. Closes the §5 correction 3 gap from EPIC
+	// R's design pass (the defensive client-side filter in Slice R3).
+	ScopedPolicyAuthorable bool
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -47,6 +54,13 @@ type WorkflowRepository interface {
 	GetByName(ctx context.Context, name string) (*WorkflowDefinition, error)
 	GetDefault(ctx context.Context) (*WorkflowDefinition, error)
 	List(ctx context.Context) ([]*WorkflowDefinition, error)
+	// ListScopedPolicyAuthorable returns workflows that platform
+	// admin has explicitly opted into the scoped policy authoring
+	// surface (R-follow-up #1, api#118). Filtered to enabled = true
+	// AND scoped_policy_authorable = true. The R3 author drawer
+	// reads this list verbatim — no client-side filtering needed
+	// once this method ships.
+	ListScopedPolicyAuthorable(ctx context.Context) ([]*WorkflowDefinition, error)
 	Update(ctx context.Context, w *WorkflowDefinition) error
 	Delete(ctx context.Context, id uuid.UUID) error
 }
@@ -80,13 +94,15 @@ func (r *Workflows) Create(ctx context.Context, w *WorkflowDefinition) error {
 		    wrap_ttl_created, wrap_ttl_approved, wrap_ttl_claimed,
 		    request_ttl, require_justification, allow_self_approval,
 		    notification_channels, is_default, enabled, is_system,
-		    fill_ttl_seconds, requires_security_approval
+		    fill_ttl_seconds, requires_security_approval,
+		    scoped_policy_authorable
 		) VALUES (
 		    $1, $2, $3, $4,
 		    $5::interval, $6::interval, $7::interval,
 		    $8::interval, $9, $10,
 		    $11, $12, $13, $14,
-		    $15, $16
+		    $15, $16,
+		    $17
 		)
 		RETURNING id, created_at, updated_at`
 	return r.pool.QueryRow(ctx, q,
@@ -96,6 +112,7 @@ func (r *Workflows) Create(ctx context.Context, w *WorkflowDefinition) error {
 		intervalString(w.RequestTTL), w.RequireJustification, w.AllowSelfApproval,
 		channels, w.IsDefault, w.Enabled, w.IsSystem,
 		w.FillTTLSeconds, w.RequiresSecurityApproval,
+		w.ScopedPolicyAuthorable,
 	).Scan(&w.ID, &w.CreatedAt, &w.UpdatedAt)
 }
 
@@ -115,6 +132,29 @@ func (r *Workflows) List(ctx context.Context) ([]*WorkflowDefinition, error) {
 	rows, err := r.pool.Query(ctx, workflowSelect+` ORDER BY name ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("storage: list workflows: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*WorkflowDefinition
+	for rows.Next() {
+		w, err := scanWorkflow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+// ListScopedPolicyAuthorable returns the workflows platform admin
+// has opted into the scoped policy authoring surface. Predicate matches
+// the partial index from migration 0035 verbatim.
+func (r *Workflows) ListScopedPolicyAuthorable(ctx context.Context) ([]*WorkflowDefinition, error) {
+	rows, err := r.pool.Query(ctx, workflowSelect+`
+		WHERE enabled = true AND scoped_policy_authorable = true
+		ORDER BY name ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list scoped-authorable workflows: %w", err)
 	}
 	defer rows.Close()
 
@@ -154,7 +194,8 @@ func (r *Workflows) Update(ctx context.Context, w *WorkflowDefinition) error {
 		    notification_channels = $11,
 		    enabled = $12,
 		    fill_ttl_seconds = $13,
-		    requires_security_approval = $14
+		    requires_security_approval = $14,
+		    scoped_policy_authorable = $15
 		WHERE id = $1`
 	tag, err := r.pool.Exec(ctx, q,
 		w.ID, w.Description, w.MinApprovers, w.ApproverRoleID,
@@ -163,6 +204,7 @@ func (r *Workflows) Update(ctx context.Context, w *WorkflowDefinition) error {
 		intervalString(w.RequestTTL), w.RequireJustification, w.AllowSelfApproval,
 		channels, w.Enabled,
 		w.FillTTLSeconds, w.RequiresSecurityApproval,
+		w.ScopedPolicyAuthorable,
 	)
 	if err != nil {
 		return fmt.Errorf("storage: update workflow: %w", err)
@@ -201,6 +243,7 @@ const workflowSelect = `
 	       require_justification, allow_self_approval,
 	       notification_channels, is_default, enabled, is_system,
 	       fill_ttl_seconds, requires_security_approval,
+	       scoped_policy_authorable,
 	       created_at, updated_at
 	FROM workflow_definitions`
 
@@ -220,6 +263,7 @@ func scanWorkflow(row interface {
 		&w.RequireJustification, &w.AllowSelfApproval,
 		&channelsRaw, &w.IsDefault, &w.Enabled, &w.IsSystem,
 		&w.FillTTLSeconds, &w.RequiresSecurityApproval,
+		&w.ScopedPolicyAuthorable,
 		&w.CreatedAt, &w.UpdatedAt,
 	)
 	if err != nil {
