@@ -152,7 +152,7 @@ func bootstrapScopedPolicies(t *testing.T) *scopedPolicyHarness {
 	v1 := app.Group("/api/v1")
 	app.Use(testAuthMW)
 
-	pprH := handlers.NewProjectPolicyRules(engine, storage.NewPolicies(pool))
+	pprH := handlers.NewProjectPolicyRules(engine, storage.NewPolicies(pool), nil)
 	v1.Post("/projects/:projectID/policy-rules", pprH.Create)
 	v1.Get("/projects/:projectID/policy-rules", pprH.List)
 	v1.Get("/projects/:projectID/policy-rules/:ruleID", pprH.Get)

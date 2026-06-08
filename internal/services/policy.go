@@ -104,6 +104,12 @@ type PolicyEngine struct {
 	authorResolver  auth.Resolver
 	authorTeamScope auth.TeamScopeResolver
 	environments    storage.EnvironmentRepository
+
+	// R-follow-up #2 (api#121) — live cap source for the §2 Q2 priority
+	// validation. Nil disables the live read; gate falls back to the
+	// PlatformReservedPriority constant (test scaffold convenience only;
+	// production main always wires this).
+	settings *SettingsService
 }
 
 // NewPolicyEngine binds an engine to its repositories. audit may be
