@@ -24,29 +24,21 @@ import (
 	"github.com/secrets-bridge/api/internal/services"
 )
 
-// Prometheus counters per §2 Q10 with LOW-CARDINALITY LOCK.
+// platformSettingUpdatesTotal — handler-side counter per §2 Q10.
+// LOW-CARDINALITY LOCK: `key` bounded by the v1 whitelist (1 value
+// today); `result` ∈ {success, invalid, unknown, error}. NEVER
+// actor_id / old_value / new_value / project_id / policy_rule_id
+// labels.
 //
-// `key` is bounded by the v1 whitelist (1 value today).
-// `result` ∈ {success, invalid, unknown, error} — bounded.
-// `trigger` ∈ {boot, pubsub, ttl, on_demand} — bounded.
-//
-// NEVER actor_id, old_value, new_value, project_id, policy_rule_id
-// as labels. The audit log is where operators look those up.
-var (
-	platformSettingUpdatesTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "platform_setting_updates_total",
-			Help: "Platform settings update attempts, by key + result. Result set is fixed at {success, invalid, unknown, error}.",
-		},
-		[]string{"key", "result"},
-	)
-	platformSettingCacheReloadsTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "platform_setting_cache_reloads_total",
-			Help: "Platform settings cache reloads, by key + trigger. Trigger set is fixed at {boot, pubsub, ttl, on_demand}.",
-		},
-		[]string{"key", "trigger"},
-	)
+// The companion `platform_setting_cache_reloads_total` lives in the
+// services package because that's where reload events fire (boot,
+// pub/sub event, TTL backstop, on-demand).
+var platformSettingUpdatesTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "platform_setting_updates_total",
+		Help: "Platform settings update attempts, by key + result. Result set is fixed at {success, invalid, unknown, error}.",
+	},
+	[]string{"key", "result"},
 )
 
 // PlatformSettings is the admin handler over SettingsService.

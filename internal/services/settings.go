@@ -34,8 +34,29 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/secrets-bridge/api/pkg/storage"
+)
+
+// platformSettingCacheReloadsTotal counts cache refresh events per
+// §2 Q10 lock. LOW-CARDINALITY LOCK: `key` bounded by the v1
+// whitelist (1 value today); `trigger` ∈ {boot, pubsub, ttl,
+// on_demand}. Companion to the handler-side updates counter.
+//
+// Lives in the services package because that's where reload events
+// fire; the increment sites are LoadCache (boot), OnInvalidationMessage
+// (pubsub), and refreshKey when called from the cold-cache GetInt
+// path (on_demand). The TTL backstop branch is reserved — once a
+// dedicated TTL refresher goroutine lands, it'll increment with
+// trigger=ttl.
+var platformSettingCacheReloadsTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "platform_setting_cache_reloads_total",
+		Help: "Platform settings cache reloads, by key + trigger. Trigger set is fixed at {boot, pubsub, ttl, on_demand}.",
+	},
+	[]string{"key", "trigger"},
 )
 
 // DefaultPlatformReservedPriority is the seed value for the
@@ -155,6 +176,9 @@ func (s *SettingsService) LoadCache(ctx context.Context) error {
 	s.cache = next
 	s.lastRefreshedAt = s.now()
 	s.mu.Unlock()
+	for _, k := range Whitelist {
+		platformSettingCacheReloadsTotal.WithLabelValues(k, "boot").Inc()
+	}
 	return nil
 }
 
@@ -167,7 +191,8 @@ func (s *SettingsService) GetInt(ctx context.Context, key string) (int, error) {
 	if v, ok, ttlOk := s.cachedInt(key); ok && ttlOk {
 		return v, nil
 	}
-	// Cache miss OR TTL expired — refresh from DB.
+	// Cache miss OR TTL expired — refresh from DB (on-demand trigger).
+	platformSettingCacheReloadsTotal.WithLabelValues(key, "on_demand").Inc()
 	if err := s.refreshKey(ctx, key); err != nil {
 		// One more attempt at returning the (now stale) cached value
 		// rather than fail-closed if anything is at all in cache. The
@@ -357,6 +382,7 @@ func (s *SettingsService) OnInvalidationMessage(ctx context.Context, key string)
 		s.logger.Warn("services: settings invalidation for unknown key ignored", "key", key)
 		return
 	}
+	platformSettingCacheReloadsTotal.WithLabelValues(key, "pubsub").Inc()
 	if err := s.refreshKey(ctx, key); err != nil {
 		s.logger.Error("services: refresh after pub/sub failed",
 			"key", key, "err", err)
