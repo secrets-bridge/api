@@ -377,7 +377,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 
 	agentsH := handlers.NewAgents(agentSvc)
 	jobsH := handlers.NewJobs(jobSvc)
-	adminH := handlers.NewAdmin(roleRepo, userRoleRepo, workflowRepo, policyRepo)
+	adminH := handlers.NewAdmin(roleRepo, userRoleRepo, workflowRepo, policyRepo).
+		WithAudit(auditRepo)
 	requestsH := handlers.NewRequests(requestSvc)
 	wrapsH := handlers.NewWraps(requestSvc, wrapSvc, agentRepo, km)
 	revealSessionSvc := services.NewRevealSessionService(
