@@ -287,11 +287,19 @@ type WorkflowBody struct {
 	IsDefault            bool       `json:"is_default,omitempty"`
 	Enabled              bool       `json:"enabled"`
 	IsSystem             bool       `json:"is_system,omitempty"`
-	CreatedAt            time.Time  `json:"created_at,omitempty"`
-	UpdatedAt            time.Time  `json:"updated_at,omitempty"`
+	// R-follow-up #1 (api#118) — *bool encodes COALESCE-preserve at
+	// the wire layer per §3 safety correction. Omitted JSON field
+	// (or explicit `null`) means PRESERVE on Update — critical for
+	// rolling deploys where older admin clients don't send the field.
+	// Send `true` or `false` to flip the flag explicitly. On Create,
+	// nil collapses to false (default-deny).
+	ScopedPolicyAuthorable *bool `json:"scoped_policy_authorable,omitempty"`
+	CreatedAt              time.Time `json:"created_at,omitempty"`
+	UpdatedAt              time.Time `json:"updated_at,omitempty"`
 }
 
 func workflowToBody(w *storage.WorkflowDefinition) WorkflowBody {
+	spa := w.ScopedPolicyAuthorable
 	return WorkflowBody{
 		ID: w.ID, Name: w.Name, Description: w.Description,
 		MinApprovers: w.MinApprovers, ApproverRoleID: w.ApproverRoleID,
@@ -303,12 +311,15 @@ func workflowToBody(w *storage.WorkflowDefinition) WorkflowBody {
 		AllowSelfApproval:    w.AllowSelfApproval,
 		NotificationChannels: w.NotificationChannels,
 		IsDefault:            w.IsDefault, Enabled: w.Enabled, IsSystem: w.IsSystem,
-		CreatedAt: w.CreatedAt, UpdatedAt: w.UpdatedAt,
+		// Always emit the current value on the wire so clients that
+		// preserve via copy-then-PUT round-trip correctly.
+		ScopedPolicyAuthorable: &spa,
+		CreatedAt:              w.CreatedAt, UpdatedAt: w.UpdatedAt,
 	}
 }
 
 func bodyToWorkflow(b WorkflowBody) *storage.WorkflowDefinition {
-	return &storage.WorkflowDefinition{
+	w := &storage.WorkflowDefinition{
 		ID: b.ID, Name: b.Name, Description: b.Description,
 		MinApprovers: b.MinApprovers, ApproverRoleID: b.ApproverRoleID,
 		WrapTTLCreated:       time.Duration(b.WrapTTLCreatedSec) * time.Second,
@@ -320,6 +331,13 @@ func bodyToWorkflow(b WorkflowBody) *storage.WorkflowDefinition {
 		NotificationChannels: b.NotificationChannels,
 		IsDefault:            b.IsDefault, Enabled: b.Enabled,
 	}
+	// R-follow-up #1 (api#118) — explicit field on create collapses
+	// nil to false (default-deny). Caller hits the explicit-merge
+	// path in UpdateWorkflow for PUT.
+	if b.ScopedPolicyAuthorable != nil {
+		w.ScopedPolicyAuthorable = *b.ScopedPolicyAuthorable
+	}
+	return w
 }
 
 // CreateWorkflow handles POST /workflows.
@@ -355,6 +373,31 @@ func (h *Admin) ListWorkflows(c fiber.Ctx) error {
 	return c.JSON(out)
 }
 
+// ListScopedAuthorableWorkflows handles GET /workflows/scoped-policy-
+// authorable. Returns enabled AND scoped_policy_authorable=true
+// workflows for the EPIC R Slice R3 author drawer (R-follow-up #1).
+//
+// Auth: bearer + policy.author at any scope. The caller doesn't need
+// scoped coverage of any specific project to LIST opted-in workflows;
+// they need it to USE one (which the gate chain at POST/PUT
+// /projects/:id/policy-rules enforces).
+//
+// §2 ROUTE-ORDER CORRECTION: this static path MUST be mounted BEFORE
+// the dynamic GET /workflows/:id route in main.go. Otherwise some
+// routers (including Fiber v3 in some configurations) would interpret
+// "scoped-policy-authorable" as the :id parameter.
+func (h *Admin) ListScopedAuthorableWorkflows(c fiber.Ctx) error {
+	ws, err := h.workflows.ListScopedPolicyAuthorable(c.Context())
+	if err != nil {
+		return adminErr(err)
+	}
+	out := make([]WorkflowBody, 0, len(ws))
+	for _, w := range ws {
+		out = append(out, workflowToBody(w))
+	}
+	return c.JSON(out)
+}
+
 // GetWorkflow handles GET /workflows/:id.
 func (h *Admin) GetWorkflow(c fiber.Ctx) error {
 	id, err := parseID(c, "id")
@@ -370,6 +413,12 @@ func (h *Admin) GetWorkflow(c fiber.Ctx) error {
 
 // UpdateWorkflow handles PUT /workflows/:id. is_default flips require
 // a separate atomic operation (not in this PR) so they're ignored here.
+//
+// R-follow-up #1 (api#118) preserve semantic: ScopedPolicyAuthorable
+// is *bool on the body. Nil = preserve (Get the existing value, set on
+// the patched struct). Explicit true/false = flip. Critical for rolling
+// deploys where older admin clients don't yet know about the field —
+// without the preserve they'd silently opt out every workflow.
 func (h *Admin) UpdateWorkflow(c fiber.Ctx) error {
 	id, err := parseID(c, "id")
 	if err != nil {
@@ -381,6 +430,15 @@ func (h *Admin) UpdateWorkflow(c fiber.Ctx) error {
 	}
 	w := bodyToWorkflow(body)
 	w.ID = id
+	if body.ScopedPolicyAuthorable == nil {
+		// Preserve via Get → merge. Cost: one extra DB round-trip
+		// per Update. Acceptable for an admin path.
+		existing, err := h.workflows.Get(c.Context(), id)
+		if err != nil {
+			return adminErr(err)
+		}
+		w.ScopedPolicyAuthorable = existing.ScopedPolicyAuthorable
+	}
 	if err := h.workflows.Update(c.Context(), w); err != nil {
 		return adminErr(err)
 	}

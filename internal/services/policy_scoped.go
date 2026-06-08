@@ -69,7 +69,27 @@ var (
 	ErrPolicyPriorityReserved       = errors.New("services: priority is reserved for platform policy rules")
 	ErrPolicyEnvironmentNotInProject = errors.New("services: the selector's environment does not belong to this project")
 	ErrPolicyNotFound               = errors.New("services: policy rule not found")
+
+	// R-follow-up #1 (api#118) — gate fires when a scoped author
+	// selects a workflow that platform admin has not opted into the
+	// scoped policy authoring surface. Distinct from
+	// ErrPlatformPolicyNotEditable: the workflow exists and is
+	// reachable by admin; it just hasn't been exposed to scoped
+	// authors yet.
+	ErrWorkflowNotAuthorable = errors.New("services: the selected workflow is not enabled for scoped policy authoring")
 )
+
+// WorkflowNotAuthorableDetail wraps ErrWorkflowNotAuthorable with the
+// workflow_id the actor selected. Handler in R2 surfaces this via
+// {error_code: workflow_not_authorable_for_scope, workflow_id: "..."}.
+// The actor already picked the workflow in the dropdown, so the id
+// isn't a leak; it's a UX affordance.
+type WorkflowNotAuthorableDetail struct {
+	WorkflowID uuid.UUID
+}
+
+func (d *WorkflowNotAuthorableDetail) Error() string { return ErrWorkflowNotAuthorable.Error() }
+func (d *WorkflowNotAuthorableDetail) Unwrap() error { return ErrWorkflowNotAuthorable }
 
 // PolicyScopeTooBroadDetail wraps ErrPolicyScopeTooBroad with the
 // variant kind. Handlers in R2 surface this via the {error_code:
@@ -185,8 +205,16 @@ func (e *PolicyEngine) CreateForScopedAuthor(ctx context.Context, in CreateScope
 	}
 
 	// Gate 5 — workflow exists.
-	if _, err := e.workflows.Get(ctx, in.WorkflowID); err != nil {
+	wf, err := e.workflows.Get(ctx, in.WorkflowID)
+	if err != nil {
 		return nil, fmt.Errorf("services: workflow %s: %w", in.WorkflowID, err)
+	}
+
+	// Gate 5b — workflow opted into scoped authoring (R-follow-up #1).
+	// Platform admins curate the surface explicitly; default-deny.
+	if !wf.ScopedPolicyAuthorable {
+		e.auditPolicyDeniedWorkflowNotAuthorable(ctx, in.ActorID, in.ProjectID, in.WorkflowID, in.CorrelationID)
+		return nil, &WorkflowNotAuthorableDetail{WorkflowID: in.WorkflowID}
 	}
 
 	// Gate 6 — INSERT + audit.
@@ -299,8 +327,21 @@ func (e *PolicyEngine) UpdateForScopedAuthor(ctx context.Context, in UpdateScope
 	}
 
 	// Workflow exists (in case it changed).
-	if _, err := e.workflows.Get(ctx, patched.WorkflowID); err != nil {
+	wf, err := e.workflows.Get(ctx, patched.WorkflowID)
+	if err != nil {
 		return nil, fmt.Errorf("services: workflow %s: %w", patched.WorkflowID, err)
+	}
+
+	// Gate 7b — workflow authorable check (R-follow-up #1). The §1 Q4
+	// grandfather rule pins this to: only enforce when the workflow
+	// CHANGED from what the rule already had. Pure priority/selector/
+	// name updates against an existing workflow attachment are NOT
+	// blocked by a later platform opt-out — the existing attachment
+	// is grandfathered.
+	workflowChanged := in.WorkflowID != nil && *in.WorkflowID != rule.WorkflowID
+	if workflowChanged && !wf.ScopedPolicyAuthorable {
+		e.auditPolicyDeniedWorkflowNotAuthorable(ctx, in.ActorID, in.ProjectID, patched.WorkflowID, in.CorrelationID)
+		return nil, &WorkflowNotAuthorableDetail{WorkflowID: patched.WorkflowID}
 	}
 
 	// Gate 8 — UPDATE + audit.
@@ -508,6 +549,38 @@ func (e *PolicyEngine) auditPolicySuccess(
 		Status:        storage.AuditStatusSuccess,
 		CorrelationID: correlationID,
 		Metadata:      meta,
+	})
+}
+
+// auditPolicyDeniedWorkflowNotAuthorable fires when a scoped author
+// selects a workflow that platform admin has not opted into the
+// scoped policy authoring surface (R-follow-up #1, api#118). Same
+// gate-order protection as the out-of-scope variant: NO policy_rule_id
+// because the rule was never written (Create) or never read (Update
+// path runs the check before the UPDATE). The attempted_workflow_id
+// IS included — the actor picked it from the dropdown they were just
+// shown, so including it isn't a leak.
+func (e *PolicyEngine) auditPolicyDeniedWorkflowNotAuthorable(
+	ctx context.Context,
+	actorID string,
+	projectID uuid.UUID,
+	workflowID uuid.UUID,
+	correlationID uuid.UUID,
+) {
+	if e.audit == nil {
+		return
+	}
+	_ = e.audit.Append(ctx, &storage.AuditEvent{
+		Actor:         actorOrAdmin(actorID),
+		Action:        "policy.denied_workflow_not_authorable",
+		Resource:      "workflow:" + workflowID.String(),
+		Status:        storage.AuditStatusFailure,
+		CorrelationID: correlationID,
+		Metadata: map[string]any{
+			"attempted_workflow_id":      workflowID.String(),
+			"attempted_project_id":       projectID.String(),
+			"actor_permission_attempted": string(auth.PermPolicyAuthor),
+		},
 	})
 }
 

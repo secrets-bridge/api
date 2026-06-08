@@ -1,0 +1,2 @@
+DROP INDEX IF EXISTS workflow_definitions_scoped_policy_authorable_idx;
+ALTER TABLE workflow_definitions DROP COLUMN IF EXISTS scoped_policy_authorable;

@@ -115,6 +115,40 @@ func Require(perm Permission, r Resolver) fiber.Handler {
 	}
 }
 
+// RequireAny returns a middleware that gates the next handler on the
+// caller holding `perm` AT ANY SCOPE (global, project, team, or any
+// other key). Use this for read-only "directory" endpoints where the
+// data isn't tenancy-scoped but the catalog should not be exposed to
+// users who don't hold the permission at all.
+//
+// Example: GET /workflows/scoped-policy-authorable (R-follow-up #1,
+// api#118) lists workflows opted into the scoped policy author
+// surface; only callers who hold policy.author somewhere should see
+// the list. The actual project coverage check runs at the POST/PUT
+// /projects/:id/policy-rules surface, not here.
+func RequireAny(perm Permission, r Resolver) fiber.Handler {
+	if r == nil {
+		panic("auth: RequireAny called with nil Resolver")
+	}
+	return func(c fiber.Ctx) error {
+		userID, ok := IdentityFromContext(c.Context())
+		if !ok {
+			return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+		}
+		grants, err := r.Resolve(c.Context(), userID)
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+		}
+		for _, g := range grants {
+			if g.Permission == string(perm) {
+				return c.Next()
+			}
+		}
+		return fiber.NewError(fiber.StatusForbidden,
+			fmt.Sprintf("missing permission %q", perm))
+	}
+}
+
 // RequireScoped returns a middleware that gates the next handler on
 // the caller holding `perm` AT A SCOPE COVERING THE REQUEST.
 //
