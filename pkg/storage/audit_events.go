@@ -53,7 +53,44 @@ type AuditQuery struct {
 // Update or Delete methods — the table is append-only by design.
 type AuditEventRepository interface {
 	Append(ctx context.Context, evt *AuditEvent) error
+	AppendTx(ctx context.Context, tx pgx.Tx, evt *AuditEvent) error
 	Query(ctx context.Context, q AuditQuery) ([]*AuditEvent, error)
+	// ListPolicyRuleHistory returns audit events for a single policy
+	// rule ordered ASC for chain reconstruction. Filters resource =
+	// 'policy_rule:<uuid>' AND action ∈ {policy.create/.update/.delete}
+	// PLUS the R-follow-up #3 pre-cutover names
+	// (policy.created_for_scope / .updated_for_scope /
+	// .deleted_for_scope) for compatibility — slice-1c's service
+	// layer remaps the legacy names before returning to the SPA.
+	//
+	// ORDER BY occurred_at ASC, id ASC — stable tie-break for
+	// same-instant events (R-follow-up #5 §2 OQ-1).
+	//
+	// limit caps the returned row count; the returned `hasMore` flag
+	// is true when there's at least one more event past the limit.
+	// limit ≤ 0 → DefaultPolicyHistoryLimit; cap MaxPolicyHistoryLimit.
+	ListPolicyRuleHistory(
+		ctx context.Context,
+		ruleID uuid.UUID,
+		limit int,
+	) (events []*AuditEvent, hasMore bool, err error)
+}
+
+// R-follow-up #5 (api#133) — limit bounds for the policy history
+// endpoint. Default matches the SPA's initial-page-size; the cap
+// guards against operator typo requests (e.g. limit=10000000).
+const (
+	DefaultPolicyHistoryLimit = 50
+	MaxPolicyHistoryLimit     = 500
+)
+
+// Policy audit action names — normalized (R-follow-up #3 §4 C2) and
+// legacy (pre-cutover, EPIC R + R-follow-up #1). The history WHERE
+// clause includes BOTH sets per R-follow-up #5 §2 D7; the service
+// layer remaps legacy → normalized before returning to the SPA.
+var policyMutationActions = []string{
+	"policy.create", "policy.update", "policy.delete",
+	"policy.created_for_scope", "policy.updated_for_scope", "policy.deleted_for_scope",
 }
 
 // AuditEvents is the Postgres implementation of AuditEventRepository.
@@ -202,4 +239,63 @@ func (r *AuditEvents) Query(ctx context.Context, q AuditQuery) ([]*AuditEvent, e
 		out = append(out, &evt)
 	}
 	return out, rows.Err()
+}
+
+// ListPolicyRuleHistory implements AuditEventRepository.
+// See the interface doc-comment for the contract.
+func (r *AuditEvents) ListPolicyRuleHistory(
+	ctx context.Context,
+	ruleID uuid.UUID,
+	limit int,
+) ([]*AuditEvent, bool, error) {
+	if limit <= 0 {
+		limit = DefaultPolicyHistoryLimit
+	}
+	if limit > MaxPolicyHistoryLimit {
+		limit = MaxPolicyHistoryLimit
+	}
+
+	// LIMIT $3 + 1 is the standard "is there at least one more?" trick.
+	// Fetch one row over the limit; if we got it, truncate + flag.
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, actor, action, resource, status, correlation_id, metadata, occurred_at
+		  FROM audit_events
+		 WHERE resource = $1
+		   AND action = ANY($2)
+		 ORDER BY occurred_at ASC, id ASC
+		 LIMIT $3
+	`, "policy_rule:"+ruleID.String(), policyMutationActions, limit+1)
+	if err != nil {
+		return nil, false, fmt.Errorf("storage: list policy rule history: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]*AuditEvent, 0, limit)
+	for rows.Next() {
+		var (
+			evt          AuditEvent
+			metadataJSON []byte
+		)
+		if err := rows.Scan(
+			&evt.ID, &evt.Actor, &evt.Action, &evt.Resource, &evt.Status,
+			&evt.CorrelationID, &metadataJSON, &evt.OccurredAt,
+		); err != nil {
+			return nil, false, fmt.Errorf("storage: scan policy history event: %w", err)
+		}
+		if len(metadataJSON) > 0 {
+			if err := json.Unmarshal(metadataJSON, &evt.Metadata); err != nil {
+				return nil, false, fmt.Errorf("storage: unmarshal policy history metadata: %w", err)
+			}
+		}
+		out = append(out, &evt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
 }

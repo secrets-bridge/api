@@ -12,25 +12,23 @@
 package handlers
 
 import (
-	"context"
 	"encoding/hex"
 	"errors"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/services/actordisplay"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
 // Audit handles GET /api/v1/audit-events.
 type Audit struct {
-	repo   storage.AuditEventRepository
-	users  storage.LocalUserRepository
-	agents storage.AgentRepository
+	repo     storage.AuditEventRepository
+	resolver *actordisplay.Resolver
 }
 
 // NewAudit binds the handler to the given repositories. `users` and
@@ -43,7 +41,7 @@ func NewAudit(
 	users storage.LocalUserRepository,
 	agents storage.AgentRepository,
 ) *Audit {
-	return &Audit{repo: repo, users: users, agents: agents}
+	return &Audit{repo: repo, resolver: actordisplay.New(users, agents)}
 }
 
 // AuditEventBody is the JSON wire shape for one audit_events row.
@@ -59,16 +57,16 @@ func NewAudit(
 // The raw `actor` field stays in the payload so UIs can use it as a
 // tooltip / forensic anchor — display is convenience, not auth.
 type AuditEventBody struct {
-	ID            string                 `json:"id"`
-	Actor         string                 `json:"actor"`
-	ActorDisplay  string                 `json:"actor_display"`
-	Action        string                 `json:"action"`
-	Resource      string                 `json:"resource"`
-	Status        string                 `json:"status"`
-	CorrelationID string                 `json:"correlation_id"`
-	Metadata      map[string]any         `json:"metadata,omitempty"`
-	OccurredAt    time.Time              `json:"occurred_at"`
-	_             struct{}               `json:"-"`
+	ID            string         `json:"id"`
+	Actor         string         `json:"actor"`
+	ActorDisplay  string         `json:"actor_display"`
+	Action        string         `json:"action"`
+	Resource      string         `json:"resource"`
+	Status        string         `json:"status"`
+	CorrelationID string         `json:"correlation_id"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
+	OccurredAt    time.Time      `json:"occurred_at"`
+	_             struct{}       `json:"-"`
 }
 
 // List handles GET /audit-events. Optional query params:
@@ -136,7 +134,7 @@ func (h *Audit) List(c fiber.Ctx) error {
 		out = append(out, AuditEventBody{
 			ID:            r.ID.String(),
 			Actor:         r.Actor,
-			ActorDisplay:  h.resolveActorDisplay(c.Context(), r.Actor, cache),
+			ActorDisplay:  h.resolver.Display(c.Context(), r.Actor, cache),
 			Action:        r.Action,
 			Resource:      r.Resource,
 			Status:        string(r.Status),
@@ -148,94 +146,10 @@ func (h *Audit) List(c fiber.Ctx) error {
 	return c.JSON(out)
 }
 
-// resolveActorDisplay turns a raw `actor` string (e.g. "user:<uuid>",
-// "agent:<uuid>", "system:oidc") into a human-readable label. Failures
-// degrade to a short placeholder so the UI never has to render a raw
-// UUID. Results are memoised per-request through the supplied cache.
-//
-// Hard rule: this function may NOT include the full UUID in the
-// fallback — operators triaging a leaked screenshot still need to be
-// able to identify the principal forensically, but only via the
-// already-present `actor` field. The display is convenience text.
-func (h *Audit) resolveActorDisplay(ctx context.Context, actor string, cache map[string]string) string {
-	if actor == "" {
-		return ""
-	}
-	if d, ok := cache[actor]; ok {
-		return d
-	}
-	d := h.lookupActorDisplay(ctx, actor)
-	cache[actor] = d
-	return d
-}
-
-func (h *Audit) lookupActorDisplay(ctx context.Context, actor string) string {
-	// Built-in non-user actors. Keep the set small + explicit; the
-	// reconciler/back-channel/etc. all emit through `system:<kind>`.
-	if strings.HasPrefix(actor, "system:") {
-		kind := strings.TrimPrefix(actor, "system:")
-		switch kind {
-		case "oidc":
-			return "System (OIDC reconciler)"
-		case "":
-			return "System"
-		default:
-			return "System (" + kind + ")"
-		}
-	}
-
-	if strings.HasPrefix(actor, "user:") && h.users != nil {
-		raw := strings.TrimPrefix(actor, "user:")
-		id, err := uuid.Parse(raw)
-		if err != nil {
-			return shortFallback("user", raw)
-		}
-		u, err := h.users.Get(ctx, id)
-		if err != nil || u == nil {
-			return shortFallback("user", raw)
-		}
-		switch {
-		case u.Email != "":
-			return u.Email
-		case u.DisplayName != "":
-			return u.DisplayName
-		default:
-			return shortFallback("user", raw)
-		}
-	}
-
-	if strings.HasPrefix(actor, "agent:") && h.agents != nil {
-		raw := strings.TrimPrefix(actor, "agent:")
-		id, err := uuid.Parse(raw)
-		if err != nil {
-			return shortFallback("agent", raw)
-		}
-		a, err := h.agents.Get(ctx, id)
-		if err != nil || a == nil {
-			return shortFallback("agent", raw)
-		}
-		if a.Name != "" {
-			return "Agent " + a.Name
-		}
-		return shortFallback("agent", raw)
-	}
-
-	// Unknown shape — return the raw actor string as the display.
-	// UI tooltip will show the same value; no information lost.
-	return actor
-}
-
-// shortFallback renders a placeholder when the actor's UUID can't be
-// resolved to a record (deleted user, agent revoked, malformed id).
-// Truncates the UUID to 8 chars + ellipsis so the placeholder is
-// recognisably short without leaking a useful identifier.
-func shortFallback(kind, raw string) string {
-	short := raw
-	if len(short) > 8 {
-		short = short[:8] + "…"
-	}
-	return "unknown " + kind + " (" + short + ")"
-}
+// Actor enrichment (resolveActorDisplay / lookupActorDisplay /
+// shortFallback) moved to internal/services/actordisplay so
+// PolicyHistoryService (R-follow-up #5 slice 1a, api#133) can reuse
+// the same lookup + caching logic without duplicating ~80 lines.
 
 // --- tiny helpers ---------------------------------------------------
 

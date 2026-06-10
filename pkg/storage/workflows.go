@@ -54,6 +54,11 @@ type WorkflowRepository interface {
 	GetByName(ctx context.Context, name string) (*WorkflowDefinition, error)
 	GetDefault(ctx context.Context) (*WorkflowDefinition, error)
 	List(ctx context.Context) ([]*WorkflowDefinition, error)
+	// ListByIDs returns workflows for the given ids in arbitrary
+	// order. Used by PolicyHistoryService (R-follow-up #5, api#133)
+	// for batch workflow-name resolution. Empty ids → empty result.
+	// Unknown ids silently absent.
+	ListByIDs(ctx context.Context, ids []uuid.UUID) ([]*WorkflowDefinition, error)
 	// ListScopedPolicyAuthorable returns workflows that platform
 	// admin has explicitly opted into the scoped policy authoring
 	// surface (R-follow-up #1, api#118). Filtered to enabled = true
@@ -132,6 +137,37 @@ func (r *Workflows) List(ctx context.Context) ([]*WorkflowDefinition, error) {
 	rows, err := r.pool.Query(ctx, workflowSelect+` ORDER BY name ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("storage: list workflows: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*WorkflowDefinition
+	for rows.Next() {
+		w, err := scanWorkflow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+// ListByIDs returns the workflows matching any of the given IDs.
+// Used by PolicyHistoryService (R-follow-up #5, api#133) for batch
+// workflow-name resolution at render time — single SQL with
+// WHERE id = ANY($1) minimizes round trips over the policy
+// rule history chain.
+//
+// Returns workflows in arbitrary order. An empty `ids` slice returns
+// an empty result with no error (zero-size ANY($1) is harmless).
+// Unknown IDs are silently absent from the result — the caller is
+// expected to render "(deleted)" for missing entries.
+func (r *Workflows) ListByIDs(ctx context.Context, ids []uuid.UUID) ([]*WorkflowDefinition, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := r.pool.Query(ctx, workflowSelect+` WHERE id = ANY($1)`, ids)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list workflows by ids: %w", err)
 	}
 	defer rows.Close()
 
