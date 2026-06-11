@@ -416,15 +416,19 @@ func TestCreateForTeamScopedAuthor_HappyPath_EmitsSuccessAuditWithScope(t *testi
 		t.Errorf("rule.ProjectID must be nil for team rule, got %v", rule.ProjectID)
 	}
 	// Audit event has scope=team + team_id + actor_permission_used=policy.author.
-	var scope, teamID, perm string
+	// R-follow-up #5 slice 1b: also asserts the new name + enabled
+	// snapshot fields surface for PolicyHistoryService to diff.
+	var scope, teamID, perm, name, enabled string
 	if err := e.pool.QueryRow(e.ctx,
 		`SELECT metadata->>'scope',
 		        metadata->>'team_id',
-		        metadata->>'actor_permission_used'
+		        metadata->>'actor_permission_used',
+		        metadata->>'name',
+		        metadata->>'enabled'
 		   FROM audit_events
 		  WHERE action='policy.create' AND actor='alice'
 		  ORDER BY occurred_at DESC LIMIT 1`,
-	).Scan(&scope, &teamID, &perm); err != nil {
+	).Scan(&scope, &teamID, &perm, &name, &enabled); err != nil {
 		t.Fatal(err)
 	}
 	if scope != "team" {
@@ -435,6 +439,12 @@ func TestCreateForTeamScopedAuthor_HappyPath_EmitsSuccessAuditWithScope(t *testi
 	}
 	if perm != string(auth.PermPolicyAuthor) {
 		t.Errorf("actor_permission_used=%q", perm)
+	}
+	if name == "" {
+		t.Errorf("R5 slice 1b: name missing from audit metadata")
+	}
+	if enabled != "true" && enabled != "false" {
+		t.Errorf("R5 slice 1b: enabled missing from audit metadata, got %q", enabled)
 	}
 }
 

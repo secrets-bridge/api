@@ -514,11 +514,16 @@ func (e *PolicyEngine) auditTeamPolicySuccess(
 	for k := range rule.Selector {
 		keys = append(keys, k)
 	}
+	// R-follow-up #5 slice 1b (api#134) — snapshot extension: add
+	// `name` + `enabled` so PolicyHistoryService can diff them
+	// without re-reading the rule row from the DB.
 	meta := map[string]any{
 		"policy_rule_id":        rule.ID.String(),
 		"team_id":               teamIDMeta,
 		"project_id":            nil,
 		"scope":                 "team",
+		"name":                  rule.Name,
+		"enabled":               rule.Enabled,
 		"priority":              rule.Priority,
 		"selector_keys":         keys,
 		"workflow_id":           rule.WorkflowID.String(),

@@ -87,12 +87,17 @@ func TestAdminCreatePolicy_TeamAnchored_HappyPath(t *testing.T) {
 	}
 
 	// Audit row with scope=team + actor_permission_used=policy.edit.
-	var scope, perm string
+	// R-follow-up #5 slice 1b: also asserts the new name + enabled
+	// snapshot fields surface for PolicyHistoryService to diff.
+	var scope, perm, name, enabled string
 	if err := pool.QueryRow(t.Context(),
-		`SELECT metadata->>'scope', metadata->>'actor_permission_used'
+		`SELECT metadata->>'scope',
+		        metadata->>'actor_permission_used',
+		        metadata->>'name',
+		        metadata->>'enabled'
 		   FROM audit_events WHERE action='policy.create'
 		   ORDER BY occurred_at DESC LIMIT 1`,
-	).Scan(&scope, &perm); err != nil {
+	).Scan(&scope, &perm, &name, &enabled); err != nil {
 		t.Fatal(err)
 	}
 	if scope != "team" {
@@ -100,6 +105,12 @@ func TestAdminCreatePolicy_TeamAnchored_HappyPath(t *testing.T) {
 	}
 	if perm != "policy.edit" {
 		t.Errorf("actor_permission_used=%q want policy.edit", perm)
+	}
+	if name == "" {
+		t.Errorf("R5 slice 1b: name missing from admin audit metadata")
+	}
+	if enabled != "true" && enabled != "false" {
+		t.Errorf("R5 slice 1b: enabled missing from admin audit metadata, got %q", enabled)
 	}
 }
 
