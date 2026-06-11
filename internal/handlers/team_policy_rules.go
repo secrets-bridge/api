@@ -100,6 +100,11 @@ type TeamPolicyRules struct {
 	engine   *services.PolicyEngine
 	policies storage.PolicyRepository
 	settings *services.SettingsService
+	// R-follow-up #5 slice 1c (api#135) — history service + audit
+	// repo. nil-safe: when not wired, History returns 503; production
+	// main always wires both via WithHistory.
+	history *services.PolicyHistoryService
+	audit   storage.AuditEventRepository
 }
 
 // NewTeamPolicyRules constructs the handler. PolicyEngine must already
@@ -107,6 +112,15 @@ type TeamPolicyRules struct {
 // rbacResolver + teamsRepo + settingsSvc are available).
 func NewTeamPolicyRules(engine *services.PolicyEngine, policies storage.PolicyRepository, settings *services.SettingsService) *TeamPolicyRules {
 	return &TeamPolicyRules{engine: engine, policies: policies, settings: settings}
+}
+
+// WithHistory wires the policy rule history service + audit repo for
+// the R-follow-up #5 History endpoint. main calls this after the
+// service is constructed; tests may leave it unwired.
+func (h *TeamPolicyRules) WithHistory(history *services.PolicyHistoryService, audit storage.AuditEventRepository) *TeamPolicyRules {
+	h.history = history
+	h.audit = audit
+	return h
 }
 
 // ---- request / response shapes -----------------------------------
@@ -537,4 +551,86 @@ func (h *TeamPolicyRules) readLiveCapOrZero(c fiber.Ctx) int {
 		return 0
 	}
 	return cap
+}
+
+// History handles GET /teams/:teamID/policy-rules/:ruleID/history.
+// R-follow-up #5 slice 1c (api#135) — team-anchored history view.
+//
+// Gate chain per §4 D3:
+//
+//  1. Parse URL params
+//  2. Coverage — requireTeamPolicyScope (handler helper, NOT middleware,
+//     per R-follow-up #3 §3 C3 — denial emits its own audit + counter)
+//  3. Resource load — policyRepo.Get(ruleID); 404 on missing OR deleted
+//     (scoped post-delete behavior per C4: scoped paths lose access at
+//     delete time; admin /policies/:id/history retains forensic visibility)
+//  4. Anchor routing — rule.TeamID nil OR != URL teamID → silent
+//     404 policy_not_found (§4 OQ4-1; gate-order enumeration protection)
+//  5. Service call — policyHistorySvc.ListForRule
+//  6. Counter + audit — policy_rule_history_views_total{scope="team"}
+//     + audit.read.policy_history event
+func (h *TeamPolicyRules) History(c fiber.Ctx) error {
+	if h.history == nil {
+		return stableErr(c, fiber.StatusServiceUnavailable,
+			"history_unavailable",
+			"policy history service not configured", nil)
+	}
+
+	teamID, err := uuid.Parse(c.Params("teamID"))
+	if err != nil {
+		return stableErr(c, fiber.StatusBadRequest, "bad_request",
+			"teamID is malformed", nil)
+	}
+	ruleID, err := uuid.Parse(c.Params("ruleID"))
+	if err != nil {
+		return stableErr(c, fiber.StatusBadRequest, "bad_request",
+			"ruleID is malformed", nil)
+	}
+
+	limit, err := parseHistoryLimit(c)
+	if err != nil {
+		return stableErr(c, fiber.StatusBadRequest, "bad_request",
+			err.Error(), nil)
+	}
+
+	actor := identityFromCtx(c)
+	if termErr := h.requireTeamPolicyScope(c, teamID, actor); termErr != nil {
+		return termErr
+	}
+
+	rule, err := h.policies.Get(c.Context(), ruleID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return stableErr(c, fiber.StatusNotFound,
+				"policy_not_found",
+				"policy rule not found", nil)
+		}
+		return mapTeamPolicyServiceErr(c, err)
+	}
+
+	// §4 anchor routing — wrong-anchor (or non-team) → silent 404.
+	// Mirrors the team Get handler's enumeration protection.
+	if rule.TeamID == nil || *rule.TeamID != teamID {
+		return stableErr(c, fiber.StatusNotFound,
+			"policy_not_found",
+			"policy rule not found", nil)
+	}
+
+	entries, hasMore, err := h.history.ListForRule(c.Context(), ruleID, limit)
+	if err != nil {
+		return stableErr(c, fiber.StatusInternalServerError,
+			"history_internal_error",
+			err.Error(), nil)
+	}
+
+	policyRuleHistoryViewsTotal.WithLabelValues(scopeTeam).Inc()
+	auditReadPolicyHistory(c, h.audit, ruleID, scopeTeam, len(entries))
+
+	return c.JSON(policyRuleHistoryResponse{
+		RuleID:  ruleID.String(),
+		Scope:   scopeTeam,
+		Entries: toHistoryEntryWires(entries),
+		HasMore: hasMore,
+		Limit:   limit,
+	})
 }
