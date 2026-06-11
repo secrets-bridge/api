@@ -40,6 +40,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
@@ -56,6 +57,11 @@ type Admin struct {
 	// admin actions are visible in the audit log alongside scoped
 	// authoring actions.
 	audit storage.AuditEventRepository
+
+	// R-follow-up #5 slice 1c (api#135) — history service for the
+	// admin PolicyHistory endpoint. nil-safe: when not wired, returns
+	// 503. Production main always wires this via WithHistory.
+	history *services.PolicyHistoryService
 }
 
 // NewAdmin constructs an Admin handler bound to its repositories.
@@ -70,6 +76,14 @@ func NewAdmin(roles storage.RoleRepository, userRoles storage.UserRoleRepository
 // written. Returns the handler so callers can chain.
 func (h *Admin) WithAudit(a storage.AuditEventRepository) *Admin {
 	h.audit = a
+	return h
+}
+
+// WithHistory wires the policy rule history service for the
+// R-follow-up #5 admin PolicyHistory endpoint. Returns the handler so
+// callers can chain.
+func (h *Admin) WithHistory(history *services.PolicyHistoryService) *Admin {
+	h.history = history
 	return h
 }
 
@@ -775,5 +789,76 @@ func (h *Admin) auditAdminPolicy(c fiber.Ctx, action string, p *storage.PolicyRu
 		Resource: "policy_rule:" + p.ID.String(),
 		Status:   storage.AuditStatusSuccess,
 		Metadata: meta,
+	})
+}
+
+// PolicyHistory handles GET /policies/:ruleID/history.
+// R-follow-up #5 slice 1c (api#135) — admin history view.
+//
+// Gate chain per §4 D3 / C2:
+//
+//  1. Auth — auth.Require(PermPolicyEdit) at the route mount (in main).
+//  2. Parse URL params + limit.
+//  3. **Existence check FIRST via the audit chain** (NOT policyRepo.Get).
+//     If at least one mutation event exists, proceed even when the rule
+//     itself was deleted. This is the admin post-delete forensic
+//     visibility path per §4 C4. Scoped paths (project / team) lose
+//     access at delete; admin retains.
+//  4. NO anchor routing — admin sees history for any anchor.
+//  5. Service call — policyHistorySvc.ListForRule.
+//  6. Counter + audit — policy_rule_history_views_total{scope=<derived>}
+//     + audit.read.policy_history event. Scope is derived from the live
+//     rule if it still exists; falls back to the most recent event's
+//     metadata `scope` field if the rule has been deleted.
+func (h *Admin) PolicyHistory(c fiber.Ctx) error {
+	if h.history == nil {
+		return fiber.NewError(fiber.StatusServiceUnavailable,
+			"policy history service not configured")
+	}
+
+	ruleID, err := parseID(c, "ruleID")
+	if err != nil {
+		return err
+	}
+
+	limit, err := parseHistoryLimit(c)
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
+
+	// Service walks the audit chain regardless of whether the rule
+	// exists. Empty result + rule-not-found → 404.
+	entries, hasMore, err := h.history.ListForRule(c.Context(), ruleID, limit)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+
+	// Scope derivation:
+	//   1. Try live rule (most accurate)
+	//   2. Fall back to most recent event's snapshot scope
+	//   3. Default to "platform" for legacy events that predate the
+	//      §4 C2 scope-in-metadata extension
+	scope := "platform"
+	if rule, getErr := h.policies.Get(c.Context(), ruleID); getErr == nil {
+		scope = scopeForRule(rule)
+	} else if len(entries) > 0 {
+		// Most recent event is entries[len-1] (chain order is ASC).
+		if entries[len(entries)-1].Scope != "" {
+			scope = entries[len(entries)-1].Scope
+		}
+	} else {
+		// No live rule AND no audit events — truly not found.
+		return fiber.NewError(fiber.StatusNotFound, "policy rule not found")
+	}
+
+	policyRuleHistoryViewsTotal.WithLabelValues(scope).Inc()
+	auditReadPolicyHistory(c, h.audit, ruleID, scope, len(entries))
+
+	return c.JSON(policyRuleHistoryResponse{
+		RuleID:  ruleID.String(),
+		Scope:   scope,
+		Entries: toHistoryEntryWires(entries),
+		HasMore: hasMore,
+		Limit:   limit,
 	})
 }

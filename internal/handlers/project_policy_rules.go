@@ -235,6 +235,11 @@ type ProjectPolicyRules struct {
 	// policy_priority_reserved envelope's `cap` field reflects the
 	// live admin-set value, NOT the EPIC R hardcode.
 	settings *services.SettingsService
+	// R-follow-up #5 slice 1c (api#135) — history service + audit
+	// repo. nil-safe: when not wired, History returns 503; production
+	// main always wires both via WithHistory.
+	history *services.PolicyHistoryService
+	audit   storage.AuditEventRepository
 }
 
 // NewProjectPolicyRules constructs the handler. The PolicyEngine must
@@ -244,6 +249,15 @@ type ProjectPolicyRules struct {
 // EPIC R hardcode constant. Production main always wires this.
 func NewProjectPolicyRules(engine *services.PolicyEngine, policies storage.PolicyRepository, settings *services.SettingsService) *ProjectPolicyRules {
 	return &ProjectPolicyRules{engine: engine, policies: policies, settings: settings}
+}
+
+// WithHistory wires the policy rule history service + audit repo for
+// the R-follow-up #5 History endpoint. main calls this after the
+// service is constructed; tests may leave it unwired.
+func (h *ProjectPolicyRules) WithHistory(history *services.PolicyHistoryService, audit storage.AuditEventRepository) *ProjectPolicyRules {
+	h.history = history
+	h.audit = audit
+	return h
 }
 
 // ---- request / response shapes ------------------------------------
@@ -619,4 +633,79 @@ func (h *ProjectPolicyRules) stashLiveCap(c fiber.Ctx) {
 		return
 	}
 	c.Locals(policyEnvelopeCapKey, cap)
+}
+
+// History handles GET /projects/:projectID/policy-rules/:ruleID/history.
+// R-follow-up #5 slice 1c (api#135) — project-anchored history view.
+//
+// Gate chain per §4 D3:
+//
+//  1. Parse URL params
+//  2. Resource load — policyRepo.Get(ruleID); 404 on missing OR deleted
+//     (scoped post-delete behavior per C4: scoped paths lose access at
+//     delete time; admin /policies/:id/history retains forensic visibility)
+//  3. Anchor routing — rule.ProjectID nil OR != URL projectID → silent
+//     404 policy_not_found (§4 OQ4-1; gate-order enumeration protection)
+//  4. Service call — policyHistorySvc.ListForRule
+//  5. Counter + audit — policy_rule_history_views_total{scope="project"}
+//     + audit.read.policy_history event
+func (h *ProjectPolicyRules) History(c fiber.Ctx) error {
+	if h.history == nil {
+		return stableErr(c, fiber.StatusServiceUnavailable,
+			"history_unavailable",
+			"policy history service not configured", nil)
+	}
+
+	projectID, err := uuid.Parse(c.Params("projectID"))
+	if err != nil {
+		return stableErr(c, fiber.StatusBadRequest, "bad_request",
+			"projectID is malformed", nil)
+	}
+	ruleID, err := uuid.Parse(c.Params("ruleID"))
+	if err != nil {
+		return stableErr(c, fiber.StatusBadRequest, "bad_request",
+			"ruleID is malformed", nil)
+	}
+
+	limit, err := parseHistoryLimit(c)
+	if err != nil {
+		return stableErr(c, fiber.StatusBadRequest, "bad_request",
+			err.Error(), nil)
+	}
+
+	rule, err := h.policies.Get(c.Context(), ruleID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return stableErr(c, fiber.StatusNotFound,
+				"policy_not_found",
+				"policy rule not found", nil)
+		}
+		return mapPolicyServiceErr(c, err)
+	}
+
+	// §4 anchor routing — wrong-anchor (or non-project) → silent 404.
+	// Mirrors the existing project Get's enumeration protection.
+	if rule.ProjectID == nil || *rule.ProjectID != projectID {
+		return stableErr(c, fiber.StatusNotFound,
+			"policy_not_found",
+			"policy rule not found", nil)
+	}
+
+	entries, hasMore, err := h.history.ListForRule(c.Context(), ruleID, limit)
+	if err != nil {
+		return stableErr(c, fiber.StatusInternalServerError,
+			"history_internal_error",
+			err.Error(), nil)
+	}
+
+	policyRuleHistoryViewsTotal.WithLabelValues(scopeProject).Inc()
+	auditReadPolicyHistory(c, h.audit, ruleID, scopeProject, len(entries))
+
+	return c.JSON(policyRuleHistoryResponse{
+		RuleID:  ruleID.String(),
+		Scope:   scopeProject,
+		Entries: toHistoryEntryWires(entries),
+		HasMore: hasMore,
+		Limit:   limit,
+	})
 }

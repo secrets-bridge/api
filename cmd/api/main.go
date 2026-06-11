@@ -379,6 +379,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	jobsH := handlers.NewJobs(jobSvc)
 	adminH := handlers.NewAdmin(roleRepo, userRoleRepo, workflowRepo, policyRepo).
 		WithAudit(auditRepo)
+	// R-follow-up #5 slice 1c — adminH.WithHistory is called further
+	// down where policyHistorySvc is constructed alongside the scoped
+	// handlers (search for "policyHistorySvc := ").
 	requestsH := handlers.NewRequests(requestSvc)
 	wrapsH := handlers.NewWraps(requestSvc, wrapSvc, agentRepo, km)
 	revealSessionSvc := services.NewRevealSessionService(
@@ -1010,12 +1013,31 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// policy.edit; these are policy.author scoped to projectID (handler
 	// runs the locked 6/8/5-gate chains inline through the service's
 	// *ForScopedAuthor methods).
-	pprH := handlers.NewProjectPolicyRules(policyEng, policyRepo, settingsSvc)
+	// R-follow-up #5 slice 1c (api#135) — policy rule history service.
+	// Pure compute over audit + workflow repos + the shared actor
+	// display resolver. Shared across the three URL families
+	// (project / team / admin) via WithHistory below.
+	policyHistorySvc := services.NewPolicyHistoryService(
+		auditRepo, workflowRepo, localUsersRepoInApp, agentRepo,
+	)
+	adminH.WithHistory(policyHistorySvc)
+	// Admin history view — `policy.edit` only. Mounted alongside the
+	// existing /policies admin routes so RBAC + URL family stay
+	// consistent. Per §4 C2/C4 the handler's existence check uses the
+	// audit chain (not policyRepo.Get) so admins retain forensic
+	// visibility for deleted rules.
+	v1.Get("/policies/:ruleID/history",
+		auth.Require(auth.PermPolicyEdit, rbacResolver), adminH.PolicyHistory)
+
+	pprH := handlers.NewProjectPolicyRules(policyEng, policyRepo, settingsSvc).
+		WithHistory(policyHistorySvc, auditRepo)
 	v1.Post("/projects/:projectID/policy-rules", pprH.Create)
 	v1.Get("/projects/:projectID/policy-rules", pprH.List)
 	v1.Get("/projects/:projectID/policy-rules/:ruleID", pprH.Get)
 	v1.Put("/projects/:projectID/policy-rules/:ruleID", pprH.Update)
 	v1.Delete("/projects/:projectID/policy-rules/:ruleID", pprH.Delete)
+	// R-follow-up #5 slice 1c — project-anchored history view.
+	v1.Get("/projects/:projectID/policy-rules/:ruleID/history", pprH.History)
 
 	// R-follow-up #3 (api#126) — team-anchored scoped policy.author
 	// routes. Mirror of the project family above; both share the same
@@ -1024,12 +1046,15 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// coverage gate (requireTeamPolicyScope) runs inline in each
 	// handler — NOT middleware — so denial emits the same audit +
 	// counter signal as the rest of the gate chain.
-	tprH := handlers.NewTeamPolicyRules(policyEng, policyRepo, settingsSvc)
+	tprH := handlers.NewTeamPolicyRules(policyEng, policyRepo, settingsSvc).
+		WithHistory(policyHistorySvc, auditRepo)
 	v1.Post("/teams/:teamID/policy-rules", tprH.Create)
 	v1.Get("/teams/:teamID/policy-rules", tprH.List)
 	v1.Get("/teams/:teamID/policy-rules/:ruleID", tprH.Get)
 	v1.Put("/teams/:teamID/policy-rules/:ruleID", tprH.Update)
 	v1.Delete("/teams/:teamID/policy-rules/:ruleID", tprH.Delete)
+	// R-follow-up #5 slice 1c — team-anchored history view.
+	v1.Get("/teams/:teamID/policy-rules/:ruleID/history", tprH.History)
 
 	// R-follow-up #3 — small /me coverage endpoint for the SPA
 	// sidebar + canAuthorTeamPolicy capability helper.
