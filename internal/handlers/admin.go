@@ -546,6 +546,18 @@ func validatePolicyAnchor(body PolicyBody) error {
 		return fiber.NewError(fiber.StatusBadRequest,
 			"project_id and team_id cannot both be set (a rule attaches to exactly one anchor)")
 	}
+
+	// Selector enum v1 lock (api#139) — applies to ALL admin anchors
+	// (platform / project / team). The user correction stated:
+	// "Admin users should not be able to create invalid provider_type
+	// selectors either." We surface the same reason variant the scoped
+	// paths use so the SPA's existing toast routing works on this
+	// surface too.
+	if d := services.ValidateProviderTypeSelector(body.Selector); d != nil {
+		return fiber.NewError(fiber.StatusBadRequest,
+			"selector.provider_type is not in the policy selector enum (provider_type_invalid)")
+	}
+
 	// Platform + project anchors don't carry team-specific selector
 	// safety rules (project-anchored rules CAN pin
 	// selector.environment_id since they're already tied to one

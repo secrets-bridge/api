@@ -61,6 +61,48 @@ const (
 	ProviderConnectionTypeKubernetes ProviderConnectionType = "kubernetes"
 )
 
+// Selector enum v1 lock (api#139) — the canonical list of provider
+// types that may appear in `policy_rules.selector["provider_type"]`.
+//
+// Backend-owned. UI mirrors this set in `src/api/policySelectorEnums.ts`;
+// both update together when a new provider type ships. The SPA must
+// not invent values — service-layer validation hard-rejects unknown
+// strings with `policy_scope_too_broad / provider_type_invalid`.
+//
+// Source of truth: this slice. Use `IsPolicySelectorProviderType` for
+// membership checks; use `PolicySelectorProviderTypes()` to enumerate
+// (returns a defensive copy so callers can't mutate).
+var policySelectorProviderTypes = []string{
+	string(ProviderConnectionTypeAWSSM),
+	string(ProviderConnectionTypeVault),
+	string(ProviderConnectionTypeGCPSM),
+	string(ProviderConnectionTypeAzureKV),
+	string(ProviderConnectionTypeKubernetes),
+}
+
+// PolicySelectorProviderTypes returns a copy of the enumerated set so
+// callers cannot mutate the canonical list. Use for UI mirror sync
+// scripts or audit/inspection paths.
+func PolicySelectorProviderTypes() []string {
+	return append([]string(nil), policySelectorProviderTypes...)
+}
+
+// IsPolicySelectorProviderType reports whether `v` is a member of the
+// locked policy selector enum. The selector-shape validator uses this
+// to gate `selector["provider_type"]` writes from all three policy
+// emit paths (project-scoped author, team-scoped author, admin).
+func IsPolicySelectorProviderType(v string) bool {
+	switch v {
+	case string(ProviderConnectionTypeAWSSM),
+		string(ProviderConnectionTypeVault),
+		string(ProviderConnectionTypeGCPSM),
+		string(ProviderConnectionTypeAzureKV),
+		string(ProviderConnectionTypeKubernetes):
+		return true
+	}
+	return false
+}
+
 // ProviderConnectionStatus is constrained by a CHECK on the schema.
 type ProviderConnectionStatus string
 

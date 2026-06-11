@@ -468,6 +468,12 @@ func validateTeamSelector(selector map[string]any) error {
 		return &PolicyScopeTooBroadDetail{Reason: PolicyScopeTooBroadTeamSelectorPinsTeamID}
 	}
 
+	// Selector enum v1 lock (api#139) — provider_type, when present,
+	// MUST be a member of the locked backend enum. Absent = wildcard.
+	if d := ValidateProviderTypeSelector(selector); d != nil {
+		return d
+	}
+
 	// Required environment_kind = "non_prod".
 	kindRaw, hasKind := selector["environment_kind"]
 	if !hasKind {
