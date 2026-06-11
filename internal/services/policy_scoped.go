@@ -570,9 +570,22 @@ func (e *PolicyEngine) auditPolicySuccess(
 	for k := range rule.Selector {
 		keys = append(keys, k)
 	}
+	// R-follow-up #5 slice 1b (api#134) — snapshot extension:
+	//   - Add `name`, `enabled`: so PolicyHistoryService can diff them
+	//     without re-reading the rule row from the DB.
+	//   - Add `scope: "project"`, `team_id: nil`: closes the
+	//     cross-cohort inconsistency from R-follow-up #3 §4 C2 — the
+	//     team + admin emits already carry both; the project emit was
+	//     the odd one out. Triage queries (the audit compatibility
+	//     query docs#34 ships) no longer have to special-case the
+	//     project path.
 	meta := map[string]any{
 		"policy_rule_id":        rule.ID.String(),
 		"project_id":            projectIDMeta,
+		"team_id":               nil,
+		"scope":                 "project",
+		"name":                  rule.Name,
+		"enabled":               rule.Enabled,
 		"priority":              rule.Priority,
 		"selector_keys":         keys,
 		"workflow_id":           rule.WorkflowID.String(),

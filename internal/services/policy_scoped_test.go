@@ -382,6 +382,14 @@ func TestCreateForScopedAuthor_HappyPath_EmitsCreateAudit_SelectorKeysOnly(t *te
 	if !containsAll(metadataText, "selector_keys", "policy.author") {
 		t.Fatalf("audit metadata missing required keys: %s", metadataText)
 	}
+	// R-follow-up #5 slice 1b (api#134) — snapshot extension. The
+	// emit MUST carry the new fields so PolicyHistoryService can
+	// reconstruct the chain without re-reading the rule row from
+	// the DB. Also asserts cross-cohort consistency: project path
+	// now emits `scope`/`team_id` like the team + admin paths.
+	if !containsAll(metadataText, `"name"`, `"enabled"`, `"scope": "project"`, `"team_id": null`) {
+		t.Fatalf("audit metadata missing R5 slice 1b extension keys: %s", metadataText)
+	}
 }
 
 // ---- UPDATE chain (8 gates) ---------------------------------------

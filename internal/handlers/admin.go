@@ -747,11 +747,16 @@ func (h *Admin) auditAdminPolicy(c fiber.Ctx, action string, p *storage.PolicyRu
 	if p.TeamID != nil {
 		teamIDMeta = p.TeamID.String()
 	}
+	// R-follow-up #5 slice 1b (api#134) — snapshot extension: add
+	// `name` + `enabled` so PolicyHistoryService can diff them
+	// without re-reading the rule row from the DB.
 	meta := map[string]any{
 		"policy_rule_id":        p.ID.String(),
 		"project_id":            projectIDMeta,
 		"team_id":               teamIDMeta,
 		"scope":                 scope,
+		"name":                  p.Name,
+		"enabled":               p.Enabled,
 		"priority":              p.Priority,
 		"selector_keys":         keys,
 		"workflow_id":           p.WorkflowID.String(),
