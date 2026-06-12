@@ -51,6 +51,13 @@ type HistoryEntry struct {
 	Scope               string // `platform` | `project` | `team`
 	Changes             []FieldChange
 	SnapshotAfter       RuleSnapshot
+	// Reconstructed marks an entry that was NOT derived from an audit
+	// event — a response-time "initial snapshot" synthesized from the
+	// live rule for rules that have zero audit history (migration-seeded
+	// or pre-cutover; M6/api#143). The UI renders these as "initial
+	// snapshot observed" rather than a real `policy.create` event (L7),
+	// so genuine create events keep their normal "created" copy.
+	Reconstructed bool
 }
 
 // FieldChange is one field's delta between consecutive snapshots.
@@ -109,9 +116,18 @@ func NewPolicyHistoryService(
 //
 // limit ≤ 0 → storage.DefaultPolicyHistoryLimit. Caller (handler) is
 // expected to validate + cap before reaching this point.
+// current is the live rule row (loaded by the handler for its scope
+// check). When the rule has ZERO audit events — a migration-seeded or
+// pre-cutover rule like the system `match-all` — and current is
+// non-nil, the service synthesizes a single Reconstructed "initial
+// snapshot" entry from it so the timeline isn't blank (M6/api#143). No
+// migration, no audit write — pure compute. current may be nil on the
+// admin post-delete forensic path (where events always exist, so the
+// synthesis branch isn't reached anyway).
 func (s *PolicyHistoryService) ListForRule(
 	ctx context.Context,
 	ruleID uuid.UUID,
+	current *storage.PolicyRule,
 	limit int,
 ) (entries []HistoryEntry, hasMore bool, err error) {
 	if s.audit == nil {
@@ -123,7 +139,10 @@ func (s *PolicyHistoryService) ListForRule(
 		return nil, false, fmt.Errorf("services: list policy rule history: %w", err)
 	}
 	if len(rawEvents) == 0 {
-		return nil, false, nil
+		if current == nil {
+			return nil, false, nil
+		}
+		return []HistoryEntry{s.reconstructedSnapshot(ctx, current)}, false, nil
 	}
 
 	// Batch-resolve every distinct workflow_id surfacing in the chain.
@@ -216,6 +235,69 @@ func (s *PolicyHistoryService) resolveWorkflowNames(
 		names[w.ID.String()] = w.Name
 	}
 	return names, nil
+}
+
+// reconstructedSnapshot builds the single synthetic "initial snapshot"
+// entry for a rule with no audit history (M6). OccurredAt is the rule's
+// created_at; the actor is "system" (no real event recorded who/when);
+// Reconstructed=true drives the UI's "initial snapshot observed"
+// treatment. No Changes — it's the baseline, not a delta.
+func (s *PolicyHistoryService) reconstructedSnapshot(
+	ctx context.Context,
+	rule *storage.PolicyRule,
+) HistoryEntry {
+	scope := "platform"
+	switch {
+	case rule.TeamID != nil:
+		scope = "team"
+	case rule.ProjectID != nil:
+		scope = "project"
+	}
+	return HistoryEntry{
+		OccurredAt:    rule.CreatedAt,
+		Actor:         "system",
+		ActorDisplay:  "system",
+		Action:        "policy.create",
+		Scope:         scope,
+		SnapshotAfter: s.snapshotFromRule(ctx, rule),
+		Reconstructed: true,
+	}
+}
+
+// snapshotFromRule renders a RuleSnapshot from the LIVE rule row (not an
+// audit event), resolving the workflow name with a single lookup.
+// Selector VALUES are never read — only the sorted key set, per the §6
+// selector lock.
+func (s *PolicyHistoryService) snapshotFromRule(
+	ctx context.Context,
+	rule *storage.PolicyRule,
+) RuleSnapshot {
+	name := rule.Name
+	enabled := rule.Enabled
+	snap := RuleSnapshot{
+		Name:       &name,
+		Enabled:    &enabled,
+		Priority:   rule.Priority,
+		WorkflowID: rule.WorkflowID.String(),
+	}
+	keys := make([]string, 0, len(rule.Selector))
+	for k := range rule.Selector {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	snap.SelectorKeys = keys
+
+	if s.workflows != nil && rule.WorkflowID != uuid.Nil {
+		if wfs, err := s.workflows.ListByIDs(ctx, []uuid.UUID{rule.WorkflowID}); err == nil {
+			for _, w := range wfs {
+				if w.ID == rule.WorkflowID {
+					n := w.Name
+					snap.WorkflowName = &n
+				}
+			}
+		}
+	}
+	return snap
 }
 
 // snapshotFromMetadata builds a RuleSnapshot from one audit event's

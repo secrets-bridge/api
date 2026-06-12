@@ -70,6 +70,7 @@ type historyEntryWire struct {
 	Scope               string             `json:"scope,omitempty"`
 	Changes             []fieldChangeWire  `json:"changes"`
 	SnapshotAfter       ruleSnapshotWire   `json:"snapshot_after"`
+	Reconstructed       bool               `json:"reconstructed,omitempty"`
 }
 
 type fieldChangeWire struct {
@@ -162,6 +163,7 @@ func toHistoryEntryWires(entries []services.HistoryEntry) []historyEntryWire {
 			Scope:               e.Scope,
 			Changes:             toFieldChangeWires(e.Changes),
 			SnapshotAfter:       toRuleSnapshotWire(e.SnapshotAfter),
+			Reconstructed:       e.Reconstructed,
 		}
 		out = append(out, w)
 	}

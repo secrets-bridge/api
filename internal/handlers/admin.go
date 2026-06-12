@@ -867,27 +867,35 @@ func (h *Admin) PolicyHistory(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 
+	// Load the live rule once (nil when deleted). Passed to the service
+	// so a zero-audit rule (e.g. the system match-all seed) still gets a
+	// synthesized initial snapshot (M6); reused below for scope.
+	var current *storage.PolicyRule
+	if rule, getErr := h.policies.Get(c.Context(), ruleID); getErr == nil {
+		current = rule
+	}
+
 	// Service walks the audit chain regardless of whether the rule
 	// exists. Empty result + rule-not-found → 404.
-	entries, hasMore, err := h.history.ListForRule(c.Context(), ruleID, limit)
+	entries, hasMore, err := h.history.ListForRule(c.Context(), ruleID, current, limit)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 
 	// Scope derivation:
-	//   1. Try live rule (most accurate)
-	//   2. Fall back to most recent event's snapshot scope
-	//   3. Default to "platform" for legacy events that predate the
-	//      §4 C2 scope-in-metadata extension
+	//   1. Live rule (most accurate)
+	//   2. Most recent event's snapshot scope (post-delete forensic)
+	//   3. Default "platform" for legacy events predating §4 C2
 	scope := "platform"
-	if rule, getErr := h.policies.Get(c.Context(), ruleID); getErr == nil {
-		scope = scopeForRule(rule)
-	} else if len(entries) > 0 {
+	switch {
+	case current != nil:
+		scope = scopeForRule(current)
+	case len(entries) > 0:
 		// Most recent event is entries[len-1] (chain order is ASC).
 		if entries[len(entries)-1].Scope != "" {
 			scope = entries[len(entries)-1].Scope
 		}
-	} else {
+	default:
 		// No live rule AND no audit events — truly not found.
 		return fiber.NewError(fiber.StatusNotFound, "policy rule not found")
 	}
