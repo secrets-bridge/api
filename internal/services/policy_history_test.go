@@ -179,7 +179,7 @@ func TestPolicyHistoryService_FullChain_CreateUpdatesDelete(t *testing.T) {
 	}
 
 	svc := services.NewPolicyHistoryService(audit, workflows, nil, nil)
-	entries, hasMore, err := svc.ListForRule(ctx, uuid.New(), 50)
+	entries, hasMore, err := svc.ListForRule(ctx, uuid.New(), nil, 50)
 	if err != nil {
 		t.Fatalf("ListForRule: %v", err)
 	}
@@ -244,6 +244,100 @@ func TestPolicyHistoryService_FullChain_CreateUpdatesDelete(t *testing.T) {
 	}
 }
 
+// TestPolicyHistoryService_ZeroEventsSynthesizesReconstructedSnapshot
+// pins M6: a rule with NO audit events (the migration-seeded match-all)
+// yields a single synthesized "initial snapshot" entry from the live
+// rule, marked Reconstructed, with no Changes — instead of a blank
+// timeline. No audit write, no migration.
+func TestPolicyHistoryService_ZeroEventsSynthesizesReconstructedSnapshot(t *testing.T) {
+	ctx := context.Background()
+	wf := uuid.New()
+	audit := &fakeAuditRepo{rows: nil} // zero events
+	workflows := &fakeWorkflowRepo{
+		byID: map[uuid.UUID]*storage.WorkflowDefinition{wf: {ID: wf, Name: "standard"}},
+	}
+	svc := services.NewPolicyHistoryService(audit, workflows, nil, nil)
+
+	created := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	rule := &storage.PolicyRule{
+		ID:         uuid.New(),
+		Name:       "match-all (system default)",
+		Selector:   map[string]any{"provider_type": "vault", "environment_kind": "non_prod"},
+		WorkflowID: wf,
+		Priority:   0,
+		Enabled:    true,
+		CreatedAt:  created,
+	}
+	entries, hasMore, err := svc.ListForRule(ctx, rule.ID, rule, 50)
+	if err != nil {
+		t.Fatalf("ListForRule: %v", err)
+	}
+	if hasMore {
+		t.Fatalf("hasMore = true; want false")
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d; want exactly 1 synthesized entry", len(entries))
+	}
+	e := entries[0]
+	if !e.Reconstructed {
+		t.Errorf("Reconstructed = false; want true")
+	}
+	if e.Actor != "system" {
+		t.Errorf("Actor = %q; want system", e.Actor)
+	}
+	if len(e.Changes) != 0 {
+		t.Errorf("synthesized entry Changes = %v; want empty (baseline, not a delta)", e.Changes)
+	}
+	if !e.OccurredAt.Equal(created) {
+		t.Errorf("OccurredAt = %v; want rule created_at %v", e.OccurredAt, created)
+	}
+	if e.SnapshotAfter.Name == nil || *e.SnapshotAfter.Name != "match-all (system default)" {
+		t.Errorf("SnapshotAfter.Name = %v", e.SnapshotAfter.Name)
+	}
+	if e.SnapshotAfter.WorkflowName == nil || *e.SnapshotAfter.WorkflowName != "standard" {
+		t.Errorf("SnapshotAfter.WorkflowName = %v; want standard", e.SnapshotAfter.WorkflowName)
+	}
+	// Selector KEYS only, sorted — values never read (§6 lock).
+	gotKeys := e.SnapshotAfter.SelectorKeys
+	wantKeys := []string{"environment_kind", "provider_type"}
+	if len(gotKeys) != len(wantKeys) {
+		t.Fatalf("SelectorKeys = %v; want %v", gotKeys, wantKeys)
+	}
+	for i := range wantKeys {
+		if gotKeys[i] != wantKeys[i] {
+			t.Errorf("SelectorKeys[%d] = %q; want %q (sorted)", i, gotKeys[i], wantKeys[i])
+		}
+	}
+}
+
+// TestPolicyHistoryService_RealCreateNotReconstructed pins L7: a rule
+// WITH a genuine policy.create audit event is NOT marked Reconstructed,
+// so the UI keeps the normal "created" copy (the grandfather copy is
+// reserved for synthesized snapshots only). The current rule is passed
+// but ignored because real events exist.
+func TestPolicyHistoryService_RealCreateNotReconstructed(t *testing.T) {
+	ctx := context.Background()
+	base := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	audit := &fakeAuditRepo{
+		rows: []*storage.AuditEvent{
+			mkEvent(base, "policy.create", "user:11111111-1111-1111-1111-111111111111",
+				map[string]any{"priority": float64(100), "selector_keys": []any{"environment_kind"}}),
+		},
+	}
+	svc := services.NewPolicyHistoryService(audit, &fakeWorkflowRepo{}, nil, nil)
+	current := &storage.PolicyRule{ID: uuid.New(), Name: "x", WorkflowID: uuid.New()}
+	entries, _, err := svc.ListForRule(ctx, current.ID, current, 50)
+	if err != nil {
+		t.Fatalf("ListForRule: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d; want 1", len(entries))
+	}
+	if entries[0].Reconstructed {
+		t.Errorf("real policy.create head marked Reconstructed; want false")
+	}
+}
+
 func TestPolicyHistoryService_LegacyActionNamesNormalized(t *testing.T) {
 	ctx := context.Background()
 	base := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
@@ -260,7 +354,7 @@ func TestPolicyHistoryService_LegacyActionNamesNormalized(t *testing.T) {
 	}
 
 	svc := services.NewPolicyHistoryService(audit, &fakeWorkflowRepo{}, nil, nil)
-	entries, _, err := svc.ListForRule(ctx, uuid.New(), 50)
+	entries, _, err := svc.ListForRule(ctx, uuid.New(), nil, 50)
 	if err != nil {
 		t.Fatalf("ListForRule: %v", err)
 	}
@@ -296,7 +390,7 @@ func TestPolicyHistoryService_LegacyMetadataMissingFields(t *testing.T) {
 	}
 
 	svc := services.NewPolicyHistoryService(audit, &fakeWorkflowRepo{}, nil, nil)
-	entries, _, err := svc.ListForRule(ctx, uuid.New(), 50)
+	entries, _, err := svc.ListForRule(ctx, uuid.New(), nil, 50)
 	if err != nil {
 		t.Fatalf("ListForRule: %v", err)
 	}
@@ -346,7 +440,7 @@ func TestPolicyHistoryService_SelectorKeysSetBased_ReorderIsNotAChange(t *testin
 	}
 
 	svc := services.NewPolicyHistoryService(audit, &fakeWorkflowRepo{}, nil, nil)
-	entries, _, err := svc.ListForRule(ctx, uuid.New(), 50)
+	entries, _, err := svc.ListForRule(ctx, uuid.New(), nil, 50)
 	if err != nil {
 		t.Fatalf("ListForRule: %v", err)
 	}
@@ -381,7 +475,7 @@ func TestPolicyHistoryService_WorkflowIdChange_DeletedWorkflowResolvesAsNilName(
 	}}
 
 	svc := services.NewPolicyHistoryService(audit, workflows, nil, nil)
-	entries, _, err := svc.ListForRule(ctx, uuid.New(), 50)
+	entries, _, err := svc.ListForRule(ctx, uuid.New(), nil, 50)
 	if err != nil {
 		t.Fatalf("ListForRule: %v", err)
 	}
@@ -411,7 +505,7 @@ func TestPolicyHistoryService_WorkflowIdChange_DeletedWorkflowResolvesAsNilName(
 func TestPolicyHistoryService_EmptyChain(t *testing.T) {
 	ctx := context.Background()
 	svc := services.NewPolicyHistoryService(&fakeAuditRepo{}, &fakeWorkflowRepo{}, nil, nil)
-	entries, hasMore, err := svc.ListForRule(ctx, uuid.New(), 50)
+	entries, hasMore, err := svc.ListForRule(ctx, uuid.New(), nil, 50)
 	if err != nil {
 		t.Fatalf("ListForRule: %v", err)
 	}
@@ -433,7 +527,7 @@ func TestPolicyHistoryService_HasMoreFlagPropagates(t *testing.T) {
 		hasMore: true,
 	}
 	svc := services.NewPolicyHistoryService(audit, &fakeWorkflowRepo{}, nil, nil)
-	_, hasMore, err := svc.ListForRule(ctx, uuid.New(), 1)
+	_, hasMore, err := svc.ListForRule(ctx, uuid.New(), nil, 1)
 	if err != nil {
 		t.Fatalf("ListForRule: %v", err)
 	}
@@ -451,7 +545,7 @@ func TestPolicyHistoryService_ActorDisplay_NilReposFallToRaw(t *testing.T) {
 		},
 	}
 	svc := services.NewPolicyHistoryService(audit, &fakeWorkflowRepo{}, nil, nil)
-	entries, _, err := svc.ListForRule(ctx, uuid.New(), 50)
+	entries, _, err := svc.ListForRule(ctx, uuid.New(), nil, 50)
 	if err != nil {
 		t.Fatalf("ListForRule: %v", err)
 	}

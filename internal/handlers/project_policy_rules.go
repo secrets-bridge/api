@@ -691,7 +691,7 @@ func (h *ProjectPolicyRules) History(c fiber.Ctx) error {
 			"policy rule not found", nil)
 	}
 
-	entries, hasMore, err := h.history.ListForRule(c.Context(), ruleID, limit)
+	entries, hasMore, err := h.history.ListForRule(c.Context(), ruleID, rule, limit)
 	if err != nil {
 		return stableErr(c, fiber.StatusInternalServerError,
 			"history_internal_error",
