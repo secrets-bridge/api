@@ -473,6 +473,10 @@ func validateTeamSelector(selector map[string]any) error {
 	if d := ValidateProviderTypeSelector(selector); d != nil {
 		return d
 	}
+	// Operation dimension (api#141) — same posture.
+	if d := ValidateOperationSelector(selector); d != nil {
+		return d
+	}
 
 	// Required environment_kind = "non_prod".
 	kindRaw, hasKind := selector["environment_kind"]

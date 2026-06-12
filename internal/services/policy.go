@@ -49,10 +49,69 @@ type Scope struct {
 	EnvironmentKind storage.EnvironmentKind
 	ProviderType    string // "vault" | "aws-sm" | ...
 	SecretRefPrefix string
+	// Operation is the action the request represents — one of the
+	// backend-owned policy selector operations (read | patch | reveal,
+	// api#141). The request-side call sites stamp it so a rule whose
+	// selector pins `operation` can match. Empty means the caller
+	// didn't classify the action (a rule pinning operation won't match
+	// — wildcard rules still do).
+	Operation string
 	// Extras carries any additional dimensions the operator might add
-	// to a selector. Today only the four fixed dimensions above are
-	// used; Extras is reserved.
+	// to a selector. Today only the fixed dimensions above are used;
+	// Extras is reserved.
 	Extras map[string]any
+}
+
+// Policy selector operation enum (api#141) — the backend-owned set of
+// values that may appear in `policy_rules.selector["operation"]`.
+//
+// These are policy-domain concepts (request actions), NOT storage or
+// provider concepts, so the source of truth lives here next to Scope
+// rather than in pkg/storage. The SPA mirrors the set in
+// `src/api/policySelectorEnums.ts`; both move together.
+//
+//   - read   — view a secret value (SubmitRead)
+//   - patch  — write / add secret keys (Submit, cross-team provision)
+//   - reveal — direct reveal / reveal-session (SubmitDirectReveal,
+//              reveal-session TTL compute)
+//
+// cross_team is deliberately NOT an operation value (§6 D6) — it's a
+// routing flavor, not a CRUD action. If a future need to distinguish
+// same-team vs cross-team arises, add a separate `request_flavor`
+// selector axis; do not overload `operation`.
+const (
+	PolicySelectorOperationRead   = "read"
+	PolicySelectorOperationPatch  = "patch"
+	PolicySelectorOperationReveal = "reveal"
+)
+
+// Unexported so callers can't mutate the canonical list. Use
+// IsPolicySelectorOperation for membership; PolicySelectorOperations()
+// for a defensive copy.
+var policySelectorOperations = []string{
+	PolicySelectorOperationRead,
+	PolicySelectorOperationPatch,
+	PolicySelectorOperationReveal,
+}
+
+// PolicySelectorOperations returns a defensive copy of the operation
+// enum (for UI mirror sync / inspection). Callers cannot mutate the
+// canonical list.
+func PolicySelectorOperations() []string {
+	return append([]string(nil), policySelectorOperations...)
+}
+
+// IsPolicySelectorOperation reports whether v is a member of the
+// locked operation enum. The selector validator gates
+// selector["operation"] writes on all three policy emit paths.
+func IsPolicySelectorOperation(v string) bool {
+	switch v {
+	case PolicySelectorOperationRead,
+		PolicySelectorOperationPatch,
+		PolicySelectorOperationReveal:
+		return true
+	}
+	return false
 }
 
 // PolicyDecision is the full result of PolicyEngine.Resolve.
@@ -258,6 +317,9 @@ func (s Scope) asMap() map[string]any {
 	}
 	if s.SecretRefPrefix != "" {
 		out["secret_ref_prefix"] = s.SecretRefPrefix
+	}
+	if s.Operation != "" {
+		out["operation"] = s.Operation
 	}
 	return out
 }

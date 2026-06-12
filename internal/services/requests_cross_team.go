@@ -231,6 +231,10 @@ func (s *RequestService) SubmitCrossTeam(ctx context.Context, in CrossTeamSubmit
 		EnvironmentKind: envKind,
 		ProviderType:    "", // cross_team is provider-agnostic at policy level
 		SecretRefPrefix: in.DestinationSecretRef,
+		// api#141 D5 — cross-team provisions/writes values into a
+		// destination, so the underlying operation is patch. cross_team
+		// itself is a routing flavor (D6), NOT an operation value.
+		Operation: PolicySelectorOperationPatch,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("services: resolve workflow: %w", err)

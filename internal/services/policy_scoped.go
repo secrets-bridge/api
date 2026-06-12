@@ -117,6 +117,12 @@ const (
 	// all three policy emit paths (project-scoped, team-scoped, admin).
 	// Empty string and non-string values also map to this reason.
 	PolicyScopeTooBroadProviderTypeInvalid = "provider_type_invalid"
+	// Selector operation dimension (api#141) — fires when
+	// `selector["operation"]` is present but not in the locked enum
+	// (IsPolicySelectorOperation: read | patch | reveal). Same posture
+	// as provider_type: empty string + non-string map here too. Wired
+	// into all three policy emit paths.
+	PolicyScopeTooBroadOperationInvalid = "operation_invalid"
 )
 
 // ---- scoped service wiring ----------------------------------------
@@ -237,8 +243,11 @@ func (e *PolicyEngine) CreateForScopedAuthor(ctx context.Context, in CreateScope
 		return nil, err
 	}
 
-	// Gate 3.5 — provider_type enum lock (api#139).
+	// Gate 3.5 — provider_type enum lock (api#139) + operation enum (api#141).
 	if d := ValidateProviderTypeSelector(in.Selector); d != nil {
+		return nil, d
+	}
+	if d := ValidateOperationSelector(in.Selector); d != nil {
 		return nil, d
 	}
 
@@ -373,6 +382,9 @@ func (e *PolicyEngine) UpdateForScopedAuthor(ctx context.Context, in UpdateScope
 		return nil, err
 	}
 	if d := ValidateProviderTypeSelector(patched.Selector); d != nil {
+		return nil, d
+	}
+	if d := ValidateOperationSelector(patched.Selector); d != nil {
 		return nil, d
 	}
 	if err := e.validateScopedEnv(ctx, patched.Selector, in.ProjectID); err != nil {
@@ -511,6 +523,27 @@ func ValidateProviderTypeSelector(selector map[string]any) *PolicyScopeTooBroadD
 	s, isStr := raw.(string)
 	if !isStr || s == "" || !storage.IsPolicySelectorProviderType(s) {
 		return &PolicyScopeTooBroadDetail{Reason: PolicyScopeTooBroadProviderTypeInvalid}
+	}
+	return nil
+}
+
+// ValidateOperationSelector enforces the operation dimension enum
+// (api#141) for `selector["operation"]`. Same shape + same three
+// emit-path wiring as ValidateProviderTypeSelector. Absent = wildcard;
+// present MUST be read | patch | reveal; empty string + non-string are
+// rejected. Reason variant: `operation_invalid`.
+//
+// cross_team is NOT a valid operation (§6 D6) — it's a routing flavor,
+// not a CRUD action; it would be rejected here as operation_invalid if
+// anyone tried to author it.
+func ValidateOperationSelector(selector map[string]any) *PolicyScopeTooBroadDetail {
+	raw, present := selector["operation"]
+	if !present {
+		return nil // wildcard
+	}
+	s, isStr := raw.(string)
+	if !isStr || s == "" || !IsPolicySelectorOperation(s) {
+		return &PolicyScopeTooBroadDetail{Reason: PolicyScopeTooBroadOperationInvalid}
 	}
 	return nil
 }
