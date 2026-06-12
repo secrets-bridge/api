@@ -107,10 +107,16 @@ func (d *PolicyScopeTooBroadDetail) Unwrap() error { return ErrPolicyScopeTooBro
 // Reason variants exposed to handlers + tests so they're literal in
 // the codebase, not magic strings.
 const (
-	PolicyScopeTooBroadEnvConstraintMissing = "env_constraint_missing"
-	PolicyScopeTooBroadEnvKindInvalid       = "env_kind_invalid"
-	PolicyScopeTooBroadSelectorEmpty        = "selector_empty"
+	PolicyScopeTooBroadEnvConstraintMissing  = "env_constraint_missing"
+	PolicyScopeTooBroadEnvKindInvalid        = "env_kind_invalid"
+	PolicyScopeTooBroadSelectorEmpty         = "selector_empty"
 	PolicyScopeTooBroadEnvKindIdInconsistent = "env_kind_id_inconsistent"
+	// Selector enum v1 lock (api#139) — fires when
+	// `selector["provider_type"]` is present but not in the locked
+	// backend enum (storage.IsPolicySelectorProviderType). Wired into
+	// all three policy emit paths (project-scoped, team-scoped, admin).
+	// Empty string and non-string values also map to this reason.
+	PolicyScopeTooBroadProviderTypeInvalid = "provider_type_invalid"
 )
 
 // ---- scoped service wiring ----------------------------------------
@@ -229,6 +235,11 @@ func (e *PolicyEngine) CreateForScopedAuthor(ctx context.Context, in CreateScope
 	// Gate 3 — selector project_id consistency.
 	if err := validateSelectorProjectMatches(in.Selector, in.ProjectID); err != nil {
 		return nil, err
+	}
+
+	// Gate 3.5 — provider_type enum lock (api#139).
+	if d := ValidateProviderTypeSelector(in.Selector); d != nil {
+		return nil, d
 	}
 
 	// Gate 4 — env constraint.
@@ -357,9 +368,12 @@ func (e *PolicyEngine) UpdateForScopedAuthor(ctx context.Context, in UpdateScope
 		return nil, ErrPolicyPriorityReserved
 	}
 
-	// Gate 7 — selector consistency + env constraint.
+	// Gate 7 — selector consistency + env constraint + provider_type enum lock.
 	if err := validateSelectorProjectMatches(patched.Selector, in.ProjectID); err != nil {
 		return nil, err
+	}
+	if d := ValidateProviderTypeSelector(patched.Selector); d != nil {
+		return nil, d
 	}
 	if err := e.validateScopedEnv(ctx, patched.Selector, in.ProjectID); err != nil {
 		return nil, err
@@ -471,6 +485,34 @@ func validateSelectorProjectMatches(selector map[string]any, projectID uuid.UUID
 		return nil
 	}
 	return ErrPolicySelectorMismatch
+}
+
+// ValidateProviderTypeSelector enforces the v1 selector enum lock
+// (api#139) for `selector["provider_type"]`. Called from all three
+// policy emit paths: project-scoped author (via
+// CreateForScopedAuthor / UpdateForScopedAuthor), team-scoped author
+// (via validateTeamSelector in the *ForTeamScopedAuthor methods), and
+// the admin path (validatePolicyAnchor → admin handler crosses the
+// package boundary; this is the cross-package surface).
+//
+// Wildcard semantics: an ABSENT `provider_type` key matches every
+// provider; this is the v1 default. A PRESENT key MUST be a valid
+// enum member. Empty string ("") and non-string values are
+// explicitly rejected — UI is expected to OMIT the field from the
+// submitted selector when the dropdown's blank option is selected.
+//
+// Reason variant: `provider_type_invalid`. No envelope extras — the
+// allowed values are documented in `docs/operations/policy-templates.md`.
+func ValidateProviderTypeSelector(selector map[string]any) *PolicyScopeTooBroadDetail {
+	raw, present := selector["provider_type"]
+	if !present {
+		return nil // wildcard
+	}
+	s, isStr := raw.(string)
+	if !isStr || s == "" || !storage.IsPolicySelectorProviderType(s) {
+		return &PolicyScopeTooBroadDetail{Reason: PolicyScopeTooBroadProviderTypeInvalid}
+	}
+	return nil
 }
 
 // validateScopedEnv enforces "scoped rules non-prod-only by construction"
