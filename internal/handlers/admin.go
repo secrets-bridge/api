@@ -557,6 +557,11 @@ func validatePolicyAnchor(body PolicyBody) error {
 		return fiber.NewError(fiber.StatusBadRequest,
 			"selector.provider_type is not in the policy selector enum (provider_type_invalid)")
 	}
+	// Operation dimension (api#141) — same all-anchors posture.
+	if d := services.ValidateOperationSelector(body.Selector); d != nil {
+		return fiber.NewError(fiber.StatusBadRequest,
+			"selector.operation is not in the policy selector enum (operation_invalid)")
+	}
 
 	// Platform + project anchors don't carry team-specific selector
 	// safety rules (project-anchored rules CAN pin

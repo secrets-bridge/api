@@ -316,6 +316,7 @@ func (s *RevealSessionService) resolveTTL(ctx context.Context, req *storage.Acce
 		EnvironmentKind: env.Kind,
 		ProviderType:    req.TargetProviderType,
 		SecretRefPrefix: req.TargetSecretRef,
+		Operation:       PolicySelectorOperationReveal, // api#141 D4 — reveal-session TTL
 	})
 	if err != nil || dec == nil {
 		return revealTTLDefaultSeconds

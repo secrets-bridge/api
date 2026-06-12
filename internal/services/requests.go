@@ -234,6 +234,7 @@ func (s *RequestService) Submit(ctx context.Context, in PatchInput) (*storage.Ac
 		EnvironmentKind: envKind,
 		ProviderType:    in.TargetProviderType,
 		SecretRefPrefix: in.TargetSecretRef,
+		Operation:       PolicySelectorOperationPatch, // api#141 — write/add keys
 	})
 	if err != nil {
 		return nil, fmt.Errorf("services: resolve workflow: %w", err)
@@ -326,6 +327,7 @@ func (s *RequestService) SubmitRead(ctx context.Context, in ReadInput) (*storage
 		EnvironmentKind: envKind,
 		ProviderType:    in.TargetProviderType,
 		SecretRefPrefix: in.TargetSecretRef,
+		Operation:       PolicySelectorOperationRead, // api#141 — view values
 	})
 	if err != nil {
 		return nil, fmt.Errorf("services: resolve workflow: %w", err)
@@ -443,6 +445,7 @@ func (s *RequestService) SubmitDirectReveal(ctx context.Context, in DirectReveal
 		EnvironmentKind: in.Environment.Kind,
 		ProviderType:    in.TargetProviderType,
 		SecretRefPrefix: in.TargetSecretRef,
+		Operation:       PolicySelectorOperationReveal, // api#141 — direct reveal
 	})
 	if err != nil {
 		return nil, fmt.Errorf("services: resolve workflow: %w", err)
