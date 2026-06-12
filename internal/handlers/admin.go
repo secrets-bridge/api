@@ -536,6 +536,30 @@ func policyToBody(p *storage.PolicyRule) PolicyBody {
 	}
 }
 
+// policySelectorEnumReject checks the provider_type / operation selector
+// enums (api#139 / api#141) on the admin authoring path. It returns the
+// offending field name + the reason detail when a value is invalid, or
+// ("", nil) when the selector is clean. The CALLER emits the envelope via
+// `return stableErr(...)` so the structured
+// `{error_code: "policy_scope_too_broad", reason: "<variant>_invalid"}`
+// response (matching the scoped paths, so the SPA's reason-variant toast
+// routing works) is the handler's terminal return — stableErr writes the
+// body AND returns nil (Fiber c.JSON success), so it must not be used in a
+// mid-handler `if err != nil` guard or the later 201 overwrites it.
+//
+// Kept separate from validatePolicyAnchor (which returns plain fiber
+// errors for anchor-shape rules): a selector-enum rejection must carry the
+// reason variant, which needs the stableErr envelope.
+func policySelectorEnumReject(body PolicyBody) (field string, detail *services.PolicyScopeTooBroadDetail) {
+	if d := services.ValidateProviderTypeSelector(body.Selector); d != nil {
+		return "provider_type", d
+	}
+	if d := services.ValidateOperationSelector(body.Selector); d != nil {
+		return "operation", d
+	}
+	return "", nil
+}
+
 // validatePolicyAnchor enforces the §1 D2 mutually-exclusive anchor
 // rule + the §5 C5 server-side team-rule selector safety. The DB
 // CHECK constraints from migration 0037 catch most of these
@@ -547,21 +571,11 @@ func validatePolicyAnchor(body PolicyBody) error {
 			"project_id and team_id cannot both be set (a rule attaches to exactly one anchor)")
 	}
 
-	// Selector enum v1 lock (api#139) — applies to ALL admin anchors
-	// (platform / project / team). The user correction stated:
-	// "Admin users should not be able to create invalid provider_type
-	// selectors either." We surface the same reason variant the scoped
-	// paths use so the SPA's existing toast routing works on this
-	// surface too.
-	if d := services.ValidateProviderTypeSelector(body.Selector); d != nil {
-		return fiber.NewError(fiber.StatusBadRequest,
-			"selector.provider_type is not in the policy selector enum (provider_type_invalid)")
-	}
-	// Operation dimension (api#141) — same all-anchors posture.
-	if d := services.ValidateOperationSelector(body.Selector); d != nil {
-		return fiber.NewError(fiber.StatusBadRequest,
-			"selector.operation is not in the policy selector enum (operation_invalid)")
-	}
+	// NOTE: the selector-enum checks (provider_type / operation) are NOT
+	// here — they live in validatePolicySelectorEnums, which emits the
+	// structured {error_code, reason} envelope the scoped paths use (the
+	// plain fiber.NewError shape this function returns can't carry the
+	// reason variant). Both CreatePolicy and UpdatePolicy call it.
 
 	// Platform + project anchors don't carry team-specific selector
 	// safety rules (project-anchored rules CAN pin
@@ -632,6 +646,11 @@ func (h *Admin) CreatePolicy(c fiber.Ctx) error {
 	}
 	if err := validatePolicyAccessFields(body); err != nil {
 		return err
+	}
+	if field, d := policySelectorEnumReject(body); d != nil {
+		return stableErr(c, fiber.StatusBadRequest, "policy_scope_too_broad",
+			"selector."+field+" is not in the policy selector enum",
+			map[string]any{"reason": d.Reason})
 	}
 	if err := validatePolicyAnchor(body); err != nil {
 		return err
@@ -713,6 +732,11 @@ func (h *Admin) UpdatePolicy(c fiber.Ctx) error {
 	// the patched rule.
 	body.ProjectID = existing.ProjectID
 	body.TeamID = existing.TeamID
+	if field, d := policySelectorEnumReject(body); d != nil {
+		return stableErr(c, fiber.StatusBadRequest, "policy_scope_too_broad",
+			"selector."+field+" is not in the policy selector enum",
+			map[string]any{"reason": d.Reason})
+	}
 	if err := validatePolicyAnchor(body); err != nil {
 		return err
 	}

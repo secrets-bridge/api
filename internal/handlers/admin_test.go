@@ -398,6 +398,55 @@ func TestPolicies_DeleteSystemReturns409(t *testing.T) {
 	}
 }
 
+// TestPolicies_SelectorEnumInvalidReturnsStructuredEnvelope pins M5:
+// the admin authoring path must reject an unknown provider_type /
+// operation selector with the SAME structured envelope the scoped
+// paths emit — {error_code: "policy_scope_too_broad", reason: ...} —
+// not a plain {error: "<message>"} string. (QA found the admin path
+// returning the flat shape, breaking the SPA's reason-variant toast.)
+func TestPolicies_SelectorEnumInvalidReturnsStructuredEnvelope(t *testing.T) {
+	app, pool, _ := bootstrapAdmin(t)
+	var stdID uuid.UUID
+	_ = pool.QueryRow(t.Context(),
+		`SELECT id FROM workflow_definitions WHERE name='standard'`).Scan(&stdID)
+
+	cases := []struct {
+		name     string
+		selector map[string]any
+		reason   string
+	}{
+		{"operation", map[string]any{"operation": "bogus"}, "operation_invalid"},
+		{"provider_type", map[string]any{"provider_type": "bogus"}, "provider_type_invalid"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, body := doJSON(t, app, "POST", "/api/v1/policies", handlers.PolicyBody{
+				Name:       "enum-reject-" + tc.name,
+				Selector:   tc.selector,
+				WorkflowID: stdID,
+				Priority:   500,
+				Enabled:    true,
+			})
+			if resp.StatusCode != fiber.StatusBadRequest {
+				t.Fatalf("want 400, got %d body %s", resp.StatusCode, body)
+			}
+			var env struct {
+				ErrorCode string `json:"error_code"`
+				Reason    string `json:"reason"`
+			}
+			if err := json.Unmarshal(body, &env); err != nil {
+				t.Fatalf("unmarshal envelope: %v (body %s)", err, body)
+			}
+			if env.ErrorCode != "policy_scope_too_broad" {
+				t.Errorf("error_code = %q, want policy_scope_too_broad (body %s)", env.ErrorCode, body)
+			}
+			if env.Reason != tc.reason {
+				t.Errorf("reason = %q, want %q", env.Reason, tc.reason)
+			}
+		})
+	}
+}
+
 // ---- error-handling smoke -------------------------------------------
 
 func TestAdmin_NotFoundReturns404(t *testing.T) {
