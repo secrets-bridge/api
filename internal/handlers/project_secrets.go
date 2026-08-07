@@ -8,10 +8,20 @@
 //
 //   POST   /projects/:id/secrets               bind a secret to a project
 //   GET    /projects/:id/secrets               list bindings (with secret detail)
-//   PUT    /projects/:id/secrets/:secret_id    update allowed_keys / allowed_ops
+//   PUT    /projects/:id/secrets/:secret_id    update allowed_keys / allowed_ops / environment_id
 //   DELETE /projects/:id/secrets/:secret_id    unbind
 //
 // Design notes:
+//
+//   - environment_id scopes the binding to one environment of the
+//     project. The column and the storage struct carried it from
+//     Slice L3 onward, but no HTTP path ever set it, so the only rows
+//     that had one came from the 0025 label-bridge backfill —
+//     operators could not create an env-scoped binding through the
+//     product. Both write paths now accept it. Omitting the field
+//     preserves the previous behaviour exactly: nil on create, and
+//     untouched on update, so a keys-only edit cannot detach a
+//     binding from its environment.
 //
 //   - allowed_keys: nil means "every key the secret exposes is
 //     allowed for this project". Non-nil = explicit allowlist. The
@@ -41,18 +51,22 @@ import (
 
 // ProjectSecrets is the HTTP layer over the project_secrets repository.
 type ProjectSecrets struct {
-	bindings storage.ProjectSecretRepository
-	projects storage.ProjectRepository
-	secrets  storage.SecretRepository
+	bindings     storage.ProjectSecretRepository
+	projects     storage.ProjectRepository
+	secrets      storage.SecretRepository
+	environments storage.EnvironmentRepository
 }
 
-// NewProjectSecrets wires the handler.
+// NewProjectSecrets wires the handler. The environment repository is
+// needed to prove a supplied environment_id belongs to the project in
+// the URL — the FK alone cannot catch a cross-project reference.
 func NewProjectSecrets(
 	b storage.ProjectSecretRepository,
 	p storage.ProjectRepository,
 	s storage.SecretRepository,
+	e storage.EnvironmentRepository,
 ) *ProjectSecrets {
-	return &ProjectSecrets{bindings: b, projects: p, secrets: s}
+	return &ProjectSecrets{bindings: b, projects: p, secrets: s, environments: e}
 }
 
 // --- request / response shapes --------------------------------------
@@ -67,9 +81,13 @@ type bindingBody struct {
 	// `.map(undefined)` → blank /admin/projects).
 	AllowedKeys *[]string `json:"allowed_keys"`
 	AllowedOps  []string  `json:"allowed_ops,omitempty"`
-	CreatedAt   time.Time `json:"created_at,omitempty"`
-	UpdatedAt   time.Time `json:"updated_at,omitempty"`
-	CreatedBy   string    `json:"created_by,omitempty"`
+	// EnvironmentID binds this row to one environment of the project.
+	// Omitted / null means the binding is not environment-scoped —
+	// the pre-existing shape, preserved for back-compat.
+	EnvironmentID *string   `json:"environment_id"`
+	CreatedAt     time.Time `json:"created_at,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at,omitempty"`
+	CreatedBy     string    `json:"created_by,omitempty"`
 
 	// Joined secret detail; populated on List + Get responses.
 	Secret *secretSummary `json:"secret,omitempty"`
@@ -87,6 +105,9 @@ type secretSummary struct {
 type updateBindingBody struct {
 	AllowedKeys *[]string `json:"allowed_keys,omitempty"`
 	AllowedOps  []string  `json:"allowed_ops,omitempty"`
+	// Absent leaves the stored environment untouched; present sets it.
+	// Detaching is not offered — unbind and re-bind instead.
+	EnvironmentID *string `json:"environment_id,omitempty"`
 }
 
 func bindingToBody(b *storage.ProjectSecret) bindingBody {
@@ -97,6 +118,10 @@ func bindingToBody(b *storage.ProjectSecret) bindingBody {
 		CreatedAt:  b.CreatedAt,
 		UpdatedAt:  b.UpdatedAt,
 		CreatedBy:  b.CreatedBy,
+	}
+	if b.EnvironmentID != nil {
+		s := b.EnvironmentID.String()
+		resp.EnvironmentID = &s
 	}
 	// Distinguish nil (all keys) from non-nil. The pointer trick
 	// keeps `null` in the JSON when the binding allows everything.
@@ -172,12 +197,18 @@ func (h *ProjectSecrets) Bind(c fiber.Ctx) error {
 		}
 	}
 
+	envID, err := h.resolveEnvironment(c, projectID, body.EnvironmentID)
+	if err != nil {
+		return err
+	}
+
 	binding := &storage.ProjectSecret{
-		ProjectID:   projectID,
-		SecretID:    body.SecretID,
-		AllowedKeys: allowedKeys,
-		AllowedOps:  ops,
-		CreatedBy:   body.CreatedBy,
+		ProjectID:     projectID,
+		SecretID:      body.SecretID,
+		EnvironmentID: envID,
+		AllowedKeys:   allowedKeys,
+		AllowedOps:    ops,
+		CreatedBy:     body.CreatedBy,
 	}
 	if err := h.bindings.Bind(c.Context(), binding); err != nil {
 		switch {
@@ -257,7 +288,12 @@ func (h *ProjectSecrets) Update(c fiber.Ctx) error {
 		}
 	}
 
-	if err := h.bindings.Update(c.Context(), projectID, secretID, allowedKeys, ops); err != nil {
+	envID, err := h.resolveEnvironment(c, projectID, body.EnvironmentID)
+	if err != nil {
+		return err
+	}
+
+	if err := h.bindings.Update(c.Context(), projectID, secretID, allowedKeys, ops, envID); err != nil {
 		switch {
 		case errors.Is(err, storage.ErrNotFound):
 			return fiber.NewError(fiber.StatusNotFound, "binding not found")
@@ -304,4 +340,33 @@ func mapProjectSecretErr(err error, msg string) error {
 		return fiber.NewError(fiber.StatusNotFound, msg)
 	}
 	return fiber.NewError(fiber.StatusInternalServerError, msg)
+}
+
+// resolveEnvironment turns the wire-level environment_id into a
+// validated UUID scoped to projectID. Returns (nil, nil) when the
+// caller omitted the field, which both write paths read as "leave the
+// stored value alone".
+//
+// The project check is the load-bearing part: environments.id carries
+// a foreign key, so a bogus UUID is caught by the database, but an
+// environment belonging to a DIFFERENT project is a perfectly valid FK
+// target. Without this check an operator could bind a secret to
+// another project's environment and silently widen access.
+func (h *ProjectSecrets) resolveEnvironment(c fiber.Ctx, projectID uuid.UUID, raw *string) (*uuid.UUID, error) {
+	if raw == nil || *raw == "" {
+		return nil, nil
+	}
+	envID, err := uuid.Parse(*raw)
+	if err != nil {
+		return nil, fiber.NewError(fiber.StatusBadRequest, "invalid environment_id")
+	}
+	env, err := h.environments.Get(c.Context(), envID)
+	if err != nil {
+		return nil, mapProjectSecretErr(err, "environment not found")
+	}
+	if env.ProjectID != projectID {
+		return nil, fiber.NewError(fiber.StatusBadRequest,
+			"environment_id does not belong to this project")
+	}
+	return &envID, nil
 }

@@ -392,7 +392,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	permissionsH := handlers.NewPermissions()
 	tenancyH := handlers.NewTenancy(projectRepo, environmentRepo)
 	projectSecretsRepo := storage.NewProjectSecrets(pool)
-	projectSecretsH := handlers.NewProjectSecrets(projectSecretsRepo, projectRepo, secretsRepo)
+	projectSecretsH := handlers.NewProjectSecrets(projectSecretsRepo, projectRepo, secretsRepo, environmentRepo)
 	teamRepo := storage.NewTeams(pool)
 	teamsH := handlers.NewTeams(teamRepo)
 	teamScopeResolver := auth.NewRepoTeamScopeResolver(teamRepo, projectRepo)

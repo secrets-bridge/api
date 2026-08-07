@@ -181,7 +181,7 @@ func TestUpdate_RewritesKeysAndOps(t *testing.T) {
 	}
 	if err := repo.Update(t.Context(), projectID, secretID,
 		[]string{"DB_HOST", "DB_PORT"},
-		[]string{storage.OpRead, storage.OpPatch}); err != nil {
+		[]string{storage.OpRead, storage.OpPatch}, nil); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 
@@ -202,7 +202,7 @@ func TestUpdate_AbsentBindingReturnsErrNotFound(t *testing.T) {
 	projectID := seedProject(t, projects, "billing")
 	secretID := seedSecret(t, secrets, "/eks/uat/billing/db")
 	if err := repo.Update(t.Context(), projectID, secretID, nil,
-		[]string{storage.OpRead}); !errors.Is(err, storage.ErrNotFound) {
+		[]string{storage.OpRead}, nil); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
@@ -270,5 +270,84 @@ func TestUnbind_AbsentReturnsErrNotFound(t *testing.T) {
 	if err := repo.Unbind(t.Context(),
 		uuid.New(), uuid.New()); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+// --- environment_id on Update ---------------------------------------
+//
+// Bind already threads EnvironmentID (pinned by
+// TestProjectSecret_EnvironmentIDRoundtrip in env_id_columns_test.go).
+// Update did not, which left operators unable to attach an environment
+// to an existing binding through any supported path.
+
+// seedEnvironment creates an environment under the given project.
+func seedEnvironment(t *testing.T, pool *storage.Pool, projectID uuid.UUID, name string) uuid.UUID {
+	t.Helper()
+	env := &storage.Environment{ProjectID: projectID, Name: name, Type: storage.EnvironmentTypeUAT}
+	if err := storage.NewEnvironments(pool).Create(t.Context(), env); err != nil {
+		t.Fatalf("seed environment %q: %v", name, err)
+	}
+	return env.ID
+}
+
+func TestUpdate_AttachesEnvironmentID(t *testing.T) {
+	repo, projects, secrets, pool := bootstrapProjectSecrets(t)
+	projectID := seedProject(t, projects, "billing")
+	secretID := seedSecret(t, secrets, "/secrets/uat/team-alpha/db")
+	envID := seedEnvironment(t, pool, projectID, "uat")
+
+	b := &storage.ProjectSecret{
+		ProjectID:  projectID,
+		SecretID:   secretID,
+		AllowedOps: []string{storage.OpRead},
+	}
+	if err := repo.Bind(t.Context(), b); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	if err := repo.Update(t.Context(), projectID, secretID,
+		[]string{"DB_HOST"}, []string{storage.OpRead}, &envID); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	got, err := repo.Get(t.Context(), projectID, secretID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.EnvironmentID == nil || *got.EnvironmentID != envID {
+		t.Fatalf("EnvironmentID: got %v want %v", got.EnvironmentID, envID)
+	}
+}
+
+func TestUpdate_NilEnvironmentIDPreservesExisting(t *testing.T) {
+	repo, projects, secrets, pool := bootstrapProjectSecrets(t)
+	projectID := seedProject(t, projects, "billing")
+	secretID := seedSecret(t, secrets, "/secrets/uat/team-alpha/db")
+	envID := seedEnvironment(t, pool, projectID, "uat")
+
+	// Bound WITH an environment from the start.
+	b := &storage.ProjectSecret{
+		ProjectID:     projectID,
+		SecretID:      secretID,
+		EnvironmentID: &envID,
+		AllowedOps:    []string{storage.OpRead},
+	}
+	if err := repo.Bind(t.Context(), b); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	// An allowed_keys-only edit must not silently detach the env.
+	if err := repo.Update(t.Context(), projectID, secretID,
+		[]string{"DB_HOST"}, []string{storage.OpRead}, nil); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	got, err := repo.Get(t.Context(), projectID, secretID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.EnvironmentID == nil || *got.EnvironmentID != envID {
+		t.Fatalf("environment was detached by an unrelated update: got %v want %v",
+			got.EnvironmentID, envID)
 	}
 }
