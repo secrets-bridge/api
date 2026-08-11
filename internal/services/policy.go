@@ -131,8 +131,12 @@ type PolicyDecision struct {
 	Workflow            *storage.WorkflowDefinition
 	MatchedRule         *storage.PolicyRule
 	DirectRevealAllowed bool
-	RequiresMFA         bool
-	RevealTTLSeconds    int
+	// RequiresMFA is ADVISORY — no caller gates on it today. Plaintext
+	// reveal always requires fresh MFA via unconditional route-level
+	// middleware, so requires_mfa=false does NOT skip step-up. See
+	// storage.PolicyRule for the full note.
+	RequiresMFA      bool
+	RevealTTLSeconds int
 	// InvariantViolated is set to true when the engine zeroed
 	// DirectRevealAllowed because the scope's environment kind was
 	// `prod`. The audit event has already been emitted; this flag
