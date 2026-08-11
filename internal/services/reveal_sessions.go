@@ -51,6 +51,14 @@ type RevealSessionService struct {
 	envs      storage.EnvironmentRepository
 	audit     storage.AuditEventRepository
 	now       func() time.Time
+
+	// Second-boundary allowlist gate. Both nil = no allowed_keys check
+	// at unwrap time (legacy tests). Wire via WithAllowlist from main so
+	// a bulk-reveal session refuses to bundle a wrap whose key falls
+	// outside the project_secrets binding's allowed_keys — defence in
+	// depth against a request row that somehow carries a denied key.
+	bindings storage.ProjectSecretRepository
+	secrets  storage.SecretRepository
 }
 
 // NewRevealSessionService wires a RevealSessionService to its deps.
@@ -77,6 +85,17 @@ func NewRevealSessionService(
 // kind for the PolicyEngine call. Returns the service for chaining.
 func (s *RevealSessionService) WithEnvironments(envs storage.EnvironmentRepository) *RevealSessionService {
 	s.envs = envs
+	return s
+}
+
+// WithAllowlist wires the project_secrets + secrets-catalog
+// repositories so Open enforces the binding's allowed_keys allowlist as
+// a second boundary: any bundled wrap whose key falls outside the
+// allowlist refuses the whole session. When either is nil the check is
+// skipped (back-compat). Returns the service for chaining.
+func (s *RevealSessionService) WithAllowlist(bindings storage.ProjectSecretRepository, secrets storage.SecretRepository) *RevealSessionService {
+	s.bindings = bindings
+	s.secrets = secrets
 	return s
 }
 
@@ -174,6 +193,12 @@ func (s *RevealSessionService) Open(ctx context.Context, in OpenInput) (*RevealS
 	}
 	if len(fresh) == 0 {
 		return nil, ErrAllWrapsConsumed
+	}
+
+	// Second-boundary allowlist gate: refuse to bundle a session if any
+	// unconsumed wrap names a key outside the binding's allowed_keys.
+	if err := s.enforceWrapAllowlist(ctx, req, fresh); err != nil {
+		return nil, err
 	}
 
 	ttl := s.resolveTTL(ctx, req)
@@ -336,6 +361,49 @@ func clampRevealTTL(ttl int) int {
 		return revealTTLMaxSeconds
 	}
 	return ttl
+}
+
+// enforceWrapAllowlist refuses the reveal when any bundled wrap names a
+// key outside the project_secrets binding's allowed_keys. When the
+// allowlist repos aren't wired, the request carries no provider/ref, or
+// no binding exists for the request's (project, provider_type,
+// secret_ref), the check is skipped — there is nothing to enforce
+// against. A nil AllowedKeys means "all keys allowed".
+func (s *RevealSessionService) enforceWrapAllowlist(ctx context.Context, req *storage.AccessRequest, wraps []storage.WrapSummary) error {
+	if s.bindings == nil || s.secrets == nil {
+		return nil
+	}
+	if req.TargetProviderType == "" || req.TargetSecretRef == "" {
+		return nil
+	}
+	projectID, err := projectIDFromRequest(req)
+	if err != nil {
+		return fmt.Errorf("services: project_id from request: %w", err)
+	}
+	catalog, err := s.secrets.ListByRef(ctx, req.TargetProviderType, req.TargetSecretRef)
+	if err != nil {
+		return fmt.Errorf("services: resolve catalog for allowlist: %w", err)
+	}
+	var binding *storage.ProjectSecret
+	for _, sec := range catalog {
+		b, err := s.bindings.Get(ctx, projectID, sec.ID)
+		if err == nil {
+			binding = b
+			break
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return fmt.Errorf("services: resolve binding for allowlist: %w", err)
+		}
+	}
+	if binding == nil || binding.AllowedKeys == nil {
+		return nil
+	}
+	for _, w := range wraps {
+		if !keyInAllowlist(binding.AllowedKeys, w.KeyName) {
+			return fmt.Errorf("%w: %q", ErrKeyNotAllowed, w.KeyName)
+		}
+	}
+	return nil
 }
 
 // projectIDFromRequest pulls the project_id out of TargetScope. Open

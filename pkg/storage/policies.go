@@ -23,8 +23,13 @@ import (
 //     single-shot wrap. The PolicyEngine ZEROES this whenever the
 //     scope's environment.kind is 'prod', regardless of what the
 //     operator wrote.
-//   - RequiresMFA: when true, the API attaches RequireFreshMFA
-//     middleware on the matched route.
+//   - RequiresMFA: ADVISORY today, NOT a runtime gate. Plaintext-reveal
+//     routes (single-wrap retrieve + bulk reveal-session open) attach
+//     `RequireFreshMFA` UNCONDITIONALLY at route-registration time —
+//     plaintext unwrap is always Tier-2 and always requires fresh MFA.
+//     Setting requires_mfa=false does NOT skip that step-up. The field
+//     is surfaced for operators + reserved for a future per-policy
+//     step-up policy; it must never be read as "reveal may skip MFA".
 //   - RevealTTLSeconds: server-enforced reveal-session/wrap TTL.
 //     CHECK constraint pins to 10..300.
 //

@@ -214,6 +214,8 @@ func revealSessionErr(err error) error {
 		return fiber.NewError(fiber.StatusGone, "all wraps already consumed")
 	case errors.Is(err, services.ErrRevealSessionEnvMissing):
 		return fiber.NewError(fiber.StatusConflict, "request has no environment binding")
+	case errors.Is(err, services.ErrKeyNotAllowed):
+		return fiber.NewError(fiber.StatusForbidden, "a wrap in this request is not permitted by the binding allowlist")
 	default:
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}

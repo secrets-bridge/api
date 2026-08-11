@@ -404,6 +404,13 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	bindingRepo := storage.NewProjectProviderConnections(pool)
 	requestSvc.WithCrossTeamRepos(teamRepo, projectRepo, environmentRepo, provConnRepo)
 
+	// Enforce the project_secrets allowed_keys allowlist on both
+	// plaintext-reveal boundaries: submit-time (direct reveal) and
+	// unwrap-time (bulk reveal session). Without these a direct reveal
+	// could name a key the binding does not permit.
+	requestSvc.WithProjectBindings(projectSecretsRepo, secretsRepo)
+	revealSessionSvc.WithAllowlist(projectSecretsRepo, secretsRepo)
+
 	// Slice P2/P3: ProviderConnectionsService for admin CRUD + the
 	// developer dropdown + the discover-finished JobService hook.
 	pcSvc := services.NewProviderConnections(provConnRepo, bindingRepo, auditRepo)

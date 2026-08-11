@@ -77,6 +77,13 @@ type RequestService struct {
 	ctProjects  CrossTeamProjectLookup
 	ctEnvs      CrossTeamEnvLookup
 	ctProvConns CrossTeamProviderConnectionLookup
+
+	// Project-binding allowlist gate. Both nil = no allowed_keys
+	// enforcement on the direct-reveal path (legacy tests). Wire via
+	// WithProjectBindings from main so a direct reveal cannot name a
+	// key outside the binding's allowed_keys allowlist.
+	bindings storage.ProjectSecretRepository
+	secrets  storage.SecretRepository
 }
 
 // NewRequestService wires a RequestService to its dependencies. The
@@ -109,6 +116,17 @@ func NewRequestService(
 // for chaining. Pass nil to disable the integration.
 func (s *RequestService) WithGitOps(g GitOpsStarter) *RequestService {
 	s.gitops = g
+	return s
+}
+
+// WithProjectBindings wires the project_secrets + secrets-catalog
+// repositories so SubmitDirectReveal enforces the binding's
+// allowed_keys allowlist before creating the auto-approved request.
+// When either is nil the enforcement is skipped (back-compat for tests
+// that never build a catalog). Returns the service for chaining.
+func (s *RequestService) WithProjectBindings(bindings storage.ProjectSecretRepository, secrets storage.SecretRepository) *RequestService {
+	s.bindings = bindings
+	s.secrets = secrets
 	return s
 }
 
@@ -400,6 +418,14 @@ var ErrDirectRevealOnProd = errors.New("services: direct reveal not permitted on
 // does not have direct_reveal_allowed=true. Maps to 403 at the handler.
 var ErrDirectRevealNotAllowed = errors.New("services: matched policy does not permit direct reveal")
 
+// ErrKeyNotAllowed is returned when a direct reveal (or a reveal-session
+// open) names a key outside the project_secrets binding's allowed_keys
+// allowlist. Maps to 403 at the handler layer. The allowlist is the
+// per-binding refinement of which keys a project may access on a bound
+// secret; the reveal paths must honour it exactly like the /requests
+// tenancy gate does.
+var ErrKeyNotAllowed = errors.New("services: requested key is not in the binding allowlist")
+
 // SubmitDirectReveal creates a read access_request that BYPASSES the
 // approval workflow. Used by the L4 dev endpoint when the matched
 // policy + non-prod env classification both green-light the path.
@@ -454,6 +480,14 @@ func (s *RequestService) SubmitDirectReveal(ctx context.Context, in DirectReveal
 	// Gate 2 — policy must explicitly opt in.
 	if !dec.DirectRevealAllowed {
 		return nil, ErrDirectRevealNotAllowed
+	}
+
+	// Gate 3 — binding allowlist. A direct reveal must not name a key
+	// outside the project_secrets binding's allowed_keys. Refuses BEFORE
+	// the auto-approved request row is written, so no wrap job is ever
+	// enqueued for a denied key.
+	if err := s.enforceBindingAllowedKeys(ctx, in.Environment.ProjectID, in.TargetProviderType, in.TargetSecretRef, in.TargetKeys); err != nil {
+		return nil, err
 	}
 
 	keys := in.TargetKeys
@@ -522,6 +556,64 @@ func (s *RequestService) SubmitDirectReveal(ctx context.Context, in DirectReveal
 		},
 	})
 	return req, nil
+}
+
+// enforceBindingAllowedKeys refuses a reveal whose requested keys fall
+// outside the project_secrets binding's allowed_keys allowlist. It
+// resolves the binding for (projectID, providerType, secretRef) exactly
+// like the /requests tenancy gate: match the catalog row(s) by
+// (provider_type, secret_ref), then look for a binding owned by the
+// project.
+//
+// Enforcement rules:
+//   - repos not wired          → skip (legacy tests)
+//   - no binding for the pair  → skip (the allowlist lives on the
+//     binding and there is none; the policy-only direct-reveal path is
+//     unchanged)
+//   - binding.AllowedKeys nil  → every key the secret exposes is allowed
+//   - restrictive allowlist    → every requested key must be present,
+//     AND an empty request is refused: an empty target_keys means
+//     "reveal every key", which would bypass a restrictive allowlist.
+func (s *RequestService) enforceBindingAllowedKeys(ctx context.Context, projectID uuid.UUID, providerType, secretRef string, requestedKeys []string) error {
+	if s.bindings == nil || s.secrets == nil {
+		return nil
+	}
+	catalog, err := s.secrets.ListByRef(ctx, providerType, secretRef)
+	if err != nil {
+		return fmt.Errorf("services: resolve catalog for allowlist: %w", err)
+	}
+	var binding *storage.ProjectSecret
+	for _, sec := range catalog {
+		b, err := s.bindings.Get(ctx, projectID, sec.ID)
+		if err == nil {
+			binding = b
+			break
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return fmt.Errorf("services: resolve binding for allowlist: %w", err)
+		}
+	}
+	if binding == nil || binding.AllowedKeys == nil {
+		return nil
+	}
+	if len(requestedKeys) == 0 {
+		return fmt.Errorf("%w: target_keys must be named within the binding allowlist", ErrKeyNotAllowed)
+	}
+	for _, k := range requestedKeys {
+		if !keyInAllowlist(binding.AllowedKeys, k) {
+			return fmt.Errorf("%w: %q", ErrKeyNotAllowed, k)
+		}
+	}
+	return nil
+}
+
+func keyInAllowlist(allowed []string, target string) bool {
+	for _, k := range allowed {
+		if k == target {
+			return true
+		}
+	}
+	return false
 }
 
 // Approve records an approval vote. When the vote count crosses the

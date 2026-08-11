@@ -275,6 +275,8 @@ func (h *DevSecrets) DirectReveal(c fiber.Ctx) error {
 			return fiber.NewError(fiber.StatusForbidden, "direct reveal is not permitted on prod environments")
 		case errors.Is(err, services.ErrDirectRevealNotAllowed):
 			return fiber.NewError(fiber.StatusForbidden, "matched policy does not permit direct reveal")
+		case errors.Is(err, services.ErrKeyNotAllowed):
+			return fiber.NewError(fiber.StatusForbidden, "requested key is not permitted by the binding allowlist")
 		default:
 			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 		}
