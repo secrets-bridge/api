@@ -291,3 +291,39 @@ func TestUpdateHandler_OmittedEnvironmentIDPreservesExisting(t *testing.T) {
 		t.Fatalf("environment was detached by an unrelated update: got %v want %v", got, h.envID)
 	}
 }
+
+// QA P2 — an invalid allowed_ops value reached the schema CHECK and
+// surfaced as a generic 500 "update failed". Persistence was correctly
+// prevented, but the status and envelope were wrong: a client-supplied
+// bad enum is a 400, not a server fault.
+func TestUpdateHandler_InvalidAllowedOpsIs400(t *testing.T) {
+	h := bootstrapProjectSecretsHandler(t)
+
+	if status, _ := h.do(t, http.MethodPost,
+		fmt.Sprintf("/projects/%s/secrets", h.projectID),
+		map[string]any{"secret_id": h.secretID.String(), "allowed_ops": []string{"read"}},
+	); status != http.StatusCreated {
+		t.Fatalf("seed bind status: got %d want 201", status)
+	}
+
+	status, body := h.do(t, http.MethodPut,
+		fmt.Sprintf("/projects/%s/secrets/%s", h.projectID, h.secretID),
+		map[string]any{"allowed_ops": []string{"delete"}})
+	if status != http.StatusBadRequest {
+		t.Fatalf("status: got %d want 400 (body=%v)", status, body)
+	}
+}
+
+func TestBindHandler_InvalidAllowedOpsIs400(t *testing.T) {
+	h := bootstrapProjectSecretsHandler(t)
+
+	status, body := h.do(t, http.MethodPost,
+		fmt.Sprintf("/projects/%s/secrets", h.projectID),
+		map[string]any{
+			"secret_id":   h.secretID.String(),
+			"allowed_ops": []string{"read", "destroy"},
+		})
+	if status != http.StatusBadRequest {
+		t.Fatalf("status: got %d want 400 (body=%v)", status, body)
+	}
+}
