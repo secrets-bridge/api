@@ -124,15 +124,15 @@ const CtxKeySessionID ctxKey = "session_id"
 // Auth resolves the request actor identity.
 //
 // Resolution order (Slice A2 adds the cookie branch at the front):
-//   1. `sb_session` cookie — validated via SessionLooker; the
-//      authenticated user's UUID becomes the actor. The slide-the-idle-
-//      TTL side effect runs inside the looker.
-//   2. `Authorization: Bearer <jwt>` — validated via TokenVerifier;
-//      the `sub` claim becomes the actor.
-//   3. `X-User-Id: <id>` — legacy header used by curl / pre-JWT UI
-//      flows. NOT a security boundary; kept so existing tests and
-//      development scripts keep working.
-//   4. Fallback: "anonymous".
+//  1. `sb_session` cookie — validated via SessionLooker; the
+//     authenticated user's UUID becomes the actor. The slide-the-idle-
+//     TTL side effect runs inside the looker.
+//  2. `Authorization: Bearer <jwt>` — validated via TokenVerifier;
+//     the `sub` claim becomes the actor.
+//  3. `X-User-Id: <id>` — legacy header used by curl / pre-JWT UI
+//     flows. NOT a security boundary; kept so existing tests and
+//     development scripts keep working.
+//  4. Fallback: "anonymous".
 //
 // A Bearer token or cookie that FAILS verification falls through to
 // the next layer rather than returning 401 — the actual authorization
@@ -174,7 +174,7 @@ func AuthWith(verifier TokenVerifier, sessions SessionLooker) fiber.Handler {
 				}
 			}
 		}
-		if actor == "anonymous" {
+		if actor == "anonymous" && AllowInsecureHeaderIdentity {
 			if v := c.Get("X-User-Id"); v != "" {
 				actor = v
 			}
@@ -185,6 +185,39 @@ func AuthWith(verifier TokenVerifier, sessions SessionLooker) fiber.Handler {
 			ctx = context.WithValue(ctx, CtxKeySession, session)
 		}
 		c.SetContext(ctx)
+		return c.Next()
+	}
+}
+
+// AllowInsecureHeaderIdentity gates the legacy `X-User-Id` identity
+// header. It is OFF by default: honoured unconditionally, the header
+// is a full authentication bypass — any caller can claim to be any
+// user, and downstream `auth.Require` resolves that user's grants.
+//
+// cmd/api sets this once at boot from `SB_ALLOW_INSECURE_HEADER_AUTH`
+// (default false). Deliberately NOT tied to SB_ENV, because a
+// misconfigured environment reporting itself as `dev` must still be
+// safe. Enable ONLY in a trusted local dev loop, never on a routable
+// deployment.
+var AllowInsecureHeaderIdentity = false
+
+// RequireAuthedExcept enforces authenticated identity on every request
+// whose path is not in `public`. Default-deny: a route added without a
+// per-route auth check is protected by this group-level gate rather
+// than silently open. The failure mode of a forgotten allow-list entry
+// is a spurious 401 (loud, caught immediately), never an open endpoint.
+//
+// It runs AFTER AuthWith (which populates the actor) and BEFORE the
+// per-route `auth.Require` RBAC checks, which still enforce specific
+// permissions on top of mere authentication.
+func RequireAuthedExcept(public map[string]bool) fiber.Handler {
+	return func(c fiber.Ctx) error {
+		if public[c.Path()] {
+			return c.Next()
+		}
+		if a := actor(c); a == "" || a == "anonymous" {
+			return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+		}
 		return c.Next()
 	}
 }

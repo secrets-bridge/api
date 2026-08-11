@@ -24,6 +24,10 @@ import (
 // returns a Fiber app with the route mounted under /api/v1.
 func bootstrapMe(t *testing.T) (*fiber.App, *storage.Pool) {
 	t.Helper()
+	// These tests exercise the legacy X-User-Id identity path, which is
+	// OFF by default (it's an auth bypass in production). Enable it for
+	// the duration of the test and restore afterwards.
+	enableHeaderIdentityForTest(t)
 	dbDSN := os.Getenv("TEST_DATABASE_URL")
 	if dbDSN == "" {
 		t.Skip("TEST_DATABASE_URL required; skipping")
@@ -76,6 +80,16 @@ func bootstrapMe(t *testing.T) (*fiber.App, *storage.Pool) {
 	app.Use(middleware.Auth(nil)) // legacy X-User-Id path
 	app.Get("/api/v1/users/me", meH.GetMe)
 	return app, pool
+}
+
+// enableHeaderIdentityForTest turns on the legacy X-User-Id path for
+// one test and restores the prior value on cleanup. Only me_test needs
+// it; production keeps it off.
+func enableHeaderIdentityForTest(t *testing.T) {
+	t.Helper()
+	prev := middleware.AllowInsecureHeaderIdentity
+	middleware.AllowInsecureHeaderIdentity = true
+	t.Cleanup(func() { middleware.AllowInsecureHeaderIdentity = prev })
 }
 
 func TestGetMe_HappyPath(t *testing.T) {
@@ -188,6 +202,7 @@ func (f fakeMFAEnrollment) AnyEnrolled(_ context.Context, _ uuid.UUID) (bool, er
 }
 
 func TestGetMe_MFAEnrolled_RoundTrip(t *testing.T) {
+	enableHeaderIdentityForTest(t)
 	app, pool := bootstrapMe(t)
 	ctx := t.Context()
 
