@@ -940,24 +940,36 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// keeps a leaked `user_id` from being used to brute-discover wrap
 	// IDs against the 404/410/200 oracle.
 	v1.Get("/requests/:id/wraps/:wrap_id",
-		middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
-			Name: "wrap:retrieve", Bucket: middleware.ByQueryUserID(),
-			Limit: 20, Window: 60 * time.Second,
-		}),
 		// Slice D Tier 2: reveal requires fresh MFA. The wrap is
 		// single-shot at the service layer; gating step-up here means
 		// a stolen cookie can't burn a wrap unless it also carries
 		// fresh MFA proof.
+		//
+		// requireMFA runs BEFORE the rate limiter (same fix as the
+		// reveal-session open route): a step-up retry must not consume
+		// the retrieve budget. The limiter then blunts brute-discovery
+		// of wrap IDs against the 404/410/200 oracle by a caller who
+		// already holds fresh MFA.
 		requireMFA,
+		middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
+			Name: "wrap:retrieve", Bucket: middleware.ByQueryUserID(),
+			Limit: 20, Window: 60 * time.Second,
+		}),
 		requestsH.RetrieveWrap,
 	)
 
 	// Slice M2 — bulk reveal sessions. Open + Expire require fresh MFA
 	// (same Tier-2 gate as the single-wrap reveal path); ListActive is
 	// session-auth only because it returns value-free summaries only.
-	// Open is rate-limited per user (same shape as RetrieveWrap) to
-	// blunt a stolen-cookie attacker from burning through every
-	// approved request the user has open.
+	//
+	// requireMFA runs BEFORE the rate limiter: a step-up retry (401
+	// step_up_required while the user gets fresh MFA) must NOT consume
+	// the open budget, otherwise the natural MFA retry flow trips 429
+	// before the user can complete a single reveal (QA P2, 2026-08-11).
+	// The limiter then blunts a stolen-cookie-WITH-fresh-MFA attacker
+	// from burning through every approved request the user has open.
+	// Budget is 30/60s for headroom on the remaining non-2xx opens
+	// (e.g. a 410 re-open of an already-consumed request still counts).
 	revealOpenBucket := func(c fiber.Ctx) (string, bool) {
 		if u, ok := auth.IdentityFromContext(c.Context()); ok && u != "" {
 			return "user:" + u, true
@@ -969,11 +981,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		return "anon:" + ip, true
 	}
 	v1.Post("/reveal-sessions",
+		requireMFA,
 		middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
 			Name: "reveal-session:open", Bucket: revealOpenBucket,
-			Limit: 20, Window: 60 * time.Second,
+			Limit: 30, Window: 60 * time.Second,
 		}),
-		requireMFA,
 		revealSessionsH.Open,
 	)
 	v1.Get("/reveal-sessions/me/active", revealSessionsH.ListActive)

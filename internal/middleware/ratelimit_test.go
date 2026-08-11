@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
 	"github.com/secrets-bridge/api/pkg/runtime"
 )
@@ -140,6 +141,60 @@ func TestRateLimit_BucketsAreIndependent(t *testing.T) {
 	resp, _ = app.Test(httptest.NewRequest("GET", "/limited/bob", nil))
 	if resp.StatusCode != 200 {
 		t.Fatalf("bob first: status %d, want 200 (separate bucket)", resp.StatusCode)
+	}
+}
+
+// The reveal-session open + wrap-retrieve routes place requireMFA BEFORE
+// the rate limiter so a step-up retry (401 step_up_required, while the
+// user gets fresh MFA) never consumes the reveal open budget — otherwise
+// the natural MFA retry flow trips 429 before a single reveal completes
+// (QA P2, 2026-08-11). This pins that ordering with a stand-in gate:
+// requests the gate rejects must not decrement the limiter's window.
+func TestRateLimit_AfterGate_RejectedRequestsDoNotConsumeBudget(t *testing.T) {
+	rdb := openRedisForRateLimit(t)
+
+	bucket := "after-gate-" + uuid.NewString()
+	gate := func(c fiber.Ctx) error {
+		if c.Get("X-Reject") == "1" {
+			return fiber.NewError(fiber.StatusUnauthorized, "step_up_required")
+		}
+		return c.Next()
+	}
+	limiter := RateLimit(rdb, nil, RateLimitConfig{
+		Name:   "test:after-gate",
+		Bucket: func(c fiber.Ctx) (string, bool) { return bucket, true },
+		Limit:  2,
+		Window: 60 * time.Second,
+	})
+
+	app := fiber.New()
+	// Ordering under test: gate BEFORE limiter (mirrors requireMFA → RateLimit).
+	app.Post("/x", gate, limiter, func(c fiber.Ctx) error { return c.SendStatus(200) })
+
+	// Five gate-rejected requests (the MFA-stale retry flow): each 401,
+	// and NONE consumes the limiter budget.
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest("POST", "/x", nil)
+		req.Header.Set("X-Reject", "1")
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatalf("reject %d: %v", i, err)
+		}
+		if resp.StatusCode != 401 {
+			t.Fatalf("reject %d: status %d, want 401 (limiter must run AFTER the gate)", i, resp.StatusCode)
+		}
+	}
+
+	// Budget intact: two accepted opens admitted, the third 429s.
+	for i := 0; i < 2; i++ {
+		resp, _ := app.Test(httptest.NewRequest("POST", "/x", nil))
+		if resp.StatusCode != 200 {
+			t.Fatalf("accepted %d: status %d, want 200 (gate-rejected requests must not consume budget)", i, resp.StatusCode)
+		}
+	}
+	resp, _ := app.Test(httptest.NewRequest("POST", "/x", nil))
+	if resp.StatusCode != 429 {
+		t.Fatalf("over-limit: status %d, want 429", resp.StatusCode)
 	}
 }
 
