@@ -170,15 +170,15 @@ func TestResolve_HigherPriorityWins(t *testing.T) {
 
 	// Lower priority added FIRST so created_at ordering won't save it.
 	if err := policies.Create(ctx, &storage.PolicyRule{
-		Name:     "low-prio-match",
-		Selector: map[string]any{"environment": "prod"},
+		Name:       "low-prio-match",
+		Selector:   map[string]any{"environment": "prod"},
 		WorkflowID: lowWF.ID, Priority: 50, Enabled: true,
 	}); err != nil {
 		t.Fatalf("low rule: %v", err)
 	}
 	if err := policies.Create(ctx, &storage.PolicyRule{
-		Name:     "high-prio-match",
-		Selector: map[string]any{"environment": "prod"},
+		Name:       "high-prio-match",
+		Selector:   map[string]any{"environment": "prod"},
 		WorkflowID: highWF.ID, Priority: 500, Enabled: true,
 	}); err != nil {
 		t.Fatalf("high rule: %v", err)
@@ -311,8 +311,8 @@ func TestResolve_DecisionCarriesAccessFields(t *testing.T) {
 		t.Fatalf("Create workflow: %v", err)
 	}
 	rule := &storage.PolicyRule{
-		Name:     "uat-direct-rule",
-		Selector: map[string]any{"environment": "uat"},
+		Name:       "uat-direct-rule",
+		Selector:   map[string]any{"environment": "uat"},
 		WorkflowID: wf.ID, Priority: 100, Enabled: true,
 		DirectRevealAllowed: true,
 		RequiresMFA:         false,
@@ -363,8 +363,8 @@ func TestResolve_ProdInvariantZerosDirectReveal(t *testing.T) {
 	// Operator misconfigures: a prod-targeted rule with
 	// direct_reveal_allowed=true.
 	rule := &storage.PolicyRule{
-		Name:     "misconfigured-prod-direct",
-		Selector: map[string]any{"environment": "prod"},
+		Name:       "misconfigured-prod-direct",
+		Selector:   map[string]any{"environment": "prod"},
 		WorkflowID: wf.ID, Priority: 200, Enabled: true,
 		DirectRevealAllowed: true,
 		RequiresMFA:         true,
@@ -424,8 +424,8 @@ func TestResolve_KindUnsetSkipsInvariant(t *testing.T) {
 	}
 	_ = workflows.Create(ctx, wf)
 	_ = policies.Create(ctx, &storage.PolicyRule{
-		Name:     "matches-prod-env",
-		Selector: map[string]any{"environment": "prod"},
+		Name:       "matches-prod-env",
+		Selector:   map[string]any{"environment": "prod"},
 		WorkflowID: wf.ID, Priority: 50, Enabled: true,
 		DirectRevealAllowed: true,
 	})
@@ -536,5 +536,134 @@ func TestWorkflows_OnlyOneDefault(t *testing.T) {
 	}
 	if err := workflows.Create(ctx, dup); err == nil {
 		t.Fatal("schema must reject a second is_default=true row")
+	}
+}
+
+// --- operation selector vs the direct-reveal path --------------------
+//
+// A QA fixture pinned `selector.operation = "read"` and expected it to
+// govern direct reveal. It does not: the direct-reveal call site
+// resolves with operation=reveal (requests.go, api#141), so an
+// operation=read rule cannot match it, the walk falls through to
+// match-all, and direct reveal is refused. The resolver was correct;
+// the fixture was not. These pin the semantics so the next person
+// writing a reveal policy sees the distinction fail loudly in a test
+// rather than as a 403 in an environment.
+
+func revealPolicyFixture(t *testing.T, workflows *storage.Workflows, policies *storage.Policies, operation string, priority int, name string) {
+	t.Helper()
+	ctx := t.Context()
+	wf := &storage.WorkflowDefinition{
+		Name: name + "-wf", MinApprovers: 0, AllowSelfApproval: true,
+		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
+		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
+	}
+	if err := workflows.Create(ctx, wf); err != nil {
+		t.Fatalf("Create workflow %s: %v", name, err)
+	}
+	rule := &storage.PolicyRule{
+		Name: name,
+		Selector: map[string]any{
+			"environment_kind":  "non_prod",
+			"secret_ref_prefix": "/eks/uat/adss/",
+			"operation":         operation,
+		},
+		WorkflowID: wf.ID, Priority: priority, Enabled: true,
+		DirectRevealAllowed: true,
+		RevealTTLSeconds:    120,
+	}
+	if err := policies.Create(ctx, rule); err != nil {
+		t.Fatalf("Create policy %s: %v", name, err)
+	}
+}
+
+// directRevealScope mirrors what RequestService stamps on the
+// direct-reveal path. If that call site ever changes operation, this
+// test is the tripwire.
+func directRevealScope() services.Scope {
+	return services.Scope{
+		EnvironmentKind: storage.EnvironmentKindNonProd,
+		SecretRefPrefix: "/eks/uat/adss/env",
+		Operation:       services.PolicySelectorOperationReveal,
+	}
+}
+
+func TestResolve_OperationReadRuleDoesNotGrantDirectReveal(t *testing.T) {
+	engine, _, policies, workflows := bootstrapPolicy(t)
+	revealPolicyFixture(t, workflows, policies, services.PolicySelectorOperationRead, 600, "qa-read-rule")
+
+	dec, err := engine.Resolve(t.Context(), directRevealScope())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if dec.DirectRevealAllowed {
+		t.Error("an operation=read rule must NOT grant direct reveal (operation=reveal)")
+	}
+}
+
+func TestResolve_OperationRevealRuleGrantsDirectReveal(t *testing.T) {
+	engine, _, policies, workflows := bootstrapPolicy(t)
+	revealPolicyFixture(t, workflows, policies, services.PolicySelectorOperationReveal, 600, "qa-reveal-rule")
+
+	dec, err := engine.Resolve(t.Context(), directRevealScope())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if !dec.DirectRevealAllowed {
+		t.Error("an operation=reveal rule must grant direct reveal")
+	}
+	if dec.RevealTTLSeconds != 120 {
+		t.Errorf("RevealTTLSeconds: got %d want 120", dec.RevealTTLSeconds)
+	}
+}
+
+// Regression guard for the ordering QA asked about: when BOTH rules
+// match, the higher priority wins. This passed before the fix too —
+// the resolver was never at fault — but it pins the behaviour the
+// fixture depended on.
+func TestResolve_HigherPriorityWinsAmongMatchingRevealRules(t *testing.T) {
+	engine, _, policies, workflows := bootstrapPolicy(t)
+	revealPolicyFixture(t, workflows, policies, services.PolicySelectorOperationReveal, 500, "qa-reveal-500")
+	revealPolicyFixture(t, workflows, policies, services.PolicySelectorOperationReveal, 600, "qa-reveal-600")
+
+	dec, err := engine.Resolve(t.Context(), directRevealScope())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if dec.MatchedRule == nil {
+		t.Fatal("expected a matched rule")
+	}
+	if dec.MatchedRule.Name != "qa-reveal-600" {
+		t.Errorf("matched %q, want qa-reveal-600 (priority DESC)", dec.MatchedRule.Name)
+	}
+}
+
+func TestResolve_DirectRevealDeniedWhenFlagFalse(t *testing.T) {
+	engine, _, policies, workflows := bootstrapPolicy(t)
+	ctx := t.Context()
+	wf := &storage.WorkflowDefinition{
+		Name: "no-reveal-wf", MinApprovers: 0, AllowSelfApproval: true,
+		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
+		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
+	}
+	if err := workflows.Create(ctx, wf); err != nil {
+		t.Fatalf("Create workflow: %v", err)
+	}
+	rule := &storage.PolicyRule{
+		Name:       "reveal-denied",
+		Selector:   map[string]any{"environment_kind": "non_prod", "operation": "reveal"},
+		WorkflowID: wf.ID, Priority: 600, Enabled: true,
+		DirectRevealAllowed: false,
+	}
+	if err := policies.Create(ctx, rule); err != nil {
+		t.Fatalf("Create policy: %v", err)
+	}
+
+	dec, err := engine.Resolve(ctx, directRevealScope())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if dec.DirectRevealAllowed {
+		t.Error("matched rule has direct_reveal_allowed=false; decision must refuse")
 	}
 }

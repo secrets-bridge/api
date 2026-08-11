@@ -509,3 +509,75 @@ func TestRoles_ListAfterManyCreates(t *testing.T) {
 		t.Fatalf("expected ≥13 roles, got %d", len(roles))
 	}
 }
+
+// QA P2 — `omitempty` on a bool drops `false` from the JSON, so a
+// policy created with requires_mfa=false / direct_reveal_allowed=false
+// came back with those keys ABSENT. Indistinguishable from "the field
+// is not supported", and it means an operator cannot confirm from the
+// API that direct reveal is switched OFF. The values were persisted
+// correctly the whole time — this is purely response serialization.
+func TestPolicies_FalseBoolsAreVisibleInResponse(t *testing.T) {
+	app, pool, _ := bootstrapAdmin(t)
+	var stdID uuid.UUID
+	_ = pool.QueryRow(t.Context(),
+		`SELECT id FROM workflow_definitions WHERE name='standard'`).Scan(&stdID)
+
+	resp, body := doJSON(t, app, "POST", "/api/v1/policies", handlers.PolicyBody{
+		Name:                "bools-false",
+		Selector:            map[string]any{"environment": "uat"},
+		WorkflowID:          stdID,
+		Priority:            410,
+		Enabled:             true,
+		DirectRevealAllowed: false,
+		RequiresMFA:         false,
+	})
+	if resp.StatusCode != fiber.StatusCreated {
+		t.Fatalf("create: %d body %s", resp.StatusCode, body)
+	}
+
+	// Assert on the RAW JSON: the keys must be present, not merely
+	// decode to false (which a missing key would also do).
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, k := range []string{"direct_reveal_allowed", "requires_mfa"} {
+		v, ok := raw[k]
+		if !ok {
+			t.Errorf("%q absent from create response — an operator cannot tell it is false vs unsupported", k)
+			continue
+		}
+		if v != false {
+			t.Errorf("%q: got %v want false", k, v)
+		}
+	}
+}
+
+func TestPolicies_TrueBoolsStillSerialize(t *testing.T) {
+	app, pool, _ := bootstrapAdmin(t)
+	var stdID uuid.UUID
+	_ = pool.QueryRow(t.Context(),
+		`SELECT id FROM workflow_definitions WHERE name='standard'`).Scan(&stdID)
+
+	resp, body := doJSON(t, app, "POST", "/api/v1/policies", handlers.PolicyBody{
+		Name:                "bools-true",
+		Selector:            map[string]any{"environment_kind": "non_prod", "operation": "reveal"},
+		WorkflowID:          stdID,
+		Priority:            420,
+		Enabled:             true,
+		DirectRevealAllowed: true,
+		RequiresMFA:         true,
+		RevealTTLSeconds:    120,
+	})
+	if resp.StatusCode != fiber.StatusCreated {
+		t.Fatalf("create: %d body %s", resp.StatusCode, body)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if raw["direct_reveal_allowed"] != true || raw["requires_mfa"] != true {
+		t.Errorf("true bools must still serialize: got %v / %v",
+			raw["direct_reveal_allowed"], raw["requires_mfa"])
+	}
+}
