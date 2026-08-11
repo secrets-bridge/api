@@ -110,6 +110,41 @@ func TestRequireAuthedExcept_AuthenticatedProtectedPasses(t *testing.T) {
 	}
 }
 
+// The /api/v1/agents/:id/ subtree carries its own auth (AgentAuth via
+// X-Agent-Secret) and is mounted UNDER the group gate. A publicPrefix
+// exemption must let anonymous-at-the-session-layer agent requests
+// through to AgentAuth — otherwise the gate 401s every agent before its
+// secret is ever checked (the regression that took the data plane
+// offline). Non-agent paths must still be gated so the earlier
+// unauthenticated-read P0 stays closed.
+func TestRequireAuthedExcept_PublicPrefixExemptsAgentSubtree(t *testing.T) {
+	app := fiber.New()
+	app.Use(AuthWith(nil, nil)) // resolves to anonymous (no session/header)
+	app.Use(RequireAuthedExcept(map[string]bool{}, "/api/v1/agents/"))
+	app.Post("/api/v1/agents/00000000-0000-4000-8000-000000000001/jobs/claim",
+		func(c fiber.Ctx) error { return c.SendString("reached") })
+	app.Get("/api/v1/policies", func(c fiber.Ctx) error { return c.SendString("leaked") })
+
+	// Agent-subtree path passes the session gate unauthenticated.
+	resp, err := app.Test(httptest.NewRequest("POST",
+		"/api/v1/agents/00000000-0000-4000-8000-000000000001/jobs/claim", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("agent subtree = %d; want 200 (prefix must exempt the session gate so AgentAuth can run)", resp.StatusCode)
+	}
+
+	// A non-agent path is still gated — default-deny holds.
+	resp2, err := app.Test(httptest.NewRequest("GET", "/api/v1/policies", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp2.StatusCode != fiber.StatusUnauthorized {
+		t.Fatalf("non-agent path = %d; want 401 (default-deny must still hold)", resp2.StatusCode)
+	}
+}
+
 func readBody(t *testing.T, resp *http.Response) string {
 	t.Helper()
 	defer func() { _ = resp.Body.Close() }()
