@@ -2,6 +2,34 @@ package main
 
 import "github.com/gofiber/fiber/v3"
 
+// publicV1Paths is the allow-list of /api/v1 routes reachable WITHOUT
+// authentication. Everything else under /api/v1 is gated by
+// middleware.RequireAuthedExcept. Keep this minimal and intentional —
+// each entry is a route that MUST work for an anonymous or
+// mid-authentication caller:
+//
+//   - auth/login, auth/logout            — establish / drop a session
+//   - auth/oidc/start, callback          — browser-driven SSO handshake
+//   - auth/oidc/logout                   — user-initiated SSO logout
+//   - auth/oidc/backchannel              — IdP server-to-server logout,
+//     self-authenticated by its own
+//     signed logout_token
+//
+// NOT here on purpose: /auth/mfa/challenge and /auth/mfa/verify require
+// an established session (they read it from context and 401 without
+// one), so the default-deny gate is correct for them.
+//
+// Health/readiness/metrics live on the root app group, outside
+// /api/v1, so they are unaffected by this list.
+var publicV1Paths = map[string]bool{
+	"/api/v1/auth/login":            true,
+	"/api/v1/auth/logout":           true,
+	"/api/v1/auth/oidc/start":       true,
+	"/api/v1/auth/oidc/callback":    true,
+	"/api/v1/auth/oidc/logout":      true,
+	"/api/v1/auth/oidc/backchannel": true,
+}
+
 // hs is sugar for building a handler chain (middleware first, final
 // handler last) in the literal below. Fiber takes variadic handlers
 // per route and drives `c.Next()` between them, so the chain must be

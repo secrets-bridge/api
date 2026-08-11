@@ -468,7 +468,6 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		}
 	}
 
-
 	// RBAC resolver for the `auth.Require(perm)` middleware. Loads each
 	// caller's user_role assignments + the role catalog at request time.
 	rbacResolver := auth.NewRepoResolver(userRoleRepo, roleRepo)
@@ -580,8 +579,23 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		requireStamped = middleware.RequireMFAStamped(sessionSvc, mfaVerifySvc)
 	}
 
+	// Legacy X-User-Id identity header: honoured only when explicitly
+	// opted in. Default OFF makes every deployment secure regardless of
+	// SB_ENV. See middleware.AllowInsecureHeaderIdentity.
+	middleware.AllowInsecureHeaderIdentity = cfg.AllowInsecureHeaderAuth
+	if cfg.AllowInsecureHeaderAuth {
+		logger.Warn("INSECURE: X-User-Id header identity is ENABLED (SB_ALLOW_INSECURE_HEADER_AUTH=true) — never set this on a routable deployment")
+	}
+
 	v1Middlewares := []any{
 		middleware.AuthWith(authSvc, sessionSvc),
+		// Default-deny: everything under /api/v1 requires authentication
+		// unless its path is in publicV1Paths. This is the group-level
+		// backstop — per-route auth.Require still enforces specific
+		// permissions on top. Without it, any handler wired without an
+		// explicit auth check is silently world-readable (the P0 that
+		// exposed /policies, /roles, /agents, etc. unauthenticated).
+		middleware.RequireAuthedExcept(publicV1Paths),
 		middleware.RBAC(),
 		middleware.Audit(logger),
 	}

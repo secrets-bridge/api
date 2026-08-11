@@ -119,8 +119,8 @@ type Config struct {
 	// `user_roles` against `OIDCGroupMap` (the JSON parses at
 	// boot via `ValidateOIDCGroupMap` so a typo fails the boot
 	// rather than silently producing wrong access).
-	OIDCGroupClaim   string            // default "groups"
-	OIDCGroupMap     map[string]string // raw value via SB_OIDC_GROUP_MAP env (JSON object)
+	OIDCGroupClaim string            // default "groups"
+	OIDCGroupMap   map[string]string // raw value via SB_OIDC_GROUP_MAP env (JSON object)
 
 	// MFADevAllowPwd is the interim unblock for app-level MFA (Slice
 	// H). When true AND SB_ENV=dev, the SessionService treats any live
@@ -196,6 +196,12 @@ type Config struct {
 	// on; deployments comfortable with step-up-only leave it off.
 	RequireMFAAtLogin bool
 
+	// AllowInsecureHeaderAuth enables the legacy `X-User-Id` identity
+	// header. OFF by default and independent of SB_ENV: honoured
+	// unconditionally the header is a full auth bypass. Enable ONLY in
+	// a trusted local dev loop, never on a routable deployment.
+	AllowInsecureHeaderAuth bool
+
 	// EPIC P (Provider Connections):
 	// AllowInsecureVaultAddr=true permits http:// vault.address values
 	// on provider_connections — the deployment-level override for
@@ -210,33 +216,34 @@ type Config struct {
 
 func loadConfig() Config {
 	return Config{
-		Addr:                   envOr("API_ADDR", ":8080"),
-		ShutdownGrace:          envDuration("API_SHUTDOWN_GRACE", 15*time.Second),
-		Env:                    envOr("SB_ENV", ModeProduction),
-		GitOpsEnabled:          envBool("SB_GITOPS_ENABLED", false),
+		Addr:                           envOr("API_ADDR", ":8080"),
+		ShutdownGrace:                  envDuration("API_SHUTDOWN_GRACE", 15*time.Second),
+		Env:                            envOr("SB_ENV", ModeProduction),
+		GitOpsEnabled:                  envBool("SB_GITOPS_ENABLED", false),
 		AllowInsecureVaultAddr:         envBool("SB_ALLOW_INSECURE_VAULT_ADDR", false),
 		ProviderConnRejectSecretValues: envBool("SB_PROVIDER_CONN_REJECT_SECRETS", true),
 		BootstrapAdminUserID:           envOr("SB_BOOTSTRAP_ADMIN_USER_ID", ""),
-		JWTSecret:              loadJWTSecret(),
-		JWTTokenTTL:            envDuration("SB_JWT_TOKEN_TTL", 8*time.Hour),
-		BootstrapAdminEmail:    envOr("SB_BOOTSTRAP_ADMIN_EMAIL", ""),
-		BootstrapAdminPassword: envOr("SB_BOOTSTRAP_ADMIN_PASSWORD", ""),
-		DevSeedPassword:        envOr("SB_DEV_SEED_PASSWORD", ""),
-		OIDCIssuer:             envOr("SB_OIDC_ISSUER", ""),
-		OIDCClientID:           envOr("SB_OIDC_CLIENT_ID", ""),
-		OIDCClientSecret:       envOr("SB_OIDC_CLIENT_SECRET", ""),
-		OIDCRedirectURL:        envOr("SB_OIDC_REDIRECT_URL", ""),
-		OIDCScopes:             envOr("SB_OIDC_SCOPES", "openid profile email"),
-		OIDCPostLogout:         envOr("SB_OIDC_POST_LOGOUT_REDIRECT", ""),
-		OIDCGroupClaim:         envOr("SB_OIDC_GROUP_CLAIM", "groups"),
-		OIDCGroupMap:           parseOIDCGroupMap(envOr("SB_OIDC_GROUP_MAP", "")),
-		MFADevAllowPwd:         envBool("SB_MFA_DEV_ALLOW_PWD", false),
-		MFATOTPIssuer:          envOr("SB_MFA_TOTP_ISSUER", "Secrets Bridge"),
-		MFAWebAuthnRPID:          envOr("SB_MFA_WEBAUTHN_RP_ID", ""),
-		MFAWebAuthnRPDisplayName: envOr("SB_MFA_WEBAUTHN_RP_DISPLAY_NAME", "Secrets Bridge"),
-		MFAWebAuthnRPOrigins:     splitCommaTrim(envOr("SB_MFA_WEBAUTHN_RP_ORIGINS", "")),
-		OIDCTrustAMRForMFA:       envBool("SB_OIDC_TRUSTED_AMR_MFA", false),
-		RequireMFAAtLogin:        envBool("SB_REQUIRE_MFA_AT_LOGIN", false),
+		JWTSecret:                      loadJWTSecret(),
+		JWTTokenTTL:                    envDuration("SB_JWT_TOKEN_TTL", 8*time.Hour),
+		BootstrapAdminEmail:            envOr("SB_BOOTSTRAP_ADMIN_EMAIL", ""),
+		BootstrapAdminPassword:         envOr("SB_BOOTSTRAP_ADMIN_PASSWORD", ""),
+		DevSeedPassword:                envOr("SB_DEV_SEED_PASSWORD", ""),
+		OIDCIssuer:                     envOr("SB_OIDC_ISSUER", ""),
+		OIDCClientID:                   envOr("SB_OIDC_CLIENT_ID", ""),
+		OIDCClientSecret:               envOr("SB_OIDC_CLIENT_SECRET", ""),
+		OIDCRedirectURL:                envOr("SB_OIDC_REDIRECT_URL", ""),
+		OIDCScopes:                     envOr("SB_OIDC_SCOPES", "openid profile email"),
+		OIDCPostLogout:                 envOr("SB_OIDC_POST_LOGOUT_REDIRECT", ""),
+		OIDCGroupClaim:                 envOr("SB_OIDC_GROUP_CLAIM", "groups"),
+		OIDCGroupMap:                   parseOIDCGroupMap(envOr("SB_OIDC_GROUP_MAP", "")),
+		MFADevAllowPwd:                 envBool("SB_MFA_DEV_ALLOW_PWD", false),
+		MFATOTPIssuer:                  envOr("SB_MFA_TOTP_ISSUER", "Secrets Bridge"),
+		MFAWebAuthnRPID:                envOr("SB_MFA_WEBAUTHN_RP_ID", ""),
+		MFAWebAuthnRPDisplayName:       envOr("SB_MFA_WEBAUTHN_RP_DISPLAY_NAME", "Secrets Bridge"),
+		MFAWebAuthnRPOrigins:           splitCommaTrim(envOr("SB_MFA_WEBAUTHN_RP_ORIGINS", "")),
+		OIDCTrustAMRForMFA:             envBool("SB_OIDC_TRUSTED_AMR_MFA", false),
+		RequireMFAAtLogin:              envBool("SB_REQUIRE_MFA_AT_LOGIN", false),
+		AllowInsecureHeaderAuth:        envBool("SB_ALLOW_INSECURE_HEADER_AUTH", false),
 	}
 }
 
@@ -387,4 +394,3 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 	}
 	return d
 }
-
