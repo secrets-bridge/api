@@ -202,18 +202,37 @@ func AuthWith(verifier TokenVerifier, sessions SessionLooker) fiber.Handler {
 var AllowInsecureHeaderIdentity = false
 
 // RequireAuthedExcept enforces authenticated identity on every request
-// whose path is not in `public`. Default-deny: a route added without a
-// per-route auth check is protected by this group-level gate rather
-// than silently open. The failure mode of a forgotten allow-list entry
-// is a spurious 401 (loud, caught immediately), never an open endpoint.
+// whose path is neither in `public` (exact match) nor under one of
+// `publicPrefixes`. Default-deny: a route added without a per-route auth
+// check is protected by this group-level gate rather than silently open.
+// The failure mode of a forgotten allow-list entry is a spurious 401
+// (loud, caught immediately), never an open endpoint.
 //
 // It runs AFTER AuthWith (which populates the actor) and BEFORE the
 // per-route `auth.Require` RBAC checks, which still enforce specific
 // permissions on top of mere authentication.
-func RequireAuthedExcept(public map[string]bool) fiber.Handler {
+//
+// publicPrefixes exempts whole route subtrees that carry their OWN auth
+// scheme rather than the session/user identity this gate checks — most
+// importantly `/api/v1/agents/:id/` (the AgentAuth group, authenticated
+// by `X-Agent-Secret`), which is a sub-group mounted UNDER this gate and
+// so would otherwise be rejected as anonymous before AgentAuth ever runs
+// (that regression took the data plane offline after the group gate
+// landed). INVARIANT: every route under an exempt prefix MUST enforce
+// its own auth (AgentAuth or auth.Require) — the group default-deny does
+// not cover it. Non-agent paths (e.g. /api/v1/policies) are unaffected,
+// so the default-deny that closed the earlier unauthenticated-read P0
+// still stands for them.
+func RequireAuthedExcept(public map[string]bool, publicPrefixes ...string) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		if public[c.Path()] {
+		path := c.Path()
+		if public[path] {
 			return c.Next()
+		}
+		for _, p := range publicPrefixes {
+			if strings.HasPrefix(path, p) {
+				return c.Next()
+			}
 		}
 		if a := actor(c); a == "" || a == "anonymous" {
 			return fiber.NewError(fiber.StatusUnauthorized, "authentication required")

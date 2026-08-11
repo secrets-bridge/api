@@ -612,7 +612,15 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		// permissions on top. Without it, any handler wired without an
 		// explicit auth check is silently world-readable (the P0 that
 		// exposed /policies, /roles, /agents, etc. unauthenticated).
-		middleware.RequireAuthedExcept(publicV1Paths),
+		//
+		// The /api/v1/agents/:id/ subtree is exempt: it is the AgentAuth
+		// group, authenticated by X-Agent-Secret, and is mounted UNDER
+		// this gate — without the exemption the session gate rejects the
+		// agent as anonymous before AgentAuth runs, which took the whole
+		// data plane offline (agents could not heartbeat or claim jobs).
+		// Every route under that prefix carries its own auth (AgentAuth,
+		// or auth.Require on /agents/:id/revoke), so the exemption is safe.
+		middleware.RequireAuthedExcept(publicV1Paths, "/api/v1/agents/"),
 		middleware.RBAC(),
 		middleware.Audit(logger),
 	}
