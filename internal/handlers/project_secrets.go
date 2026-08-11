@@ -6,10 +6,10 @@
 //
 // Endpoints (admin-only, under /api/v1):
 //
-//   POST   /projects/:id/secrets               bind a secret to a project
-//   GET    /projects/:id/secrets               list bindings (with secret detail)
-//   PUT    /projects/:id/secrets/:secret_id    update allowed_keys / allowed_ops / environment_id
-//   DELETE /projects/:id/secrets/:secret_id    unbind
+//	POST   /projects/:id/secrets               bind a secret to a project
+//	GET    /projects/:id/secrets               list bindings (with secret detail)
+//	PUT    /projects/:id/secrets/:secret_id    update allowed_keys / allowed_ops / environment_id
+//	DELETE /projects/:id/secrets/:secret_id    unbind
 //
 // Design notes:
 //
@@ -41,6 +41,7 @@ package handlers
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -94,12 +95,12 @@ type bindingBody struct {
 }
 
 type secretSummary struct {
-	ID            uuid.UUID         `json:"id"`
-	ClusterName   string            `json:"cluster_name"`
-	ProviderType  string            `json:"provider_type"`
-	SecretRef     string            `json:"secret_ref"`
-	Status        string            `json:"status"`
-	Labels        map[string]string `json:"labels,omitempty"`
+	ID           uuid.UUID         `json:"id"`
+	ClusterName  string            `json:"cluster_name"`
+	ProviderType string            `json:"provider_type"`
+	SecretRef    string            `json:"secret_ref"`
+	Status       string            `json:"status"`
+	Labels       map[string]string `json:"labels,omitempty"`
 }
 
 type updateBindingBody struct {
@@ -155,11 +156,12 @@ func secretToSummary(s *storage.Secret) *secretSummary {
 // Bind handles POST /projects/:id/secrets.
 //
 // Body:
-//   {
-//     "secret_id":    "<uuid>",
-//     "allowed_keys": ["DB_HOST", "DB_PORT"]   // omit for "all keys"
-//     "allowed_ops":  ["read"]                  // defaults to ["read"]
-//   }
+//
+//	{
+//	  "secret_id":    "<uuid>",
+//	  "allowed_keys": ["DB_HOST", "DB_PORT"]   // omit for "all keys"
+//	  "allowed_ops":  ["read"]                  // defaults to ["read"]
+//	}
 func (h *ProjectSecrets) Bind(c fiber.Ctx) error {
 	projectID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
@@ -186,6 +188,9 @@ func (h *ProjectSecrets) Bind(c fiber.Ctx) error {
 	ops := body.AllowedOps
 	if len(ops) == 0 {
 		ops = []string{storage.OpRead}
+	}
+	if err := validateAllowedOps(ops); err != nil {
+		return err
 	}
 
 	var allowedKeys []string
@@ -278,6 +283,9 @@ func (h *ProjectSecrets) Update(c fiber.Ctx) error {
 		// CHECK refuses ARRAY[]::text[] anyway.
 		return fiber.NewError(fiber.StatusBadRequest, "allowed_ops must be non-empty")
 	}
+	if err := validateAllowedOps(ops); err != nil {
+		return err
+	}
 
 	var allowedKeys []string
 	if body.AllowedKeys != nil {
@@ -340,6 +348,24 @@ func mapProjectSecretErr(err error, msg string) error {
 		return fiber.NewError(fiber.StatusNotFound, msg)
 	}
 	return fiber.NewError(fiber.StatusInternalServerError, msg)
+}
+
+// validateAllowedOps refuses any operation outside the set the
+// schema CHECK permits. Postgres rejects them anyway, but as a
+// constraint violation that the repository surfaces as an opaque
+// error and the handler maps to 500 — a client-supplied bad enum is
+// a 400, and the caller deserves to be told which value was wrong.
+func validateAllowedOps(ops []string) error {
+	for _, op := range ops {
+		switch op {
+		case storage.OpRead, storage.OpPatch, storage.OpDiscover:
+		default:
+			return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf(
+				"allowed_ops contains unknown operation %q (valid: %s, %s, %s)",
+				op, storage.OpRead, storage.OpPatch, storage.OpDiscover))
+		}
+	}
+	return nil
 }
 
 // resolveEnvironment turns the wire-level environment_id into a

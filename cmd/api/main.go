@@ -863,34 +863,35 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// /me/mfa) instead of an unreachable 401 step_up_required.
 	requireMFA := middleware.RequireFreshMFA(sessionSvc, mfaVerifySvc)
 
-	v1.Post("/requests", requestsH.Submit)
-	v1.Post("/requests/read", requestsH.SubmitRead)
-	v1.Get("/requests", requestsH.List)
-	v1.Get("/requests/:id", requestsH.Get)
-	v1.Post("/requests/:id/approve", requireMFA, requestsH.Approve)
-	v1.Post("/requests/:id/reject", requireMFA, requestsH.Reject)
-	v1.Post("/requests/:id/cancel", requestsH.Cancel)
+	// Registration ORDER is load-bearing (literal paths before :id) —
+	// see requestRoutes.register, which owns that invariant and is
+	// pinned by cmd/api/routes_test.go.
+	requestRoutes{
+		submit:     hs(requestsH.Submit),
+		submitRead: hs(requestsH.SubmitRead),
+		list:       hs(requestsH.List),
+		get:        hs(requestsH.Get),
+		approve:    hs(requireMFA, requestsH.Approve),
+		reject:     hs(requireMFA, requestsH.Reject),
+		cancel:     hs(requestsH.Cancel),
 
-	// Slice N3 — cross-team flow. Inbox routes come BEFORE :id routes
-	// so Fiber's match order picks the literal path.
-	v1.Get("/requests/inbox", crossTeamH.Inbox)
-	v1.Get("/requests/inbox/count", crossTeamH.InboxCount)
-	v1.Post("/requests/cross-team",
-		auth.Require(auth.PermSecretRequest, rbacResolver),
-		crossTeamH.Submit,
-	)
-	v1.Post("/requests/:id/fill",
-		auth.Require(auth.PermSecretValueProvide, rbacResolver),
-		crossTeamH.Fill,
-	)
-	v1.Post("/requests/:id/refuse",
-		auth.Require(auth.PermSecretValueProvide, rbacResolver),
-		crossTeamH.Refuse,
-	)
-	v1.Post("/requests/:id/verify",
-		requireMFA,
-		crossTeamH.Verify,
-	)
+		// Slice N3 — cross-team flow.
+		inbox:      hs(crossTeamH.Inbox),
+		inboxCount: hs(crossTeamH.InboxCount),
+		crossTeamSubmit: hs(
+			auth.Require(auth.PermSecretRequest, rbacResolver),
+			crossTeamH.Submit,
+		),
+		fill: hs(
+			auth.Require(auth.PermSecretValueProvide, rbacResolver),
+			crossTeamH.Fill,
+		),
+		refuse: hs(
+			auth.Require(auth.PermSecretValueProvide, rbacResolver),
+			crossTeamH.Refuse,
+		),
+		verify: hs(requireMFA, crossTeamH.Verify),
+	}.register(v1)
 	// Value-free wrap summaries for the request detail page. Lets the
 	// UI render the Wraps card (one row per key with a ready/consumed
 	// pill) without ever fetching plaintext until the user clicks
