@@ -506,8 +506,14 @@ type PolicyBody struct {
 	Priority            int            `json:"priority"`
 	Enabled             bool           `json:"enabled"`
 	IsSystem            bool           `json:"is_system,omitempty"`
-	DirectRevealAllowed bool           `json:"direct_reveal_allowed,omitempty"`
-	RequiresMFA         bool           `json:"requires_mfa,omitempty"`
+	// NOT omitempty. `omitempty` on a bool drops `false`, so a rule
+	// with direct reveal switched OFF came back with the key absent —
+	// indistinguishable from "this field is not supported". An
+	// operator confirming that a rule does NOT permit direct reveal
+	// needs to see the false, not infer it from silence. Both values
+	// were always persisted correctly; only the response hid them.
+	DirectRevealAllowed bool           `json:"direct_reveal_allowed"`
+	RequiresMFA         bool           `json:"requires_mfa"`
 	RevealTTLSeconds    int            `json:"reveal_ttl_seconds,omitempty"`
 
 	// R-follow-up #3 (api#127) — anchor fields. Admin can author a
