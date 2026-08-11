@@ -78,10 +78,10 @@ func secretsErr(err error) error {
 
 // BulkUpsertBody is the JSON the agent's DiscoverExecutor POSTs.
 type BulkUpsertBody struct {
-	ClusterName    string             `json:"cluster_name"`
-	ProviderType   string             `json:"provider_type"`
-	ProviderConfig map[string]any     `json:"provider_config,omitempty"`
-	Items          []BulkUpsertItem   `json:"items"`
+	ClusterName    string           `json:"cluster_name"`
+	ProviderType   string           `json:"provider_type"`
+	ProviderConfig map[string]any   `json:"provider_config,omitempty"`
+	Items          []BulkUpsertItem `json:"items"`
 }
 
 // BulkUpsertItem is one entry in the batch.
@@ -199,14 +199,14 @@ func (h *Secrets) List(c fiber.Ctx) error {
 //   - bindings or scopeResolver unset → no scoping (legacy behaviour)
 //   - identity missing                → 401
 //   - global admin                    → no id restriction (unless
-//                                       ?project_id= is supplied)
+//     ?project_id= is supplied)
 //   - scoped caller                   → restrict to the secrets bound
-//                                       to their projects; if a
-//                                       ?project_id= is supplied AND
-//                                       in their set, narrow further.
-//                                       Empty access set → empty
-//                                       result (encoded as a non-nil
-//                                       empty SecretIDs).
+//     to their projects; if a
+//     ?project_id= is supplied AND
+//     in their set, narrow further.
+//     Empty access set → empty
+//     result (encoded as a non-nil
+//     empty SecretIDs).
 func (h *Secrets) applyProjectScope(c fiber.Ctx, f *storage.SecretsListFilter) error {
 	if h.bindings == nil || h.scopeResolver == nil {
 		return nil
@@ -282,14 +282,55 @@ func containsUUID(set []uuid.UUID, target uuid.UUID) bool {
 	return false
 }
 
-// Get handles GET /api/v1/secrets/:id.
+// Get handles GET /api/v1/secrets/:id. Scoped identically to List: a
+// non-global caller may only read a secret bound to one of their
+// projects. An out-of-scope id returns 404 (like a missing secret) so
+// catalog existence never leaks.
 func (h *Secrets) Get(c fiber.Ctx) error {
 	id := c.Params("id")
 	s, err := h.svc.Get(c.Context(), id)
 	if err != nil {
 		return secretsErr(err)
 	}
+	if err := h.authorizeSecretRead(c, s); err != nil {
+		return err
+	}
 	return c.JSON(secretToBody(s))
+}
+
+// authorizeSecretRead enforces the same project scope on GET /secrets/:id
+// as applyProjectScope enforces on the list. When scoping isn't wired it
+// is a no-op; a global secret.list grant sees everything; a scoped
+// caller may only read a secret bound to one of their projects —
+// otherwise 404 (never 403, so existence stays hidden).
+func (h *Secrets) authorizeSecretRead(c fiber.Ctx, s *storage.Secret) error {
+	if h.bindings == nil || h.scopeResolver == nil {
+		return nil
+	}
+	userID, ok := auth.IdentityFromContext(c.Context())
+	if !ok {
+		return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+	}
+	access, err := auth.EffectiveProjectAccess(c.Context(), userID, auth.PermSecretList, h.scopeResolver, h.teamScope)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	if access.IsGlobal {
+		return nil
+	}
+	if len(access.ProjectIDs) == 0 {
+		return fiber.NewError(fiber.StatusNotFound, "not found")
+	}
+	ids, err := h.bindings.ListSecretIDsForProjects(c.Context(), access.ProjectIDs)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	for _, id := range ids {
+		if id == s.ID {
+			return nil
+		}
+	}
+	return fiber.NewError(fiber.StatusNotFound, "not found")
 }
 
 // filterFromQuery builds a SecretsListFilter from the request's query

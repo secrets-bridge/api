@@ -47,6 +47,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
@@ -56,6 +57,8 @@ type ProjectSecrets struct {
 	projects     storage.ProjectRepository
 	secrets      storage.SecretRepository
 	environments storage.EnvironmentRepository
+	resolver     auth.Resolver
+	teamScope    auth.TeamScopeResolver
 }
 
 // NewProjectSecrets wires the handler. The environment repository is
@@ -68,6 +71,39 @@ func NewProjectSecrets(
 	e storage.EnvironmentRepository,
 ) *ProjectSecrets {
 	return &ProjectSecrets{bindings: b, projects: p, secrets: s, environments: e}
+}
+
+// WithScope wires the read-path tenancy filter so GET /projects/:id/secrets
+// (which exposes binding metadata: allowed_keys, allowed_ops, secret
+// refs, labels) is restricted to callers whose grants cover the project.
+// An out-of-scope project returns 404. When the resolver is nil the
+// handler stays in legacy allow-all mode. Returns the handler for
+// chaining.
+func (h *ProjectSecrets) WithScope(r auth.Resolver, tr auth.TeamScopeResolver) *ProjectSecrets {
+	h.resolver = r
+	h.teamScope = tr
+	return h
+}
+
+// authorizeProjectRead returns 404 when the caller's grants don't cover
+// the project (never 403 — existence stays hidden). No-op when scoping
+// isn't wired.
+func (h *ProjectSecrets) authorizeProjectRead(c fiber.Ctx, projectID uuid.UUID) error {
+	if h.resolver == nil {
+		return nil
+	}
+	userID, ok := auth.IdentityFromContext(c.Context())
+	if !ok {
+		return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+	}
+	access, err := auth.ReadableProjectAccess(c.Context(), userID, h.resolver, h.teamScope)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	if !access.Covers(projectID) {
+		return fiber.NewError(fiber.StatusNotFound, "project not found")
+	}
+	return nil
 }
 
 // --- request / response shapes --------------------------------------
@@ -240,6 +276,9 @@ func (h *ProjectSecrets) List(c fiber.Ctx) error {
 	projectID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid project id")
+	}
+	if err := h.authorizeProjectRead(c, projectID); err != nil {
+		return err
 	}
 	if _, err := h.projects.Get(c.Context(), projectID); err != nil {
 		return mapProjectSecretErr(err, "project not found")

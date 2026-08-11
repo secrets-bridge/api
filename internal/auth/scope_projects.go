@@ -12,10 +12,10 @@ import (
 // (Slice B of api#43) and the submit-time enforcement on
 // POST /requests/{read,patch} (Slice C).
 //
-//   IsGlobal == true  → caller holds the permission at empty scope;
-//                       admin view, no project filter.
-//   IsGlobal == false → caller is tenancy-scoped to ProjectIDs (which
-//                       may be empty — then they see no rows).
+//	IsGlobal == true  → caller holds the permission at empty scope;
+//	                    admin view, no project filter.
+//	IsGlobal == false → caller is tenancy-scoped to ProjectIDs (which
+//	                    may be empty — then they see no rows).
 //
 // Project IDs that don't parse as UUIDs are silently dropped. A grant
 // with a project_id key that is empty string is treated as global —
@@ -29,10 +29,10 @@ type ProjectAccess struct {
 // TeamAccess summarises which teams a caller can act on for a given
 // permission, with the subtree fully expanded.
 //
-//   IsGlobal == true → caller holds the permission globally; every
-//                      team matches.
-//   IsGlobal == false → caller is scoped to TeamIDs (each granted
-//                       team_id + all its descendants, deduped).
+//	IsGlobal == true → caller holds the permission globally; every
+//	                   team matches.
+//	IsGlobal == false → caller is scoped to TeamIDs (each granted
+//	                    team_id + all its descendants, deduped).
 type TeamAccess struct {
 	IsGlobal bool
 	TeamIDs  []uuid.UUID
@@ -134,6 +134,57 @@ func EffectiveProjectAccess(ctx context.Context, userID string, perm Permission,
 			continue
 		}
 		addProject(u)
+	}
+	return pa, nil
+}
+
+// Covers reports whether this access set includes the given project.
+// A global grant covers every project.
+func (pa ProjectAccess) Covers(projectID uuid.UUID) bool {
+	if pa.IsGlobal {
+		return true
+	}
+	for _, id := range pa.ProjectIDs {
+		if id == projectID {
+			return true
+		}
+	}
+	return false
+}
+
+// ReadableProjectAccess is the caller's project VISIBILITY on the read
+// path — the union of their secret.list and secret.request grants. A
+// global grant on EITHER permission yields global visibility; otherwise
+// the two granted project sets are unioned and deduped.
+//
+// This is the single definition shared by the /users/me projection and
+// every project / environment / project-secret read endpoint, so an API
+// list can never surface a project the UI's switcher would hide. An
+// empty result (IsGlobal=false, no ProjectIDs) means "sees nothing" — a
+// list returns empty, a detail returns 404.
+func ReadableProjectAccess(ctx context.Context, userID string, r Resolver, tr TeamScopeResolver) (ProjectAccess, error) {
+	list, err := EffectiveProjectAccess(ctx, userID, PermSecretList, r, tr)
+	if err != nil {
+		return ProjectAccess{}, err
+	}
+	if list.IsGlobal {
+		return ProjectAccess{IsGlobal: true}, nil
+	}
+	req, err := EffectiveProjectAccess(ctx, userID, PermSecretRequest, r, tr)
+	if err != nil {
+		return ProjectAccess{}, err
+	}
+	if req.IsGlobal {
+		return ProjectAccess{IsGlobal: true}, nil
+	}
+	pa := ProjectAccess{}
+	seen := map[uuid.UUID]struct{}{}
+	for _, id := range append(append([]uuid.UUID{}, list.ProjectIDs...), req.ProjectIDs...) {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		pa.ProjectIDs = append(pa.ProjectIDs, id)
 	}
 	return pa, nil
 }
