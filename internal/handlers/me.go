@@ -1,15 +1,18 @@
 // Package handlers — me.go: "current user" projections.
 //
 // GET /api/v1/users/me                returns the full profile shape
-//                                      the UI needs to render
-//                                      identity + nav state in one
-//                                      call: id / email / display_name
-//                                      / deduped permissions / team
-//                                      memberships / accessible
-//                                      project IDs.
+//
+//	the UI needs to render
+//	identity + nav state in one
+//	call: id / email / display_name
+//	/ deduped permissions / team
+//	memberships / accessible
+//	project IDs.
+//
 // GET /api/v1/users/me/projects       project switcher dropdown (the
-//                                      original endpoint — same data
-//                                      as me.projects but inlined).
+//
+//	original endpoint — same data
+//	as me.projects but inlined).
 //
 // Global admins (any unscoped grant for secret.list OR secret.request)
 // see every project; tenancy-scoped callers see only their granted
@@ -128,21 +131,21 @@ type TeamSummary struct {
 // round-trip for the UI's post-login hydration: identity + nav-gating
 // permissions + tenancy boundaries in one call.
 type MeResponse struct {
-	ID          string           `json:"id"`
-	Email       string           `json:"email"`
-	DisplayName string           `json:"display_name"`
+	ID          string `json:"id"`
+	Email       string `json:"email"`
+	DisplayName string `json:"display_name"`
 	// Permissions is the deduped set of permission strings (e.g.
 	// "secret.list") collected across every active role grant the
 	// user holds. The UI uses this to gate sidebar nav items + buttons.
-	Permissions []string         `json:"permissions"`
+	Permissions []string `json:"permissions"`
 	// Teams the user is a direct member of. Hierarchical access (a
 	// section head seeing reports' work) is computed server-side via
 	// the team-scope resolver — the UI doesn't need the subtree here.
-	Teams       []TeamSummary    `json:"teams"`
+	Teams []TeamSummary `json:"teams"`
 	// Projects the user can read or request against. Same projection
 	// as GET /users/me/projects; inlined here so login hydration is
 	// one HTTP call.
-	Projects    []ProjectSummary `json:"projects"`
+	Projects []ProjectSummary `json:"projects"`
 	// MFAEnrolled — true when the user has at least one factor
 	// (TOTP or WebAuthn) enrolled. Slice H5. The SPA reads this
 	// after login to decide whether to:
@@ -247,15 +250,9 @@ func (h *Me) GetMe(c fiber.Ctx) error {
 // projectsForUser is the shared helper between GetMe and ListProjects.
 // Same access semantics as ListProjects.
 func (h *Me) projectsForUser(c fiber.Ctx, userID string) ([]ProjectSummary, error) {
-	access, err := auth.EffectiveProjectAccess(c.Context(), userID, auth.PermSecretList, h.resolver, h.teamScope)
+	access, err := auth.ReadableProjectAccess(c.Context(), userID, h.resolver, h.teamScope)
 	if err != nil {
 		return nil, fiber.NewError(fiber.StatusInternalServerError, err.Error())
-	}
-	if !access.IsGlobal && len(access.ProjectIDs) == 0 {
-		alt, err := auth.EffectiveProjectAccess(c.Context(), userID, auth.PermSecretRequest, h.resolver, h.teamScope)
-		if err == nil && (alt.IsGlobal || len(alt.ProjectIDs) > 0) {
-			access = alt
-		}
 	}
 	all, err := h.projects.List(c.Context())
 	if err != nil {
@@ -263,17 +260,8 @@ func (h *Me) projectsForUser(c fiber.Ctx, userID string) ([]ProjectSummary, erro
 	}
 	out := make([]ProjectSummary, 0, len(all))
 	for _, p := range all {
-		if !access.IsGlobal {
-			inSet := false
-			for _, pid := range access.ProjectIDs {
-				if pid == p.ID {
-					inSet = true
-					break
-				}
-			}
-			if !inSet {
-				continue
-			}
+		if !access.Covers(p.ID) {
+			continue
 		}
 		summary := ProjectSummary{
 			ID:     p.ID.String(),

@@ -523,6 +523,16 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		WithTenancyGate(projectSecretsRepo, secretsRepo, rbacResolver).
 		WithTeamScope(teamScopeResolver)
 
+	// Read-path tenancy isolation (P0): the project + environment +
+	// project-secret read endpoints apply the SAME project scope as the
+	// /users/me projection, so an authenticated-but-unscoped caller can
+	// no longer enumerate projects / environments / bindings / secret
+	// refs by hitting the API directly. List endpoints return only the
+	// caller's covered rows (empty when they cover none); detail
+	// endpoints 404 an out-of-scope id so existence never leaks.
+	tenancyH = tenancyH.WithScope(rbacResolver, teamScopeResolver)
+	projectSecretsH = projectSecretsH.WithScope(rbacResolver, teamScopeResolver)
+
 	// "What are my projects?" projection (api#43 Slice D) — drives the
 	// UI project switcher.
 	meH := handlers.NewMe(projectRepo, rbacResolver).

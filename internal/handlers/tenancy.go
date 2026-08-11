@@ -4,18 +4,18 @@
 //
 // Endpoints mounted under /api/v1 by main:
 //
-//   POST   /projects                       create project
-//   GET    /projects                       list projects
-//   GET    /projects/:id                   get project
-//   PUT    /projects/:id/status            update status (active|archived)
-//   GET    /projects/:id/environments      list a project's environments
+//	POST   /projects                       create project
+//	GET    /projects                       list projects
+//	GET    /projects/:id                   get project
+//	PUT    /projects/:id/status            update status (active|archived)
+//	GET    /projects/:id/environments      list a project's environments
 //
-//   POST   /environments                   create environment under a project
-//   GET    /environments                   list every environment (flat)
-//   GET    /environments/:id               get environment
-//   PUT    /environments/:id               update description + risk_level
-//                                          (Slice L1 — kind and name immutable)
-//   DELETE /environments/:id               hard-delete environment
+//	POST   /environments                   create environment under a project
+//	GET    /environments                   list every environment (flat)
+//	GET    /environments/:id               get environment
+//	PUT    /environments/:id               update description + risk_level
+//	                                       (Slice L1 — kind and name immutable)
+//	DELETE /environments/:id               hard-delete environment
 //
 // Design notes:
 //
@@ -47,19 +47,59 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
 // Tenancy bundles the projects + environments repositories behind one
 // handler so route registration stays compact.
+//
+// The read endpoints (list + get for projects and environments) are
+// tenancy-scoped: a caller sees only the projects their grants cover
+// (auth.ReadableProjectAccess = secret.list ∪ secret.request), and each
+// environment inherits its project's visibility. Detail endpoints
+// return 404 — never 403 — for an out-of-scope id so existence never
+// leaks. Scoping is wired via WithScope; when unset the handler keeps
+// the legacy allow-all behaviour (used by tests that don't seed grants).
 type Tenancy struct {
 	projects     storage.ProjectRepository
 	environments storage.EnvironmentRepository
+	resolver     auth.Resolver
+	teamScope    auth.TeamScopeResolver
 }
 
 // NewTenancy wires the handler.
 func NewTenancy(p storage.ProjectRepository, e storage.EnvironmentRepository) *Tenancy {
 	return &Tenancy{projects: p, environments: e}
+}
+
+// WithScope wires the read-path tenancy filter. Pass the RBAC resolver
+// (and optionally the team-scope expander) from main so the project +
+// environment read endpoints restrict results to the caller's access
+// set. When the resolver is nil the handler stays in legacy allow-all
+// mode. Returns the handler for chaining.
+func (h *Tenancy) WithScope(r auth.Resolver, tr auth.TeamScopeResolver) *Tenancy {
+	h.resolver = r
+	h.teamScope = tr
+	return h
+}
+
+// projectScope resolves the caller's readable project set. The bool is
+// false when scoping isn't wired (legacy allow-all) so callers skip
+// filtering; a wired scope with no identity is a 401.
+func (h *Tenancy) projectScope(c fiber.Ctx) (auth.ProjectAccess, bool, error) {
+	if h.resolver == nil {
+		return auth.ProjectAccess{}, false, nil
+	}
+	userID, ok := auth.IdentityFromContext(c.Context())
+	if !ok {
+		return auth.ProjectAccess{}, true, fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+	}
+	access, err := auth.ReadableProjectAccess(c.Context(), userID, h.resolver, h.teamScope)
+	if err != nil {
+		return auth.ProjectAccess{}, true, fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	return access, true, nil
 }
 
 // --- projects --------------------------------------------------------
@@ -134,24 +174,40 @@ func (h *Tenancy) SetProjectTeam(c fiber.Ctx) error {
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
-// ListProjects handles GET /projects.
+// ListProjects handles GET /projects. Scoped: a non-global caller sees
+// only projects their grants cover; empty scope → empty list.
 func (h *Tenancy) ListProjects(c fiber.Ctx) error {
+	access, scoped, err := h.projectScope(c)
+	if err != nil {
+		return err
+	}
 	rows, err := h.projects.List(c.Context())
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 	out := make([]projectBody, 0, len(rows))
 	for _, p := range rows {
+		if scoped && !access.Covers(p.ID) {
+			continue
+		}
 		out = append(out, projectToBody(p))
 	}
 	return c.JSON(out)
 }
 
-// GetProject handles GET /projects/:id.
+// GetProject handles GET /projects/:id. An out-of-scope id returns 404
+// (identical to a missing project) so existence never leaks.
 func (h *Tenancy) GetProject(c fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid UUID")
+	}
+	access, scoped, err := h.projectScope(c)
+	if err != nil {
+		return err
+	}
+	if scoped && !access.Covers(id) {
+		return fiber.NewError(fiber.StatusNotFound, "project not found")
 	}
 	p, err := h.projects.Get(c.Context(), id)
 	if err != nil {
@@ -193,10 +249,18 @@ func (h *Tenancy) UpdateProjectStatus(c fiber.Ctx) error {
 }
 
 // ListEnvironmentsForProject handles GET /projects/:id/environments.
+// An out-of-scope project id returns 404 so existence never leaks.
 func (h *Tenancy) ListEnvironmentsForProject(c fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid UUID")
+	}
+	access, scoped, err := h.projectScope(c)
+	if err != nil {
+		return err
+	}
+	if scoped && !access.Covers(id) {
+		return fiber.NewError(fiber.StatusNotFound, "project not found")
 	}
 	rows, err := h.environments.ListByProject(c.Context(), id)
 	if err != nil {
@@ -290,24 +354,38 @@ func (h *Tenancy) CreateEnvironment(c fiber.Ctx) error {
 }
 
 // ListEnvironments handles GET /environments. Flat list across all
-// projects. Useful for the Integrations form's environment dropdown.
+// projects. Scoped: each environment inherits its project's visibility;
+// a non-global caller sees only environments in projects they cover.
 func (h *Tenancy) ListEnvironments(c fiber.Ctx) error {
+	access, scoped, err := h.projectScope(c)
+	if err != nil {
+		return err
+	}
 	rows, err := h.environments.List(c.Context())
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 	out := make([]environmentBody, 0, len(rows))
 	for _, e := range rows {
+		if scoped && !access.Covers(e.ProjectID) {
+			continue
+		}
 		out = append(out, environmentToBody(e))
 	}
 	return c.JSON(out)
 }
 
-// GetEnvironment handles GET /environments/:id.
+// GetEnvironment handles GET /environments/:id. An environment whose
+// project is out of the caller's scope returns 404 so existence never
+// leaks.
 func (h *Tenancy) GetEnvironment(c fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid UUID")
+	}
+	access, scoped, err := h.projectScope(c)
+	if err != nil {
+		return err
 	}
 	e, err := h.environments.Get(c.Context(), id)
 	if err != nil {
@@ -315,6 +393,9 @@ func (h *Tenancy) GetEnvironment(c fiber.Ctx) error {
 			return fiber.NewError(fiber.StatusNotFound, "environment not found")
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	if scoped && !access.Covers(e.ProjectID) {
+		return fiber.NewError(fiber.StatusNotFound, "environment not found")
 	}
 	return c.JSON(environmentToBody(e))
 }

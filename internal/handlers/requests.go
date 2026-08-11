@@ -158,10 +158,32 @@ func (h *Requests) Submit(c fiber.Ctx) error {
 // ---- list / get ------------------------------------------------------
 
 // List handles GET /requests.
+//
+// Scoped (when the tenancy gate is wired): a non-global caller may only
+// list their OWN requests — the `requester_id` filter is forced to the
+// authenticated identity so they can never enumerate other users'
+// requests. Global callers (secret.approve / secret.list / secret.request
+// at empty scope — i.e. admins + the platform approver) see every
+// request, honouring the query filters. Scoped-approver queue visibility
+// (seeing others' requests within an approve-scoped project) is a tracked
+// follow-up; failing closed here is the safe default.
 func (h *Requests) List(c fiber.Ctx) error {
 	f := storage.AccessRequestListFilter{
 		RequesterID: c.Query("requester_id"),
 		Status:      storage.AccessRequestStatus(c.Query("status")),
+	}
+	if h.resolver != nil {
+		userID, ok := auth.IdentityFromContext(c.Context())
+		if !ok {
+			return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+		}
+		vis, err := h.requestVisibility(c, userID)
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+		}
+		if !vis.IsGlobal {
+			f.RequesterID = userID
+		}
 	}
 	rows, err := h.svc.List(c.Context(), f)
 	if err != nil {
@@ -175,6 +197,9 @@ func (h *Requests) List(c fiber.Ctx) error {
 }
 
 // Get handles GET /requests/:id and includes its approvals inline.
+// Scoped: only the requester, a global viewer, or a caller whose grants
+// cover the request's project may read it. An out-of-scope id returns
+// 404 (identical to a missing request) so existence never leaks.
 func (h *Requests) Get(c fiber.Ctx) error {
 	id, err := parseID(c, "id")
 	if err != nil {
@@ -183,6 +208,9 @@ func (h *Requests) Get(c fiber.Ctx) error {
 	req, err := h.svc.Get(c.Context(), id)
 	if err != nil {
 		return requestErr(err)
+	}
+	if err := h.authorizeRequestRead(c, req); err != nil {
+		return err
 	}
 	approvals, err := h.svc.Approvals(c.Context(), id)
 	if err != nil {
@@ -194,6 +222,78 @@ func (h *Requests) Get(c fiber.Ctx) error {
 		body.Approvals = append(body.Approvals, approvalToBody(a))
 	}
 	return c.JSON(body)
+}
+
+// requestVisibility returns the caller's request-read scope: IsGlobal
+// when they hold secret.approve, secret.list, or secret.request at empty
+// scope (admins + the platform approver); otherwise the union of their
+// approve + readable (list ∪ request) project sets. Own requests are
+// always visible independently of this set.
+func (h *Requests) requestVisibility(c fiber.Ctx, userID string) (auth.ProjectAccess, error) {
+	approve, err := auth.EffectiveProjectAccess(c.Context(), userID, auth.PermSecretApprove, h.resolver, h.teamScope)
+	if err != nil {
+		return auth.ProjectAccess{}, err
+	}
+	if approve.IsGlobal {
+		return auth.ProjectAccess{IsGlobal: true}, nil
+	}
+	readable, err := auth.ReadableProjectAccess(c.Context(), userID, h.resolver, h.teamScope)
+	if err != nil {
+		return auth.ProjectAccess{}, err
+	}
+	if readable.IsGlobal {
+		return auth.ProjectAccess{IsGlobal: true}, nil
+	}
+	pa := auth.ProjectAccess{}
+	seen := map[uuid.UUID]struct{}{}
+	for _, id := range append(append([]uuid.UUID{}, approve.ProjectIDs...), readable.ProjectIDs...) {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		pa.ProjectIDs = append(pa.ProjectIDs, id)
+	}
+	return pa, nil
+}
+
+// authorizeRequestRead gates GET /requests/:id. Allowed when the caller
+// is the requester, is a global viewer, or holds visibility over the
+// request's project. Otherwise 404 — never 403 — so existence stays
+// hidden. No-op when the tenancy gate isn't wired.
+func (h *Requests) authorizeRequestRead(c fiber.Ctx, req *storage.AccessRequest) error {
+	if h.resolver == nil {
+		return nil
+	}
+	userID, ok := auth.IdentityFromContext(c.Context())
+	if !ok {
+		return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+	}
+	if req.RequesterID == userID {
+		return nil
+	}
+	vis, err := h.requestVisibility(c, userID)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	if pid, ok := requestProjectID(req); ok && vis.Covers(pid) {
+		return nil
+	}
+	return fiber.NewError(fiber.StatusNotFound, "request not found")
+}
+
+// requestProjectID extracts the request's project, preferring the
+// first-class cross-team column and falling back to the target_scope
+// jsonb the read/patch/direct-reveal flows populate.
+func requestProjectID(req *storage.AccessRequest) (uuid.UUID, bool) {
+	if req.TargetProjectID != nil {
+		return *req.TargetProjectID, true
+	}
+	if raw, ok := req.TargetScope["project_id"].(string); ok && raw != "" {
+		if id, err := uuid.Parse(raw); err == nil {
+			return id, true
+		}
+	}
+	return uuid.Nil, false
 }
 
 // ---- approve / reject / cancel ---------------------------------------
