@@ -1148,6 +1148,45 @@ func (s *RequestService) enqueueRequestJob(ctx context.Context, req *storage.Acc
 		jobType = storage.JobTypeRead
 		// No pre-existing wraps for read; the agent creates them
 		// after fetching the value.
+	case storage.AccessRequestTypeCrossTeam:
+		// Cross-team writes the values Team B filled into the
+		// DESTINATION provider connection + secret_ref + keys — the
+		// underlying operation is a patch (api#170). The base payload's
+		// target_* fields are the patch/read source columns, which are
+		// empty for cross_team; source them from the destination_*
+		// columns instead. The destination provider type + config come
+		// from the bound connection; the values are the fill wraps.
+		jobType = storage.JobTypePatch
+		if req.DestinationProviderConnectionID == nil {
+			return fmt.Errorf("cross_team request %s has no destination connection", req.ID)
+		}
+		if s.ctProvConns == nil {
+			return errors.New("services: cross_team job enqueue needs a provider-connection lookup")
+		}
+		conn, err := s.ctProvConns.Get(ctx, *req.DestinationProviderConnectionID)
+		if err != nil {
+			return fmt.Errorf("resolve destination connection: %w", err)
+		}
+		cfg := make(map[string]any, len(conn.Scope))
+		for k, v := range conn.Scope {
+			cfg[k] = v
+		}
+		payload["target_provider_type"] = string(conn.Type)
+		payload["target_provider_config"] = cfg
+		payload["target_secret_ref"] = req.DestinationSecretRef
+		payload["target_keys"] = req.DestinationKeys
+		summaries, err := s.wraps.ListSummariesForRequest(ctx, req.ID)
+		if err != nil {
+			return fmt.Errorf("list wrap summaries: %w", err)
+		}
+		wraps := make([]map[string]any, 0, len(summaries))
+		for _, sm := range summaries {
+			wraps = append(wraps, map[string]any{
+				"wrap_id":  sm.ID.String(),
+				"key_name": sm.KeyName,
+			})
+		}
+		payload["wraps"] = wraps
 	default:
 		// Other types (update/rotate) don't yet have a job-emission
 		// path. Skip silently — Approve still flips status to
