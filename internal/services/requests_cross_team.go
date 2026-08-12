@@ -223,6 +223,9 @@ func (s *RequestService) SubmitCrossTeam(ctx context.Context, in CrossTeamSubmit
 	if err := s.validateCrossTeamDestination(ctx, in.DestinationProviderConnectionID); err != nil {
 		return nil, err
 	}
+	if err := s.enforceCrossTeamDestinationKeys(ctx, in); err != nil {
+		return nil, err
+	}
 
 	envID, envKind, _ := s.resolveEnvironment(ctx, in.ProjectID, in.Environment)
 	dec, err := s.policy.Resolve(ctx, Scope{
@@ -340,6 +343,28 @@ func (s *RequestService) validateCrossTeamTargetChain(ctx context.Context, in Cr
 		}
 	}
 	return nil
+}
+
+// enforceCrossTeamDestinationKeys refuses a cross-team submit whose
+// destination_keys fall outside the target project's binding allowlist
+// for the destination secret — the same gate direct-reveal and patch
+// requests already apply (api#153). It resolves the destination
+// provider type from the bound connection, then delegates to the shared
+// enforceBindingAllowedKeys. No-op when the binding repos are unwired or
+// the destination secret carries no restrictive allowlist, so callers
+// without a bound catalog secret behave exactly as before.
+func (s *RequestService) enforceCrossTeamDestinationKeys(ctx context.Context, in CrossTeamSubmitInput) error {
+	if s.ctProvConns == nil || s.bindings == nil || s.secrets == nil {
+		return nil
+	}
+	conn, err := s.ctProvConns.Get(ctx, in.DestinationProviderConnectionID)
+	if err != nil {
+		if errors.Is(err, storage.ErrConnectionNotFound) {
+			return ErrCrossTeamDestinationUnbound
+		}
+		return fmt.Errorf("services: resolve destination provider type: %w", err)
+	}
+	return s.enforceBindingAllowedKeys(ctx, in.TargetProjectID, string(conn.Type), in.DestinationSecretRef, in.DestinationKeys)
 }
 
 func (s *RequestService) validateCrossTeamDestination(ctx context.Context, id uuid.UUID) error {

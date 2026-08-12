@@ -49,6 +49,8 @@ type crossTeamHarness struct {
 	provConnRepo  *storage.ProviderConnections
 	wfRepo        *storage.Workflows
 	policiesR     *storage.Policies
+	secretsR      *storage.Secrets
+	bindingsR     *storage.ProjectSecrets
 }
 
 func buildCrossTeamHarness(t *testing.T) *crossTeamHarness {
@@ -75,10 +77,13 @@ func buildCrossTeamHarness(t *testing.T) *crossTeamHarness {
 	jobsRepo := storage.NewSyncJobs(pool)
 	jobSvc := services.NewJobService(jobsRepo, auditRepo)
 	provConnRepo := storage.NewProviderConnections(pool)
+	secretsRepo := storage.NewSecrets(pool)
+	bindingsRepo := storage.NewProjectSecrets(pool)
 
 	reqSvc := services.NewRequestService(requestRepo, approvalRepo, wrapSvc, workflows, engine, auditRepo, jobSvc).
 		WithEnvironments(envRepo).
-		WithCrossTeamRepos(teamRepo, projRepo, envRepo, provConnRepo)
+		WithCrossTeamRepos(teamRepo, projRepo, envRepo, provConnRepo).
+		WithProjectBindings(bindingsRepo, secretsRepo)
 	jobSvc.OnCompleted(reqSvc.OnJobCompleted)
 
 	return &crossTeamHarness{
@@ -93,6 +98,8 @@ func buildCrossTeamHarness(t *testing.T) *crossTeamHarness {
 		provConnRepo: provConnRepo,
 		wfRepo:       workflows,
 		policiesR:    policies,
+		secretsR:     secretsRepo,
+		bindingsR:    bindingsRepo,
 	}
 }
 
@@ -206,6 +213,49 @@ func TestSubmitCrossTeam_EmptyDestKeys(t *testing.T) {
 	_, err := h.reqSvc.SubmitCrossTeam(t.Context(), in)
 	if !errors.Is(err, services.ErrCrossTeamKeysEmpty) {
 		t.Fatalf("err = %v want ErrCrossTeamKeysEmpty", err)
+	}
+}
+
+// A cross-team submit must refuse destination_keys that fall outside
+// the target project's binding allowlist for the destination secret —
+// the same gate direct-reveal and patch enforce (api#153/#168). Without
+// it, a requester could route arbitrary keys into a bound destination.
+func TestSubmitCrossTeam_RejectsNonAllowlistedDestinationKey(t *testing.T) {
+	h := buildCrossTeamHarness(t)
+	in := seedCrossTeamScope(t, h, "ct-allowlist")
+	ctx := t.Context()
+
+	// Bind the destination secret to the TARGET project with a
+	// restrictive allowlist ({DB_PASSWORD, DB_USER}).
+	sec := &storage.Secret{
+		ClusterName:  "ct-allowlist-cluster",
+		ProviderType: "vault", // matches the seeded destination connection type
+		SecretRef:    in.DestinationSecretRef,
+		Status:       "present",
+	}
+	if err := h.secretsR.Upsert(ctx, sec); err != nil {
+		t.Fatalf("seed catalog secret: %v", err)
+	}
+	if err := h.bindingsR.Bind(ctx, &storage.ProjectSecret{
+		ProjectID:   in.TargetProjectID,
+		SecretID:    sec.ID,
+		AllowedOps:  []string{storage.OpPatch},
+		AllowedKeys: []string{"DB_PASSWORD", "DB_USER"},
+		CreatedBy:   "ct-allowlist-test",
+	}); err != nil {
+		t.Fatalf("seed binding: %v", err)
+	}
+
+	// A key outside the allowlist is refused at submit.
+	in.DestinationKeys = []string{"DB_ROOT"}
+	if _, err := h.reqSvc.SubmitCrossTeam(ctx, in); !errors.Is(err, services.ErrKeyNotAllowed) {
+		t.Fatalf("err = %v; want ErrKeyNotAllowed for a non-allowlisted destination key", err)
+	}
+
+	// Allowlisted keys still submit cleanly.
+	in.DestinationKeys = []string{"DB_PASSWORD", "DB_USER"}
+	if _, err := h.reqSvc.SubmitCrossTeam(ctx, in); err != nil {
+		t.Fatalf("allowlisted keys must submit: %v", err)
 	}
 }
 

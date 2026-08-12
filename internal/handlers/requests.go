@@ -339,11 +339,6 @@ func (h *Requests) Reject(c fiber.Ctx) error {
 	return c.JSON(requestToBody(req))
 }
 
-// CancelBody is the body for POST /requests/:id/cancel.
-type CancelBody struct {
-	ActorID string `json:"actor_id"`
-}
-
 // ---- read flow -------------------------------------------------------
 
 // SubmitReadRequestBody is the JSON sent by the UI when a user wants
@@ -518,16 +513,24 @@ func (h *Requests) ListWraps(c fiber.Ctx) error {
 // ---- end read flow ---------------------------------------------------
 
 // Cancel handles POST /requests/:id/cancel.
+//
+// The cancelling actor is the authenticated session identity, NOT a
+// caller-supplied body field. An earlier stub read `actor_id` from the
+// request body, so a requester who POSTed without that field was
+// compared against "" and always got 403 "only the original requester
+// can cancel" — even on their own pending request (api#168). The
+// service still enforces requester == actor; this handler just feeds it
+// the identity the middleware already resolved.
 func (h *Requests) Cancel(c fiber.Ctx) error {
 	id, err := parseID(c, "id")
 	if err != nil {
 		return err
 	}
-	var body CancelBody
-	if err := c.Bind().JSON(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
+	actor, ok := auth.IdentityFromContext(c.Context())
+	if !ok || actor == "" {
+		return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
 	}
-	req, err := h.svc.Cancel(c.Context(), id, body.ActorID)
+	req, err := h.svc.Cancel(c.Context(), id, actor)
 	if err != nil {
 		return requestErr(err)
 	}
