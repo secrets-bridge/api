@@ -51,6 +51,7 @@ type crossTeamHarness struct {
 	policiesR     *storage.Policies
 	secretsR      *storage.Secrets
 	bindingsR     *storage.ProjectSecrets
+	jobsR         *storage.SyncJobs
 }
 
 func buildCrossTeamHarness(t *testing.T) *crossTeamHarness {
@@ -100,6 +101,7 @@ func buildCrossTeamHarness(t *testing.T) *crossTeamHarness {
 		policiesR:    policies,
 		secretsR:     secretsRepo,
 		bindingsR:    bindingsRepo,
+		jobsR:        jobsRepo,
 	}
 }
 
@@ -428,6 +430,64 @@ func TestVerify_SourceApproveWithoutSecurityRequirement(t *testing.T) {
 	}
 	if len(resp.NextRequired) != 0 {
 		t.Errorf("NextRequired = %v want empty", resp.NextRequired)
+	}
+}
+
+// Reaching `approved` must enqueue a patch job that writes the filled
+// values to the DESTINATION connection — otherwise the request stalls
+// at `approved` forever (api#170). The job payload is sourced from the
+// destination_* fields + the fill wraps; OnJobCompleted then transitions
+// the request to `executed` when the agent finishes.
+func TestVerifyCrossTeam_ApprovedEnqueuesDestinationPatchJob(t *testing.T) {
+	h := buildCrossTeamHarness(t)
+	ctx := t.Context()
+	in := seedCrossTeamScope(t, h, "ct-exec")
+	req, err := h.reqSvc.SubmitCrossTeam(ctx, in)
+	if err != nil {
+		t.Fatalf("SubmitCrossTeam: %v", err)
+	}
+	if _, err := h.reqSvc.Fill(ctx, services.FillCrossTeamInput{
+		RequestID: req.ID, FillerID: "bob@example.com",
+		KeyValues: map[string][]byte{"DB_PASSWORD": []byte("a"), "DB_USER": []byte("b")},
+	}); err != nil {
+		t.Fatalf("Fill: %v", err)
+	}
+	resp, err := h.reqSvc.VerifyCrossTeam(ctx, services.VerifyCrossTeamInput{
+		RequestID: req.ID, ApproverID: "carol@example.com",
+		VotedAs: services.VotedAsSource, Decision: storage.ApprovalDecisionApprove,
+	})
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if resp.Status != storage.AccessRequestStatusApproved {
+		t.Fatalf("Status = %s want approved", resp.Status)
+	}
+
+	// A patch job must have been enqueued + linked to the request.
+	got, err := h.requestsR.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatalf("Get request: %v", err)
+	}
+	if got.JobID == nil {
+		t.Fatal("approved cross_team request has no job_id — execution was not enqueued (stuck-at-approved bug)")
+	}
+	job, err := h.jobsR.Get(ctx, *got.JobID)
+	if err != nil {
+		t.Fatalf("Get job: %v", err)
+	}
+	if job.JobType != storage.JobTypePatch {
+		t.Errorf("job type = %s want patch", job.JobType)
+	}
+	// Payload sourced from the DESTINATION fields (not the empty target_*).
+	if job.Payload["target_secret_ref"] != in.DestinationSecretRef {
+		t.Errorf("target_secret_ref = %v want %s", job.Payload["target_secret_ref"], in.DestinationSecretRef)
+	}
+	if job.Payload["target_provider_type"] != "vault" { // the seeded destination connection type
+		t.Errorf("target_provider_type = %v want vault (destination connection type)", job.Payload["target_provider_type"])
+	}
+	wraps, ok := job.Payload["wraps"].([]any)
+	if !ok || len(wraps) != 2 {
+		t.Errorf("wraps = %v want 2 fill wraps in the payload", job.Payload["wraps"])
 	}
 }
 
