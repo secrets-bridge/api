@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -171,6 +172,7 @@ func bootstrapScopeIso(t *testing.T) *scopeIsoFixture {
 	app.Get("/api/v1/secrets/:id", secretsH.Get)
 	app.Get("/api/v1/requests", requestsH.List)
 	app.Get("/api/v1/requests/:id", requestsH.Get)
+	app.Post("/api/v1/requests/:id/cancel", requestsH.Cancel)
 	fx.app = app
 	return fx
 }
@@ -223,6 +225,46 @@ func (fx *scopeIsoFixture) doGet(t *testing.T, path string, userID uuid.UUID) (i
 	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, string(b)
+}
+
+// doPost issues an authenticated POST as userID with an empty body and
+// returns status + body.
+func (fx *scopeIsoFixture) doPost(t *testing.T, path string, userID uuid.UUID) (int, string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, nil)
+	req.Header.Set("X-User-Id", userID.String())
+	resp, err := fx.app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
+	if err != nil {
+		t.Fatalf("POST %s: %v", path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+// The cancel actor is the authenticated session identity, not a body
+// field. A requester cancelling their own pending request (with NO
+// actor_id in the body) must succeed; a different authenticated user
+// must still be refused. This locks the api#168 regression where the
+// handler compared "" (missing body field) to the requester and 403'd
+// every requester-initiated cancel.
+func TestCancel_UsesSessionIdentityNotBody(t *testing.T) {
+	fx := bootstrapScopeIso(t)
+
+	// A non-owner cannot cancel someone else's request.
+	if st, body := fx.doPost(t, "/api/v1/requests/"+fx.billingDevReq.String()+"/cancel", fx.policyAuthor); st != http.StatusForbidden {
+		t.Fatalf("non-owner cancel = %d body=%s; want 403", st, body)
+	}
+
+	// The original requester cancels their own request with an empty
+	// body — identity comes from the session, not actor_id.
+	st, body := fx.doPost(t, "/api/v1/requests/"+fx.billingDevReq.String()+"/cancel", fx.billingDev)
+	if st != http.StatusOK {
+		t.Fatalf("requester self-cancel = %d body=%s; want 200", st, body)
+	}
+	if !strings.Contains(body, "cancelled") {
+		t.Errorf("cancel response did not report cancelled status: %s", body)
+	}
 }
 
 func jsonLen(t *testing.T, body string) int {

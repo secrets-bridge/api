@@ -359,6 +359,8 @@ func crossTeamErr(err error) error {
 		return fiber.NewError(fiber.StatusForbidden, "cross_team_destination_unbound")
 	case errors.Is(err, services.ErrCrossTeamKeysEmpty):
 		return fiber.NewError(fiber.StatusBadRequest, "cross_team_keys_empty")
+	case errors.Is(err, services.ErrKeyNotAllowed):
+		return fiber.NewError(fiber.StatusForbidden, "cross_team_key_not_allowed")
 	case errors.Is(err, services.ErrCrossTeamMinApproversUnsupported):
 		return fiber.NewError(fiber.StatusBadRequest, "cross_team_min_approvers_unsupported")
 	case errors.Is(err, services.ErrSeparationOfDuties):
