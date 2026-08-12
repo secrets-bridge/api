@@ -558,6 +558,24 @@ type RequestBody struct {
 	CreatedAt            time.Time      `json:"created_at"`
 	UpdatedAt            time.Time      `json:"updated_at"`
 	Approvals            []ApprovalBody `json:"approvals,omitempty"`
+
+	// cross_team-only metadata (absent on patch/read via omitempty).
+	// Populates the approver's verify panel so they don't approve blind
+	// (ui#87). METADATA ONLY — ids, refs, key NAMES, timestamps, and the
+	// frozen approval requirement. No values, no wrapped bodies ever.
+	TargetTeamID                    string     `json:"target_team_id,omitempty"`
+	TargetProjectID                 string     `json:"target_project_id,omitempty"`
+	TargetEnvironmentID             string     `json:"target_environment_id,omitempty"`
+	DestinationProviderConnectionID string     `json:"destination_provider_connection_id,omitempty"`
+	DestinationSecretRef            string     `json:"destination_secret_ref,omitempty"`
+	DestinationKeys                 []string   `json:"destination_keys,omitempty"`
+	FilledByUserID                  string     `json:"filled_by_user_id,omitempty"`
+	FilledAt                        *time.Time `json:"filled_at,omitempty"`
+	FillComment                     string     `json:"fill_comment,omitempty"`
+	FillExpiresAt                   *time.Time `json:"fill_expires_at,omitempty"`
+	RefuseReason                    string     `json:"refuse_reason,omitempty"`
+	SnapRequiresSecurityApproval    *bool      `json:"snap_requires_security_approval,omitempty"`
+	SnapMinApprovers                *int16     `json:"snap_min_approvers,omitempty"`
 }
 
 // ApprovalBody is the JSON shape for one approval row.
@@ -591,6 +609,29 @@ func requestToBody(r *storage.AccessRequest) RequestBody {
 	if r.JobID != nil {
 		body.JobID = r.JobID.String()
 	}
+	// cross_team metadata for the approver verify panel (ui#87). All
+	// omitempty, so patch/read rows serialize exactly as before.
+	if r.TargetTeamID != nil {
+		body.TargetTeamID = r.TargetTeamID.String()
+	}
+	if r.TargetProjectID != nil {
+		body.TargetProjectID = r.TargetProjectID.String()
+	}
+	if r.TargetEnvironmentID != nil {
+		body.TargetEnvironmentID = r.TargetEnvironmentID.String()
+	}
+	if r.DestinationProviderConnectionID != nil {
+		body.DestinationProviderConnectionID = r.DestinationProviderConnectionID.String()
+	}
+	body.DestinationSecretRef = r.DestinationSecretRef
+	body.DestinationKeys = r.DestinationKeys
+	body.FilledByUserID = r.FilledByUserID
+	body.FilledAt = r.FilledAt
+	body.FillComment = r.FillComment
+	body.FillExpiresAt = r.FillExpiresAt
+	body.RefuseReason = r.RefuseReason
+	body.SnapRequiresSecurityApproval = r.SnapRequiresSecurityApproval
+	body.SnapMinApprovers = r.SnapMinApprovers
 	return body
 }
 
