@@ -130,9 +130,18 @@ type RevealSessionResponse struct {
 
 // Sentinel errors. Map to HTTP at the handler layer.
 var (
-	// ErrAllWrapsConsumed is returned by Open when every wrap tied to
-	// the request has already been consumed (single-shot). Maps to 410.
+	// ErrAllWrapsConsumed is returned by Open when the request HAS wraps
+	// but every one has already been consumed (single-shot) or expired.
+	// Maps to 410.
 	ErrAllWrapsConsumed = errors.New("services: all wraps already consumed")
+
+	// ErrWrapsNotProduced is returned by Open when the request has NO wraps
+	// at all — the agent/job path has not produced them yet (or failed
+	// before creating any). Distinct from ErrAllWrapsConsumed (wraps
+	// existed but are all spent): maps to 503 wrap_not_ready so the caller
+	// gets a retryable signal instead of the misleading "all wraps already
+	// consumed". (api#160)
+	ErrWrapsNotProduced = errors.New("services: reveal wraps have not been produced yet")
 
 	// ErrRevealSessionEnvMissing is returned by Open when the request
 	// has no environment_id bound (L3 should have populated it; legacy
@@ -192,6 +201,12 @@ func (s *RevealSessionService) Open(ctx context.Context, in OpenInput) (*RevealS
 		}
 	}
 	if len(fresh) == 0 {
+		// api#160: distinguish "no wraps produced yet" (agent/job hasn't
+		// created any) from "all wraps consumed/expired". The former is a
+		// retryable 503 wrap_not_ready; the latter stays 410.
+		if len(summaries) == 0 {
+			return nil, ErrWrapsNotProduced
+		}
 		return nil, ErrAllWrapsConsumed
 	}
 

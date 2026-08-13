@@ -99,6 +99,16 @@ func (h *RevealSessions) Open(c fiber.Ctx) error {
 		RequestID: reqID,
 	})
 	if err != nil {
+		// api#160: no wraps produced yet is a distinct, retryable state —
+		// return a clearer 503 wrap_not_ready with metadata-only fields
+		// instead of the misleading 410 "all wraps already consumed".
+		if errors.Is(err, services.ErrWrapsNotProduced) {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error":      "wrap_not_ready",
+				"message":    "Reveal wraps have not been produced yet. The agent may still be processing or unavailable.",
+				"request_id": reqID.String(),
+			})
+		}
 		return revealSessionErr(err)
 	}
 
@@ -212,6 +222,10 @@ func revealSessionErr(err error) error {
 		return fiber.NewError(fiber.StatusConflict, "request not retrievable in current state")
 	case errors.Is(err, services.ErrAllWrapsConsumed):
 		return fiber.NewError(fiber.StatusGone, "all wraps already consumed")
+	case errors.Is(err, services.ErrWrapsNotProduced):
+		// Defensive: the Open handler intercepts this to add request_id;
+		// this arm keeps it a clear 503 rather than a 500 for any other path.
+		return fiber.NewError(fiber.StatusServiceUnavailable, "wrap_not_ready")
 	case errors.Is(err, services.ErrRevealSessionEnvMissing):
 		return fiber.NewError(fiber.StatusConflict, "request has no environment binding")
 	case errors.Is(err, services.ErrKeyNotAllowed):

@@ -293,6 +293,48 @@ func TestOpen_RejectsWhenAllWrapsConsumed(t *testing.T) {
 	}
 }
 
+// api#160: a request whose agent/job path has produced NO wraps yet must
+// NOT be reported as "all wraps already consumed". Open returns the
+// distinct ErrWrapsNotProduced (→ 503 wrap_not_ready), never
+// ErrAllWrapsConsumed.
+func TestOpen_NoWrapsProduced_ReturnsNotReady(t *testing.T) {
+	h := buildRevealHarness(t)
+	ctx := t.Context()
+
+	env := seedUATEnvWithRule(t, h, "rs-no-wraps", 60)
+	// Submit a direct reveal but do NOT seed any wraps — simulates the
+	// agent still processing (or unavailable), so no wrap row exists yet.
+	req, err := h.reqSvc.SubmitDirectReveal(ctx, services.DirectRevealInput{
+		RequesterID:        "alice",
+		Environment:        env,
+		TargetProviderType: "vault",
+		TargetSecretRef:    "billing/uat/db",
+		TargetKeys:         []string{"DB_PASSWORD"},
+		Justification:      "no wraps produced yet",
+	})
+	if err != nil {
+		t.Fatalf("SubmitDirectReveal: %v", err)
+	}
+
+	// Sanity: the request genuinely has zero wraps.
+	if ids, err := h.wrapsR.ListIDsForRequest(ctx, req.ID); err != nil {
+		t.Fatalf("ListIDsForRequest: %v", err)
+	} else if len(ids) != 0 {
+		t.Fatalf("precondition: request has %d wraps, want 0", len(ids))
+	}
+
+	_, err = h.revealSvc.Open(ctx, services.OpenInput{
+		UserID:    "alice",
+		RequestID: req.ID,
+	})
+	if !errors.Is(err, services.ErrWrapsNotProduced) {
+		t.Fatalf("got %v, want ErrWrapsNotProduced (no wraps yet must not look like all-consumed)", err)
+	}
+	if errors.Is(err, services.ErrAllWrapsConsumed) {
+		t.Errorf("no-wraps case wrongly reported as ErrAllWrapsConsumed")
+	}
+}
+
 func TestOpen_TTLFromPolicy(t *testing.T) {
 	h := buildRevealHarness(t)
 	ctx := t.Context()
