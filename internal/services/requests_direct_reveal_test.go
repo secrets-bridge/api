@@ -2,6 +2,7 @@ package services_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,6 +43,29 @@ func TestSubmitDirectReveal_RejectsProdEnv(t *testing.T) {
 	})
 	if !errors.Is(err, services.ErrDirectRevealOnProd) {
 		t.Errorf("got %v, want ErrDirectRevealOnProd", err)
+	}
+
+	// api#165: the refusal must be visible in the audit trail (it used to
+	// be silent — Gate 1 returns before the policy engine runs).
+	var count int
+	var meta string
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*), COALESCE(max(metadata::text), '')
+		   FROM audit_events
+		  WHERE action = 'secret.reveal.direct.refused_prod'
+		    AND resource = $1
+		    AND correlation_id = $2`,
+		"environment:"+prodEnv.ID.String(), prodEnv.ID).Scan(&count, &meta); err != nil {
+		t.Fatalf("query refusal audit: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("refused_prod audit count = %d want 1 (refused prod reveal must be audited)", count)
+	}
+	// Metadata carries the scope + reason, and nothing that looks like a value.
+	for _, want := range []string{"prod_direct_reveal_forbidden", "billing/prod/db", prodEnv.ID.String(), "alice@example.com"} {
+		if !strings.Contains(meta, want) {
+			t.Errorf("refusal audit metadata missing %q; got %s", want, meta)
+		}
 	}
 }
 
@@ -93,8 +117,8 @@ func TestSubmitDirectReveal_HappyPath_AutoExecutes(t *testing.T) {
 		t.Fatalf("wf Create: %v", err)
 	}
 	rule := &storage.PolicyRule{
-		Name:     "uat-direct-rule",
-		Selector: map[string]any{"project_id": projectID.String(), "environment": "uat"},
+		Name:                "uat-direct-rule",
+		Selector:            map[string]any{"project_id": projectID.String(), "environment": "uat"},
 		WorkflowID:          wf.ID,
 		Priority:            500,
 		Enabled:             true,

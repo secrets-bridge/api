@@ -462,6 +462,26 @@ func (s *RequestService) SubmitDirectReveal(ctx context.Context, in DirectReveal
 
 	// Gate 1 — env.kind hard check (defence in depth).
 	if in.Environment.Kind == storage.EnvironmentKindProd {
+		// api#165: the refusal is correct but was silent — Gate 1 returns
+		// before PolicyEngine.Resolve, so policy.invariant.violated never
+		// fires on this path. Emit a metadata-only audit event so a refused
+		// prod direct-reveal attempt is visible in the trail. No plaintext,
+		// no values, no wrap bodies — only the scope + refusal reason.
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:         "user:" + in.RequesterID,
+			Action:        "secret.reveal.direct.refused_prod",
+			Resource:      "environment:" + in.Environment.ID.String(),
+			Status:        storage.AuditStatusFailure,
+			CorrelationID: in.Environment.ID,
+			Metadata: map[string]any{
+				"environment_id":    in.Environment.ID.String(),
+				"environment_kind":  string(in.Environment.Kind),
+				"project_id":        in.Environment.ProjectID.String(),
+				"target_secret_ref": in.TargetSecretRef,
+				"requester_id":      in.RequesterID,
+				"refusal_reason":    "prod_direct_reveal_forbidden",
+			},
+		})
 		return nil, ErrDirectRevealOnProd
 	}
 
