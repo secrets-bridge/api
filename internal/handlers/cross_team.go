@@ -258,39 +258,17 @@ func (h *CrossTeam) Inbox(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 
-	in := services.InboxInput{Limit: 100}
-	if !access.IsGlobal {
-		// Optional ?team_id= narrows further.
-		if tidRaw := c.Query("team_id"); tidRaw != "" {
-			tid, err := uuid.Parse(tidRaw)
-			if err != nil {
-				return fiber.NewError(fiber.StatusBadRequest, "team_id must be a UUID")
-			}
-			if !containsUUIDValue(access.TeamIDs, tid) {
-				return fiber.NewError(fiber.StatusForbidden, "out_of_scope_team")
-			}
-			in.TeamIDs = []uuid.UUID{tid}
-		} else {
-			in.TeamIDs = access.TeamIDs
-		}
-	} else {
-		// Global scope — caller can see every team's inbox. If they
-		// pass a team_id filter, honour it.
-		if tidRaw := c.Query("team_id"); tidRaw != "" {
-			tid, err := uuid.Parse(tidRaw)
-			if err != nil {
-				return fiber.NewError(fiber.StatusBadRequest, "team_id must be a UUID")
-			}
-			in.TeamIDs = []uuid.UUID{tid}
-		} else {
-			// Global + no filter: walk all teams the resolver knows.
-			// For v1 we don't have a "list every team" call here; the
-			// SPA will pass ?team_id= per team in this case.
-			return c.Status(fiber.StatusOK).JSON([]CrossTeamRequestBody{})
-		}
+	teamIDs, emptyResult, serr := resolveInboxTeamScope(c, access)
+	if serr != nil {
+		return serr
+	}
+	if emptyResult {
+		// Global + no team_id filter: no "list every team" query in v1;
+		// the SPA passes ?team_id= per team.
+		return c.Status(fiber.StatusOK).JSON([]CrossTeamRequestBody{})
 	}
 
-	rows, err := h.svc.Inbox(c.Context(), in)
+	rows, err := h.svc.Inbox(c.Context(), services.InboxInput{Limit: 100, TeamIDs: teamIDs})
 	if err != nil {
 		return crossTeamErr(err)
 	}
@@ -311,16 +289,19 @@ func (h *CrossTeam) InboxCount(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
-	if !access.IsGlobal && len(access.TeamIDs) == 0 {
+	// api#167: resolve the team scope EXACTLY as Inbox does so the badge
+	// count and the list never diverge — an explicit out-of-scope team_id
+	// is a 403 here too (was previously ignored → 200 {"total":0}).
+	teamIDs, emptyResult, serr := resolveInboxTeamScope(c, access)
+	if serr != nil {
+		return serr
+	}
+	if emptyResult {
 		return c.Status(fiber.StatusOK).JSON(InboxCountResponse{Total: 0})
 	}
-	// For v1, count is approximate — we just return len(Inbox(allowed)).
-	// A dedicated COUNT(*) endpoint can land later if needed.
-	in := services.InboxInput{Limit: 500}
-	if !access.IsGlobal {
-		in.TeamIDs = access.TeamIDs
-	}
-	rows, err := h.svc.Inbox(c.Context(), in)
+	// For v1, count is approximate — we return len(Inbox(allowed)). A
+	// dedicated COUNT(*) endpoint can land later if needed.
+	rows, err := h.svc.Inbox(c.Context(), services.InboxInput{Limit: 500, TeamIDs: teamIDs})
 	if err != nil {
 		return crossTeamErr(err)
 	}
@@ -328,6 +309,43 @@ func (h *CrossTeam) InboxCount(c fiber.Ctx) error {
 }
 
 // --- helpers ---------------------------------------------------------------
+
+// resolveInboxTeamScope maps the caller's effective team access plus an
+// optional ?team_id= filter to the team set an inbox list/count query should
+// use. Both Inbox and InboxCount call it so the badge count and the list can
+// never diverge (api#167): an explicit out-of-scope team_id is a 403 on
+// BOTH, a malformed team_id is a 400 on both, and the rows counted are
+// exactly the rows listed.
+//
+// Returns:
+//   - teamIDs: the allowed-team filter for services.Inbox. A nil/empty slice
+//     is fail-closed at the storage layer (ListInbox returns no rows), so it
+//     never leaks another team's inbox.
+//   - emptyResult: true only when the caller is global AND passed no team_id.
+//     There is no "list every team" query in v1 (the SPA passes ?team_id= per
+//     team), so both handlers return an empty result in that case.
+//   - err: a *fiber.Error (400 "team_id must be a UUID" or 403
+//     "out_of_scope_team") to return verbatim.
+func resolveInboxTeamScope(c fiber.Ctx, access auth.TeamAccess) (teamIDs []uuid.UUID, emptyResult bool, err error) {
+	tidRaw := c.Query("team_id")
+	if tidRaw != "" {
+		tid, perr := uuid.Parse(tidRaw)
+		if perr != nil {
+			return nil, false, fiber.NewError(fiber.StatusBadRequest, "team_id must be a UUID")
+		}
+		// A tenancy-scoped caller may only filter to a team they cover;
+		// a global caller may filter to any team.
+		if !access.IsGlobal && !containsUUIDValue(access.TeamIDs, tid) {
+			return nil, false, fiber.NewError(fiber.StatusForbidden, "out_of_scope_team")
+		}
+		return []uuid.UUID{tid}, false, nil
+	}
+	// No explicit filter.
+	if access.IsGlobal {
+		return nil, true, nil
+	}
+	return access.TeamIDs, false, nil
+}
 
 func parseUUIDField(raw, name string) (uuid.UUID, error) {
 	if raw == "" {
