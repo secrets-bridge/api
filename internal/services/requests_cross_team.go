@@ -367,6 +367,31 @@ func (s *RequestService) enforceCrossTeamDestinationKeys(ctx context.Context, in
 	return s.enforceBindingAllowedKeys(ctx, in.TargetProjectID, string(conn.Type), in.DestinationSecretRef, in.DestinationKeys)
 }
 
+// enforceCrossTeamDestinationKeysForRequest re-runs the destination-key
+// allowlist gate against a STORED cross_team request. api#168 blocks
+// non-allowlisted keys at submit; this defense-in-depth re-check (api#169)
+// runs again at the fill and execute boundaries so a request created before
+// api#168 — or one whose binding allowlist was tightened after submit —
+// cannot slip a disallowed key past those later stages. Same no-op posture
+// as enforceBindingAllowedKeys: when the binding repos are unwired or the
+// destination secret carries no restrictive allowlist, it passes cleanly.
+func (s *RequestService) enforceCrossTeamDestinationKeysForRequest(ctx context.Context, req *storage.AccessRequest) error {
+	if s.ctProvConns == nil || s.bindings == nil || s.secrets == nil {
+		return nil
+	}
+	if req.DestinationProviderConnectionID == nil || req.TargetProjectID == nil {
+		return nil
+	}
+	conn, err := s.ctProvConns.Get(ctx, *req.DestinationProviderConnectionID)
+	if err != nil {
+		if errors.Is(err, storage.ErrConnectionNotFound) {
+			return ErrCrossTeamDestinationUnbound
+		}
+		return fmt.Errorf("services: resolve destination provider type: %w", err)
+	}
+	return s.enforceBindingAllowedKeys(ctx, *req.TargetProjectID, string(conn.Type), req.DestinationSecretRef, req.DestinationKeys)
+}
+
 func (s *RequestService) validateCrossTeamDestination(ctx context.Context, id uuid.UUID) error {
 	if s.ctProvConns == nil {
 		return nil
@@ -414,6 +439,17 @@ func (s *RequestService) Fill(ctx context.Context, in FillCrossTeamInput) (*stor
 	wf, err := s.workflows.Get(ctx, *req.WorkflowID)
 	if err != nil {
 		return nil, fmt.Errorf("services: load workflow: %w", err)
+	}
+
+	// api#169 defense-in-depth: re-validate the request's destination keys
+	// against the binding allowlist BEFORE wrapping any value. If a key is no
+	// longer allowed (pre-api#168 row, or the allowlist was tightened after
+	// submit), refuse the fill with ErrKeyNotAllowed → 403
+	// cross_team_key_not_allowed. Runs before the wrap loop and before the
+	// Fill transition, so no plaintext is persisted and the request stays
+	// pending_values.
+	if err := s.enforceCrossTeamDestinationKeysForRequest(ctx, req); err != nil {
+		return nil, err
 	}
 
 	// Wrap each plaintext under workflow.wrap_ttl_created. Same
@@ -631,14 +667,34 @@ func (s *RequestService) VerifyCrossTeam(ctx context.Context, in VerifyCrossTeam
 		fresh, _ := s.requests.Get(ctx, req.ID)
 		if s.jobs != nil && fresh != nil {
 			if jerr := s.enqueueRequestJob(ctx, fresh); jerr != nil {
-				_ = s.audit.Append(ctx, &storage.AuditEvent{
-					Actor:         "user:" + in.ApproverID,
-					Action:        "request.cross_team.enqueue_job_failed",
-					Resource:      "request:" + req.ID.String(),
-					Status:        storage.AuditStatusFailure,
-					CorrelationID: req.ID,
-					Metadata:      map[string]any{"error": jerr.Error()},
-				})
+				if errors.Is(jerr, ErrKeyNotAllowed) {
+					// api#169: a destination-key allowlist rejection at the
+					// execute boundary is a policy failure, not a transient
+					// enqueue error. No job was created (no provider write);
+					// transition the request to failed so it can't sit at
+					// approved waiting for a dispatch that must never run.
+					// Metadata-only — never the value, wrap, or payload.
+					if uerr := s.requests.UpdateStatus(ctx, req.ID, storage.AccessRequestStatusFailed); uerr == nil {
+						statusToSet = storage.AccessRequestStatusFailed
+					}
+					_ = s.audit.Append(ctx, &storage.AuditEvent{
+						Actor:         "user:" + in.ApproverID,
+						Action:        "request.cross_team.execute.key_rejected",
+						Resource:      "request:" + req.ID.String(),
+						Status:        storage.AuditStatusFailure,
+						CorrelationID: req.ID,
+						Metadata:      map[string]any{"reason": "destination_key_not_allowed"},
+					})
+				} else {
+					_ = s.audit.Append(ctx, &storage.AuditEvent{
+						Actor:         "user:" + in.ApproverID,
+						Action:        "request.cross_team.enqueue_job_failed",
+						Resource:      "request:" + req.ID.String(),
+						Status:        storage.AuditStatusFailure,
+						CorrelationID: req.ID,
+						Metadata:      map[string]any{"error": jerr.Error()},
+					})
+				}
 			}
 		}
 	}
