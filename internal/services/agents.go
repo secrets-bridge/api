@@ -274,27 +274,17 @@ func (s *AgentService) SetPublicKey(ctx context.Context, id uuid.UUID, publicKey
 	return nil
 }
 
-// Revoke transitions an agent to status=revoked, stamps revoked_at +
-// revoked_by (the acting admin's identity), AND deletes its cached secret
-// hash so the next heartbeat is rejected immediately. Direct calls to
-// storage UpdateStatus bypass the cache invalidation; callers must use this
-// entry point. reason is recorded in audit metadata only (api#179).
-func (s *AgentService) Revoke(ctx context.Context, id uuid.UUID, revokedBy, reason string) error {
-	if err := s.agents.Revoke(ctx, id, revokedBy, s.now().UTC()); err != nil {
+func (s *AgentService) Revoke(ctx context.Context, id uuid.UUID) error {
+	if err := s.agents.UpdateStatus(ctx, id, storage.AgentStatusRevoked); err != nil {
 		return err
 	}
 	s.invalidateSecretHashCache(ctx, id)
 
-	actor := "admin"
-	if revokedBy != "" {
-		actor = "user:" + revokedBy
-	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    actor,
-		Action:   "agent.revoked",
+		Actor:    "admin",
+		Action:   "agent.revoke",
 		Resource: "agent:" + id.String(),
 		Status:   storage.AuditStatusSuccess,
-		Metadata: map[string]any{"reason": reason},
 	})
 	return nil
 }

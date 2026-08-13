@@ -303,7 +303,7 @@ func TestRevoke_InvalidatesCache(t *testing.T) {
 	}
 
 	// Revoke through the service — the only correct revocation path.
-	if err := svc.Revoke(ctx, minted.ID, "test-admin", "test revoke"); err != nil {
+	if err := svc.Revoke(ctx, minted.ID); err != nil {
 		t.Fatalf("Revoke: %v", err)
 	}
 

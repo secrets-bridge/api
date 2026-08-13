@@ -4,12 +4,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"strings"
-	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
-	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/storage"
@@ -128,61 +126,16 @@ func (h *Agents) Heartbeat(c fiber.Ctx) error {
 	// touch last_seen_at without a second cache lookup pattern that'd
 	// fork the validation path.
 	secret := c.Get("X-Agent-Secret")
-
-	// api#179: a heartbeat MAY carry an optional runtime body (status /
-	// agent_version / capabilities). A bodyless heartbeat keeps the
-	// certified 204 contract exactly — the live agent sends no body and is
-	// unaffected. A heartbeat with a body records the fields and returns a
-	// richer 200 { status, server_time, next_heartbeat_seconds }.
-	if len(c.Body()) == 0 {
-		if err := h.svc.Heartbeat(c.Context(), id, secret); err != nil {
-			return heartbeatErr(err)
+	if err := h.svc.Heartbeat(c.Context(), id, secret); err != nil {
+		switch {
+		case errors.Is(err, storage.ErrNotFound):
+			return fiber.NewError(fiber.StatusNotFound, "agent not found")
+		case errors.Is(err, storage.ErrUnauthorized):
+			return fiber.NewError(fiber.StatusUnauthorized, "heartbeat rejected")
 		}
-		return c.SendStatus(fiber.StatusNoContent)
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
-
-	var body HeartbeatRequest
-	if err := c.Bind().JSON(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
-	}
-	if err := h.svc.RecordHeartbeat(c.Context(), id, secret, services.HeartbeatInput{
-		AgentVersion: body.AgentVersion,
-		LastStatus:   body.Status,
-		Capabilities: body.Capabilities,
-	}); err != nil {
-		return heartbeatErr(err)
-	}
-	return c.Status(fiber.StatusOK).JSON(HeartbeatResponse{
-		Status:               "ok",
-		ServerTime:           time.Now().UTC().Format(rfc3339Nano),
-		NextHeartbeatSeconds: 30,
-	})
-}
-
-// HeartbeatRequest is the OPTIONAL richer heartbeat body. cluster_name is
-// accepted but ignored (identity is fixed at enroll).
-type HeartbeatRequest struct {
-	Status       string   `json:"status,omitempty"`
-	AgentVersion string   `json:"agent_version,omitempty"`
-	ClusterName  string   `json:"cluster_name,omitempty"`
-	Capabilities []string `json:"capabilities,omitempty"`
-}
-
-// HeartbeatResponse is returned for a heartbeat that carried a body.
-type HeartbeatResponse struct {
-	Status               string `json:"status"`
-	ServerTime           string `json:"server_time"`
-	NextHeartbeatSeconds int    `json:"next_heartbeat_seconds"`
-}
-
-func heartbeatErr(err error) error {
-	switch {
-	case errors.Is(err, storage.ErrNotFound):
-		return fiber.NewError(fiber.StatusNotFound, "agent not found")
-	case errors.Is(err, storage.ErrUnauthorized):
-		return fiber.NewError(fiber.StatusUnauthorized, "heartbeat rejected")
-	}
-	return fiber.NewError(fiber.StatusInternalServerError, "heartbeat failed")
+	return c.SendStatus(fiber.StatusNoContent)
 }
 
 // AgentListItem is one row in the response to GET /api/v1/agents.
@@ -215,23 +168,10 @@ func (h *Agents) Revoke(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	actor, _ := auth.IdentityFromContext(c.Context())
-	var body RevokeAgentRequest
-	if len(c.Body()) > 0 {
-		_ = c.Bind().JSON(&body) // reason is optional
-	}
-	if err := h.svc.Revoke(c.Context(), id, actor, body.Reason); err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			return fiber.NewError(fiber.StatusNotFound, "agent not found")
-		}
-		return fiber.NewError(fiber.StatusInternalServerError, "revoke failed")
+	if err := h.svc.Revoke(c.Context(), id); err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 	return c.SendStatus(fiber.StatusNoContent)
-}
-
-// RevokeAgentRequest carries the optional revoke reason (audit metadata).
-type RevokeAgentRequest struct {
-	Reason string `json:"reason,omitempty"`
 }
 
 func (h *Agents) List(c fiber.Ctx) error {
