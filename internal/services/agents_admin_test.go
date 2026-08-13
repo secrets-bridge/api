@@ -118,7 +118,8 @@ func TestRevoke_RecordsReasonAndActor(t *testing.T) {
 	if status != "revoked" || revokedBy != "admin-user-9" || revokedAt == nil {
 		t.Errorf("revoke state wrong: status=%s revoked_by=%s revoked_at=%v", status, revokedBy, revokedAt)
 	}
-	// audit: agent.revoked with reason, no credential.
+	// audit: agent.revoked with reason + agent_id + provider_connection_id
+	// (QA follow-up), no credential.
 	var meta string
 	if err := h.pool.QueryRow(ctx,
 		`SELECT metadata::text FROM audit_events WHERE action='agent.revoked'`).Scan(&meta); err != nil {
@@ -126,6 +127,61 @@ func TestRevoke_RecordsReasonAndActor(t *testing.T) {
 	}
 	if !strings.Contains(meta, "credential rotation") {
 		t.Errorf("revoke audit missing reason: %s", meta)
+	}
+	if !strings.Contains(meta, id.String()) {
+		t.Errorf("revoke audit missing agent_id: %s", meta)
+	}
+	if !strings.Contains(meta, h.connID.String()) {
+		t.Errorf("revoke audit missing provider_connection_id: %s", meta)
+	}
+}
+
+// a safe enrollment rejection emits a metadata-only agent.enrollment.rejected
+// audit (reason code only, never the token) — QA follow-up.
+func TestEnroll_RejectionEmitsAudit(t *testing.T) {
+	h := bootstrapEnroll(t, "aws-sm", "active")
+	ctx := t.Context()
+
+	_, err := h.svc.Enroll(ctx, services.EnrollInput{
+		Token: "totally-bogus-token", AgentName: "x", ProviderType: "aws-sm",
+	})
+	if !errors.Is(err, services.ErrEnrollmentTokenInvalid) {
+		t.Fatalf("bad-token enroll err = %v; want ErrEnrollmentTokenInvalid", err)
+	}
+	var meta string
+	if err := h.pool.QueryRow(ctx,
+		`SELECT metadata::text FROM audit_events WHERE action='agent.enrollment.rejected'`).Scan(&meta); err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	if !strings.Contains(meta, "token_invalid") {
+		t.Errorf("enrollment.rejected audit missing reason: %s", meta)
+	}
+	if strings.Contains(meta, "totally-bogus-token") {
+		t.Errorf("token plaintext leaked into audit: %s", meta)
+	}
+}
+
+// a rejected agent auth emits a metadata-only agent.auth.rejected audit
+// (reason code only, never the presented secret) — QA follow-up.
+func TestAuthenticate_RejectionEmitsAudit(t *testing.T) {
+	h := bootstrapEnroll(t, "aws-sm", "active")
+	ctx := t.Context()
+	id, _ := h.enroll(t, "auth-rej")
+
+	err := h.svc.RecordHeartbeat(ctx, id, "not-the-real-token", services.HeartbeatInput{})
+	if !errors.Is(err, storage.ErrUnauthorized) {
+		t.Fatalf("wrong-secret heartbeat err = %v; want ErrUnauthorized", err)
+	}
+	var meta string
+	if err := h.pool.QueryRow(ctx,
+		`SELECT metadata::text FROM audit_events WHERE action='agent.auth.rejected'`).Scan(&meta); err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	if !strings.Contains(meta, "bad_secret") {
+		t.Errorf("auth.rejected audit missing reason: %s", meta)
+	}
+	if strings.Contains(meta, "not-the-real-token") {
+		t.Errorf("presented secret leaked into audit: %s", meta)
 	}
 }
 

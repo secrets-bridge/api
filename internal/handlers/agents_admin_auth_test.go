@@ -96,6 +96,10 @@ func bootstrapAdminAgents(t *testing.T) *adminAgentsFixture {
 	v1.Get("/admin/agents", auth.Require(auth.PermAgentList, resolver), agentsH.AdminListAgents)
 	v1.Get("/admin/agents/:id", auth.Require(auth.PermAgentList, resolver), agentsH.AdminGetAgent)
 	v1.Post("/admin/agents/:id/revoke", auth.Require(auth.PermAgentRevoke, resolver), agentsH.Revoke)
+	// FU1: the legacy list is enforced with agent.list too (QA follow-up).
+	// OFF the /api/v1/agents/ session-exempt prefix (exact path, no trailing
+	// slash), so the session gate + explicit permission both apply.
+	v1.Get("/agents", auth.Require(auth.PermAgentList, resolver), agentsH.List)
 	fx.app = app
 	return fx
 }
@@ -152,5 +156,31 @@ func TestAdminAgents_AuthMatrix(t *testing.T) {
 	if got := fx.do(t, http.MethodPost, "/api/v1/admin/agents/"+fx.agentID.String()+"/revoke",
 		map[string]string{"X-User-Id": fx.adminUser.String()}); got != http.StatusNoContent {
 		t.Errorf("revoke admin = %d; want 204", got)
+	}
+}
+
+// FU1 (QA follow-up): the legacy GET /api/v1/agents list now enforces
+// agent.list. Same matrix as the admin surface, on the exact endpoint QA
+// flagged. Prove-by-revert: removing auth.Require(PermAgentList) from the
+// /agents route turns the no-perm case from 403 into 200.
+func TestLegacyAgentsList_RequiresAgentList(t *testing.T) {
+	fx := bootstrapAdminAgents(t)
+
+	cases := []struct {
+		name    string
+		headers map[string]string
+		want    int
+	}{
+		{"unauthenticated → 401", nil, http.StatusUnauthorized},
+		{"agent credential (no session) → 401", map[string]string{"X-Agent-Secret": "whatever"}, http.StatusUnauthorized},
+		{"user without agent.list → 403", map[string]string{"X-User-Id": fx.noPermUser.String()}, http.StatusForbidden},
+		{"admin with agent.list → 200", map[string]string{"X-User-Id": fx.adminUser.String()}, http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := fx.do(t, http.MethodGet, "/api/v1/agents", tc.headers); got != tc.want {
+				t.Errorf("GET /api/v1/agents = %d; want %d", got, tc.want)
+			}
+		})
 	}
 }
