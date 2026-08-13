@@ -16,10 +16,21 @@ import (
 // Agents is the HTTP layer over services.AgentService.
 type Agents struct {
 	svc *services.AgentService
+	// directMintEnabled gates the legacy POST /agents direct mint
+	// (api#183). Default false → self-enrollment is the only onboarding
+	// path; the direct mint is a break-glass admin action.
+	directMintEnabled bool
 }
 
 // NewAgents binds an Agents handler to its service.
 func NewAgents(svc *services.AgentService) *Agents { return &Agents{svc: svc} }
+
+// WithDirectMint enables/disables the legacy POST /agents direct mint.
+// Returns the handler for chaining. Off by default.
+func (h *Agents) WithDirectMint(enabled bool) *Agents {
+	h.directMintEnabled = enabled
+	return h
+}
 
 // MintRequest is the body of POST /api/v1/agents. PublicKey is the
 // agent's X25519 public key, base64-encoded. When present, the CP
@@ -45,6 +56,16 @@ type MintResponse struct {
 // includes the plaintext long-lived secret; the API does NOT support
 // retrieving it after the fact.
 func (h *Agents) Mint(c fiber.Ctx) error {
+	// api#183: the accepted onboarding model is self-enrollment only. The
+	// legacy direct mint is disabled unless explicitly enabled as a
+	// break-glass admin action (SB_ALLOW_DIRECT_AGENT_MINT=true).
+	if !h.directMintEnabled {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "direct_agent_mint_disabled",
+			"message": "direct agent mint is disabled; onboard via the enrollment flow: " +
+				"POST /provider-connections/:id/agent-enrollment-token then POST /agents/enroll",
+		})
+	}
 	var req MintRequest
 	if err := c.Bind().JSON(&req); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
