@@ -30,16 +30,32 @@ type Agent struct {
 	LastSeenAt         *time.Time
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
+
+	// Agent Onboarding MVP (migration 0038) — all nullable/additive so
+	// the certified mint path (which leaves them zero) is unaffected.
+	// ProviderConnectionID binds an ENROLLED agent to exactly one
+	// provider connection; it is set at enroll time and never changed.
+	ProviderConnectionID *uuid.UUID
+	ClusterName          string
+	ProviderType         string
+	Region               string
+	AgentVersion         string
+	PublicKeyFingerprint string
+	Capabilities         []string
 }
 
 // AgentStatus is constrained by a CHECK in the schema. Migration 0003
-// dropped the 'pending' value — agents are active immediately at mint.
+// dropped the 'pending' value; migration 0038 widened it back with
+// enrolled/error/disabled for the onboarding flow.
 type AgentStatus string
 
 const (
-	AgentStatusActive  AgentStatus = "active"
-	AgentStatusStale   AgentStatus = "stale"
-	AgentStatusRevoked AgentStatus = "revoked"
+	AgentStatusEnrolled AgentStatus = "enrolled"
+	AgentStatusActive   AgentStatus = "active"
+	AgentStatusStale    AgentStatus = "stale"
+	AgentStatusError    AgentStatus = "error"
+	AgentStatusDisabled AgentStatus = "disabled"
+	AgentStatusRevoked  AgentStatus = "revoked"
 )
 
 // AgentRepository is the read/write surface for the agents table.
@@ -49,6 +65,12 @@ type AgentRepository interface {
 	// secret and computes the hash before this call — the repository
 	// never touches plaintext.
 	Create(ctx context.Context, a *Agent) error
+
+	// CreateEnrolled inserts an agent produced by the enrollment flow —
+	// bound to a provider connection, carrying cluster/provider/region/
+	// version/capabilities. Reuses the same secret_hash credential column
+	// as Create; the certified mint path is unchanged.
+	CreateEnrolled(ctx context.Context, a *Agent) error
 
 	// Get returns one agent by ID.
 	Get(ctx context.Context, id uuid.UUID) (*Agent, error)
@@ -118,6 +140,54 @@ func (r *Agents) Create(ctx context.Context, a *Agent) error {
 	}
 	row = r.pool.QueryRow(ctx, insertWithID, a.ID, a.Name, scope, a.Status, a.SecretHash, a.PublicKey, a.PublicKeyAlgorithm)
 	return row.Scan(&a.CreatedAt, &a.UpdatedAt)
+}
+
+// CreateEnrolled inserts an enrolled agent bound to a provider connection.
+// The credential (secret_hash) is generated + hashed by the caller, exactly
+// like Create. All the onboarding columns are nullable in the schema; empty
+// values land as NULL (capabilities defaults to []).
+func (r *Agents) CreateEnrolled(ctx context.Context, a *Agent) error {
+	if a.Name == "" {
+		return errors.New("storage: agent Name is required")
+	}
+	if len(a.SecretHash) == 0 {
+		return errors.New("storage: agent SecretHash is required")
+	}
+	if a.ProviderConnectionID == nil {
+		return errors.New("storage: enrolled agent ProviderConnectionID is required")
+	}
+	if a.Status == "" {
+		a.Status = AgentStatusEnrolled
+	}
+	if a.Scope == nil {
+		a.Scope = map[string]any{}
+	}
+	scope, err := json.Marshal(a.Scope)
+	if err != nil {
+		return fmt.Errorf("storage: marshal agent scope: %w", err)
+	}
+	if a.Capabilities == nil {
+		a.Capabilities = []string{}
+	}
+	caps, err := json.Marshal(a.Capabilities)
+	if err != nil {
+		return fmt.Errorf("storage: marshal agent capabilities: %w", err)
+	}
+
+	const q = `
+		INSERT INTO agents (
+			name, scope, status, secret_hash, public_key, public_key_algorithm,
+			provider_connection_id, cluster_name, provider_type, region,
+			agent_version, public_key_fingerprint, capabilities)
+		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''),
+			$7, NULLIF($8, ''), NULLIF($9, ''), NULLIF($10, ''),
+			NULLIF($11, ''), NULLIF($12, ''), $13)
+		RETURNING id, created_at, updated_at`
+	row := r.pool.QueryRow(ctx, q,
+		a.Name, scope, a.Status, a.SecretHash, a.PublicKey, a.PublicKeyAlgorithm,
+		a.ProviderConnectionID, a.ClusterName, a.ProviderType, a.Region,
+		a.AgentVersion, a.PublicKeyFingerprint, caps)
+	return row.Scan(&a.ID, &a.CreatedAt, &a.UpdatedAt)
 }
 
 // Get fetches one agent by ID. Returns ErrNotFound when no row matches.
