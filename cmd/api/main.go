@@ -404,6 +404,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	bindingRepo := storage.NewProjectProviderConnections(pool)
 	requestSvc.WithCrossTeamRepos(teamRepo, projectRepo, environmentRepo, provConnRepo)
 
+	// Agent Onboarding MVP (api#178): wire enrollment-token generation +
+	// self-enrollment onto the existing agent service. Mutates the same
+	// agentSvc pointer AgentAuth + agentsH already hold; the certified
+	// mint/heartbeat/auth paths are untouched.
+	agentSvc.WithEnrollment(storage.NewAgentEnrollmentTokens(pool), provConnRepo)
+
 	// Enforce the project_secrets allowed_keys allowlist on both
 	// plaintext-reveal boundaries: submit-time (direct reveal) and
 	// unwrap-time (bulk reveal session). Without these a direct reveal
@@ -760,6 +766,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Post("/agents", auth.Require(auth.PermAgentMint, rbacResolver), agentsH.Mint)
 	v1.Post("/agents/:id/revoke", auth.Require(auth.PermAgentRevoke, rbacResolver), agentsH.Revoke)
 	v1.Get("/agents", agentsH.List)
+	// Agent self-enrollment (api#178). Auth = the enrollment token ONLY.
+	// This route IS under the /api/v1/agents/ session-exempt prefix by
+	// design (the enrolling agent has no session and no X-Agent-Secret
+	// yet); the token it presents is validated in the handler/service.
+	// It is NOT on the AgentAuth :id group. Registered before that group.
+	v1.Post("/agents/enroll", agentsH.Enroll)
 	v1.Post("/jobs", jobsH.Enqueue)
 
 	// Dynamic workflow + policy engine.
@@ -1043,6 +1055,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Put("/provider-connections/:id", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.Update)
 	v1.Delete("/provider-connections/:id", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.Delete)
 	v1.Post("/provider-connections/:id/discover-now", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.DiscoverNow)
+	// Agent Onboarding MVP (api#178): admin mints a one-time enrollment
+	// token for this connection. Session-gated + agent.mint — NOT under
+	// the /api/v1/agents/ session-exempt prefix, so the global session
+	// gate + this explicit permission both apply.
+	v1.Post("/provider-connections/:id/agent-enrollment-token", auth.Require(auth.PermAgentMint, rbacResolver), agentsH.GenerateEnrollmentToken)
 	v1.Post("/provider-connections/:id/bindings", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.CreateBinding)
 	v1.Get("/provider-connections/:id/bindings", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.ListBindings)
 	v1.Delete("/provider-connection-bindings/:binding_id", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.DeleteBinding)

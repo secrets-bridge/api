@@ -53,6 +53,27 @@ type AgentService struct {
 	// revocation propagation window when an admin bypasses Revoke();
 	// long enough to give meaningful cache hit rates at scale.
 	secretHashCacheTTL time.Duration
+
+	// Agent Onboarding MVP (api#178). Both nil unless WithEnrollment is
+	// called — the certified mint/heartbeat/auth paths never touch them.
+	enrollTokens storage.AgentEnrollmentTokenRepository
+	provConns    AgentProviderConnectionLookup
+}
+
+// AgentProviderConnectionLookup is the narrow Get-only slice of the
+// provider-connections repository the enrollment flow needs (validate the
+// connection exists + is active, and read its type for the binding check).
+type AgentProviderConnectionLookup interface {
+	Get(ctx context.Context, id uuid.UUID) (*storage.ProviderConnection, error)
+}
+
+// WithEnrollment wires the enrollment-token repository + provider-connection
+// lookup so GenerateEnrollmentToken + Enroll are operative. Returns the
+// service for chaining. Unwired (the default), those methods return an error.
+func (s *AgentService) WithEnrollment(tokens storage.AgentEnrollmentTokenRepository, provConns AgentProviderConnectionLookup) *AgentService {
+	s.enrollTokens = tokens
+	s.provConns = provConns
+	return s
 }
 
 // NewAgentService constructs an AgentService.
