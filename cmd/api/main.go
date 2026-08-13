@@ -521,7 +521,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// grants expand the same way as on the catalog read path.
 	requestsH = requestsH.
 		WithTenancyGate(projectSecretsRepo, secretsRepo, rbacResolver).
-		WithTeamScope(teamScopeResolver)
+		WithTeamScope(teamScopeResolver).
+		// Best-effort display-name enrichment for the approver verify
+		// panel (ui#87 follow-up) — team/project/env/connection names +
+		// requester/filled-by display names. Metadata only.
+		WithNameResolvers(teamRepo, projectRepo, environmentRepo, provConnRepo, localUsersRepoInApp)
 
 	// Read-path tenancy isolation (P0): the project + environment +
 	// project-secret read endpoints apply the SAME project scope as the
