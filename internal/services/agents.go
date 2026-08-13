@@ -2,12 +2,12 @@
 //
 // AgentService owns the one-credential agent flow:
 //
-//   1. Admin calls Mint → returns {id, agent_secret}. The plaintext
-//      secret is returned ONCE; only its SHA-256 hash is persisted.
-//   2. Admin (or the chart that wraps this call) lands those values
-//      in the agent's K8s Secret / env vars.
-//   3. Agent reads the values at startup and presents agent_secret in
-//      the X-Agent-Secret header on every heartbeat.
+//  1. Admin calls Mint → returns {id, agent_secret}. The plaintext
+//     secret is returned ONCE; only its SHA-256 hash is persisted.
+//  2. Admin (or the chart that wraps this call) lands those values
+//     in the agent's K8s Secret / env vars.
+//  3. Agent reads the values at startup and presents agent_secret in
+//     the X-Agent-Secret header on every heartbeat.
 //
 // There is intentionally no separate registration step — the Pod can
 // restart at will, re-read the same Secret, and keep heartbeating
@@ -184,9 +184,9 @@ func (s *AgentService) Mint(ctx context.Context, in MintInput) (*MintedAgent, er
 //
 // Hot path:
 //
-//	1. Read the secret hash + status from Redis.
-//	2. On cache miss: read from Postgres and prime the cache.
-//	3. ConstantTimeCompare against the cached/loaded hash.
+//  1. Read the secret hash + status from Redis.
+//  2. On cache miss: read from Postgres and prime the cache.
+//  3. ConstantTimeCompare against the cached/loaded hash.
 func (s *AgentService) Authenticate(ctx context.Context, id uuid.UUID, agentSecret string) error {
 	cached, hadCache, err := s.readSecretHashCache(ctx, id)
 	if err != nil {
@@ -195,6 +195,9 @@ func (s *AgentService) Authenticate(ctx context.Context, id uuid.UUID, agentSecr
 	if !hadCache {
 		agent, err := s.agents.Get(ctx, id)
 		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				s.auditAuthRejected(ctx, id, "unknown_agent")
+			}
 			return err
 		}
 		cached = cachedSecretHash{Status: string(agent.Status), Hash: agent.SecretHash}
@@ -202,16 +205,32 @@ func (s *AgentService) Authenticate(ctx context.Context, id uuid.UUID, agentSecr
 	}
 
 	if cached.Status == string(storage.AgentStatusRevoked) {
+		s.auditAuthRejected(ctx, id, "revoked")
 		return storage.ErrUnauthorized
 	}
 	if len(cached.Hash) == 0 {
+		s.auditAuthRejected(ctx, id, "no_credential")
 		return storage.ErrUnauthorized
 	}
 	presented := sha256.Sum256([]byte(agentSecret))
 	if subtle.ConstantTimeCompare(presented[:], cached.Hash) != 1 {
+		s.auditAuthRejected(ctx, id, "bad_secret")
 		return storage.ErrUnauthorized
 	}
 	return nil
+}
+
+// auditAuthRejected records a metadata-only agent.auth.rejected event
+// (QA follow-up). No secret, hash, or header material — only the agent id
+// and a coarse reason code. Best-effort; never blocks the auth decision.
+func (s *AgentService) auditAuthRejected(ctx context.Context, id uuid.UUID, reason string) {
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "agent:" + id.String(),
+		Action:   "agent.auth.rejected",
+		Resource: "agent:" + id.String(),
+		Status:   storage.AuditStatusDenied,
+		Metadata: map[string]any{"reason": reason},
+	})
 }
 
 // Heartbeat authenticates the agent and bumps last_seen_at. Best-effort
@@ -267,24 +286,48 @@ func (s *AgentService) SetPublicKey(ctx context.Context, id uuid.UUID, publicKey
 		Resource: "agent:" + id.String(),
 		Status:   storage.AuditStatusSuccess,
 		Metadata: map[string]any{
-			"algorithm":       algorithm,
-			"public_key_sha":  base64.RawURLEncoding.EncodeToString(sum[:8]),
+			"algorithm":      algorithm,
+			"public_key_sha": base64.RawURLEncoding.EncodeToString(sum[:8]),
 		},
 	})
 	return nil
 }
 
-func (s *AgentService) Revoke(ctx context.Context, id uuid.UUID) error {
-	if err := s.agents.UpdateStatus(ctx, id, storage.AgentStatusRevoked); err != nil {
+// Revoke transitions an agent to status=revoked, stamps revoked_at +
+// revoked_by (the acting admin's identity), AND deletes its cached secret
+// hash so the next heartbeat is rejected immediately. Direct calls to
+// storage UpdateStatus bypass the cache invalidation; callers must use this
+// entry point. reason is recorded in audit metadata only (api#179).
+func (s *AgentService) Revoke(ctx context.Context, id uuid.UUID, revokedBy, reason string) error {
+	// Load via the admin read path so the audit can name the provider
+	// connection binding (metadata-only, QA follow-up) — the certified Get
+	// doesn't project provider_connection_id. Missing agent → ErrNotFound.
+	row, err := s.agents.GetAdmin(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := s.agents.Revoke(ctx, id, revokedBy, s.now().UTC()); err != nil {
 		return err
 	}
 	s.invalidateSecretHashCache(ctx, id)
 
+	actor := "admin"
+	if revokedBy != "" {
+		actor = "user:" + revokedBy
+	}
+	meta := map[string]any{
+		"agent_id": id.String(),
+		"reason":   reason,
+	}
+	if row.ProviderConnectionID != nil {
+		meta["provider_connection_id"] = row.ProviderConnectionID.String()
+	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "admin",
-		Action:   "agent.revoke",
+		Actor:    actor,
+		Action:   "agent.revoked",
 		Resource: "agent:" + id.String(),
 		Status:   storage.AuditStatusSuccess,
+		Metadata: meta,
 	})
 	return nil
 }

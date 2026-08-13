@@ -135,6 +135,38 @@ func (s *AgentService) GenerateEnrollmentToken(ctx context.Context, in GenerateE
 	}, nil
 }
 
+// RevokeEnrollmentToken revokes an UNUSED enrollment token so it can never
+// be redeemed. Metadata-only audit. api#179.
+func (s *AgentService) RevokeEnrollmentToken(ctx context.Context, id uuid.UUID, revokedBy, reason string) error {
+	if s.enrollTokens == nil {
+		return ErrEnrollmentNotConfigured
+	}
+	tok, err := s.enrollTokens.Get(ctx, id)
+	if err != nil {
+		return err // ErrEnrollmentTokenNotFound → 404 at the handler
+	}
+	if err := s.enrollTokens.Revoke(ctx, id, revokedBy, s.now().UTC()); err != nil {
+		return err // already consumed/revoked → ErrEnrollmentTokenNotFound → 409
+	}
+	actor := "admin"
+	if revokedBy != "" {
+		actor = "user:" + revokedBy
+	}
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:         actor,
+		Action:        "agent.enrollment_token.revoked",
+		Resource:      "provider_connection:" + tok.ProviderConnectionID.String(),
+		Status:        storage.AuditStatusSuccess,
+		CorrelationID: id,
+		Metadata: map[string]any{
+			"enrollment_token_id":    id.String(),
+			"provider_connection_id": tok.ProviderConnectionID.String(),
+			"reason":                 reason,
+		},
+	})
+	return nil
+}
+
 // EnrollInput is the agent's outbound self-enrollment request.
 type EnrollInput struct {
 	Token                string
@@ -160,7 +192,52 @@ type EnrolledAgent struct {
 // Enroll validates a one-time token, creates a provider-connection-bound
 // agent, consumes the token, and returns the persistent agent credential
 // once. No provider credentials or secret values are ever returned.
+//
+// On a safe rejection (bad/expired/consumed/revoked token, provider or
+// cluster mismatch, unusable connection) it emits a metadata-only
+// agent.enrollment.rejected audit (QA follow-up) — reason code only, never
+// the token, hash, or any secret material.
 func (s *AgentService) Enroll(ctx context.Context, in EnrollInput) (*EnrolledAgent, error) {
+	res, err := s.enroll(ctx, in)
+	if err != nil {
+		if reason, ok := enrollRejectReason(err); ok {
+			_ = s.audit.Append(ctx, &storage.AuditEvent{
+				Actor:    "agent:enroll",
+				Action:   "agent.enrollment.rejected",
+				Resource: "agent_enrollment_token",
+				Status:   storage.AuditStatusDenied,
+				Metadata: map[string]any{"reason": reason},
+			})
+		}
+	}
+	return res, err
+}
+
+// enrollRejectReason maps a safe rejection sentinel to a coarse reason code
+// for the metadata-only audit. Returns ok=false for internal/config errors
+// (those are 5xx, not rejections) so we don't audit them as denials.
+func enrollRejectReason(err error) (string, bool) {
+	switch {
+	case errors.Is(err, ErrEnrollmentTokenInvalid):
+		return "token_invalid", true
+	case errors.Is(err, ErrEnrollmentTokenExpired):
+		return "token_expired", true
+	case errors.Is(err, ErrEnrollmentTokenConsumed):
+		return "token_already_consumed", true
+	case errors.Is(err, ErrEnrollmentTokenRevoked):
+		return "token_revoked", true
+	case errors.Is(err, ErrEnrollmentProviderMismatch):
+		return "provider_type_mismatch", true
+	case errors.Is(err, ErrEnrollmentClusterMismatch):
+		return "cluster_name_mismatch", true
+	case errors.Is(err, ErrEnrollmentConnectionUnusable):
+		return "provider_connection_unavailable", true
+	default:
+		return "", false
+	}
+}
+
+func (s *AgentService) enroll(ctx context.Context, in EnrollInput) (*EnrolledAgent, error) {
 	if s.enrollTokens == nil || s.provConns == nil {
 		return nil, ErrEnrollmentNotConfigured
 	}

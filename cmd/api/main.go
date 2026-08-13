@@ -765,13 +765,30 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// list-level RBAC lands as a follow-up.
 	v1.Post("/agents", auth.Require(auth.PermAgentMint, rbacResolver), agentsH.Mint)
 	v1.Post("/agents/:id/revoke", auth.Require(auth.PermAgentRevoke, rbacResolver), agentsH.Revoke)
-	v1.Get("/agents", agentsH.List)
+	// agent.list enforced (QA follow-up): this legacy list is OFF the
+	// /api/v1/agents/ session-exempt prefix, so the session gate already
+	// yields 401 for anonymous + agent-credential (X-Agent-Secret, no
+	// session) callers; the explicit permission adds 403 for an
+	// authenticated user without agent.list. Richer projection + filters
+	// live on GET /admin/agents.
+	v1.Get("/agents", auth.Require(auth.PermAgentList, rbacResolver), agentsH.List)
 	// Agent self-enrollment (api#178). Auth = the enrollment token ONLY.
 	// This route IS under the /api/v1/agents/ session-exempt prefix by
 	// design (the enrolling agent has no session and no X-Agent-Secret
 	// yet); the token it presents is validated in the handler/service.
 	// It is NOT on the AgentAuth :id group. Registered before that group.
 	v1.Post("/agents/enroll", agentsH.Enroll)
+
+	// Agent management admin surface (api#179). Deliberately OFF the
+	// /api/v1/agents/ session-exempt prefix (under /admin/agents), so the
+	// global session gate applies AND each carries an explicit permission.
+	// Never returns credentials.
+	v1.Get("/admin/agents", auth.Require(auth.PermAgentList, rbacResolver), agentsH.AdminListAgents)
+	v1.Get("/admin/agents/:id", auth.Require(auth.PermAgentList, rbacResolver), agentsH.AdminGetAgent)
+	v1.Post("/admin/agents/:id/revoke", auth.Require(auth.PermAgentRevoke, rbacResolver), agentsH.Revoke)
+	// Revoke an UNUSED enrollment token. Session-gated + agent.mint (not
+	// under the exempt prefix — /agent-enrollment-tokens != /agents/).
+	v1.Post("/agent-enrollment-tokens/:id/revoke", auth.Require(auth.PermAgentMint, rbacResolver), agentsH.RevokeEnrollmentToken)
 	v1.Post("/jobs", jobsH.Enqueue)
 
 	// Dynamic workflow + policy engine.
@@ -1060,6 +1077,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// the /api/v1/agents/ session-exempt prefix, so the global session
 	// gate + this explicit permission both apply.
 	v1.Post("/provider-connections/:id/agent-enrollment-token", auth.Require(auth.PermAgentMint, rbacResolver), agentsH.GenerateEnrollmentToken)
+	// Provider-scoped agent list (api#179), for the UI connection → Agents
+	// tab. Session-gated + agent.list.
+	v1.Get("/provider-connections/:id/agents", auth.Require(auth.PermAgentList, rbacResolver), agentsH.ListAgentsForConnection)
 	v1.Post("/provider-connections/:id/bindings", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.CreateBinding)
 	v1.Get("/provider-connections/:id/bindings", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.ListBindings)
 	v1.Delete("/provider-connection-bindings/:binding_id", auth.Require(auth.PermIntegrationEdit, rbacResolver), pcH.DeleteBinding)
