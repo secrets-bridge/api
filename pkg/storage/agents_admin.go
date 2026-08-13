@@ -82,7 +82,6 @@ func (r *Agents) ListAdmin(ctx context.Context, f AgentAdminFilter) ([]*AgentAdm
 	if f.ProviderType != "" {
 		where = append(where, fmt.Sprintf("a.provider_type = $%d", i))
 		args = append(args, f.ProviderType)
-		i++
 	}
 	q := agentAdminSelect
 	if len(where) > 0 {
