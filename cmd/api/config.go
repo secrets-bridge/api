@@ -212,6 +212,14 @@ type Config struct {
 	// deployment-level override (false) disables that pass; the
 	// credential-shaped key refusal still runs unconditionally.
 	ProviderConnRejectSecretValues bool
+
+	// AllowDirectAgentMint gates the legacy POST /api/v1/agents direct
+	// mint (api#183). OFF by default: the accepted Agent Onboarding model
+	// is self-enrollment only (POST /provider-connections/:id/
+	// agent-enrollment-token → POST /agents/enroll). Enable ONLY as an
+	// explicit, audited break-glass admin mint. Does not affect any
+	// already-minted agent's auth/heartbeat/job behavior.
+	AllowDirectAgentMint bool
 }
 
 func loadConfig() Config {
@@ -244,6 +252,7 @@ func loadConfig() Config {
 		OIDCTrustAMRForMFA:             envBool("SB_OIDC_TRUSTED_AMR_MFA", false),
 		RequireMFAAtLogin:              envBool("SB_REQUIRE_MFA_AT_LOGIN", false),
 		AllowInsecureHeaderAuth:        envBool("SB_ALLOW_INSECURE_HEADER_AUTH", false),
+		AllowDirectAgentMint:           envBool("SB_ALLOW_DIRECT_AGENT_MINT", false),
 	}
 }
 

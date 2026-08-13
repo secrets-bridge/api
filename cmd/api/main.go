@@ -375,7 +375,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// pcSvc.OnDiscoverJobCompleted is installed AFTER pcSvc is built
 	// below.
 
-	agentsH := handlers.NewAgents(agentSvc)
+	agentsH := handlers.NewAgents(agentSvc).WithDirectMint(cfg.AllowDirectAgentMint)
 	jobsH := handlers.NewJobs(jobSvc)
 	adminH := handlers.NewAdmin(roleRepo, userRoleRepo, workflowRepo, policyRepo).
 		WithAudit(auditRepo)
