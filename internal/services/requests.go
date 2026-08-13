@@ -1167,6 +1167,17 @@ func (s *RequestService) enqueueRequestJob(ctx context.Context, req *storage.Acc
 		if err != nil {
 			return fmt.Errorf("resolve destination connection: %w", err)
 		}
+		// api#169 defense-in-depth at the execute boundary: re-validate the
+		// destination keys against the binding allowlist before enqueuing the
+		// patch job. If a key is no longer allowed (pre-api#168 row, or the
+		// allowlist was tightened between approval and dispatch), refuse to
+		// enqueue — the agent never claims a job and never writes to the
+		// provider. The caller (VerifyCrossTeam) marks the request failed.
+		if req.TargetProjectID != nil {
+			if err := s.enforceBindingAllowedKeys(ctx, *req.TargetProjectID, string(conn.Type), req.DestinationSecretRef, req.DestinationKeys); err != nil {
+				return err
+			}
+		}
 		cfg := make(map[string]any, len(conn.Scope))
 		for k, v := range conn.Scope {
 			cfg[k] = v

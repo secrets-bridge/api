@@ -707,6 +707,221 @@ func TestFill_NoPlaintextInDBOrAudit(t *testing.T) {
 	}
 }
 
+// seedCrossTeamDestBinding binds the destination secret to the TARGET
+// project with a restrictive allowlist, so the api#168 submit gate and the
+// api#169 fill/execute defense-in-depth checks all resolve a real binding.
+// Returns the catalog secret so the test can later tighten the allowlist.
+func seedCrossTeamDestBinding(t *testing.T, h *crossTeamHarness, in services.CrossTeamSubmitInput, cluster string, allowedKeys []string) *storage.Secret {
+	t.Helper()
+	ctx := t.Context()
+	sec := &storage.Secret{
+		ClusterName:  cluster,
+		ProviderType: "vault", // matches the seeded destination connection type
+		SecretRef:    in.DestinationSecretRef,
+		Status:       "present",
+	}
+	if err := h.secretsR.Upsert(ctx, sec); err != nil {
+		t.Fatalf("seed catalog secret: %v", err)
+	}
+	if err := h.bindingsR.Bind(ctx, &storage.ProjectSecret{
+		ProjectID:   in.TargetProjectID,
+		SecretID:    sec.ID,
+		AllowedOps:  []string{storage.OpPatch},
+		AllowedKeys: allowedKeys,
+		CreatedBy:   "ct-did-test",
+	}); err != nil {
+		t.Fatalf("seed binding: %v", err)
+	}
+	return sec
+}
+
+// api#169 test 1: the allowlist gate does NOT break the certified happy
+// path — allowlisted keys still submit → fill → approve → enqueue the
+// destination patch job (the CP-side "execute dispatched" proof; the
+// approved→executed transition is covered by the live cert + job_lifecycle).
+func TestCrossTeam_AllowlistedKeys_FillApproveEnqueues(t *testing.T) {
+	h := buildCrossTeamHarness(t)
+	ctx := t.Context()
+	in := seedCrossTeamScope(t, h, "ct-did-ok")
+	seedCrossTeamDestBinding(t, h, in, "ct-did-ok-cluster", []string{"DB_PASSWORD", "DB_USER"})
+
+	req, err := h.reqSvc.SubmitCrossTeam(ctx, in)
+	if err != nil {
+		t.Fatalf("SubmitCrossTeam with allowlisted keys: %v", err)
+	}
+	if _, err := h.reqSvc.Fill(ctx, services.FillCrossTeamInput{
+		RequestID: req.ID, FillerID: "bob@example.com",
+		KeyValues: map[string][]byte{"DB_PASSWORD": []byte("a"), "DB_USER": []byte("b")},
+	}); err != nil {
+		t.Fatalf("Fill with allowlisted keys: %v", err)
+	}
+	resp, err := h.reqSvc.VerifyCrossTeam(ctx, services.VerifyCrossTeamInput{
+		RequestID: req.ID, ApproverID: "carol@example.com",
+		VotedAs: services.VotedAsSource, Decision: storage.ApprovalDecisionApprove,
+	})
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if resp.Status != storage.AccessRequestStatusApproved {
+		t.Fatalf("Status = %s want approved (allowlisted happy path must not be blocked)", resp.Status)
+	}
+	got, err := h.requestsR.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatalf("Get request: %v", err)
+	}
+	if got.JobID == nil {
+		t.Fatal("approved cross_team request has no job_id — DiD check wrongly blocked the allowlisted happy path")
+	}
+	job, err := h.jobsR.Get(ctx, *got.JobID)
+	if err != nil {
+		t.Fatalf("Get job: %v", err)
+	}
+	if job.JobType != storage.JobTypePatch {
+		t.Errorf("job type = %s want patch", job.JobType)
+	}
+}
+
+// api#169 test 2 (fill boundary) + test 5 (leak sweep): a request whose
+// destination key was valid at submit but later removed from the binding
+// allowlist is refused at fill with ErrKeyNotAllowed — no plaintext is
+// wrapped and the request stays pending_values.
+func TestFill_RejectsDestinationKeyRemovedFromAllowlist(t *testing.T) {
+	h := buildCrossTeamHarness(t)
+	ctx := t.Context()
+	in := seedCrossTeamScope(t, h, "ct-did-fill")
+	sec := seedCrossTeamDestBinding(t, h, in, "ct-did-fill-cluster", []string{"DB_PASSWORD", "DB_USER"})
+
+	// Submit while DB_PASSWORD is allowlisted (passes the api#168 gate).
+	in.DestinationKeys = []string{"DB_PASSWORD"}
+	req, err := h.reqSvc.SubmitCrossTeam(ctx, in)
+	if err != nil {
+		t.Fatalf("SubmitCrossTeam: %v", err)
+	}
+
+	// Tighten the allowlist AFTER submit: DB_PASSWORD is no longer allowed.
+	if err := h.bindingsR.Update(ctx, in.TargetProjectID, sec.ID,
+		[]string{"DB_USER"}, []string{storage.OpPatch}, nil); err != nil {
+		t.Fatalf("tighten allowlist: %v", err)
+	}
+
+	// The fill must be refused before any value is wrapped.
+	canary := []byte("ZZZ-ct-fill-did-canary-XYZ")
+	_, err = h.reqSvc.Fill(ctx, services.FillCrossTeamInput{
+		RequestID: req.ID, FillerID: "bob@example.com",
+		KeyValues: map[string][]byte{"DB_PASSWORD": append([]byte(nil), canary...)},
+	})
+	if !errors.Is(err, services.ErrKeyNotAllowed) {
+		t.Fatalf("Fill err = %v; want ErrKeyNotAllowed (→ 403 cross_team_key_not_allowed)", err)
+	}
+
+	// Status unchanged: still pending_values.
+	got, err := h.requestsR.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatalf("Get request: %v", err)
+	}
+	if got.Status != storage.AccessRequestStatusPendingValues {
+		t.Fatalf("status = %s want pending_values (fill rejection must not transition)", got.Status)
+	}
+
+	// No wrap rows persisted for the request.
+	var wrapCount int
+	if err := h.pool.QueryRow(ctx,
+		`SELECT count(*) FROM secret_wraps WHERE request_id = $1`, req.ID).Scan(&wrapCount); err != nil {
+		t.Fatalf("count wraps: %v", err)
+	}
+	if wrapCount != 0 {
+		t.Fatalf("wrap rows = %d want 0 (no plaintext may be wrapped on a rejected fill)", wrapCount)
+	}
+
+	// Leak sweep: the canary must not appear in any encrypted_value.
+	rows, err := h.pool.Query(ctx, `SELECT encrypted_value FROM secret_wraps`)
+	if err != nil {
+		t.Fatalf("scan wraps: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if bytes.Contains(raw, canary) {
+			t.Fatal("canary leaked into secret_wraps.encrypted_value on a rejected fill")
+		}
+	}
+}
+
+// api#169 test 3 (execute boundary) + test 5 (leak sweep): a request that
+// was filled while its key was allowlisted, then had the key removed before
+// approval, must NOT enqueue a job (no provider write) — it transitions to
+// failed with a metadata-only audit event.
+func TestVerifyCrossTeam_ExecuteRejectsKeyRemovedAfterFill(t *testing.T) {
+	h := buildCrossTeamHarness(t)
+	ctx := t.Context()
+	in := seedCrossTeamScope(t, h, "ct-did-exec")
+	sec := seedCrossTeamDestBinding(t, h, in, "ct-did-exec-cluster", []string{"DB_PASSWORD", "DB_USER"})
+
+	in.DestinationKeys = []string{"DB_PASSWORD"}
+	req, err := h.reqSvc.SubmitCrossTeam(ctx, in)
+	if err != nil {
+		t.Fatalf("SubmitCrossTeam: %v", err)
+	}
+	// Fill succeeds — DB_PASSWORD still allowlisted at fill time.
+	if _, err := h.reqSvc.Fill(ctx, services.FillCrossTeamInput{
+		RequestID: req.ID, FillerID: "bob@example.com",
+		KeyValues: map[string][]byte{"DB_PASSWORD": []byte("filled-value")},
+	}); err != nil {
+		t.Fatalf("Fill (still allowlisted): %v", err)
+	}
+
+	// Tighten the allowlist between fill and approval.
+	if err := h.bindingsR.Update(ctx, in.TargetProjectID, sec.ID,
+		[]string{"DB_USER"}, []string{storage.OpPatch}, nil); err != nil {
+		t.Fatalf("tighten allowlist: %v", err)
+	}
+
+	// Approve crosses the threshold; the execute-boundary re-check refuses
+	// to enqueue → request goes to failed, not approved, and no job exists.
+	resp, err := h.reqSvc.VerifyCrossTeam(ctx, services.VerifyCrossTeamInput{
+		RequestID: req.ID, ApproverID: "carol@example.com",
+		VotedAs: services.VotedAsSource, Decision: storage.ApprovalDecisionApprove,
+	})
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if resp.Status != storage.AccessRequestStatusFailed {
+		t.Fatalf("resp.Status = %s want failed (execute boundary must reject the disallowed key)", resp.Status)
+	}
+	got, err := h.requestsR.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatalf("Get request: %v", err)
+	}
+	if got.Status != storage.AccessRequestStatusFailed {
+		t.Fatalf("persisted status = %s want failed", got.Status)
+	}
+	if got.JobID != nil {
+		t.Fatal("a job was enqueued for a disallowed-key request — the provider could be written (execute boundary breached)")
+	}
+
+	// A metadata-only failure audit event was emitted.
+	var actions []string
+	rows, err := h.pool.Query(ctx,
+		`SELECT action FROM audit_events WHERE correlation_id = $1`, req.ID)
+	if err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var a string
+		if err := rows.Scan(&a); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		actions = append(actions, a)
+	}
+	if !sliceContains(actions, "request.cross_team.execute.key_rejected") {
+		t.Fatalf("audit actions = %v; want a request.cross_team.execute.key_rejected event", actions)
+	}
+}
+
 func sliceContains(haystack []string, needle string) bool {
 	for _, v := range haystack {
 		if v == needle {
