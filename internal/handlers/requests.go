@@ -16,6 +16,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -45,6 +46,33 @@ type Requests struct {
 	secrets   storage.SecretRepository
 	resolver  auth.Resolver
 	teamScope auth.TeamScopeResolver
+
+	// Optional display-name resolvers (ui#87 follow-up). Narrow Get-only
+	// slices of the respective repositories; all best-effort.
+	teamNames teamNamer
+	projNames projectNamer
+	envNames  envNamer
+	connNames connNamer
+	userNames userNamer
+}
+
+// Narrow name-lookup interfaces so the request-detail response can carry
+// human-readable labels without the handler depending on the full repo
+// surface (and so tests can inject fakes).
+type teamNamer interface {
+	Get(context.Context, uuid.UUID) (*storage.Team, error)
+}
+type projectNamer interface {
+	Get(context.Context, uuid.UUID) (*storage.Project, error)
+}
+type envNamer interface {
+	Get(context.Context, uuid.UUID) (*storage.Environment, error)
+}
+type connNamer interface {
+	Get(context.Context, uuid.UUID) (*storage.ProviderConnection, error)
+}
+type userNamer interface {
+	Get(context.Context, uuid.UUID) (*storage.LocalUser, error)
 }
 
 // NewRequests binds a handler to its service.
@@ -66,6 +94,73 @@ func (h *Requests) WithTenancyGate(b storage.ProjectSecretRepository, s storage.
 func (h *Requests) WithTeamScope(tr auth.TeamScopeResolver) *Requests {
 	h.teamScope = tr
 	return h
+}
+
+// WithNameResolvers wires the best-effort display-name lookups used to
+// enrich the request-detail response for the approver verify panel
+// (ui#87 follow-up). Passing nil for any leaves that name absent; the
+// UI falls back to the id. Names/emails only — never a value.
+func (h *Requests) WithNameResolvers(t teamNamer, p projectNamer, e envNamer, c connNamer, u userNamer) *Requests {
+	h.teamNames = t
+	h.projNames = p
+	h.envNames = e
+	h.connNames = c
+	h.userNames = u
+	return h
+}
+
+// enrichNames best-effort resolves human-readable labels onto the body.
+// Every lookup failure is swallowed — a missing name is not an error,
+// the UI just shows the id. Requester display is resolved for every
+// type; the target/destination/filled-by names only for cross_team.
+func (h *Requests) enrichNames(ctx context.Context, body *RequestBody, req *storage.AccessRequest) {
+	if h.userNames != nil {
+		body.RequesterDisplay = h.userDisplay(ctx, req.RequesterID)
+	}
+	if req.Type != storage.AccessRequestTypeCrossTeam {
+		return
+	}
+	if h.teamNames != nil && req.TargetTeamID != nil {
+		if t, err := h.teamNames.Get(ctx, *req.TargetTeamID); err == nil && t != nil {
+			body.TargetTeamName = t.Name
+		}
+	}
+	if h.projNames != nil && req.TargetProjectID != nil {
+		if p, err := h.projNames.Get(ctx, *req.TargetProjectID); err == nil && p != nil {
+			body.TargetProjectName = p.Name
+		}
+	}
+	if h.envNames != nil && req.TargetEnvironmentID != nil {
+		if e, err := h.envNames.Get(ctx, *req.TargetEnvironmentID); err == nil && e != nil {
+			body.TargetEnvironmentName = e.Name
+		}
+	}
+	if h.connNames != nil && req.DestinationProviderConnectionID != nil {
+		if cn, err := h.connNames.Get(ctx, *req.DestinationProviderConnectionID); err == nil && cn != nil {
+			body.DestinationProviderLabel = cn.Name + " · " + string(cn.Type)
+		}
+	}
+	if h.userNames != nil && req.FilledByUserID != "" {
+		body.FilledByDisplay = h.userDisplay(ctx, req.FilledByUserID)
+	}
+}
+
+// userDisplay resolves a user id to a display name/email, best-effort.
+// Returns "" when the id isn't a UUID or the user isn't a local_user
+// (e.g. an OIDC subject) — the UI then shows the raw id.
+func (h *Requests) userDisplay(ctx context.Context, id string) string {
+	uid, err := uuid.Parse(id)
+	if err != nil {
+		return ""
+	}
+	u, err := h.userNames.Get(ctx, uid)
+	if err != nil || u == nil {
+		return ""
+	}
+	if u.DisplayName != "" {
+		return u.DisplayName
+	}
+	return u.Email
 }
 
 func requestErr(err error) error {
@@ -221,6 +316,7 @@ func (h *Requests) Get(c fiber.Ctx) error {
 	for _, a := range approvals {
 		body.Approvals = append(body.Approvals, approvalToBody(a))
 	}
+	h.enrichNames(c.Context(), &body, req)
 	return c.JSON(body)
 }
 
@@ -576,6 +672,18 @@ type RequestBody struct {
 	RefuseReason                    string     `json:"refuse_reason,omitempty"`
 	SnapRequiresSecurityApproval    *bool      `json:"snap_requires_security_approval,omitempty"`
 	SnapMinApprovers                *int16     `json:"snap_min_approvers,omitempty"`
+
+	// Human-readable display names resolved best-effort for the approver
+	// verify panel (ui#87 follow-up) so it shows "QA-CrossTeam-B" not a
+	// UUID. Populated only when the name resolvers are wired; the UI
+	// falls back to the ids above when a name is absent. Still metadata —
+	// names + emails, never values.
+	TargetTeamName           string `json:"target_team_name,omitempty"`
+	TargetProjectName        string `json:"target_project_name,omitempty"`
+	TargetEnvironmentName    string `json:"target_environment_name,omitempty"`
+	DestinationProviderLabel string `json:"destination_provider_label,omitempty"`
+	FilledByDisplay          string `json:"filled_by_display,omitempty"`
+	RequesterDisplay         string `json:"requester_display,omitempty"`
 }
 
 // ApprovalBody is the JSON shape for one approval row.
