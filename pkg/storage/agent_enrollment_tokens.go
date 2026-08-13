@@ -46,6 +46,11 @@ type AgentEnrollmentTokenRepository interface {
 	// only if the token is still unconsumed (single-use guard). Returns
 	// ErrEnrollmentTokenNotFound when the row is already consumed / gone.
 	MarkConsumed(ctx context.Context, id, agentID uuid.UUID, at time.Time) error
+	// Get resolves a token by id (admin revoke path). (api#179)
+	Get(ctx context.Context, id uuid.UUID) (*AgentEnrollmentToken, error)
+	// Revoke stamps revoked_at + revoked_by on an UNUSED, un-revoked token.
+	// Returns ErrEnrollmentTokenNotFound when already consumed/revoked/gone.
+	Revoke(ctx context.Context, id uuid.UUID, revokedBy string, at time.Time) error
 }
 
 // AgentEnrollmentTokens is the Postgres implementation.
@@ -111,6 +116,30 @@ func (r *AgentEnrollmentTokens) MarkConsumed(ctx context.Context, id, agentID uu
 	tag, err := r.pool.Exec(ctx, q, id, at, agentID)
 	if err != nil {
 		return fmt.Errorf("storage: mark enrollment token consumed: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrEnrollmentTokenNotFound
+	}
+	return nil
+}
+
+// Get resolves a token by id.
+func (r *AgentEnrollmentTokens) Get(ctx context.Context, id uuid.UUID) (*AgentEnrollmentToken, error) {
+	q := `SELECT ` + agentEnrollmentTokenColumns + `
+		FROM agent_enrollment_tokens WHERE id = $1`
+	return scanEnrollmentToken(r.pool.QueryRow(ctx, q, id))
+}
+
+// Revoke stamps revoked_at + revoked_by on a token that is not yet consumed
+// or revoked. Zero rows (already consumed/revoked/gone) → ErrEnrollmentTokenNotFound.
+func (r *AgentEnrollmentTokens) Revoke(ctx context.Context, id uuid.UUID, revokedBy string, at time.Time) error {
+	const q = `
+		UPDATE agent_enrollment_tokens
+		SET    revoked_at = $2, revoked_by = NULLIF($3, '')
+		WHERE  id = $1 AND consumed_at IS NULL AND revoked_at IS NULL`
+	tag, err := r.pool.Exec(ctx, q, id, at, revokedBy)
+	if err != nil {
+		return fmt.Errorf("storage: revoke enrollment token: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrEnrollmentTokenNotFound

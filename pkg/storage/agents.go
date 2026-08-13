@@ -84,6 +84,19 @@ type AgentRepository interface {
 	// TouchLastSeen records a heartbeat. No-op on revoked agents.
 	TouchLastSeen(ctx context.Context, id uuid.UUID, at time.Time) error
 
+	// RecordHeartbeat records a heartbeat plus optional runtime fields
+	// (agent_version / last_status / capabilities). Nil pointers leave the
+	// column unchanged. No-op on revoked agents. (api#179)
+	RecordHeartbeat(ctx context.Context, id uuid.UUID, at time.Time, agentVersion, lastStatus *string, capabilities *[]string) error
+
+	// Revoke sets status=revoked + revoked_at + revoked_by. (api#179)
+	Revoke(ctx context.Context, id uuid.UUID, revokedBy string, at time.Time) error
+
+	// ListAdmin / GetAdmin are the admin read projection (onboarding
+	// columns + provider-connection name; never credentials). (api#179)
+	ListAdmin(ctx context.Context, f AgentAdminFilter) ([]*AgentAdminRow, error)
+	GetAdmin(ctx context.Context, id uuid.UUID) (*AgentAdminRow, error)
+
 	// UpdateStatus transitions an agent to a new status.
 	UpdateStatus(ctx context.Context, id uuid.UUID, status AgentStatus) error
 
@@ -235,16 +248,66 @@ func (r *Agents) List(ctx context.Context) ([]*Agent, error) {
 }
 
 // TouchLastSeen records a heartbeat. Bumps updated_at via the trigger.
+// A first heartbeat from an enrolled agent (api#178) also flips it active,
+// same as the stale→active recovery.
 func (r *Agents) TouchLastSeen(ctx context.Context, id uuid.UUID, at time.Time) error {
 	const q = `
 		UPDATE agents
 		SET    last_seen_at = $2,
-		       status = CASE WHEN status = 'stale' THEN 'active' ELSE status END
+		       status = CASE WHEN status IN ('stale', 'enrolled') THEN 'active' ELSE status END
 		WHERE  id = $1
 		  AND  status != 'revoked'`
 	tag, err := r.pool.Exec(ctx, q, id, at)
 	if err != nil {
 		return fmt.Errorf("storage: touch agent last seen: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// RecordHeartbeat is the richer heartbeat (api#179): last_seen + the same
+// stale/enrolled→active flip, plus optional runtime fields the agent
+// reports. Nil pointers leave that column unchanged. No-op on revoked.
+func (r *Agents) RecordHeartbeat(ctx context.Context, id uuid.UUID, at time.Time, agentVersion, lastStatus *string, capabilities *[]string) error {
+	var caps []byte
+	if capabilities != nil {
+		b, err := json.Marshal(*capabilities)
+		if err != nil {
+			return fmt.Errorf("storage: marshal capabilities: %w", err)
+		}
+		caps = b
+	}
+	const q = `
+		UPDATE agents
+		SET    last_seen_at  = $2,
+		       status        = CASE WHEN status IN ('stale', 'enrolled') THEN 'active' ELSE status END,
+		       agent_version = COALESCE($3, agent_version),
+		       last_status   = COALESCE($4, last_status),
+		       capabilities  = COALESCE($5, capabilities)
+		WHERE  id = $1
+		  AND  status != 'revoked'`
+	tag, err := r.pool.Exec(ctx, q, id, at, agentVersion, lastStatus, caps)
+	if err != nil {
+		return fmt.Errorf("storage: record agent heartbeat: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// Revoke sets status=revoked + revoked_at + revoked_by (actor identity).
+// api#179 replaces bare UpdateStatus(revoked) for the admin revoke path.
+func (r *Agents) Revoke(ctx context.Context, id uuid.UUID, revokedBy string, at time.Time) error {
+	const q = `
+		UPDATE agents
+		SET    status = 'revoked', revoked_at = $2, revoked_by = NULLIF($3, '')
+		WHERE  id = $1`
+	tag, err := r.pool.Exec(ctx, q, id, at, revokedBy)
+	if err != nil {
+		return fmt.Errorf("storage: revoke agent: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
