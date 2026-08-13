@@ -135,38 +135,6 @@ func (s *AgentService) GenerateEnrollmentToken(ctx context.Context, in GenerateE
 	}, nil
 }
 
-// RevokeEnrollmentToken revokes an UNUSED enrollment token so it can never
-// be redeemed. Metadata-only audit. api#179.
-func (s *AgentService) RevokeEnrollmentToken(ctx context.Context, id uuid.UUID, revokedBy, reason string) error {
-	if s.enrollTokens == nil {
-		return ErrEnrollmentNotConfigured
-	}
-	tok, err := s.enrollTokens.Get(ctx, id)
-	if err != nil {
-		return err // ErrEnrollmentTokenNotFound → 404 at the handler
-	}
-	if err := s.enrollTokens.Revoke(ctx, id, revokedBy, s.now().UTC()); err != nil {
-		return err // already consumed/revoked → ErrEnrollmentTokenNotFound → 409
-	}
-	actor := "admin"
-	if revokedBy != "" {
-		actor = "user:" + revokedBy
-	}
-	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:         actor,
-		Action:        "agent.enrollment_token.revoked",
-		Resource:      "provider_connection:" + tok.ProviderConnectionID.String(),
-		Status:        storage.AuditStatusSuccess,
-		CorrelationID: id,
-		Metadata: map[string]any{
-			"enrollment_token_id":    id.String(),
-			"provider_connection_id": tok.ProviderConnectionID.String(),
-			"reason":                 reason,
-		},
-	})
-	return nil
-}
-
 // EnrollInput is the agent's outbound self-enrollment request.
 type EnrollInput struct {
 	Token                string
