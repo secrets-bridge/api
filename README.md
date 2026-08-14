@@ -11,7 +11,7 @@
 ---
 # secrets-bridge / api
 
-**Control Plane API for [Secrets Bridge](https://github.com/secrets-bridge)** — Go + Fiber v3. Owns the workflow / RBAC / audit / metadata domain backed by PostgreSQL and Redis. Agents and the dashboard SPA talk to this service over HTTPS.
+**Control Plane API for [Secrets Bridge](https://github.com/secrets-bridge)**. Go + Fiber v3. Owns the workflow / RBAC / audit / metadata domain backed by PostgreSQL and Redis. Agents and the dashboard SPA talk to this service over HTTPS.
 
 ## Capabilities
 
@@ -22,19 +22,19 @@
 | Agent registration + heartbeat (single-credential model) | Live | `internal/services/agents.go` |
 | Agent job claim → complete loop | Live | `internal/services/jobs.go` |
 | Patch + read-flow request lifecycle | Live | `internal/services/requests.go` |
-| KMS-envelope-encrypted secret wraps | Live | `pkg/keymgmt/` — backends: local / vault-transit / aws-kms |
+| KMS-envelope-encrypted secret wraps | Live | `pkg/keymgmt/` (backends: local / vault-transit / aws-kms) |
 | Wire-envelope encryption (X25519 sealing CP→Agent, KMS DEK Agent→CP) | Live | `pkg/sealing/` + `pkg/keymgmt/` |
-| Dynamic policy + workflow engine — `PolicyDecision` with PROD invariant | Live | `internal/services/policy.go` (Slice L2) |
+| Dynamic policy + workflow engine: `PolicyDecision` with PROD invariant | Live | `internal/services/policy.go` (Slice L2) |
 | First-class environment model (`kind=non_prod/prod` classification, `risk_level`) | Live | `pkg/storage/environments.go` + migrations 0022/0024 (Slice L1+L3) |
 | Dev-facing per-env endpoints + `secret.reveal.direct` permission | Live | `internal/handlers/dev_secrets.go` + `internal/services/requests.go::SubmitDirectReveal` (Slice L4) |
 | RBAC + permission catalog | Live | `internal/auth/` |
 | Team hierarchy + section-head pattern | Live | `internal/auth/scope_projects.go` + migration 0018 |
-| GitOps observation panel (ArgoCD, read-only) | Live (opt-in) | `pkg/argocd/` — `SB_GITOPS_ENABLED=true` |
+| GitOps observation panel (ArgoCD, read-only) | Live (opt-in) | `pkg/argocd/`, `SB_GITOPS_ENABLED=true` |
 | Cookie auth + server-side sessions | Live | `pkg/storage/sessions.go` + `internal/services/sessions.go` |
 | Account lockout + login rate limit | Live | `internal/services/auth.go` (5 wrong → 15min lock; per-IP rate limit) |
 | OIDC client (PKCE + back-channel logout) | Live (opt-in via `SB_OIDC_ISSUER`) | `internal/services/oidc.go` |
-| App-MFA enrollment (TOTP + WebAuthn) + step-up on Tier 2 ops | Live | `internal/services/mfa_*.go` + `internal/middleware/stepup.go` (Slices H–I) |
-| Login-time MFA gate (opt-in) | Live | `internal/middleware/requirestamped.go` — `SB_REQUIRE_MFA_AT_LOGIN=true` (Slice K) |
+| App-MFA enrollment (TOTP + WebAuthn) + step-up on Tier 2 ops | Live | `internal/services/mfa_*.go` + `internal/middleware/stepup.go` (Slices H to I) |
+| Login-time MFA gate (opt-in) | Live | `internal/middleware/requirestamped.go`, `SB_REQUIRE_MFA_AT_LOGIN=true` (Slice K) |
 | Group-claim → role mapping at JIT | Open ([#57](https://github.com/secrets-bridge/api/pull/57)) | `RoleReconciler` in oidc.go |
 
 ## Layout
@@ -43,15 +43,15 @@
 cmd/api/                main + config (the binary)
 internal/
   auth/                 permission catalog (constants + Catalog + RBAC resolver)
-  handlers/             HTTP layer — thin parse/serialize, calls services
+  handlers/             HTTP layer: thin parse/serialize, calls services
   middleware/           RequestID / Logger / Recover / AuthWith / AgentAuth /
                         RateLimit / RequireFreshMFA / RBAC / Audit
   observability/        structured logger (slog JSON)
-  services/             business logic — testable in isolation
+  services/             business logic: testable in isolation
 pkg/
   argocd/               read-only ArgoCD client (BRD §26 GitOps integration)
   keymgmt/              KeyManager interface + local / vault-transit / aws-kms
-  runtime/              Redis primitives — locks, idempotency, rate limit, pub/sub
+  runtime/              Redis primitives: locks, idempotency, rate limit, pub/sub
   sealing/              X25519 + HKDF-SHA256 + AES-256-GCM wire-envelope crypto
   storage/              Postgres repositories + migrations (golang-migrate)
   workflow/             (reserved for workflow state-machine helpers)
@@ -71,7 +71,7 @@ pkg/
 | `GET /api/v1/auth/oidc/start` | none | PKCE + state + nonce → 302 to IdP authorize. `?step_up=mfa` forces MFA re-prompt |
 | `GET /api/v1/auth/oidc/callback` | IdP | Code exchange + JIT-provision + cookie set + redirect to `return_to` |
 | `POST /api/v1/auth/oidc/logout` | cookie | RP-initiated logout + IdP `end_session_endpoint` |
-| `POST /api/v1/auth/oidc/backchannel` | IdP signature | RFC 8417 — revoke every session for the user's `sub` |
+| `POST /api/v1/auth/oidc/backchannel` | IdP signature | RFC 8417: revoke every session for the user's `sub` |
 | `/api/v1/*` (everything else) | cookie / Bearer JWT / X-User-Id stub | Versioned API surface |
 
 Tier 2 ops (approve / reject / reveal wrap) additionally require `last_mfa_at` within the step-up TTL (15 min). Stale sessions get `401 step_up_required` + `WWW-Authenticate: step-up max_age=900 acr_values=mfa`.
@@ -89,7 +89,7 @@ Tier 2 ops (approve / reject / reveal wrap) additionally require `last_mfa_at` w
 | `REDIS_URL` | required | Redis URL (db index in path) |
 | `SB_ENV` | `production` | `dev` or `production`. In `production`, `local` KMS backend is REJECTED at boot. |
 
-### Auth / sessions / OIDC (Slices A1–E)
+### Auth / sessions / OIDC (Slices A1 to E)
 
 | Env var | Default | Notes |
 |---|---|---|
@@ -105,8 +105,8 @@ Tier 2 ops (approve / reject / reveal wrap) additionally require `last_mfa_at` w
 | `SB_OIDC_SCOPES` | `openid profile email` | Space-separated. Add `groups` if your IdP needs it explicitly for the claim. |
 | `SB_OIDC_POST_LOGOUT_REDIRECT` | (unset) | Where the IdP sends users after `end_session_endpoint`. |
 | `SB_OIDC_GROUP_CLAIM` (open in #57) | `groups` | ID-token claim that carries the user's groups. Authentik / Keycloak / Okta default. |
-| `SB_OIDC_GROUP_MAP` (open in #57) | (unset) | JSON object `{"<idp-group>":"<sb-role>"}`. Empty → reconciler short-circuits; JIT users get no grants. Validated at boot — malformed JSON fails LOUD. |
-| `SB_MFA_DEV_ALLOW_PWD` | `false` | **Interim flag (Slice H).** When `true` AND `SB_ENV=dev`, every live session is treated as MFA-fresh — Tier 2 step-up is bypassed. **Refused at boot under `SB_ENV=production`.** Exists to unblock dev/UAT pilots while app-level MFA (`/auth/mfa/{challenge,verify}` + WebAuthn / TOTP enrolment) is being built. Drop once Slice H4 ships. |
+| `SB_OIDC_GROUP_MAP` (open in #57) | (unset) | JSON object `{"<idp-group>":"<sb-role>"}`. Empty → reconciler short-circuits; JIT users get no grants. Validated at boot: malformed JSON fails LOUD. |
+| `SB_MFA_DEV_ALLOW_PWD` | `false` | **Interim flag (Slice H).** When `true` AND `SB_ENV=dev`, every live session is treated as MFA-fresh: Tier 2 step-up is bypassed. **Refused at boot under `SB_ENV=production`.** Exists to unblock dev/UAT pilots while app-level MFA (`/auth/mfa/{challenge,verify}` + WebAuthn / TOTP enrolment) is being built. Drop once Slice H4 ships. |
 
 ### KMS / wrap envelope
 
@@ -127,9 +127,9 @@ Tier 2 ops (approve / reject / reveal wrap) additionally require `last_mfa_at` w
 
 Enforced in code review + (where possible) by CI. Violations block merge.
 
-- **No secret values** anywhere in this service — not in Postgres, not in Redis, not in logs, not in API responses, not in errors, not in audit events. Provider values stay inside their provider; only the agent touches them.
+- **No secret values** anywhere in this service: not in Postgres, not in Redis, not in logs, not in API responses, not in errors, not in audit events. Provider values stay inside their provider; only the agent touches them.
 - **No plaintext password** in any audit event metadata. Anti-leak canary tests grep for known-distinctive strings.
-- **Stateless.** No in-process state that wouldn't survive a pod restart. Sessions, lockout state, rate-limit windows, OIDC state — all in Postgres or Redis.
+- **Stateless.** No in-process state that wouldn't survive a pod restart. Sessions, lockout state, rate-limit windows, and OIDC state all live in Postgres or Redis.
 - **Every privileged action emits an audit event with a correlation_id.** `audit_events` is append-only at the schema level (BEFORE UPDATE/DELETE triggers).
 - **Cookie attributes:** HttpOnly always, SameSite=Strict, Secure prod-only (`SB_ENV=dev` drops it for `http://localhost` Vite dev). MaxAge = AbsoluteTTL (default 8h).
 - **The role reconciler ONLY touches `granted_by = 'system:oidc'` rows.** Admin-assigned grants are invisible to it. This protects bootstrap-admin + manually-curated team-scoped grants from getting blown away on every OIDC sign-in.
@@ -184,6 +184,6 @@ Multi-stage build on `golang:1.25-alpine`, runs on `distroless/static` as the `n
 
 ## See also
 
-- [`secrets-bridge/skills/api/SKILL.md`](https://github.com/secrets-bridge/skills/blob/main/api/SKILL.md) — internal working-instructions skill for this repo (env vars, conventions, gotchas).
-- [`secrets-bridge/skills/PROGRESS.md`](https://github.com/secrets-bridge/skills/blob/main/PROGRESS.md) — slice-by-slice activity log; each PR has an entry with the load-bearing invariants called out.
-- [`BRD.md`](https://github.com/secrets-bridge/secrets-bridge/blob/main/BRD.md) — full business + functional requirements.
+- [`secrets-bridge/skills/api/SKILL.md`](https://github.com/secrets-bridge/skills/blob/main/api/SKILL.md): internal working-instructions skill for this repo (env vars, conventions, gotchas).
+- [`secrets-bridge/skills/PROGRESS.md`](https://github.com/secrets-bridge/skills/blob/main/PROGRESS.md): slice-by-slice activity log; each PR has an entry with the load-bearing invariants called out.
+- [`BRD.md`](https://github.com/secrets-bridge/secrets-bridge/blob/main/BRD.md): full business + functional requirements.
