@@ -231,27 +231,13 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
-		// JSON error body shape — the SPA (and any other typed client)
-		// expects `{"error":"<message>"}` so a parsed body has the field
-		// the client extracts the message from. Fiber v3's default
-		// handler emits plain text, which the SPA's `client.ts` then
-		// shows as the literal `HTTP <status>` placeholder because
-		// JSON.parse fails. Override the handler to JSON so the
-		// step-up modal + every other error path can display the real
-		// reason. Discovered during a Slice K pilot rollout where the
-		// SPA surfaced "401: HTTP 401" instead of the step-up modal's
-		// human message.
-		ErrorHandler: func(c fiber.Ctx, err error) error {
-			code := fiber.StatusInternalServerError
-			var fe *fiber.Error
-			if errors.As(err, &fe) {
-				code = fe.Code
-			}
-			// Preserve any headers the route handler set (e.g.
-			// RequireFreshMFA's `WWW-Authenticate: step-up` challenge).
-			c.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
-			return c.Status(code).JSON(fiber.Map{"error": err.Error()})
-		},
+		// JSON error bodies so typed clients (the SPA's client.ts) can
+		// parse `{"error": ...}` instead of Fiber v3's default plain
+		// text (which the SPA would show as a literal `HTTP <status>`).
+		// 5xx bodies are generic and logged server-side with the
+		// correlation ID; 4xx messages (e.g. the step-up modal reason)
+		// pass through. See jsonErrorHandler in errors.go.
+		ErrorHandler: jsonErrorHandler(logger),
 	})
 
 	// Middleware order is intentional: request ID first so every other
@@ -878,8 +864,22 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Get("/projects/:id/environments/:env_id/secrets", devSecretsH.ListEnvSecrets)
 	v1.Post("/projects/:id/environments/:env_id/request",
 		auth.Require(auth.PermSecretRequest, rbacResolver), devSecretsH.SubmitEnvRequest)
+
+	// Tier-2 step-up gate (RequireFreshMFA): a session must carry a fresh
+	// MFA stamp (within StepUpTTL) to run high-risk actions. It 401s with
+	// `WWW-Authenticate: step-up` when stale, 412 mfa_enrollment_required
+	// when the user has no factor at all, and fails closed when never
+	// stamped. Defined here so the direct-reveal submit below AND the
+	// request-lifecycle routes further down share one instance.
+	requireMFA := middleware.RequireFreshMFA(sessionSvc, mfaVerifySvc)
+
+	// Pre-launch triage (item 2): direct-reveal auto-approves and enqueues
+	// a read of a live value, so the SUBMIT is itself a Tier-2 action and
+	// now requires fresh MFA, not just the value pickup downstream.
 	v1.Post("/projects/:id/environments/:env_id/direct-reveal",
-		auth.Require(auth.PermSecretRevealDirect, rbacResolver), devSecretsH.DirectReveal)
+		auth.Require(auth.PermSecretRevealDirect, rbacResolver),
+		requireMFA,
+		devSecretsH.DirectReveal)
 
 	// Slice H2 (api#64): user-self MFA enrollment + management. No
 	// RBAC gate — every authenticated user manages their OWN factors.
@@ -923,18 +923,14 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// Patch-request lifecycle. Plaintext values arrive only via
 	// POST /requests, are envelope-encrypted by WrapService before
 	// touching Postgres, and never appear in responses.
-	// Slice D — Tier 2 step-up gate. Approve / reject / reveal-wrap
-	// require an MFA-fresh session (architect Q6). The middleware
-	// 401s with `WWW-Authenticate: step-up max_age=900 acr_values=mfa`
-	// when `last_mfa_at` is older than the session policy's StepUpTTL.
-	// Sessions without an MFA stamp at all (local-admin sign-in, IdP
-	// without MFA) fail closed. Mounted as a route-level middleware
-	// AFTER AuthWith so the session pointer is in context.
-	// Slice H5: pass the enrollment checker so stale-session-with-zero-
-	// factors returns 412 mfa_enrollment_required (SPA routes to
-	// /me/mfa) instead of an unreachable 401 step_up_required.
-	requireMFA := middleware.RequireFreshMFA(sessionSvc, mfaVerifySvc)
-
+	// Tier-2 step-up gate for the request lifecycle (approve / reject /
+	// verify / reveal-wrap). The shared `requireMFA` instance is defined
+	// above, near the direct-reveal submit. It 401s with
+	// `WWW-Authenticate: step-up max_age=900 acr_values=mfa` when
+	// `last_mfa_at` is older than the session policy's StepUpTTL, returns
+	// 412 mfa_enrollment_required when the user has zero factors, and
+	// fails closed when the session was never MFA-stamped.
+	//
 	// Registration ORDER is load-bearing (literal paths before :id) —
 	// see requestRoutes.register, which owns that invariant and is
 	// pinned by cmd/api/routes_test.go.
@@ -954,12 +950,18 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 			auth.Require(auth.PermSecretRequest, rbacResolver),
 			crossTeamH.Submit,
 		),
+		// Pre-launch triage (item 3): the value-provider path is Tier-2.
+		// Fill submits a secret value; refuse transitions the request as
+		// the provider. Both now require fresh MFA on top of the
+		// secret.value.provide permission.
 		fill: hs(
 			auth.Require(auth.PermSecretValueProvide, rbacResolver),
+			requireMFA,
 			crossTeamH.Fill,
 		),
 		refuse: hs(
 			auth.Require(auth.PermSecretValueProvide, rbacResolver),
+			requireMFA,
 			crossTeamH.Refuse,
 		),
 		verify: hs(requireMFA, crossTeamH.Verify),
