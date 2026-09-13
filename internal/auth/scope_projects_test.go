@@ -58,16 +58,53 @@ func TestEffectiveProjectAccess_GlobalAdmin(t *testing.T) {
 	}
 }
 
-func TestEffectiveProjectAccess_NonProjectScopeIsGlobalForFilter(t *testing.T) {
-	// A grant scoped to environment but not project should not narrow
-	// the project filter — Slice C still enforces env later.
+// API-11: a grant whose scope constrains only on some non-project /
+// non-team dimension (env, secret_ref_prefix, …) must FAIL CLOSED — it
+// grants NO project coverage, not global access. Treating it as global
+// was a privilege escalation (a narrow env-scoped grant silently
+// covering every project).
+func TestEffectiveProjectAccess_NonProjectScopeFailsClosed(t *testing.T) {
 	pa, err := auth.EffectiveProjectAccess(context.Background(), "u1", auth.PermSecretList,
 		&scopeStub{grants: []auth.Grant{{Permission: "secret.list", Scope: map[string]string{"environment": "uat"}}}}, nil)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if !pa.IsGlobal {
-		t.Fatal("expected IsGlobal true when scope has no project_id key")
+	if pa.IsGlobal {
+		t.Fatal("env-only scope must NOT be global (API-11 fail-closed)")
+	}
+	if len(pa.ProjectIDs) != 0 {
+		t.Fatalf("env-only scope must contribute no projects; got %v", pa.ProjectIDs)
+	}
+}
+
+// A secret_ref_prefix-only scope is likewise not global and contributes
+// no project coverage.
+func TestEffectiveProjectAccess_PrefixOnlyScopeFailsClosed(t *testing.T) {
+	pa, err := auth.EffectiveProjectAccess(context.Background(), "u1", auth.PermSecretList,
+		&scopeStub{grants: []auth.Grant{{Permission: "secret.list", Scope: map[string]string{"secret_ref_prefix": "billing/"}}}}, nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if pa.IsGlobal || len(pa.ProjectIDs) != 0 {
+		t.Fatalf("prefix-only scope must fail closed; got IsGlobal=%v projects=%v", pa.IsGlobal, pa.ProjectIDs)
+	}
+}
+
+// A grant that carries BOTH project_id and a secondary dimension still
+// resolves to that project — the fail-closed change only affects scopes
+// with NO project_id and NO team_id.
+func TestEffectiveProjectAccess_ProjectPlusEnvStillResolvesProject(t *testing.T) {
+	p := uuid.New()
+	pa, err := auth.EffectiveProjectAccess(context.Background(), "u1", auth.PermSecretList,
+		&scopeStub{grants: []auth.Grant{{Permission: "secret.list", Scope: map[string]string{"project_id": p.String(), "environment": "uat"}}}}, nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if pa.IsGlobal {
+		t.Fatal("project+env scope must not be global")
+	}
+	if len(pa.ProjectIDs) != 1 || pa.ProjectIDs[0] != p {
+		t.Fatalf("expected exactly project %s; got %v", p, pa.ProjectIDs)
 	}
 }
 

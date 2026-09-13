@@ -106,6 +106,36 @@ func (h *ProjectSecrets) authorizeProjectRead(c fiber.Ctx, projectID uuid.UUID) 
 	return nil
 }
 
+// authorizeProjectWrite gates the binding WRITE surfaces (Bind / Update /
+// Unbind). Those were reachable by any authenticated user (API-04): the
+// binding table is exactly what checkTenancy and the reveal allowlists
+// read, so an attacker who could bind arbitrary catalog secrets to a
+// project could widen their own reach through the request/reveal flow.
+//
+// The caller must hold integration.bind at a scope covering the project
+// (a global grant, a project_id grant, or a team_id grant expanded
+// through the subtree). Not covered → 403 out_of_scope_project, matching
+// the submit-time tenancy gate (checkTenancy) rather than the read
+// path's existence-hiding 404 — a write authorization failure is not an
+// existence probe. No-op when scoping isn't wired (legacy / unit tests).
+func (h *ProjectSecrets) authorizeProjectWrite(c fiber.Ctx, projectID uuid.UUID) error {
+	if h.resolver == nil {
+		return nil
+	}
+	userID, ok := auth.IdentityFromContext(c.Context())
+	if !ok {
+		return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+	}
+	access, err := auth.EffectiveProjectAccess(c.Context(), userID, auth.PermIntegrationBind, h.resolver, h.teamScope)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	if !access.Covers(projectID) {
+		return fiber.NewError(fiber.StatusForbidden, "out_of_scope_project")
+	}
+	return nil
+}
+
 // --- request / response shapes --------------------------------------
 
 type bindingBody struct {
@@ -202,6 +232,9 @@ func (h *ProjectSecrets) Bind(c fiber.Ctx) error {
 	projectID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid project id")
+	}
+	if err := h.authorizeProjectWrite(c, projectID); err != nil {
+		return err
 	}
 
 	var body bindingBody
@@ -310,6 +343,9 @@ func (h *ProjectSecrets) Update(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid secret id")
 	}
+	if err := h.authorizeProjectWrite(c, projectID); err != nil {
+		return err
+	}
 
 	var body updateBindingBody
 	if err := c.Bind().JSON(&body); err != nil {
@@ -370,6 +406,9 @@ func (h *ProjectSecrets) Unbind(c fiber.Ctx) error {
 	secretID, err := uuid.Parse(c.Params("secret_id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid secret id")
+	}
+	if err := h.authorizeProjectWrite(c, projectID); err != nil {
+		return err
 	}
 	if err := h.bindings.Unbind(c.Context(), projectID, secretID); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
