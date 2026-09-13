@@ -847,16 +847,24 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// schema (BRD §17, migration 0001) without an HTTP surface; this
 	// wires admin CRUD so the UI can manage them. Projects use a
 	// soft-delete (archive via status flip); environments hard-delete.
-	v1.Post("/projects", tenancyH.CreateProject)
+	// Write surfaces gated on team.edit (API-04): project + environment
+	// lifecycle is tenancy administration. Reads stay open (the UI
+	// hydrates without a session gate on GETs, per the v1 posture);
+	// only mutations require the permission.
+	v1.Post("/projects", auth.Require(auth.PermTeamEdit, rbacResolver), tenancyH.CreateProject)
 	v1.Get("/projects", tenancyH.ListProjects)
 	v1.Get("/projects/:id", tenancyH.GetProject)
-	v1.Put("/projects/:id/status", tenancyH.UpdateProjectStatus)
+	v1.Put("/projects/:id/status", auth.Require(auth.PermTeamEdit, rbacResolver), tenancyH.UpdateProjectStatus)
 	v1.Put("/projects/:id/team", auth.Require(auth.PermTeamEdit, rbacResolver), tenancyH.SetProjectTeam)
 	v1.Get("/projects/:id/environments", tenancyH.ListEnvironmentsForProject)
 
-	// Project ↔ secret bindings (multi-tenancy, api#43 Slice A).
-	// Admin scope today; once OIDC + RBAC route gating land (P0-1/P0-2)
-	// these will require a `projects.bind` permission.
+	// Project ↔ secret bindings (multi-tenancy, api#43 Slice A). The
+	// WRITE handlers (Bind / Update / Unbind) self-gate on a SCOPED
+	// integration.bind covering the project (API-04) — a global grant, a
+	// project_id grant, or a team_id grant expanded through the subtree.
+	// The check is inside the handler (not an auth.Require route
+	// middleware) because integration.bind is scope-bearing and needs
+	// the team-aware resolver. List stays read-filtered by project scope.
 	v1.Post("/projects/:id/secrets", projectSecretsH.Bind)
 	v1.Get("/projects/:id/secrets", projectSecretsH.List)
 	v1.Put("/projects/:id/secrets/:secret_id", projectSecretsH.Update)
@@ -907,11 +915,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Post("/auth/mfa/challenge", authMFAH.Challenge)
 	v1.Post("/auth/mfa/verify", authMFAH.Verify)
 
-	v1.Post("/environments", tenancyH.CreateEnvironment)
+	v1.Post("/environments", auth.Require(auth.PermTeamEdit, rbacResolver), tenancyH.CreateEnvironment)
 	v1.Get("/environments", tenancyH.ListEnvironments)
 	v1.Get("/environments/:id", tenancyH.GetEnvironment)
-	v1.Put("/environments/:id", tenancyH.UpdateEnvironment)
-	v1.Delete("/environments/:id", tenancyH.DeleteEnvironment)
+	v1.Put("/environments/:id", auth.Require(auth.PermTeamEdit, rbacResolver), tenancyH.UpdateEnvironment)
+	v1.Delete("/environments/:id", auth.Require(auth.PermTeamEdit, rbacResolver), tenancyH.DeleteEnvironment)
 
 	// Teams admin (api#43-followup). N-level hierarchy via
 	// parent_team_id. Membership is structural-only; role grants on a

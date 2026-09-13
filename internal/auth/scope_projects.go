@@ -123,11 +123,16 @@ func EffectiveProjectAccess(ctx context.Context, userID string, perm Permission,
 
 		pid := g.Scope["project_id"]
 		if pid == "" {
-			// A non-empty scope without project_id or team_id
-			// constrains in some other dimension (env, secret_ref_prefix,
-			// …). Treat as "global for project filtering" — submit-time
-			// gates still enforce the other dimensions.
-			return ProjectAccess{IsGlobal: true}, nil
+			// A non-empty scope with neither project_id NOR team_id
+			// constrains only in some other dimension (env,
+			// secret_ref_prefix, …). Treating that as "global for
+			// project filtering" was a privilege escalation (API-11): an
+			// env- or prefix-scoped grant silently conferred access to
+			// EVERY project. Fail closed — this grant contributes no
+			// project coverage. A caller who must act across projects in
+			// one environment needs an explicit project_id/team_id scope
+			// (or a global, empty-scope grant).
+			continue
 		}
 		u, err := uuid.Parse(pid)
 		if err != nil {
