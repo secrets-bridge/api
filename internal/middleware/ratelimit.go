@@ -40,9 +40,8 @@ import (
 
 // BucketFunc derives the bucket key from the inbound request. Returns
 // (key, true) to apply the limit; (_, false) to skip — useful for
-// endpoints where the actor identity is genuinely unresolvable (e.g.
-// the wrap retrieval path before the temporary `user_id` query stub
-// is supplied).
+// endpoints where the actor identity is genuinely unresolvable (e.g. an
+// anonymous request with no client IP).
 type BucketFunc func(c fiber.Ctx) (string, bool)
 
 // RateLimitConfig describes one bucket.
@@ -132,22 +131,10 @@ func ByPathAgentID() BucketFunc {
 	}
 }
 
-// ByQueryUserID keys the bucket on a `user_id` query param. Used by
-// the user-bound wrap retrieval path which carries identity in a
-// stub-auth query param until OIDC + a real session middleware land
-// (architect's A2 slice). When the param is absent we fall back to
-// per-IP so anonymous probing is still constrained.
-func ByQueryUserID() BucketFunc {
-	return func(c fiber.Ctx) (string, bool) {
-		u := c.Query("user_id")
-		if u == "" {
-			ip := c.IP()
-			if ip == "" {
-				return "", false
-			}
-			return "anon:" + ip, true
-		}
-		return "user:" + u, true
-	}
-}
-
+// NOTE: an earlier ByQueryUserID() bucket keyed on a `user_id` query
+// param. It was removed (API-02): keying a per-user budget on a
+// caller-supplied, spoofable value let an attacker rotate the param to
+// sidestep the limit while probing another user's wraps. The
+// user-bound wrap retrieval path now keys on the authenticated session
+// identity (see the bySessionBucket closure in cmd/api/main.go), which
+// cannot be forged from the request.

@@ -395,23 +395,38 @@ func requestProjectID(req *storage.AccessRequest) (uuid.UUID, bool) {
 // ---- approve / reject / cancel ---------------------------------------
 
 // DecisionBody is the small body for approve/reject.
+//
+// The acting approver is NEVER taken from the body — it is derived from
+// the authenticated session (auth.IdentityFromContext) so a caller
+// cannot approve/reject "as" another user (API-01). An earlier version
+// read an `approver_id` field from here; that field has been removed so
+// a spoofed value cannot even be parsed, let alone trusted.
 type DecisionBody struct {
-	ApproverID string `json:"approver_id"`
-	Comment    string `json:"comment,omitempty"`
-	Reason     string `json:"reason,omitempty"`
+	Comment string `json:"comment,omitempty"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 // Approve handles POST /requests/:id/approve.
+//
+// The approver identity is the authenticated session identity, not a
+// body field. The route additionally gates on auth.Require(secret.approve)
+// (wired in main); the self-approval and approver-scope checks in the
+// service then run on the session identity, so an authenticated user can
+// no longer approve any request as any borrowed approver (API-01).
 func (h *Requests) Approve(c fiber.Ctx) error {
 	id, err := parseID(c, "id")
 	if err != nil {
 		return err
 	}
+	approver, ok := auth.IdentityFromContext(c.Context())
+	if !ok || approver == "" {
+		return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+	}
 	var body DecisionBody
 	if err := c.Bind().JSON(&body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
 	}
-	req, err := h.svc.Approve(c.Context(), id, body.ApproverID, body.Comment)
+	req, err := h.svc.Approve(c.Context(), id, approver, body.Comment)
 	if err != nil {
 		return requestErr(err)
 	}
@@ -419,16 +434,23 @@ func (h *Requests) Approve(c fiber.Ctx) error {
 }
 
 // Reject handles POST /requests/:id/reject.
+//
+// Same posture as Approve: the acting identity is the session, never the
+// body.
 func (h *Requests) Reject(c fiber.Ctx) error {
 	id, err := parseID(c, "id")
 	if err != nil {
 		return err
 	}
+	approver, ok := auth.IdentityFromContext(c.Context())
+	if !ok || approver == "" {
+		return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+	}
 	var body DecisionBody
 	if err := c.Bind().JSON(&body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
 	}
-	req, err := h.svc.Reject(c.Context(), id, body.ApproverID, body.Reason)
+	req, err := h.svc.Reject(c.Context(), id, approver, body.Reason)
 	if err != nil {
 		return requestErr(err)
 	}
@@ -488,20 +510,16 @@ type RetrieveWrapBody struct {
 	Algorithm   string `json:"algorithm"`
 }
 
-// RetrieveWrapForUserQuery holds the user identifier the handler needs
-// to authorize the retrieval. Today the user identity comes from a
-// `user_id` query string param — real auth integration replaces this
-// with a middleware-stashed identity later.
-type RetrieveWrapForUserQuery struct {
-	UserID string `json:"user_id"`
-}
-
 // RetrieveWrap handles GET /api/v1/requests/:id/wraps/:wrap_id.
 //
-// Authorization (today): user identity comes from the `user_id` query
-// param. When the auth design lands this swaps to a middleware-stashed
-// identity, but the service-layer check (requester == userID) remains
-// the load-bearing rule.
+// Authorization: the retrieving user is the authenticated session
+// identity (auth.IdentityFromContext), NEVER a caller-supplied
+// `user_id` query param. An earlier version read the identity from the
+// query string, so any authenticated user could pass another user's id
+// and receive read-flow plaintext, burning the victim's single-shot
+// wrap and recording the victim as the retriever (API-02). Any
+// `user_id` query param is now ignored; the service-layer ownership
+// check (requester == identity) runs on the session identity.
 func (h *Requests) RetrieveWrap(c fiber.Ctx) error {
 	reqID, err := parseID(c, "id")
 	if err != nil {
@@ -511,9 +529,9 @@ func (h *Requests) RetrieveWrap(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	userID := c.Query("user_id")
-	if userID == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "user_id query param required (until auth middleware lands)")
+	userID, ok := auth.IdentityFromContext(c.Context())
+	if !ok || userID == "" {
+		return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
 	}
 
 	plaintext, wrap, err := h.svc.RetrieveWrapForUser(c.Context(), reqID, wrapID, userID)
@@ -568,17 +586,18 @@ type WrapSummaryBody struct {
 // which keys have wraps issued (and whether each is already consumed)
 // without revealing any plaintext.
 //
-// Authorization (today): consistent with RetrieveWrap, the user
-// identity comes from the `user_id` query param. The service layer's
-// ownership check (requester == userID) gates the response.
+// Authorization: consistent with RetrieveWrap, the user identity is the
+// authenticated session identity, never a `user_id` query param
+// (API-02). The ownership check (requester == identity) gates the
+// response.
 func (h *Requests) ListWraps(c fiber.Ctx) error {
 	reqID, err := parseID(c, "id")
 	if err != nil {
 		return err
 	}
-	userID := c.Query("user_id")
-	if userID == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "user_id query param required (until auth middleware lands)")
+	userID, ok := auth.IdentityFromContext(c.Context())
+	if !ok || userID == "" {
+		return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
 	}
 
 	req, err := h.svc.Get(c.Context(), reqID)

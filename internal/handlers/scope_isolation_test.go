@@ -173,6 +173,12 @@ func bootstrapScopeIso(t *testing.T) *scopeIsoFixture {
 	app.Get("/api/v1/requests", requestsH.List)
 	app.Get("/api/v1/requests/:id", requestsH.Get)
 	app.Post("/api/v1/requests/:id/cancel", requestsH.Cancel)
+	// Approve + wrap-list are wired WITHOUT the auth.Require(secret.approve)
+	// gate here on purpose: these routes exercise the handler's
+	// identity-from-session behaviour (API-01 / API-02). The route-level
+	// permission gate is proven separately in cmd/api/security_authz_test.go.
+	app.Post("/api/v1/requests/:id/approve", requestsH.Approve)
+	app.Get("/api/v1/requests/:id/wraps", requestsH.ListWraps)
 	fx.app = app
 	return fx
 }
