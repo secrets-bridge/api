@@ -64,6 +64,16 @@ const (
 	PermAgentRevoke Permission = "agent.revoke"
 	PermAgentList   Permission = "agent.list"
 
+	// PermJobEnqueue gates the manual admin enqueue surface POST /jobs
+	// (API-03). Sync jobs are otherwise created internally by
+	// RequestService on approval and by the worker's discover scheduler;
+	// the HTTP enqueue route accepts a free-form job_type + payload, so
+	// leaving it ungated let any authenticated user pre-queue a malicious
+	// patch/read/discover job. No seed role carries this permission — the
+	// route is fail-closed by default; operators grant job.enqueue
+	// explicitly when they need the manual surface.
+	PermJobEnqueue Permission = "job.enqueue"
+
 	// Developer / approver ---------------------------------------------
 	PermSecretRequest Permission = "secret.request"
 	PermSecretApprove Permission = "secret.approve"
@@ -147,6 +157,7 @@ var Catalog = []Descriptor{
 	{PermAgentMint, "Agents", "Mint a new agent identity and return its credentials."},
 	{PermAgentRevoke, "Agents", "Revoke an agent — heartbeats stop being accepted."},
 	{PermAgentList, "Agents", "List all registered agents and their status."},
+	{PermJobEnqueue, "Agents", "Manually enqueue a sync job via POST /jobs. Not carried by any seed role — grant explicitly. Normal request/discover flows enqueue jobs internally without this permission."},
 
 	{PermSecretRequest, "Secrets", "Submit a patch or read request against a provider secret."},
 	{PermSecretApprove, "Secrets", "Approve or reject pending secret requests."},

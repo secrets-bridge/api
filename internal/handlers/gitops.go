@@ -28,6 +28,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
@@ -340,18 +341,20 @@ type observationResponse struct {
 
 // GetRequestObservations handles GET /requests/:id/gitops.
 //
-// Permission today: requester sees their own; admin sees all. The
-// real auth model is the same stub-middleware-and-query-param shape
-// the read-flow retrieval uses (handler reads `user_id` query param;
-// see RetrieveWrap in requests.go). Real auth lands later.
+// Authorization: the requester sees their own observations. The acting
+// identity is the authenticated session identity (auth.IdentityFromContext),
+// NEVER a caller-supplied `user_id` query param — an earlier version
+// read the query string, so any authenticated user could pass another
+// user's id and read that user's GitOps observation rows (API-02). Any
+// `user_id` query param is now ignored.
 func (h *GitOps) GetRequestObservations(c fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid request UUID")
 	}
-	userID := c.Query("user_id")
-	if userID == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "user_id query parameter required")
+	userID, ok := auth.IdentityFromContext(c.Context())
+	if !ok || userID == "" {
+		return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
 	}
 	req, err := h.requests.Get(c.Context(), id)
 	if err != nil {

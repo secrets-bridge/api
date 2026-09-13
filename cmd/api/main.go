@@ -775,7 +775,14 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// Revoke an UNUSED enrollment token. Session-gated + agent.mint (not
 	// under the exempt prefix — /agent-enrollment-tokens != /agents/).
 	v1.Post("/agent-enrollment-tokens/:id/revoke", auth.Require(auth.PermAgentMint, rbacResolver), agentsH.RevokeEnrollmentToken)
-	v1.Post("/jobs", jobsH.Enqueue)
+	// POST /jobs is the manual admin enqueue surface. It accepts a
+	// free-form job_type + payload, so it MUST carry a dedicated admin
+	// permission (API-03) — otherwise any authenticated user could
+	// pre-queue a malicious patch/read/discover job. Normal flows never
+	// use this route: RequestService enqueues on approval and the worker
+	// enqueues discover jobs, both via the storage layer directly. No
+	// seed role carries job.enqueue, so this is fail-closed by default.
+	v1.Post("/jobs", auth.Require(auth.PermJobEnqueue, rbacResolver), jobsH.Enqueue)
 
 	// Dynamic workflow + policy engine.
 	v1.Post("/roles", auth.Require(auth.PermRoleEdit, rbacResolver), adminH.CreateRole)
@@ -939,9 +946,14 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		submitRead: hs(requestsH.SubmitRead),
 		list:       hs(requestsH.List),
 		get:        hs(requestsH.Get),
-		approve:    hs(requireMFA, requestsH.Approve),
-		reject:     hs(requireMFA, requestsH.Reject),
-		cancel:     hs(requestsH.Cancel),
+		// API-01: approve/reject now REQUIRE secret.approve (mirrors the
+		// cross-team fill/refuse gating) AND derive the acting approver
+		// from the session, never a body field. auth.Require runs before
+		// requireMFA so a caller lacking the permission gets 403 without
+		// being prompted for step-up.
+		approve: hs(auth.Require(auth.PermSecretApprove, rbacResolver), requireMFA, requestsH.Approve),
+		reject:  hs(auth.Require(auth.PermSecretApprove, rbacResolver), requireMFA, requestsH.Reject),
+		cancel:  hs(requestsH.Cancel),
 
 		// Slice N3 — cross-team flow.
 		inbox:      hs(crossTeamH.Inbox),
@@ -966,22 +978,41 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		),
 		verify: hs(requireMFA, crossTeamH.Verify),
 	}.register(v1)
+
+	// bySessionBucket keys a rate-limit bucket on the authenticated
+	// session identity (falling back to per-IP for anonymous probes). It
+	// replaces the earlier ByQueryUserID bucket that keyed on the
+	// spoofable `user_id` query param — an attacker could rotate that
+	// value to sidestep the per-user budget while probing another user's
+	// wraps (API-02). The same closure feeds the reveal-session limiter
+	// below.
+	bySessionBucket := func(c fiber.Ctx) (string, bool) {
+		if u, ok := auth.IdentityFromContext(c.Context()); ok && u != "" {
+			return "user:" + u, true
+		}
+		ip := c.IP()
+		if ip == "" {
+			return "", false
+		}
+		return "anon:" + ip, true
+	}
+
 	// Value-free wrap summaries for the request detail page. Lets the
 	// UI render the Wraps card (one row per key with a ready/consumed
 	// pill) without ever fetching plaintext until the user clicks
-	// Reveal. Same `user_id` stub-auth as the retrieval endpoint.
+	// Reveal. Identity comes from the session, same as the retrieval
+	// endpoint.
 	v1.Get("/requests/:id/wraps", requestsH.ListWraps)
 
-	// User-bound wrap retrieval for the read flow. Auth identity comes
-	// from a `user_id` query param today; swaps to a middleware-stashed
-	// identity once the auth design lands. Service-layer enforces
-	// requester==userID + request.type=read.
+	// User-bound wrap retrieval for the read flow. The retrieving user is
+	// the authenticated session identity — the handler ignores any
+	// `user_id` query param (API-02). Service-layer enforces
+	// requester==identity + request.type=read.
 	//
-	// Rate limit per architect Q7 (Slice A1): 20 / 60s per user (or
-	// per IP for anonymous probes). The wrap is single-shot at the
-	// service layer; the rate limit blunts pre-approval probing and
-	// keeps a leaked `user_id` from being used to brute-discover wrap
-	// IDs against the 404/410/200 oracle.
+	// Rate limit per architect Q7 (Slice A1): 20 / 60s per session
+	// identity (or per IP for anonymous probes). The wrap is single-shot
+	// at the service layer; the rate limit blunts pre-approval probing
+	// and brute-discovery of wrap IDs against the 404/410/200 oracle.
 	v1.Get("/requests/:id/wraps/:wrap_id",
 		// Slice D Tier 2: reveal requires fresh MFA. The wrap is
 		// single-shot at the service layer; gating step-up here means
@@ -995,7 +1026,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		// already holds fresh MFA.
 		requireMFA,
 		middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
-			Name: "wrap:retrieve", Bucket: middleware.ByQueryUserID(),
+			Name: "wrap:retrieve", Bucket: bySessionBucket,
 			Limit: 20, Window: 60 * time.Second,
 		}),
 		requestsH.RetrieveWrap,
@@ -1013,20 +1044,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// from burning through every approved request the user has open.
 	// Budget is 30/60s for headroom on the remaining non-2xx opens
 	// (e.g. a 410 re-open of an already-consumed request still counts).
-	revealOpenBucket := func(c fiber.Ctx) (string, bool) {
-		if u, ok := auth.IdentityFromContext(c.Context()); ok && u != "" {
-			return "user:" + u, true
-		}
-		ip := c.IP()
-		if ip == "" {
-			return "", false
-		}
-		return "anon:" + ip, true
-	}
+	// Keyed on the session identity via the shared bySessionBucket
+	// defined above.
 	v1.Post("/reveal-sessions",
 		requireMFA,
 		middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
-			Name: "reveal-session:open", Bucket: revealOpenBucket,
+			Name: "reveal-session:open", Bucket: bySessionBucket,
 			Limit: 30, Window: 60 * time.Second,
 		}),
 		revealSessionsH.Open,
