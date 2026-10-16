@@ -342,3 +342,52 @@ func TestLive_OtherPuts_KeepOmittedFields(t *testing.T) {
 		t.Errorf("explicit false/\"\" not applied: discover=%v description=%v", discover, cdesc)
 	}
 }
+
+func TestLive_ArgoCDEnabledPut_RequiresKey(t *testing.T) {
+	l := newLiveApp(t)
+	op := l.grantUser(t, []string{"integration.edit"}, `{}`)
+	code, body := l.call(t, http.MethodPost, "/api/v1/argocd-endpoints", op, map[string]any{
+		"name": "argo-a", "base_url": "https://argocd.example.com", "token_b64": "ZmFrZS10b2tlbg==",
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("create endpoint = %d %s", code, body)
+	}
+	var ep struct{ ID uuid.UUID }
+	mustJSON(t, body, &ep)
+	path := "/api/v1/argocd-endpoints/" + ep.ID.String() + "/enabled"
+	enabled := func() bool {
+		t.Helper()
+		var on bool
+		if err := l.pool.QueryRow(t.Context(), `SELECT enabled FROM argocd_endpoints WHERE id = $1`, ep.ID).Scan(&on); err != nil {
+			t.Fatalf("read endpoint: %v", err)
+		}
+		return on
+	}
+	if !enabled() {
+		t.Fatal("new endpoint should start enabled")
+	}
+
+	// A body without the key (or with null) is refused and changes nothing.
+	for _, b := range []map[string]any{{}, {"enabled": nil}} {
+		if code, _ := l.call(t, http.MethodPut, path, op, b); code != http.StatusBadRequest {
+			t.Errorf("PUT %v = %d, want 400", b, code)
+		}
+	}
+	if !enabled() {
+		t.Error("endpoint was disabled by a PUT that never said so")
+	}
+
+	// Explicit false disables, explicit true re-enables.
+	if code, body := l.call(t, http.MethodPut, path, op, map[string]any{"enabled": false}); code != http.StatusNoContent {
+		t.Fatalf("explicit false = %d %s", code, body)
+	}
+	if enabled() {
+		t.Error("explicit false did not disable the endpoint")
+	}
+	if code, body := l.call(t, http.MethodPut, path, op, map[string]any{"enabled": true}); code != http.StatusNoContent {
+		t.Fatalf("explicit true = %d %s", code, body)
+	}
+	if !enabled() {
+		t.Error("explicit true did not re-enable the endpoint")
+	}
+}
