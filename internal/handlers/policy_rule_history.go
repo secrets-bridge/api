@@ -34,6 +34,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
+	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
@@ -130,12 +131,8 @@ func auditReadPolicyHistory(
 	if repo == nil {
 		return
 	}
-	actor := identityFromCtx(c)
-	if actor == "" {
-		actor = "admin"
-	}
 	_ = repo.Append(c.Context(), &storage.AuditEvent{
-		Actor:    actor,
+		Actor:    auth.AuditActor(c.Context()),
 		Action:   "audit.read.policy_history",
 		Resource: "policy_rule:" + ruleID.String(),
 		Status:   storage.AuditStatusSuccess,

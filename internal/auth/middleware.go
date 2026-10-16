@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/gofiber/fiber/v3"
@@ -52,6 +53,18 @@ func (r *RepoResolver) Resolve(ctx context.Context, userID string) ([]Grant, err
 	}
 	out := make([]Grant, 0, len(urs)*2)
 	for _, ur := range urs {
+		// Fail closed on a malformed stored scope (API-N-06): the grant
+		// covers nothing. Every guard reads an empty scope as global, so
+		// letting a bad value collapse to {} would hand out global access.
+		if ur.ScopeMalformed {
+			slog.WarnContext(ctx, "auth: ignoring user_role with a non-object scope", "user_role_id", ur.ID.String())
+			continue
+		}
+		scope, ok := grantScopeStrings(ur.Scope)
+		if !ok {
+			slog.WarnContext(ctx, "auth: ignoring user_role with a malformed scope value", "user_role_id", ur.ID.String())
+			continue
+		}
 		role, err := r.roles.Get(ctx, ur.RoleID)
 		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
@@ -59,26 +72,11 @@ func (r *RepoResolver) Resolve(ctx context.Context, userID string) ([]Grant, err
 			}
 			return nil, fmt.Errorf("auth: load role %s: %w", ur.RoleID, err)
 		}
-		scope := scopeAsStrings(ur.Scope)
 		for _, p := range role.Permissions {
 			out = append(out, Grant{Permission: p, Scope: scope})
 		}
 	}
 	return out, nil
-}
-
-// scopeAsStrings narrows the storage layer's `map[string]any` to the
-// string-typed scope keys the middleware actually understands. Non-
-// string values are silently dropped (defensive — the schema should
-// only ever store strings).
-func scopeAsStrings(in map[string]any) map[string]string {
-	out := make(map[string]string, len(in))
-	for k, v := range in {
-		if s, ok := v.(string); ok && s != "" {
-			out[k] = s
-		}
-	}
-	return out
 }
 
 // ScopeFn produces a request scope from the Fiber ctx. Common
@@ -146,6 +144,39 @@ func RequireAny(perm Permission, r Resolver) fiber.Handler {
 		}
 		return fiber.NewError(fiber.StatusForbidden,
 			fmt.Sprintf("missing permission %q", perm))
+	}
+}
+
+// RequireAnyOf returns a middleware that gates the next handler on the
+// caller holding AT LEAST ONE of `perms` at any scope. It is a coarse
+// route-level gate for endpoints whose exact permission depends on the
+// request (e.g. the cross-team verify lane: secret.approve for the
+// source vote, secret.security.approve for the security vote); the
+// handler/service still enforces the precise permission and scope.
+func RequireAnyOf(r Resolver, perms ...Permission) fiber.Handler {
+	if r == nil {
+		panic("auth: RequireAnyOf called with nil Resolver")
+	}
+	if len(perms) == 0 {
+		panic("auth: RequireAnyOf called with no permissions")
+	}
+	return func(c fiber.Ctx) error {
+		userID, ok := IdentityFromContext(c.Context())
+		if !ok {
+			return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+		}
+		grants, err := r.Resolve(c.Context(), userID)
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+		}
+		for _, g := range grants {
+			for _, p := range perms {
+				if g.Permission == string(p) {
+					return c.Next()
+				}
+			}
+		}
+		return fiber.NewError(fiber.StatusForbidden, "missing permission")
 	}
 }
 
@@ -275,4 +306,30 @@ func ScopeFromJSONBody(keys ...string) ScopeFn {
 		}
 		return out, nil
 	}
+}
+
+// AuditActor names who caused an action, for the audit log's actor
+// column, from the request context (API-15):
+//
+//	"user:<id>"          an authenticated session or bearer caller
+//	"agent:<id>"         an agent authenticated by AgentAuth
+//	"anonymous"          an HTTP request with no identity
+//	"system:background"  no request identity at all (boot, background work)
+//
+// Subsystems that act on their own write their own "system:<kind>"
+// (system:oidc, system:request-lifecycle, system:gitops).
+//
+// It is the single place audit actors are derived from a context, so a
+// row never says "admin" or a bare id that the audit UI can't resolve.
+func AuditActor(ctx context.Context) string {
+	if id, ok := IdentityFromContext(ctx); ok {
+		return "user:" + id
+	}
+	if agentID, ok := middleware.AgentIDFromContext(ctx); ok {
+		return "agent:" + agentID.String()
+	}
+	if _, inRequest := ctx.Value(middleware.CtxKeyActor).(string); inRequest {
+		return "anonymous"
+	}
+	return "system:background"
 }

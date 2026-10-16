@@ -331,6 +331,38 @@ func TestUserMFAFactors_IncrementSignCount_MonotonicEnforcement(t *testing.T) {
 	}
 }
 
+// API-S-17: many authenticators never implement a signature counter
+// and report 0 on every assertion. WebAuthn §6.1.1 only treats a
+// non-increasing counter as a clone signal when one of the two values
+// is nonzero, so stored=0 + new=0 must succeed. Once the stored value
+// is nonzero, a 0 is a regression again.
+func TestUserMFAFactors_IncrementSignCount_ZeroCounterAuthenticator(t *testing.T) {
+	pool := freshDB(t)
+	ctx := t.Context()
+	uid := newMFAUser(t, pool, "alice@example.com")
+	repo := storage.NewUserMFAFactors(pool)
+
+	f := newWebAuthnFactor(uid, "platform-key", []byte{0x51, 0x51})
+	if err := repo.Create(ctx, f); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := repo.IncrementSignCount(ctx, f.ID, 0); err != nil {
+			t.Fatalf("0→0 (assertion %d): %v", i+1, err)
+		}
+	}
+	if err := repo.IncrementSignCount(ctx, f.ID, 2); err != nil {
+		t.Fatalf("0→2: %v", err)
+	}
+	if err := repo.IncrementSignCount(ctx, f.ID, 0); !errors.Is(err, storage.ErrSignCountRegression) {
+		t.Fatalf("2→0: want ErrSignCountRegression, got %v", err)
+	}
+	got, _ := repo.Get(ctx, f.ID)
+	if got.WebAuthnSignCount != 2 {
+		t.Fatalf("stored counter = %d; want 2", got.WebAuthnSignCount)
+	}
+}
+
 func TestUserMFAFactors_IncrementSignCount_RejectsTOTP(t *testing.T) {
 	pool := freshDB(t)
 	ctx := t.Context()

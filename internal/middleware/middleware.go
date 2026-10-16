@@ -91,7 +91,7 @@ func Recover(logger *slog.Logger) fiber.Handler {
 // stays test-friendly + so consumers without a JWT signer can pass
 // nil (header-only mode, useful for the offline test path).
 type TokenVerifier interface {
-	SubjectFromToken(token string) (string, error)
+	SubjectFromToken(ctx context.Context, token string) (string, error)
 }
 
 // SessionLooker is the slice of `services.SessionService` the auth
@@ -169,7 +169,7 @@ func AuthWith(verifier TokenVerifier, sessions SessionLooker) fiber.Handler {
 		}
 		if actor == "anonymous" && verifier != nil {
 			if h := c.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-				if sub, err := verifier.SubjectFromToken(strings.TrimPrefix(h, "Bearer ")); err == nil {
+				if sub, err := verifier.SubjectFromToken(c.Context(), strings.TrimPrefix(h, "Bearer ")); err == nil {
 					actor = sub
 				}
 			}

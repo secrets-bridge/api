@@ -221,6 +221,19 @@ func mapPolicyServiceErr(c fiber.Ctx, err error) error {
 	return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 }
 
+// scopedWorkflowNotFound turns a missing workflow on the scoped
+// create / update path into the same 403 envelope the team-anchored
+// path returns for not-found, disabled and not-authorable workflows.
+// Without it the wrapped storage not-found fell through to a 500. Only
+// the workflow lookup can produce storage.ErrNotFound on these paths
+// (the rule lookup maps its own not-found to ErrPolicyNotFound).
+func scopedWorkflowNotFound(err error, workflowID uuid.UUID) error {
+	if errors.Is(err, storage.ErrNotFound) {
+		return &services.WorkflowNotAuthorableDetail{WorkflowID: workflowID}
+	}
+	return err
+}
+
 // ---- handler type --------------------------------------------------
 
 // ProjectPolicyRules owns the project-anchored scoped policy.author
@@ -240,6 +253,9 @@ type ProjectPolicyRules struct {
 	// main always wires both via WithHistory.
 	history *services.PolicyHistoryService
 	audit   storage.AuditEventRepository
+	// readScope gates List / Get / History on project visibility
+	// (API-N-04). Wired via WithReadScope.
+	readScope projectReadScope
 }
 
 // NewProjectPolicyRules constructs the handler. The PolicyEngine must
@@ -258,6 +274,29 @@ func (h *ProjectPolicyRules) WithHistory(history *services.PolicyHistoryService,
 	h.history = history
 	h.audit = audit
 	return h
+}
+
+// WithReadScope wires the project gate for the read routes (List, Get,
+// History). A caller covers the project through secret.list /
+// secret.request (the developer view), policy.author (the scoped authors
+// who write these rules) or policy.edit; anyone else gets 404. Returns
+// the handler for chaining.
+func (h *ProjectPolicyRules) WithReadScope(r auth.Resolver, tr auth.TeamScopeResolver) *ProjectPolicyRules {
+	h.readScope = newProjectReadScope(r, tr, auth.PermPolicyAuthor, auth.PermPolicyEdit)
+	return h
+}
+
+// projectReadable runs the read gate. When the project isn't covered it
+// writes the 404 envelope and reports ok=false; the caller returns err.
+func (h *ProjectPolicyRules) projectReadable(c fiber.Ctx, projectID uuid.UUID, notFoundCode, notFoundMsg string) (bool, error) {
+	covered, err := h.readScope.covers(c, projectID)
+	if err != nil {
+		return false, err
+	}
+	if !covered {
+		return false, stableErr(c, fiber.StatusNotFound, notFoundCode, notFoundMsg, nil)
+	}
+	return true, nil
 }
 
 // ---- request / response shapes ------------------------------------
@@ -437,6 +476,7 @@ func (h *ProjectPolicyRules) Create(c fiber.Ctx) error {
 		CorrelationID: uuid.New(),
 	})
 	if err != nil {
+		err = scopedWorkflowNotFound(err, workflowID)
 		if reason := policyDenialReasonFor(err); reason != "" {
 			policyRulesDeniedTotal.WithLabelValues(reason).Inc()
 		}
@@ -464,6 +504,9 @@ func (h *ProjectPolicyRules) List(c fiber.Ctx) error {
 	if err != nil {
 		return stableErr(c, fiber.StatusBadRequest, "bad_request",
 			"projectID is malformed", nil)
+	}
+	if ok, err := h.projectReadable(c, projectID, "project_not_found", "project not found"); !ok {
+		return err
 	}
 	rules, err := h.policies.ListForProject(c.Context(), projectID)
 	if err != nil {
@@ -502,6 +545,11 @@ func (h *ProjectPolicyRules) Get(c fiber.Ctx) error {
 	if err != nil {
 		return stableErr(c, fiber.StatusBadRequest, "bad_request",
 			"ruleID is malformed", nil)
+	}
+	// Same envelope as a missing or wrong-anchor rule, so an out-of-scope
+	// caller can't tell the cases apart.
+	if ok, err := h.projectReadable(c, projectID, "policy_not_found", "policy rule not found"); !ok {
+		return err
 	}
 	rule, err := h.policies.Get(c.Context(), ruleID)
 	if err != nil {
@@ -569,6 +617,9 @@ func (h *ProjectPolicyRules) Update(c fiber.Ctx) error {
 
 	rule, err := h.engine.UpdateForScopedAuthor(c.Context(), in)
 	if err != nil {
+		if in.WorkflowID != nil {
+			err = scopedWorkflowNotFound(err, *in.WorkflowID)
+		}
 		if reason := policyDenialReasonFor(err); reason != "" {
 			policyRulesDeniedTotal.WithLabelValues(reason).Inc()
 		}
@@ -672,6 +723,9 @@ func (h *ProjectPolicyRules) History(c fiber.Ctx) error {
 		return stableErr(c, fiber.StatusBadRequest, "bad_request",
 			err.Error(), nil)
 	}
+	if ok, err := h.projectReadable(c, projectID, "policy_not_found", "policy rule not found"); !ok {
+		return err
+	}
 
 	rule, err := h.policies.Get(c.Context(), ruleID)
 	if err != nil {
@@ -693,9 +747,13 @@ func (h *ProjectPolicyRules) History(c fiber.Ctx) error {
 
 	entries, hasMore, err := h.history.ListForRule(c.Context(), ruleID, rule, limit)
 	if err != nil {
+		// API-16: stableErr writes the body itself (it skips the app
+		// error handler), so the storage detail is logged here and the
+		// client gets a fixed message.
+		logInternalError(c, "policy rule history failed", err)
 		return stableErr(c, fiber.StatusInternalServerError,
 			"history_internal_error",
-			err.Error(), nil)
+			"policy rule history is temporarily unavailable", nil)
 	}
 
 	policyRuleHistoryViewsTotal.WithLabelValues(scopeProject).Inc()

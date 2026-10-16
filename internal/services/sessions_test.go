@@ -364,3 +364,56 @@ func svcPool(t *testing.T, _ *services.SessionService) *storage.Pool {
 	t.Cleanup(pool.Close)
 	return pool
 }
+
+// API-S-05: a disabled user's session is refused on its next use and
+// revoked, so re-enabling the account does not revive it.
+func TestSession_DisabledUserSessionRefusedAndRevoked(t *testing.T) {
+	svc, pool, owner := bootstrapSessions(t)
+	ctx := t.Context()
+	users := storage.NewLocalUsers(pool)
+
+	issued, err := svc.Issue(ctx, owner.ID, "10.0.0.1", "test")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if _, err := svc.Validate(ctx, issued.CookieValue); err != nil {
+		t.Fatalf("Validate before disable: %v", err)
+	}
+
+	if err := users.SetDisabled(ctx, owner.ID, true); err != nil {
+		t.Fatalf("SetDisabled: %v", err)
+	}
+	if _, err := svc.Validate(ctx, issued.CookieValue); err == nil {
+		t.Fatal("Validate accepted a disabled user's session")
+	}
+	if _, err := svc.SubjectFromCookie(ctx, issued.CookieValue); err == nil {
+		t.Fatal("SubjectFromCookie accepted a disabled user's session")
+	}
+
+	var revoked bool
+	if err := pool.QueryRow(ctx,
+		`SELECT revoked_at IS NOT NULL FROM sessions WHERE id = $1`, issued.Session.ID,
+	).Scan(&revoked); err != nil {
+		t.Fatalf("read session: %v", err)
+	}
+	if !revoked {
+		t.Fatal("disabled user's session was not revoked")
+	}
+	var audits int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM audit_events
+		WHERE action = 'session.revoke' AND metadata->>'reason' = 'user_disabled'`,
+	).Scan(&audits); err != nil {
+		t.Fatalf("count audit: %v", err)
+	}
+	if audits != 1 {
+		t.Fatalf("session.revoke user_disabled audit events = %d, want 1", audits)
+	}
+
+	if err := users.SetDisabled(ctx, owner.ID, false); err != nil {
+		t.Fatalf("SetDisabled(false): %v", err)
+	}
+	if _, err := svc.Validate(ctx, issued.CookieValue); err == nil {
+		t.Fatal("session came back after the user was re-enabled")
+	}
+}

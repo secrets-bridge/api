@@ -134,8 +134,9 @@ type UserMFAFactorRepository interface {
 
 	// IncrementSignCount enforces the WebAuthn monotonic counter
 	// invariant. `newCount` MUST be strictly greater than the
-	// stored value — otherwise ErrSignCountRegression. Only valid
-	// for WebAuthn rows; TOTP rows return ErrKindMismatch.
+	// stored value — otherwise ErrSignCountRegression — except that
+	// stored 0 + new 0 is accepted (authenticator without a counter).
+	// Only valid for WebAuthn rows; TOTP rows return ErrKindMismatch.
 	IncrementSignCount(ctx context.Context, id uuid.UUID, newCount int64) error
 }
 
@@ -274,12 +275,18 @@ func (r *UserMFAFactors) TouchLastUsed(ctx context.Context, id uuid.UUID, at tim
 // TOTP row both produce zero RowsAffected, and we distinguish the
 // two with a follow-up SELECT only on the unhappy path. Saves the
 // common case from a round-trip.
+//
+// Stored 0 and new 0 is NOT a regression: WebAuthn §6.1.1 only
+// treats a non-increasing counter as a clone signal when one of the
+// two values is nonzero, and many authenticators never implement a
+// counter (they report 0 forever). API-S-17.
 func (r *UserMFAFactors) IncrementSignCount(ctx context.Context, id uuid.UUID, newCount int64) error {
 	const q = `UPDATE user_mfa_factors
 	           SET webauthn_sign_count = $1
 	           WHERE id = $2
 	             AND kind = 'webauthn'
-	             AND webauthn_sign_count < $1`
+	             AND (webauthn_sign_count < $1
+	                  OR ($1 = 0 AND webauthn_sign_count = 0))`
 	tag, err := r.pool.Exec(ctx, q, newCount, id)
 	if err != nil {
 		return fmt.Errorf("storage: increment sign_count: %w", err)

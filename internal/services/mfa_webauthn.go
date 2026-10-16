@@ -55,6 +55,7 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -414,10 +415,27 @@ func (s *WebAuthnService) FinishAssertion(ctx context.Context, userID uuid.UUID,
 	if err != nil {
 		return nil, err
 	}
+	// The library verifies the assertion signature against the
+	// credential's public key, so the stored (envelope-encrypted)
+	// COSE key has to be loaded for the credential the browser used.
+	// Without it every assertion failed (API-S-17).
+	release, err := s.attachPublicKey(ctx, user, parsed.RawID)
+	if err != nil {
+		s.auditAssertFailure(ctx, userID, "kms_unwrap")
+		return nil, err
+	}
+	defer release()
 	cred, err := s.rp.ValidateLogin(user, *pending.Session, parsed)
 	if err != nil {
 		s.auditAssertFailure(ctx, userID, "assertion_verify")
 		return nil, fmt.Errorf("%w: %v", ErrWebAuthnAssertion, err)
+	}
+	// The library flags a non-increasing counter (unless both stored
+	// and new are 0) without failing the ceremony. Treat it as the
+	// clone signal here, before touching the row.
+	if cred.Authenticator.CloneWarning {
+		s.auditAssertFailure(ctx, userID, "sign_count_regression")
+		return nil, storage.ErrSignCountRegression
 	}
 
 	// Resolve the factor row this credential id belongs to so we can
@@ -532,10 +550,10 @@ func (s *WebAuthnService) loadWebAuthnUser(ctx context.Context, userID uuid.UUID
 		email: u.Email,
 		name:  u.DisplayName,
 	}
-	// We only carry the credential id + sign count into the library
-	// — not the public key. BeginRegistration uses these for
-	// excludeCredentials; FinishRegistration (which IS where we
-	// install the new credential) doesn't read the existing pool.
+	// Only the credential id + sign count are loaded here. That is
+	// all BeginRegistration (excludeCredentials) and BeginLogin
+	// (allowCredentials) need. FinishAssertion additionally calls
+	// attachPublicKey for the one credential being asserted.
 	for _, r := range rows {
 		if r.Kind != storage.MFAFactorKindWebAuthn {
 			continue
@@ -552,8 +570,35 @@ func (s *WebAuthnService) loadWebAuthnUser(ctx context.Context, userID uuid.UUID
 				SignCount: uint32(r.WebAuthnSignCount), //nolint:gosec // sign_count fits
 			},
 		})
+		wu.rows = append(wu.rows, r)
 	}
 	return wu, nil
+}
+
+// attachPublicKey unwraps the stored COSE public key of the credential
+// whose id is rawID and sets it on the matching entry in user.creds.
+// Only that one row is decrypted. An unknown rawID is left alone: the
+// library rejects it as not owned by the user. The returned func
+// zeroes the plaintext key and must be called once validation is done.
+func (s *WebAuthnService) attachPublicKey(ctx context.Context, user *webauthnUser, rawID []byte) (func(), error) {
+	for i := range user.creds {
+		if !bytes.Equal(user.creds[i].ID, rawID) {
+			continue
+		}
+		r := user.rows[i]
+		dataKey, err := s.km.DecryptDataKey(ctx, r.DataKeyCiphertext, r.KMSKeyID)
+		if err != nil {
+			return func() {}, fmt.Errorf("mfa/webauthn: unwrap dk: %w", err)
+		}
+		pub, err := aeadDecrypt(dataKey, r.SecretNonce, r.SecretCiphertext)
+		zero(dataKey)
+		if err != nil {
+			return func() {}, fmt.Errorf("mfa/webauthn: aead open: %w", err)
+		}
+		user.creds[i].PublicKey = pub
+		return func() { zero(pub) }, nil
+	}
+	return func() {}, nil
 }
 
 func webauthnEnrollKey(rdb *runtime.Client, challenge string) string {
@@ -569,6 +614,9 @@ type webauthnUser struct {
 	email string
 	name  string
 	creds []webauthn.Credential
+	// rows[i] is the factor row behind creds[i]; attachPublicKey reads
+	// its envelope columns.
+	rows []*storage.UserMFAFactor
 }
 
 func (u *webauthnUser) WebAuthnID() []byte {

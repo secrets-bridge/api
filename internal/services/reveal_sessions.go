@@ -429,12 +429,19 @@ func (s *RevealSessionService) MarkExpired(
 	if len(refreshErrs) > 0 {
 		meta["wrap_refresh_errors"] = refreshErrs
 	}
+	// Correlate with the request the session was opened for, like
+	// reveal.session.opened does; nil lets storage assign one.
+	var corr uuid.UUID
+	if sess.AccessRequestID != nil {
+		corr = *sess.AccessRequestID
+	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "user:" + userID,
-		Action:   "reveal.session.expired",
-		Resource: "reveal_session:" + id.String(),
-		Status:   storage.AuditStatusSuccess,
-		Metadata: meta,
+		Actor:         "user:" + userID,
+		Action:        "reveal.session.expired",
+		Resource:      "reveal_session:" + id.String(),
+		Status:        storage.AuditStatusSuccess,
+		CorrelationID: corr,
+		Metadata:      meta,
 	})
 	return nil
 }

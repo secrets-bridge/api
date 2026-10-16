@@ -10,10 +10,15 @@
 //   - Enroll / Confirm read `auth.IdentityFromContext` only
 //   - Delete (Slice H3+) passes (factor_id, userID) to the repository
 //     so a hostile request can't delete another user's factor
+//
+// Once the user has a factor, enroll / confirm / delete also need a
+// fresh MFA stamp; that gate is route-level (cmd/api/mfa_routes.go,
+// api#191 H3), not in these handlers.
 
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -32,6 +37,13 @@ type MFA struct {
 	users    storage.LocalUserRepository
 	totp     *services.TOTPService
 	webauthn *services.WebAuthnService
+	deleter  MFAFactorDeleter
+}
+
+// MFAFactorDeleter is the audited delete path
+// (services.MFAVerifyService.DeleteFactor).
+type MFAFactorDeleter interface {
+	DeleteFactor(ctx context.Context, userID, factorID uuid.UUID) error
 }
 
 // NewMFA wires the handler. `totp` and `webauthn` may each be nil —
@@ -46,6 +58,14 @@ func NewMFA(factors storage.UserMFAFactorRepository, users storage.LocalUserRepo
 // Returns the handler for chained construction.
 func (h *MFA) WithWebAuthn(svc *services.WebAuthnService) *MFA {
 	h.webauthn = svc
+	return h
+}
+
+// WithFactorDeleter routes DELETE /users/me/mfa/factors/:id through
+// the audited service path (H3). Without it the handler falls back to
+// the bare repository delete (tests only).
+func (h *MFA) WithFactorDeleter(d MFAFactorDeleter) *MFA {
+	h.deleter = d
 	return h
 }
 
@@ -102,7 +122,13 @@ func (h *MFA) Delete(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "factor id must be a uuid")
 	}
-	if err := h.factors.Delete(c.Context(), fid, uid); err != nil {
+	del := h.factors.Delete
+	if h.deleter != nil {
+		del = func(ctx context.Context, id, userID uuid.UUID) error {
+			return h.deleter.DeleteFactor(ctx, userID, id)
+		}
+	}
+	if err := del(c.Context(), fid, uid); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "factor not found")
 		}
@@ -160,9 +186,16 @@ func (h *MFA) EnrollTOTP(c fiber.Ctx) error {
 			accountName = u.Email
 		}
 	}
+	if strings.TrimSpace(body.Label) == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "label required")
+	}
 	out, err := h.totp.Enroll(c.Context(), uid, body.Label, accountName)
 	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		// Past the label check every failure is internal (KMS data
+		// key, Redis pending-challenge write). API-16: a generic 500;
+		// the app error handler logs the detail, which can carry the
+		// KMS backend URL and key name.
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(TOTPEnrollResponse{
 		ChallengeID:     out.ChallengeID,

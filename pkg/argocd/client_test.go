@@ -3,10 +3,12 @@ package argocd_test
 import (
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/secrets-bridge/api/pkg/argocd"
@@ -228,5 +230,65 @@ func TestNew_BadTLSCA(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "no usable certificates") {
 		t.Fatalf("got %v want no-usable-certificates", err)
+	}
+}
+
+// An ArgoCD endpoint (or anything in front of it) that answers with a
+// redirect must not get the bearer token re-sent: not to an http://
+// downgrade, not to another host, not to another path. The client
+// refuses to follow any redirect and reports it.
+func TestClient_RefusesRedirects(t *testing.T) {
+	var sinkHits, sinkAuth atomic.Int32
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sinkHits.Add(1)
+		if r.Header.Get("Authorization") != "" {
+			sinkAuth.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	}))
+	t.Cleanup(sink.Close)
+
+	var sameHostAuth atomic.Int32
+	front := httptest.NewTLSServer(nil)
+	front.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/elsewhere/api/v1/applications":
+			if r.Header.Get("Authorization") != "" {
+				sameHostAuth.Add(1)
+			}
+			_, _ = w.Write([]byte(`{"items":[]}`))
+		case "/same-host/api/v1/applications":
+			http.Redirect(w, r, front.URL+"/elsewhere/api/v1/applications", http.StatusTemporaryRedirect)
+		default: // downgrade to plain http on another listener
+			http.Redirect(w, r, sink.URL+r.URL.Path, http.StatusFound)
+		}
+	})
+	t.Cleanup(front.Close)
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: front.Certificate().Raw})
+
+	for _, tc := range []struct{ name, base string }{
+		{"https to http downgrade", front.URL},
+		{"same host other path", front.URL + "/same-host"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := argocd.New(argocd.Config{BaseURL: tc.base, Token: "hyg-redirect-canary-token", TLSCAPEM: string(caPEM)})
+			if err != nil {
+				t.Fatalf("argocd.New: %v", err)
+			}
+			_, err = c.ListApplications(context.Background(), "")
+			if !errors.Is(err, argocd.ErrRedirectRefused) {
+				t.Fatalf("ListApplications err = %v; want ErrRedirectRefused", err)
+			}
+			if strings.Contains(err.Error(), "hyg-redirect-canary-token") {
+				t.Fatalf("error leaks the token: %v", err)
+			}
+		})
+	}
+	if sinkHits.Load() != 0 || sinkAuth.Load() != 0 {
+		t.Fatalf("redirect was followed: %d request(s) to the http sink, %d with Authorization", sinkHits.Load(), sinkAuth.Load())
+	}
+	if sameHostAuth.Load() != 0 {
+		t.Fatalf("same-host redirect was followed with the token %d time(s)", sameHostAuth.Load())
 	}
 }

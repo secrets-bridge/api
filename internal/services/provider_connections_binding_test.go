@@ -224,7 +224,7 @@ func TestBindForScopedActor_Gate2_OutOfScope_EmitsDeniedAudit(t *testing.T) {
 	var count int
 	if err := e.pool.QueryRow(e.ctx,
 		`SELECT count(*) FROM audit_events WHERE action='binding.denied_out_of_scope' AND actor=$1`,
-		"mallory",
+		"user:mallory",
 	).Scan(&count); err != nil {
 		t.Fatal(err)
 	}

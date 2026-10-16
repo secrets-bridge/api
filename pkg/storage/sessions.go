@@ -35,6 +35,11 @@ type Session struct {
 	RevokedAt      *time.Time
 	IP             string
 	UserAgent      string
+
+	// UserDisabled is the owning local_users.disabled flag at lookup
+	// time. Only GetByTokenHash fills it (same round trip, PK join);
+	// SessionService.Validate refuses the session when it is true.
+	UserDisabled bool
 }
 
 // SessionRepository is the public surface.
@@ -85,23 +90,27 @@ func (r *Sessions) Create(ctx context.Context, s *Session) error {
 	return nil
 }
 
-// GetByTokenHash returns the live session whose token_hash matches.
-// Sessions whose `revoked_at` is set OR whose absolute / idle expiry
-// is in the past return `ErrNotFound` — the caller treats them as
-// authentication failure.
+// GetByTokenHash returns the session whose token_hash matches, with
+// the owner's `disabled` flag in UserDisabled (joined on the
+// local_users primary key, so no extra round trip). It does NOT
+// filter revoked / expired / disabled rows; SessionService.Validate
+// owns those checks and Revoke needs the row either way.
 func (r *Sessions) GetByTokenHash(ctx context.Context, tokenHash []byte) (*Session, error) {
 	if len(tokenHash) == 0 {
 		return nil, ErrNotFound
 	}
 	const q = `
-		SELECT id, user_id, token_hash, created_at, expires_at, idle_expires_at,
-		       last_mfa_at, revoked_at, COALESCE(ip, ''), COALESCE(user_agent, '')
-		FROM sessions
-		WHERE token_hash = $1`
+		SELECT s.id, s.user_id, s.token_hash, s.created_at, s.expires_at, s.idle_expires_at,
+		       s.last_mfa_at, s.revoked_at, COALESCE(s.ip, ''), COALESCE(s.user_agent, ''),
+		       u.disabled
+		FROM sessions s
+		JOIN local_users u ON u.id = s.user_id
+		WHERE s.token_hash = $1`
 	var s Session
 	if err := r.pool.QueryRow(ctx, q, tokenHash).Scan(
 		&s.ID, &s.UserID, &s.TokenHash, &s.CreatedAt, &s.ExpiresAt, &s.IdleExpiresAt,
 		&s.LastMFAAt, &s.RevokedAt, &s.IP, &s.UserAgent,
+		&s.UserDisabled,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -207,4 +216,19 @@ func (r *Sessions) ListActiveForUser(ctx context.Context, userID uuid.UUID, now 
 		out = append(out, &s)
 	}
 	return out, rows.Err()
+}
+
+// UserIDForSession returns the user a session belongs to, revoked or
+// not. Used to attribute session-level audit events (session.mfa_stamped)
+// to "user:<id>" rather than to the session. Not on SessionRepository:
+// callers type-assert for it so other implementations stay unchanged.
+func (r *Sessions) UserIDForSession(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	var userID uuid.UUID
+	if err := r.pool.QueryRow(ctx, `SELECT user_id FROM sessions WHERE id = $1`, id).Scan(&userID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, ErrNotFound
+		}
+		return uuid.Nil, fmt.Errorf("storage: session user: %w", err)
+	}
+	return userID, nil
 }

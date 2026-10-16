@@ -424,3 +424,66 @@ func TestBootstrapDevUsers_AuditEventsWritten(t *testing.T) {
 		}
 	}
 }
+
+// API-S-25: once a lock expires, one guess is allowed and a wrong one
+// re-locks straight away (the counter is still over the threshold).
+func TestLogin_ExpiredLockoutAllowsOneGuessThenRelocks(t *testing.T) {
+	svc, pool := bootstrapAuth(t)
+	svc = svc.WithLockoutPolicy(services.LockoutPolicy{Threshold: 3, Duration: time.Hour})
+	ctx := t.Context()
+
+	repo := storage.NewLocalUsers(pool)
+	user := mustCreateUser(t, repo, "frank@example.com", "pw-f")
+	for i := 0; i < 3; i++ {
+		_, _ = svc.Login(ctx, "frank@example.com", []byte("nope"))
+	}
+	if err := repo.Lock(ctx, user.ID, time.Now().UTC().Add(-time.Minute)); err != nil {
+		t.Fatalf("Lock backdate: %v", err)
+	}
+
+	if _, err := svc.Login(ctx, "frank@example.com", []byte("still-wrong")); err == nil {
+		t.Fatal("wrong password after expiry: expected ErrInvalidCredentials")
+	}
+	got, err := repo.Get(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.FailedLoginCount != 4 || got.LockedUntil == nil || !got.LockedUntil.After(time.Now()) {
+		t.Fatalf("count=%d locked_until=%v, want 4 and a fresh lock", got.FailedLoginCount, got.LockedUntil)
+	}
+	if _, err := svc.Login(ctx, "frank@example.com", []byte("pw-f")); err == nil {
+		t.Fatal("correct password right after re-lock: expected ErrInvalidCredentials")
+	}
+}
+
+// API-S-05: a correctly signed bearer token stops resolving once the
+// user is disabled or deleted.
+func TestSubjectFromToken_RefusesDisabledAndUnknownUsers(t *testing.T) {
+	svc, pool := bootstrapAuth(t)
+	ctx := t.Context()
+	repo := storage.NewLocalUsers(pool)
+	mustCreateUser(t, repo, "gina@example.com", "pw-g")
+
+	res, err := svc.Login(ctx, "gina@example.com", []byte("pw-g"))
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	sub, err := svc.SubjectFromToken(ctx, res.Token)
+	if err != nil || sub != res.User.ID.String() {
+		t.Fatalf("SubjectFromToken = %q, %v; want %s", sub, err, res.User.ID)
+	}
+
+	if err := repo.SetDisabled(ctx, res.User.ID, true); err != nil {
+		t.Fatalf("SetDisabled: %v", err)
+	}
+	if _, err := svc.SubjectFromToken(ctx, res.Token); err == nil {
+		t.Fatal("SubjectFromToken accepted a disabled user's token")
+	}
+
+	if _, err := pool.Exec(ctx, `DELETE FROM local_users WHERE id = $1`, res.User.ID); err != nil {
+		t.Fatalf("delete user: %v", err)
+	}
+	if _, err := svc.SubjectFromToken(ctx, res.Token); err == nil {
+		t.Fatal("SubjectFromToken accepted a deleted user's token")
+	}
+}

@@ -73,10 +73,11 @@ type RequestService struct {
 	// Cross-team validators (Slice N3). All nil = no target-chain /
 	// destination existence checks (legacy tests). Wire via
 	// WithCrossTeamRepos.
-	ctTeams     CrossTeamTeamLookup
-	ctProjects  CrossTeamProjectLookup
-	ctEnvs      CrossTeamEnvLookup
-	ctProvConns CrossTeamProviderConnectionLookup
+	ctTeams        CrossTeamTeamLookup
+	ctProjects     CrossTeamProjectLookup
+	ctEnvs         CrossTeamEnvLookup
+	ctProvConns    CrossTeamProviderConnectionLookup
+	ctDestBindings CrossTeamDestinationBindingLookup
 
 	// Project-binding gate + provider-config source. Wire via
 	// WithProjectBindings from main. Both nil = direct reveal and the
@@ -1139,7 +1140,7 @@ func (s *RequestService) OnJobCompleted(ctx context.Context, job *storage.SyncJo
 	}
 	if err := s.requests.UpdateStatus(ctx, *job.RequestID, target); err != nil {
 		_ = s.audit.Append(ctx, &storage.AuditEvent{
-			Actor:         "system",
+			Actor:         "system:request-lifecycle",
 			Action:        "request.transition_failed",
 			Resource:      "request:" + job.RequestID.String(),
 			Status:        storage.AuditStatusFailure,
@@ -1153,7 +1154,7 @@ func (s *RequestService) OnJobCompleted(ctx context.Context, job *storage.SyncJo
 		return
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:         "system",
+		Actor:         "system:request-lifecycle",
 		Action:        "request.transition",
 		Resource:      "request:" + job.RequestID.String(),
 		Status:        storage.AuditStatusSuccess,
@@ -1251,6 +1252,16 @@ func (s *RequestService) enqueueRequestJob(ctx context.Context, req *storage.Acc
 		if err != nil {
 			return fmt.Errorf("resolve destination connection: %w", err)
 		}
+		// API-N-03 defense-in-depth at the execute boundary: the
+		// destination must still be bound to the source project (the
+		// binding may have been removed since submit). Rows submitted
+		// before the source project was required carry none; their
+		// source vote already needed a global approver.
+		if srcProject, ok := crossTeamSourceProject(req); ok {
+			if err := s.requireCrossTeamDestinationBinding(ctx, srcProject, req.EnvironmentID, conn.ID); err != nil {
+				return err
+			}
+		}
 		// api#169 defense-in-depth at the execute boundary: re-validate the
 		// destination keys against the binding allowlist before enqueuing the
 		// patch job. If a key is no longer allowed (pre-api#168 row, or the
@@ -1262,23 +1273,44 @@ func (s *RequestService) enqueueRequestJob(ctx context.Context, req *storage.Acc
 				return err
 			}
 		}
-		cfg := make(map[string]any, len(conn.Scope))
-		for k, v := range conn.Scope {
-			cfg[k] = v
-		}
+		// The connection scope is {address, mount, ...}; the agent pins its
+		// connection and fails a job that carries those keys, so pass only
+		// the keys it accepts (kvMount/kvPrefix for vault).
 		payload["target_provider_type"] = string(conn.Type)
-		payload["target_provider_config"] = cfg
+		payload["target_provider_config"] = AgentJobProviderConfig(string(conn.Type), conn.Scope)
 		payload["target_secret_ref"] = req.DestinationSecretRef
 		payload["target_keys"] = req.DestinationKeys
 		summaries, err := s.wraps.ListSummariesForRequest(ctx, req.ID)
 		if err != nil {
 			return fmt.Errorf("list wrap summaries: %w", err)
 		}
+		// API-S-07 defense-in-depth: only wraps for declared destination
+		// keys reach the agent. Fill refuses undeclared keys, but a fill
+		// accepted before that check could have wrapped extra ones.
+		declared := make(map[string]struct{}, len(req.DestinationKeys))
+		for _, k := range req.DestinationKeys {
+			declared[k] = struct{}{}
+		}
 		wraps := make([]map[string]any, 0, len(summaries))
+		dropped := 0
 		for _, sm := range summaries {
+			if _, ok := declared[sm.KeyName]; !ok {
+				dropped++
+				continue
+			}
 			wraps = append(wraps, map[string]any{
 				"wrap_id":  sm.ID.String(),
 				"key_name": sm.KeyName,
+			})
+		}
+		if dropped > 0 {
+			_ = s.audit.Append(ctx, &storage.AuditEvent{
+				Actor:         "system",
+				Action:        "request.cross_team.execute.undeclared_wraps_dropped",
+				Resource:      "request:" + req.ID.String(),
+				Status:        storage.AuditStatusFailure,
+				CorrelationID: req.ID,
+				Metadata:      map[string]any{"dropped_count": dropped},
 			})
 		}
 		payload["wraps"] = wraps

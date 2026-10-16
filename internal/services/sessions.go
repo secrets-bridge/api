@@ -102,13 +102,28 @@ func (s *SessionService) MarkMFA(ctx context.Context, sessionID uuid.UUID, at ti
 		return fmt.Errorf("services: touch last_mfa_at: %w", err)
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "session:" + sessionID.String(),
+		Actor:    s.sessionUserActor(ctx, sessionID),
 		Action:   "session.mfa_stamped",
 		Resource: "session:" + sessionID.String(),
 		Status:   storage.AuditStatusSuccess,
 		Metadata: map[string]any{"at": at.UTC().Format(time.RFC3339Nano)},
 	})
 	return nil
+}
+
+// sessionUserActor attributes a session-level event to the session's
+// user ("user:<id>"), so it lines up with the rest of that user's audit
+// trail. Falls back to the request context when the repository can't
+// resolve the owner.
+func (s *SessionService) sessionUserActor(ctx context.Context, sessionID uuid.UUID) string {
+	if r, ok := s.sessions.(interface {
+		UserIDForSession(context.Context, uuid.UUID) (uuid.UUID, error)
+	}); ok {
+		if uid, err := r.UserIDForSession(ctx, sessionID); err == nil {
+			return "user:" + uid.String()
+		}
+	}
+	return auditActorFromContext(ctx)
 }
 
 // HasFreshMFA reports whether the session's `last_mfa_at` is within
@@ -242,6 +257,13 @@ func (s *SessionService) Validate(ctx context.Context, cookieValue string) (*sto
 	if !session.ExpiresAt.After(now) || !session.IdleExpiresAt.After(now) {
 		return nil, ErrSessionInvalid
 	}
+	if session.UserDisabled {
+		// API-S-05: a disabled user's live session dies on its next
+		// use. Revoke the row too, so re-enabling the account later
+		// does not bring an old (possibly stolen) cookie back.
+		s.revokeForDisabledUser(ctx, session, now)
+		return nil, ErrSessionInvalid
+	}
 
 	newIdle := now.Add(s.policy.IdleTTL)
 	// Don't let the idle TTL slide past the absolute lifetime.
@@ -263,6 +285,37 @@ func (s *SessionService) Validate(ctx context.Context, cookieValue string) (*sto
 		session.IdleExpiresAt = newIdle
 	}
 	return session, nil
+}
+
+// revokeForDisabledUser revokes a session whose owner is disabled and
+// audits it. Best effort: Validate refuses the session either way.
+func (s *SessionService) revokeForDisabledUser(ctx context.Context, session *storage.Session, now time.Time) {
+	if err := s.sessions.Revoke(ctx, session.ID, now); err != nil {
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:    "system:session",
+			Action:   "session.revoke",
+			Resource: "session:" + session.ID.String(),
+			Status:   storage.AuditStatusFailure,
+			Metadata: map[string]any{
+				"session_id": session.ID.String(),
+				"user_id":    session.UserID.String(),
+				"reason":     "user_disabled",
+				"error":      err.Error(),
+			},
+		})
+		return
+	}
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "system:session",
+		Action:   "session.revoke",
+		Resource: "session:" + session.ID.String(),
+		Status:   storage.AuditStatusSuccess,
+		Metadata: map[string]any{
+			"session_id": session.ID.String(),
+			"user_id":    session.UserID.String(),
+			"reason":     "user_disabled",
+		},
+	})
 }
 
 // Revoke marks the session referenced by the cookie value dead. The

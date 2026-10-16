@@ -168,6 +168,12 @@ func mapVerifyError(err error) error {
 		return fiber.NewError(fiber.StatusGone, "challenge expired or already used")
 	case errors.Is(err, services.ErrMFAInvalid):
 		return fiber.NewError(fiber.StatusBadRequest, "verification failed")
+	case errors.Is(err, services.ErrMFALocked):
+		// M4: too many wrong codes on this factor. Even the correct
+		// code is refused until the lockout window passes.
+		return fiber.NewError(fiber.StatusTooManyRequests, "too many failed attempts, try again later")
+	case errors.Is(err, services.ErrMFAGuardUnavailable):
+		return fiber.NewError(fiber.StatusServiceUnavailable, "mfa temporarily unavailable")
 	case errors.Is(err, services.ErrMFASessionRequired):
 		return fiber.NewError(fiber.StatusUnauthorized, "session required")
 	case errors.Is(err, services.ErrWebAuthnNotConfigured):

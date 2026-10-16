@@ -23,6 +23,7 @@ package handlers
 import (
 	"encoding/base64"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -30,6 +31,8 @@ import (
 
 	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/services"
+	"github.com/secrets-bridge/api/pkg/argocd"
+	"github.com/secrets-bridge/api/pkg/sanitize"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
@@ -116,6 +119,13 @@ func (h *GitOps) CreateArgoCDEndpoint(c fiber.Ctx) error {
 		TLSServerName: body.TLSServerName,
 	})
 	if err != nil {
+		switch {
+		case errors.Is(err, services.ErrInsecureArgoCDURL):
+			return fiber.NewError(fiber.StatusBadRequest,
+				"base_url must use https (http:// is only accepted with SB_ENV=dev or SB_ALLOW_INSECURE_ARGOCD_ADDR=true)")
+		case errors.Is(err, services.ErrInvalidArgoCDURL):
+			return fiber.NewError(fiber.StatusBadRequest, "base_url must be an absolute https URL with a host")
+		}
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 	return c.Status(fiber.StatusCreated).JSON(argocdEndpointToResponse(e))
@@ -151,18 +161,23 @@ func (h *GitOps) GetArgoCDEndpoint(c fiber.Ctx) error {
 }
 
 // SetArgoCDEndpointEnabled handles PUT /argocd-endpoints/:id/enabled.
+// The body must carry "enabled" (true or false). A body without it used
+// to read as false and quietly disable the endpoint.
 func (h *GitOps) SetArgoCDEndpointEnabled(c fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid UUID")
 	}
 	var body struct {
-		Enabled bool `json:"enabled"`
+		Enabled *bool `json:"enabled"`
 	}
 	if err := c.Bind().JSON(&body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
 	}
-	if err := h.endpoints.SetEnabled(c.Context(), id, body.Enabled); err != nil {
+	if body.Enabled == nil {
+		return fiber.NewError(fiber.StatusBadRequest, "enabled is required (true or false)")
+	}
+	if err := h.endpoints.SetEnabled(c.Context(), id, *body.Enabled); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "argocd endpoint not found")
 		}
@@ -193,7 +208,7 @@ func argocdEndpointToResponse(e *storage.ArgoCDEndpoint) argocdEndpointResponse 
 		BaseURL:       e.BaseURL,
 		TLSServerName: e.TLSServerName,
 		Enabled:       e.Enabled,
-		HealthError:   e.LastHealthError,
+		HealthError:   sanitize.DiscoverError(e.LastHealthError), // raw poller text (API-16)
 		KMSKeyID:      e.TokenKMSKeyID,
 	}
 	if e.EnvironmentID != nil {
@@ -383,9 +398,9 @@ func observationToResponse(o *storage.GitOpsObservation) observationResponse {
 		ApplicationName:      o.ApplicationName,
 		ApplicationNamespace: o.ApplicationNamespace,
 		PollingState:         string(o.PollingState),
-		ObservedState:        o.ObservedState,
+		ObservedState:        observedStateForClient(o.ObservedState),
 		PollsCount:           o.PollsCount,
-		LastError:            o.LastError,
+		LastError:            observationErrorClass(o.LastError),
 	}
 	if o.LastPolledAt != nil {
 		s := o.LastPolledAt.UTC().Format(time.RFC3339)
@@ -409,7 +424,7 @@ func observationToResponse(o *storage.GitOpsObservation) observationResponse {
 // the UI needs to bulk-create gitops_app_mappings rows.
 //
 // Optional query parameter:
-//   ?project=<name>   filter to a single ArgoCD project (e.g. "egov-uat")
+//   ?project=<name>   filter to a single ArgoCD project (e.g. "team-alpha")
 //
 // Returns 503 when the endpoint is disabled or the ArgoCD call fails;
 // the UI then renders "discovery unavailable" without retrying.
@@ -426,9 +441,112 @@ func (h *GitOps) GetDiscoveredApps(c fiber.Ctx) error {
 		if errors.Is(err, storage.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "argocd endpoint not found")
 		}
+		if errors.Is(err, services.ErrInsecureArgoCDURL) || errors.Is(err, services.ErrInvalidArgoCDURL) {
+			// A row registered before the scheme check. Nothing was
+			// sent; the operator must re-register it over https.
+			return fiber.NewError(fiber.StatusConflict,
+				"argocd endpoint base_url must use https; re-register the endpoint")
+		}
 		// 503 instead of 500 — the upstream is the failure point, not the api.
 		return fiber.NewError(fiber.StatusServiceUnavailable, err.Error())
 	}
 	return c.JSON(apps)
 }
 
+// Observation rows are shaped on read for the requester-facing route.
+// Rows the worker wrote before it stopped persisting ArgoCD free text
+// still carry health_message and per-resource message, which can hold
+// whatever a controller or probe put there (connection strings, tokens).
+// last_error is raw poller text and names the ArgoCD base URL. The
+// stored row is left as is; only the response is shaped.
+
+// observedStateKeys is the allow-list of observed_state keys a client
+// sees. Metadata only: anything not listed (free text, keys a future
+// worker adds) is dropped until it is reviewed and added here.
+var observedStateKeys = map[string]bool{
+	"health_status":   true,
+	"sync_status":     true,
+	"sync_revision":   true,
+	"operation_phase": true,
+	"resource_count":  true,
+	"resources":       true,
+}
+
+// observedResourceKeys is the allow-list for each resources[] entry.
+var observedResourceKeys = map[string]bool{
+	"group":     true,
+	"version":   true,
+	"kind":      true,
+	"name":      true,
+	"namespace": true,
+	"status":    true,
+	"health":    true,
+}
+
+func observedStateForClient(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		if !observedStateKeys[k] {
+			continue
+		}
+		if k == "resources" {
+			out[k] = observedResourcesForClient(v)
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func observedResourcesForClient(v any) []map[string]any {
+	items, _ := v.([]any)
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		r := make(map[string]any, len(m))
+		for k, val := range m {
+			if observedResourceKeys[k] {
+				r[k] = val
+			}
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// observationErrorClass maps the poller's raw last_error to a stable
+// class. The prefixes are the ones the worker's GitOps poller writes;
+// the argocd sentinels appear verbatim in its fetch errors.
+func observationErrorClass(raw string) string {
+	switch {
+	case raw == "":
+		return ""
+	case raw == "endpoint disabled":
+		return "endpoint_disabled"
+	case strings.HasPrefix(raw, "endpoint lookup:"):
+		return "endpoint_unavailable"
+	case raw == "no token resolver configured", strings.HasPrefix(raw, "unwrap token:"):
+		return "token_unavailable"
+	case strings.HasPrefix(raw, "build argocd client:"):
+		return "client_config_invalid"
+	case strings.HasPrefix(raw, "argocd fetch:"):
+		switch {
+		case strings.Contains(raw, argocd.ErrUnauthorized.Error()):
+			return "argocd_unauthorized"
+		case strings.Contains(raw, argocd.ErrForbidden.Error()):
+			return "argocd_forbidden"
+		case strings.Contains(raw, argocd.ErrNotFound.Error()):
+			return "argocd_app_not_found"
+		case strings.Contains(raw, argocd.ErrRedirectRefused.Error()):
+			return "argocd_redirect_refused"
+		}
+		return "argocd_unreachable"
+	}
+	return "poll_failed"
+}

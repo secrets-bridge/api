@@ -58,7 +58,7 @@ func TestCreateForScopedAuthor_Gate5b_RejectsOptedOutWorkflow(t *testing.T) {
 	if err := e.pool.QueryRow(e.ctx,
 		`SELECT metadata ? 'policy_rule_id' FROM audit_events
 		 WHERE action='policy.denied_workflow_not_authorable'
-		   AND actor='alice'
+		   AND actor='user:alice'
 		 ORDER BY occurred_at DESC LIMIT 1`,
 	).Scan(&hasRuleID); err != nil {
 		t.Fatalf("query denied audit: %v", err)
@@ -73,7 +73,7 @@ func TestCreateForScopedAuthor_Gate5b_RejectsOptedOutWorkflow(t *testing.T) {
 	if err := e.pool.QueryRow(e.ctx,
 		`SELECT metadata->>'attempted_workflow_id' FROM audit_events
 		 WHERE action='policy.denied_workflow_not_authorable'
-		   AND actor='alice'
+		   AND actor='user:alice'
 		 ORDER BY occurred_at DESC LIMIT 1`,
 	).Scan(&attemptedWorkflowID); err != nil {
 		t.Fatalf("query attempted_workflow_id: %v", err)
