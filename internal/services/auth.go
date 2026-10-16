@@ -165,34 +165,51 @@ func (s *AuthService) Login(ctx context.Context, email string, password []byte) 
 		return nil, ErrInvalidCredentials
 	}
 
-	// Lockout check before the bcrypt compare. Burning bcrypt cost on
-	// a locked account would let an attacker keep an account locked
-	// indefinitely with negligible cost on their end.
-	if user.LockedUntil != nil && user.LockedUntil.After(time.Now().UTC()) {
+	// Lockout gate before the bcrypt compare (API-S-25). One atomic
+	// UPDATE ... RETURNING both checks the lock and counts this
+	// attempt, so concurrent guesses can't all read "not locked" and
+	// each get a compare: at most Threshold attempts pass from a clean
+	// counter. Refused attempts still pay a compare against the real
+	// hash so locked and unlocked accounts answer in similar time.
+	attempt, err := s.users.BeginLoginAttempt(ctx, user.ID,
+		s.lockout.Threshold, s.lockout.Duration, time.Now().UTC())
+	if err != nil {
+		// Fail closed: without the counter we can't bound guesses.
 		_ = bcrypt.CompareHashAndPassword(user.PasswordHash, password)
-		s.auditLocked(ctx, user)
+		s.auditFailureWithError(ctx, user, "lockout_check_failed", err)
+		return nil, ErrInvalidCredentials
+	}
+	if !attempt.Allowed {
+		_ = bcrypt.CompareHashAndPassword(user.PasswordHash, password)
+		switch {
+		case attempt.Disabled:
+			s.auditFailure(ctx, email, "user_disabled")
+		case attempt.NotFound:
+			s.auditFailure(ctx, email, "user_not_found")
+		default:
+			s.auditLocked(ctx, user, attempt.LockedUntil)
+		}
 		return nil, ErrInvalidCredentials
 	}
 
 	if err := bcrypt.CompareHashAndPassword(user.PasswordHash, password); err != nil {
-		s.recordFailedLogin(ctx, user)
+		s.recordFailedLogin(ctx, user, attempt)
 		return nil, ErrInvalidCredentials
 	}
 
-	// Clear the counter + any stale lock — happy path resets state.
-	if user.FailedLoginCount > 0 || user.LockedUntil != nil {
-		if clearErr := s.users.ClearLockout(ctx, user.ID); clearErr != nil {
-			// Don't fail the login because we couldn't reset state —
-			// audit and continue. The next failed attempt will simply
-			// see an over-threshold counter and re-lock immediately.
-			_ = s.audit.Append(ctx, &storage.AuditEvent{
-				Actor:    "user:" + user.ID.String(),
-				Action:   "auth.lockout.clear_failed",
-				Resource: "user:" + user.ID.String(),
-				Status:   storage.AuditStatusFailure,
-				Metadata: map[string]any{"error": clearErr.Error()},
-			})
-		}
+	// The attempt was counted up front, so a correct password always
+	// resets the counter (and any lock this attempt just applied).
+	if clearErr := s.users.ClearLockout(ctx, user.ID); clearErr != nil {
+		// Don't fail the login because we couldn't reset state —
+		// audit and continue. The next attempt sees the stale
+		// counter and may be refused until it is cleared.
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:    "user:" + user.ID.String(),
+			Action:   "auth.lockout.clear_failed",
+			Resource: "user:" + user.ID.String(),
+			Status:   storage.AuditStatusFailure,
+			Metadata: map[string]any{"error": clearErr.Error()},
+		})
 	}
 
 	claims := auth.Claims{
@@ -219,44 +236,14 @@ func (s *AuthService) Login(ctx context.Context, email string, password []byte) 
 	}, nil
 }
 
-// recordFailedLogin atomically increments the wrong-password counter
-// and pins the account when the threshold is crossed. Errors are
-// audited but never bubbled — a Postgres flake must not silently
-// permit unbounded retries, but it also must not 5xx a wrong-password
-// path which is the most common failure on the login surface.
-func (s *AuthService) recordFailedLogin(ctx context.Context, user *storage.LocalUser) {
-	n, err := s.users.IncrementFailedLogins(ctx, user.ID)
-	if err != nil {
-		_ = s.audit.Append(ctx, &storage.AuditEvent{
-			Actor:    "anonymous",
-			Action:   "auth.login",
-			Resource: "user:" + user.ID.String(),
-			Status:   storage.AuditStatusDenied,
-			Metadata: map[string]any{
-				"error_kind":     "wrong_password",
-				"increment_err":  err.Error(),
-				"email_length":   len(user.Email),
-				"user_id_redact": user.ID.String(),
-			},
-		})
-		return
-	}
+// recordFailedLogin audits a wrong password. The counter was already
+// bumped (and the lock already applied when the threshold was
+// reached) by BeginLoginAttempt before the compare ran, so this only
+// writes the audit trail.
+func (s *AuthService) recordFailedLogin(ctx context.Context, user *storage.LocalUser, attempt *storage.LoginAttempt) {
+	n := attempt.FailedLoginCount
 	s.auditFailureWithCount(ctx, user, "wrong_password", n)
-	if n >= s.lockout.Threshold {
-		until := time.Now().UTC().Add(s.lockout.Duration)
-		if lockErr := s.users.Lock(ctx, user.ID, until); lockErr != nil {
-			_ = s.audit.Append(ctx, &storage.AuditEvent{
-				Actor:    "anonymous",
-				Action:   "auth.lockout.apply_failed",
-				Resource: "user:" + user.ID.String(),
-				Status:   storage.AuditStatusFailure,
-				Metadata: map[string]any{
-					"error":              lockErr.Error(),
-					"failed_login_count": n,
-				},
-			})
-			return
-		}
+	if n >= s.lockout.Threshold && attempt.LockedUntil != nil {
 		_ = s.audit.Append(ctx, &storage.AuditEvent{
 			Actor:    "anonymous",
 			Action:   "auth.lockout.applied",
@@ -264,7 +251,7 @@ func (s *AuthService) recordFailedLogin(ctx context.Context, user *storage.Local
 			Status:   storage.AuditStatusDenied,
 			Metadata: map[string]any{
 				"failed_login_count": n,
-				"locked_until":       until.Format(time.RFC3339Nano),
+				"locked_until":       attempt.LockedUntil.UTC().Format(time.RFC3339Nano),
 				"threshold":          s.lockout.Threshold,
 				"duration_seconds":   int(s.lockout.Duration.Seconds()),
 			},
@@ -293,7 +280,7 @@ func (s *AuthService) BootstrapLocalAdmin(ctx context.Context, email, password s
 		return "", nil
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), passwordBcryptCost)
 	if err != nil {
 		return "", fmt.Errorf("services: hash password: %w", err)
 	}
@@ -383,7 +370,7 @@ func (s *AuthService) BootstrapDevUsers(ctx context.Context, sharedPassword stri
 			}
 		}
 
-		hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+		hash, err := bcrypt.GenerateFromPassword([]byte(password), passwordBcryptCost)
 		if err != nil {
 			return nil, fmt.Errorf("services: hash password for %s: %w", spec.email, err)
 		}
@@ -483,10 +470,23 @@ func (s *AuthService) auditFailureWithCount(ctx context.Context, u *storage.Loca
 	})
 }
 
-func (s *AuthService) auditLocked(ctx context.Context, u *storage.LocalUser) {
+func (s *AuthService) auditFailureWithError(ctx context.Context, u *storage.LocalUser, kind string, err error) {
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "anonymous",
+		Action:   "auth.login",
+		Resource: "user:" + u.ID.String(),
+		Status:   storage.AuditStatusDenied,
+		Metadata: map[string]any{
+			"error_kind": kind,
+			"error":      err.Error(),
+		},
+	})
+}
+
+func (s *AuthService) auditLocked(ctx context.Context, u *storage.LocalUser, lockedUntil *time.Time) {
 	var until string
-	if u.LockedUntil != nil {
-		until = u.LockedUntil.UTC().Format(time.RFC3339Nano)
+	if lockedUntil != nil {
+		until = lockedUntil.UTC().Format(time.RFC3339Nano)
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
 		Actor:    "anonymous",
@@ -523,24 +523,34 @@ func (s *AuthService) auditBreakGlass(ctx context.Context, u *storage.LocalUser)
 	})
 }
 
+// passwordBcryptCost is the bcrypt cost for every local_users hash
+// (bootstrap, dev seed, OIDC JIT) and for dummyBcryptHash. Keep them
+// equal: Login compares against the dummy hash for unknown emails, so
+// a cheaper real hash would make existing accounts answer faster.
+const passwordBcryptCost = 12
+
 // dummyBcryptHash is a bcrypt hash for an unguessable random string —
 // it exists so the "user not found" path still pays bcrypt cost,
 // hiding email enumeration via timing.
 var dummyBcryptHash = mustGenerateDummyHash()
 
 func mustGenerateDummyHash() []byte {
-	h, err := bcrypt.GenerateFromPassword([]byte("dummy-bcrypt-anti-enumeration-target"), 12)
+	h, err := bcrypt.GenerateFromPassword([]byte("dummy-bcrypt-anti-enumeration-target"), passwordBcryptCost)
 	if err != nil {
 		panic(fmt.Errorf("services: dummy bcrypt: %w", err))
 	}
 	return h
 }
 
-// SubjectFromToken is a thin pass-through to `Signer.VerifyToken`
-// returning just the `sub` claim. Middleware uses this to extract the
-// user id without exposing the full claims struct outside this
-// package.
-func (s *AuthService) SubjectFromToken(token string) (string, error) {
+// SubjectFromToken verifies a bearer JWT via `Signer.VerifyToken` and
+// returns its `sub` claim. Middleware uses this to extract the user
+// id without exposing the full claims struct outside this package.
+//
+// API-S-05: a valid signature is not enough. The subject must still
+// be an existing, enabled local user, checked with one primary-key
+// lookup per bearer request, so disabling a user stops their tokens
+// right away instead of at expiry. Any lookup failure fails closed.
+func (s *AuthService) SubjectFromToken(ctx context.Context, token string) (string, error) {
 	if s.signer == nil {
 		return "", auth.ErrInvalidToken
 	}
@@ -548,10 +558,15 @@ func (s *AuthService) SubjectFromToken(token string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err := uuid.Parse(claims.Subject); err != nil {
+	id, err := uuid.Parse(claims.Subject)
+	if err != nil {
 		// Sub MUST be a UUID for local users; OIDC may relax this
 		// later but the field stays opaque to the rest of the
 		// platform either way.
+		return "", auth.ErrInvalidToken
+	}
+	user, err := s.users.Get(ctx, id)
+	if err != nil || user.Disabled {
 		return "", auth.ErrInvalidToken
 	}
 	return claims.Subject, nil
