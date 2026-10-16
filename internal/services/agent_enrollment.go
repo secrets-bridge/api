@@ -197,13 +197,19 @@ type EnrolledAgent struct {
 func (s *AgentService) Enroll(ctx context.Context, in EnrollInput) (*EnrolledAgent, error) {
 	res, err := s.enroll(ctx, in)
 	if err != nil {
-		if reason, ok := enrollRejectReason(err); ok {
+		// Rolled up like agent.auth.rejected (API-N-07): the route is
+		// unauthenticated and the enrolling caller has no agent id, so
+		// one row per reason per window.
+		if reason, ok := enrollRejectReason(err); ok && s.claimRejectAuditSlot(ctx, cacheKindEnrollRejectAudit, "unknown", reason) {
 			_ = s.audit.Append(ctx, &storage.AuditEvent{
 				Actor:    "agent:enroll",
 				Action:   "agent.enrollment.rejected",
 				Resource: "agent_enrollment_token",
 				Status:   storage.AuditStatusDenied,
-				Metadata: map[string]any{"reason": reason},
+				Metadata: map[string]any{
+					"reason":                reason,
+					"rollup_window_seconds": int(rejectAuditWindow / time.Second),
+				},
 			})
 		}
 	}
@@ -231,6 +237,25 @@ func enrollRejectReason(err error) (string, bool) {
 		return "provider_connection_unavailable", true
 	default:
 		return "", false
+	}
+}
+
+// unconsumableTokenErr names why the transactional consume matched no
+// row. It re-reads the token so a revoke or expiry that landed after the
+// pre-checks is reported as such; a lost race reads as consumed.
+func (s *AgentService) unconsumableTokenErr(ctx context.Context, id uuid.UUID, now time.Time) error {
+	tok, err := s.enrollTokens.Get(ctx, id)
+	switch {
+	case err != nil:
+		return ErrEnrollmentTokenInvalid
+	case tok.RevokedAt != nil:
+		return ErrEnrollmentTokenRevoked
+	case tok.ConsumedAt != nil:
+		return ErrEnrollmentTokenConsumed
+	case !tok.ExpiresAt.After(now):
+		return ErrEnrollmentTokenExpired
+	default:
+		return ErrEnrollmentTokenConsumed
 	}
 }
 
@@ -320,17 +345,16 @@ func (s *AgentService) enroll(ctx context.Context, in EnrollInput) (*EnrolledAge
 		PublicKeyFingerprint: in.PublicKeyFingerprint,
 		Capabilities:         caps,
 	}
-	if err := s.agents.CreateEnrolled(ctx, agent); err != nil {
-		return nil, fmt.Errorf("agents: create enrolled agent: %w", err)
-	}
-
-	// Single-use guard: burn the token atomically. A concurrent double
-	// enrollment loses this race and is reported as already-consumed.
-	if err := s.enrollTokens.MarkConsumed(ctx, tok.ID, agent.ID, now); err != nil {
+	// Single-use guard (API-18): burn the token FIRST and create the agent
+	// in the same transaction. The consume re-checks consumed/revoked/
+	// expired under the row lock, so a concurrent double enrollment (or a
+	// token revoked after the checks above) never leaves an agent row
+	// behind, and a failed insert un-burns the token.
+	if err := s.enrollTokens.ConsumeAndCreateAgent(ctx, tok.ID, now, agent); err != nil {
 		if errors.Is(err, storage.ErrEnrollmentTokenNotFound) {
-			return nil, ErrEnrollmentTokenConsumed
+			return nil, s.unconsumableTokenErr(ctx, tok.ID, now)
 		}
-		return nil, fmt.Errorf("agents: consume enrollment token: %w", err)
+		return nil, fmt.Errorf("agents: enroll agent: %w", err)
 	}
 
 	_ = s.audit.Append(ctx, &storage.AuditEvent{

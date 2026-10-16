@@ -402,6 +402,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// agentSvc pointer AgentAuth + agentsH already hold; the certified
 	// mint/heartbeat/auth paths are untouched.
 	agentSvc.WithEnrollment(storage.NewAgentEnrollmentTokens(pool), provConnRepo)
+	// Discovery uploads are pinned to the uploading agent's own cluster +
+	// provider type (agents row / bound connection), not the batch body.
+	secretsSvc.WithAgentIdentity(agentRepo, provConnRepo)
 
 	// Enforce the project_secrets binding on both plaintext-reveal
 	// boundaries: submit-time (direct reveal + per-env request: a read

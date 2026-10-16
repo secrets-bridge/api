@@ -331,3 +331,52 @@ func scanCacheKey(t *testing.T, rdb *runtime.Client, pattern string) int {
 	}
 	return len(seen)
 }
+
+// API-N-07: identical rejected auths are folded into one audit row per
+// window, but only while Redis can hold the rollup slot. With Redis
+// unreachable every rejection is still written (api#187 auditability
+// beats flood control), and auth itself keeps working off Postgres.
+func TestAuthenticate_RejectAuditRollup_FallsBackWithoutRedis(t *testing.T) {
+	svc, pool, _ := bootstrap(t)
+	ctx := t.Context()
+	minted, err := svc.Mint(ctx, services.MintInput{Name: "agent"})
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	count := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE action = 'agent.auth.rejected'`).Scan(&n); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		return n
+	}
+
+	for i := 0; i < 10; i++ {
+		if err := svc.Authenticate(ctx, minted.ID, "wrong"); !errors.Is(err, storage.ErrUnauthorized) {
+			t.Fatalf("wrong secret: %v", err)
+		}
+	}
+	if n := count(); n != 1 {
+		t.Fatalf("with Redis: %d rows for 10 identical rejections; want 1", n)
+	}
+
+	// Same service shape, Redis gone.
+	dead, err := runtime.Open(ctx, runtime.Config{URL: os.Getenv("TEST_REDIS_URL"), Namespace: "sb-test-dead"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	_ = dead.Close()
+	noRedis := services.NewAgentService(storage.NewAgents(pool), storage.NewAuditEvents(pool), dead)
+	for i := 0; i < 5; i++ {
+		if err := noRedis.Authenticate(ctx, minted.ID, "wrong"); !errors.Is(err, storage.ErrUnauthorized) {
+			t.Fatalf("wrong secret without Redis: %v", err)
+		}
+	}
+	if n := count(); n != 1+5 {
+		t.Fatalf("without Redis: %d rows; want %d (every rejection audited)", n, 1+5)
+	}
+	if err := noRedis.Authenticate(ctx, minted.ID, minted.AgentSecret); err != nil {
+		t.Fatalf("right secret without Redis: %v", err)
+	}
+}

@@ -3,6 +3,7 @@ package services_test
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -43,6 +44,8 @@ func TestRetrieveWrap_HappyPath(t *testing.T) {
 	}
 
 	agent, _ := bootstrapAgent(t, h, "agent-"+t.Name())
+	// H4: an agent only fetches wraps for a job it has claimed.
+	claimJob(t, h, agent.ID)
 
 	plaintext, wrap, err := h.requests.RetrieveWrap(ctx, summaries[0].ID, agent.ID)
 	if err != nil {
@@ -122,6 +125,7 @@ func TestRetrieveWrap_AlreadyConsumed(t *testing.T) {
 	_, _ = h.requests.Approve(ctx, req.ID, "bob", "")
 	summaries, _ := h.requests.WrapSummariesForRequest(ctx, req.ID)
 	agent, _ := bootstrapAgent(t, h, "agent-"+t.Name())
+	claimJob(t, h, agent.ID)
 
 	if _, _, err := h.requests.RetrieveWrap(ctx, summaries[0].ID, agent.ID); err != nil {
 		t.Fatalf("first Retrieve: %v", err)
@@ -163,6 +167,72 @@ func TestWrapSummaries_NoLeak(t *testing.T) {
 	// but it'll be obvious in code review.
 	if len(summaries) != 1 || summaries[0].KeyName != "X" {
 		t.Fatalf("unexpected summaries: %+v", summaries)
+	}
+}
+
+// claimJob has agentID claim the oldest queued job (the harness wipes
+// sync_jobs, so that is the one the test just approved).
+func claimJob(t *testing.T, h *requestHarness, agentID uuid.UUID) *storage.SyncJob {
+	t.Helper()
+	job, err := h.jobs.Claim(t.Context(), agentID)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	return job
+}
+
+// H4: a patch wrap is only served to the agent holding the request's job.
+// Unclaimed, or claimed by someone else, the fetch is refused without
+// burning the wrap.
+func TestRetrieveWrap_RequiresClaimedJob(t *testing.T) {
+	h := bootstrapRequests(t)
+	ctx := t.Context()
+	req, _ := h.requests.Submit(ctx, samplePatch("alice"))
+	if _, err := h.requests.Approve(ctx, req.ID, "bob", ""); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	summaries, _ := h.requests.WrapSummariesForRequest(ctx, req.ID)
+	a, _ := bootstrapAgent(t, h, "agent-a-"+t.Name())
+	b, _ := bootstrapAgent(t, h, "agent-b-"+t.Name())
+
+	if _, _, err := h.requests.RetrieveWrap(ctx, summaries[0].ID, a.ID); !errors.Is(err, storage.ErrJobNotClaimed) {
+		t.Fatalf("unclaimed: got %v want ErrJobNotClaimed", err)
+	}
+	claimJob(t, h, a.ID)
+	if _, _, err := h.requests.RetrieveWrap(ctx, summaries[0].ID, b.ID); !errors.Is(err, storage.ErrJobNotClaimed) {
+		t.Fatalf("other agent: got %v want ErrJobNotClaimed", err)
+	}
+	w, _ := h.wrapsR.Get(ctx, summaries[0].ID)
+	if w.ConsumedAt != nil {
+		t.Fatal("a refused fetch burned the wrap")
+	}
+	if _, _, err := h.requests.RetrieveWrap(ctx, summaries[0].ID, a.ID); err != nil {
+		t.Fatalf("claimer: %v", err)
+	}
+}
+
+// H4: read-flow wraps go to the requester; an agent is refused even when
+// it holds the read job.
+func TestRetrieveWrap_RefusesUserDestinedWrap(t *testing.T) {
+	h := bootstrapRequests(t)
+	ctx := t.Context()
+	req, _ := h.requests.SubmitRead(ctx, sampleRead("alice"))
+	if _, err := h.requests.Approve(ctx, req.ID, "bob", ""); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	a, _ := bootstrapAgent(t, h, "agent-"+t.Name())
+	claimJob(t, h, a.ID)
+	wrap, err := h.wraps.WrapByAgent(ctx, a.ID, services.WrapRequest{
+		Plaintext: []byte("for-alice-only"), RequestID: &req.ID, KeyName: "DB_PASSWORD", TTL: 30 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("WrapByAgent: %v", err)
+	}
+	if _, _, err := h.requests.RetrieveWrap(ctx, wrap.ID, a.ID); !errors.Is(err, services.ErrWrapNotForAgent) {
+		t.Fatalf("got %v want ErrWrapNotForAgent", err)
+	}
+	if _, _, err := h.requests.RetrieveWrapForUser(ctx, req.ID, wrap.ID, "alice"); err != nil {
+		t.Fatalf("requester retrieve after refused agent fetch: %v", err)
 	}
 }
 

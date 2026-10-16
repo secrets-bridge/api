@@ -159,6 +159,10 @@ func Open(env *Envelope, recipientPrivKey, recipientPubKey []byte) ([]byte, erro
 	if err != nil {
 		return nil, fmt.Errorf("sealing: gcm: %w", err)
 	}
+	// gcm.Open panics on a wrong-size nonce; the envelope is untrusted.
+	if len(env.Nonce) != gcm.NonceSize() || len(env.Ciphertext) < gcm.Overhead() {
+		return nil, fmt.Errorf("sealing: malformed envelope")
+	}
 	plaintext, err := gcm.Open(nil, env.Nonce, env.Ciphertext, nil)
 	if err != nil {
 		return nil, fmt.Errorf("sealing: open: %w", err)

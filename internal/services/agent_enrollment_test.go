@@ -5,10 +5,13 @@ package services_test
 // only TEST_DATABASE_URL and constructs the service with a nil runtime client.
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -296,5 +299,148 @@ func TestEnroll_AuditMetadataOnly_NoLeak(t *testing.T) {
 	}
 	if !sliceContains(actions, "agent.enrollment_token.created") || !sliceContains(actions, "agent.enrolled") {
 		t.Fatalf("audit actions = %v; want both agent.enrollment_token.created and agent.enrolled", actions)
+	}
+}
+
+// barrierTokens holds every GetByHash caller until n of them have read
+// the token, so n enrollments all pass the unconsumed/unrevoked/unexpired
+// pre-checks before any of them consumes: the API-18 race, made
+// deterministic.
+type barrierTokens struct {
+	storage.AgentEnrollmentTokenRepository
+	n       int
+	mu      sync.Mutex
+	arrived int
+	all     chan struct{}
+}
+
+func (b *barrierTokens) GetByHash(ctx context.Context, h []byte) (*storage.AgentEnrollmentToken, error) {
+	tok, err := b.AgentEnrollmentTokenRepository.GetByHash(ctx, h)
+	b.mu.Lock()
+	b.arrived++
+	if b.arrived == b.n {
+		close(b.all)
+	}
+	b.mu.Unlock()
+	<-b.all
+	return tok, err
+}
+
+// API-18: N concurrent enrolls with one token, all past the pre-checks,
+// yield exactly one agent and no orphan rows.
+func TestEnroll_ConcurrentSameToken_NoOrphanAgents(t *testing.T) {
+	h := bootstrapEnroll(t, "aws-sm", "active")
+	ctx := t.Context()
+	tok := h.generate(t, services.GenerateEnrollmentTokenInput{})
+
+	const n = 8
+	barrier := &barrierTokens{AgentEnrollmentTokenRepository: storage.NewAgentEnrollmentTokens(h.pool), n: n, all: make(chan struct{})}
+	svc := services.NewAgentService(storage.NewAgents(h.pool), storage.NewAuditEvents(h.pool), nil).
+		WithEnrollment(barrier, storage.NewProviderConnections(h.pool))
+
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = svc.Enroll(ctx, services.EnrollInput{
+				Token: tok.Token, AgentName: fmt.Sprintf("race-%d", i), ProviderType: "aws-sm",
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	ok := 0
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			ok++
+		case errors.Is(err, services.ErrEnrollmentTokenConsumed):
+		default:
+			t.Fatalf("unexpected enroll error: %v", err)
+		}
+	}
+	if ok != 1 {
+		t.Fatalf("%d enrollments succeeded with one token; want 1", ok)
+	}
+	var agents int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM agents`).Scan(&agents); err != nil {
+		t.Fatalf("count agents: %v", err)
+	}
+	if agents != 1 {
+		t.Fatalf("agents rows = %d after the race; want 1 (no orphans)", agents)
+	}
+}
+
+// staleLookupTokens returns the token as it was read, then changes it in
+// Postgres before the caller acts: the token is revoked (or expires)
+// after Enroll's pre-checks but before its consume.
+type staleLookupTokens struct {
+	storage.AgentEnrollmentTokenRepository
+	pool  *storage.Pool
+	alter string
+}
+
+func (s *staleLookupTokens) GetByHash(ctx context.Context, h []byte) (*storage.AgentEnrollmentToken, error) {
+	tok, err := s.AgentEnrollmentTokenRepository.GetByHash(ctx, h)
+	if err == nil {
+		if _, xerr := s.pool.Exec(ctx, s.alter, tok.ID); xerr != nil {
+			return nil, xerr
+		}
+	}
+	return tok, err
+}
+
+// API-18: the consume itself refuses a revoked or expired token, so one
+// that turns bad after the pre-checks still cannot enroll an agent.
+func TestEnroll_TokenRevokedOrExpiredAfterCheck_Refused(t *testing.T) {
+	cases := []struct {
+		name  string
+		alter string
+		want  error
+	}{
+		{"revoked", `UPDATE agent_enrollment_tokens SET revoked_at = now(), revoked_by = 'admin-user-1' WHERE id = $1`, services.ErrEnrollmentTokenRevoked},
+		{"expired", `UPDATE agent_enrollment_tokens SET created_at = now() - interval '2 minutes', expires_at = now() - interval '1 minute' WHERE id = $1`, services.ErrEnrollmentTokenExpired},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := bootstrapEnroll(t, "aws-sm", "active")
+			ctx := t.Context()
+			tok := h.generate(t, services.GenerateEnrollmentTokenInput{})
+			svc := services.NewAgentService(storage.NewAgents(h.pool), storage.NewAuditEvents(h.pool), nil).
+				WithEnrollment(&staleLookupTokens{AgentEnrollmentTokenRepository: storage.NewAgentEnrollmentTokens(h.pool), pool: h.pool, alter: tc.alter},
+					storage.NewProviderConnections(h.pool))
+
+			_, err := svc.Enroll(ctx, services.EnrollInput{Token: tok.Token, AgentName: "late-" + tc.name, ProviderType: "aws-sm"})
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("enroll err = %v; want %v", err, tc.want)
+			}
+			var agents int
+			if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM agents`).Scan(&agents); err != nil {
+				t.Fatalf("count agents: %v", err)
+			}
+			if agents != 0 {
+				t.Fatalf("a %s token created %d agent rows", tc.name, agents)
+			}
+		})
+	}
+}
+
+// API-18: a failed agent insert (name already taken) rolls the consume
+// back, so the operator can retry the same token with another name.
+func TestEnroll_FailedInsertLeavesTokenUsable(t *testing.T) {
+	h := bootstrapEnroll(t, "aws-sm", "active")
+	ctx := t.Context()
+	first := h.generate(t, services.GenerateEnrollmentTokenInput{})
+	if _, err := h.svc.Enroll(ctx, services.EnrollInput{Token: first.Token, AgentName: "taken", ProviderType: "aws-sm"}); err != nil {
+		t.Fatalf("first enroll: %v", err)
+	}
+	second := h.generate(t, services.GenerateEnrollmentTokenInput{})
+	if _, err := h.svc.Enroll(ctx, services.EnrollInput{Token: second.Token, AgentName: "taken", ProviderType: "aws-sm"}); err == nil {
+		t.Fatal("enroll with a duplicate agent name succeeded")
+	}
+	if _, err := h.svc.Enroll(ctx, services.EnrollInput{Token: second.Token, AgentName: "fresh-name", ProviderType: "aws-sm"}); err != nil {
+		t.Fatalf("retry with the same token after a failed insert: %v", err)
 	}
 }

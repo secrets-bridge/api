@@ -948,6 +948,14 @@ func (s *RequestService) WorkflowFor(ctx context.Context, req *storage.AccessReq
 // the owning request is in a state where retrieval is allowed
 // (approved) before the wrap layer's atomic MarkConsumed runs.
 //
+// H4 gates (api#191), all checked before anything is consumed:
+//   - the wrap belongs to a request, and that request's wraps are
+//     destined for an agent (patch, or cross_team which executes as a
+//     patch). Read-flow wraps are destined for the requester and are
+//     never served to an agent (ErrWrapNotForAgent).
+//   - the request's job is claimed by this agent right now. Enforced
+//     inside the consume statement (storage.ErrJobNotClaimed).
+//
 // Returns:
 //   - plaintext bytes (caller is responsible for zeroing after use)
 //   - the storage row (for content_hash / byte_length echo to client)
@@ -968,17 +976,131 @@ func (s *RequestService) RetrieveWrap(ctx context.Context, wrapID, agentID uuid.
 	if err != nil {
 		return nil, nil, err
 	}
-	if wrap.RequestID != nil {
-		req, err := s.requests.Get(ctx, *wrap.RequestID)
-		if err != nil {
-			return nil, nil, fmt.Errorf("services: load owning request: %w", err)
-		}
-		if req.Status != storage.AccessRequestStatusApproved {
-			return nil, nil, ErrRequestNotApproved
-		}
+	if wrap.RequestID == nil {
+		s.auditAgentWrapRefused(ctx, "wrap.retrieve", agentID, uuid.Nil, wrapID, "no_owning_request")
+		return nil, nil, ErrWrapNotForAgent
 	}
-	// Consume + decrypt is one shot; WrapService handles audit.
-	return s.wraps.Retrieve(ctx, wrapID, agentID)
+	req, err := s.requests.Get(ctx, *wrap.RequestID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("services: load owning request: %w", err)
+	}
+	switch req.Type {
+	case storage.AccessRequestTypePatch, storage.AccessRequestTypeCrossTeam:
+		// agent-destined
+	default:
+		s.auditAgentWrapRefused(ctx, "wrap.retrieve", agentID, req.ID, wrapID, "user_destined_wrap")
+		return nil, nil, ErrWrapNotForAgent
+	}
+	if req.Status != storage.AccessRequestStatusApproved {
+		return nil, nil, ErrRequestNotApproved
+	}
+	if req.JobID == nil {
+		s.auditAgentWrapRefused(ctx, "wrap.retrieve", agentID, req.ID, wrapID, "job_not_claimed")
+		return nil, nil, storage.ErrJobNotClaimed
+	}
+	// Consume + decrypt is one shot, gated on the job claim; WrapService
+	// handles audit.
+	return s.wraps.RetrieveForAgentJob(ctx, wrapID, agentID, *req.JobID)
+}
+
+// ErrWrapNotForAgent is returned by RetrieveWrap for a wrap whose
+// consumer is not an agent (read-flow wraps go to the requester) or
+// that has no owning request. Maps to HTTP 403.
+var ErrWrapNotForAgent = errors.New("services: wrap is not retrievable by an agent")
+
+// ErrWrapCreateNotRead is returned by CreateAgentWrap when the named
+// request is not a read request. Maps to HTTP 400.
+var ErrWrapCreateNotRead = errors.New("services: wrap creation only supported for read requests")
+
+// ErrKeyNotRequested is returned by CreateAgentWrap when key_name is
+// not one of the read request's target_keys. Maps to HTTP 403.
+var ErrKeyNotRequested = errors.New("services: key_name is not one of the request's target keys")
+
+// CreateAgentWrap stores a value an agent fetched for a read request
+// (POST /agents/:id/wraps). H4 gates (api#191), in order:
+//
+//  1. the request exists, is a read request and is approved;
+//  2. its job is claimed by this agent right now (storage.ErrJobNotClaimed);
+//  3. key_name is one of the request's target_keys. An empty
+//     target_keys list means "every key in the bundle" (SubmitRead), so
+//     any key is accepted there;
+//  4. the request has no wrap for this key yet (storage.ErrDuplicateWrapKey).
+//
+// Gates 2 and 4 are re-checked inside the insert transaction, which
+// locks the job row, so concurrent posts and a racing Complete cannot
+// slip a second value in. plaintext is zeroed by the wrap layer on
+// success; the caller zeroes it on error.
+func (s *RequestService) CreateAgentWrap(ctx context.Context, agentID, requestID uuid.UUID, keyName string, plaintext []byte) (*storage.SecretWrap, error) {
+	req, err := s.requests.Get(ctx, requestID)
+	if err != nil {
+		return nil, err
+	}
+	if req.Type != storage.AccessRequestTypeRead {
+		return nil, ErrWrapCreateNotRead
+	}
+	if req.Status != storage.AccessRequestStatusApproved {
+		return nil, ErrRequestNotApproved
+	}
+	if req.JobID == nil {
+		s.auditAgentWrapRefused(ctx, "wrap.create", agentID, req.ID, uuid.Nil, "job_not_claimed")
+		return nil, storage.ErrJobNotClaimed
+	}
+	owns, err := s.wraps.AgentHoldsJob(ctx, *req.JobID, req.ID, agentID, storage.JobTypeRead)
+	if err != nil {
+		return nil, fmt.Errorf("services: check job claim: %w", err)
+	}
+	if !owns {
+		s.auditAgentWrapRefused(ctx, "wrap.create", agentID, req.ID, uuid.Nil, "job_not_claimed")
+		return nil, storage.ErrJobNotClaimed
+	}
+	if len(req.TargetKeys) > 0 && !keyInAllowlist(req.TargetKeys, keyName) {
+		s.auditAgentWrapRefused(ctx, "wrap.create", agentID, req.ID, uuid.Nil, "key_not_requested")
+		return nil, ErrKeyNotRequested
+	}
+	wf, err := s.WorkflowFor(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("services: load workflow: %w", err)
+	}
+	wrap, err := s.wraps.WrapForClaimedJob(ctx, agentID, *req.JobID, WrapRequest{
+		Plaintext: plaintext,
+		RequestID: &req.ID,
+		KeyName:   keyName,
+		TTL:       wf.WrapTTLApproved,
+	})
+	switch {
+	case errors.Is(err, storage.ErrJobNotClaimed):
+		s.auditAgentWrapRefused(ctx, "wrap.create", agentID, req.ID, uuid.Nil, "job_not_claimed")
+		return nil, storage.ErrJobNotClaimed
+	case errors.Is(err, storage.ErrDuplicateWrapKey):
+		s.auditAgentWrapRefused(ctx, "wrap.create", agentID, req.ID, uuid.Nil, "duplicate_key")
+		return nil, storage.ErrDuplicateWrapKey
+	case err != nil:
+		return nil, err
+	}
+	return wrap, nil
+}
+
+// auditAgentWrapRefused records a metadata-only denial for an agent wrap
+// call refused by an H4 gate: ids and a reason code, never a value, key
+// material or the agent-supplied key name.
+func (s *RequestService) auditAgentWrapRefused(ctx context.Context, action string, agentID, requestID, wrapID uuid.UUID, reason string) {
+	resource := "request:" + requestID.String()
+	meta := map[string]any{"reason": reason, "agent_id": agentID.String()}
+	if wrapID != uuid.Nil {
+		resource = "wrap:" + wrapID.String()
+		meta["wrap_id"] = wrapID.String()
+	}
+	if requestID != uuid.Nil {
+		meta["request_id"] = requestID.String()
+	}
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:         "agent:" + agentID.String(),
+		Action:        action,
+		Resource:      resource,
+		Status:        storage.AuditStatusDenied,
+		CorrelationID: requestID,
+		Metadata:      meta,
+	})
 }
 
 // ErrRequestNotApproved is returned by RetrieveWrap when the owning

@@ -64,6 +64,33 @@ type WrapRequest struct {
 // Wrap encrypts plaintext via envelope encryption and stores the row.
 // On success, plaintext is zeroed in place — callers must not reuse it.
 func (s *WrapService) Wrap(ctx context.Context, req WrapRequest) (*storage.SecretWrap, error) {
+	return s.wrapWith(ctx, req, s.wraps.Create)
+}
+
+// WrapForClaimedJob is the agent-side create behind POST
+// /agents/:id/wraps (H4). Same envelope encryption as Wrap, but the row
+// is stored through storage.CreateForClaimedJob: only while jobID (the
+// request's read job) is claimed by agentID, and only if the request has
+// no wrap for this key yet. Returns storage.ErrJobNotClaimed or
+// storage.ErrDuplicateWrapKey.
+func (s *WrapService) WrapForClaimedJob(ctx context.Context, agentID, jobID uuid.UUID, req WrapRequest) (*storage.SecretWrap, error) {
+	if req.Actor == "" {
+		req.Actor = "agent:" + agentID.String()
+	}
+	return s.wrapWith(ctx, req, func(ctx context.Context, w *storage.SecretWrap) error {
+		return s.wraps.CreateForClaimedJob(ctx, w, jobID, agentID, storage.JobTypeRead)
+	})
+}
+
+// AgentHoldsJob reports whether jobID is requestID's job of jobType and
+// is claimed by agentID right now. A cheap pre-check so callers can
+// refuse a non-owner before any other validation; the create / consume
+// paths re-check atomically.
+func (s *WrapService) AgentHoldsJob(ctx context.Context, jobID, requestID, agentID uuid.UUID, jobType storage.JobType) (bool, error) {
+	return s.wraps.JobClaimedBy(ctx, jobID, requestID, agentID, jobType)
+}
+
+func (s *WrapService) wrapWith(ctx context.Context, req WrapRequest, store func(context.Context, *storage.SecretWrap) error) (*storage.SecretWrap, error) {
 	if len(req.Plaintext) == 0 {
 		return nil, errors.New("wraps: plaintext is empty")
 	}
@@ -98,7 +125,7 @@ func (s *WrapService) Wrap(ctx context.Context, req WrapRequest) (*storage.Secre
 		ByteLength:        byteLen,
 		ExpiresAt:         s.now().Add(req.TTL).UTC(),
 	}
-	if err := s.wraps.Create(ctx, w); err != nil {
+	if err := store(ctx, w); err != nil {
 		return nil, fmt.Errorf("wraps: store: %w", err)
 	}
 
@@ -127,11 +154,28 @@ func (s *WrapService) Wrap(ctx context.Context, req WrapRequest) (*storage.Secre
 // promptly. MarkConsumed is called inside the same transaction-ish
 // sequence so the wrap can never be retrieved twice.
 func (s *WrapService) Retrieve(ctx context.Context, id, agentID uuid.UUID) ([]byte, *storage.SecretWrap, error) {
+	return s.retrieveAsAgent(ctx, id, agentID, func(at time.Time) error {
+		return s.wraps.MarkConsumed(ctx, id, agentID, at)
+	})
+}
+
+// RetrieveForAgentJob is the agent fetch behind GET
+// /agents/:id/wraps/:wrap_id (H4): the single-shot consume only succeeds
+// while jobID, the wrap's request (patch) job, is claimed by agentID.
+// A refusal (storage.ErrJobNotClaimed) does not burn the wrap.
+func (s *WrapService) RetrieveForAgentJob(ctx context.Context, id, agentID, jobID uuid.UUID) ([]byte, *storage.SecretWrap, error) {
+	return s.retrieveAsAgent(ctx, id, agentID, func(at time.Time) error {
+		return s.wraps.MarkConsumedForJob(ctx, id, agentID, jobID, storage.JobTypePatch, at)
+	})
+}
+
+func (s *WrapService) retrieveAsAgent(ctx context.Context, id, agentID uuid.UUID, consume func(time.Time) error) ([]byte, *storage.SecretWrap, error) {
+	// Read before consuming: the consume clears the ciphertext columns.
 	w, err := s.wraps.Get(ctx, id)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := s.wraps.MarkConsumed(ctx, id, agentID, s.now().UTC()); err != nil {
+	if err := consume(s.now().UTC()); err != nil {
 		s.auditRetrieveOutcome(ctx, agentID, id, wrapCorrelation(w.RequestID), err)
 		return nil, nil, err
 	}
@@ -162,6 +206,7 @@ func (s *WrapService) Retrieve(ctx context.Context, id, agentID uuid.UUID) ([]by
 // user (named via userID) rather than an agent. Used by the read
 // flow's user-bound retrieval endpoint.
 func (s *WrapService) RetrieveByUser(ctx context.Context, id uuid.UUID, userID string) ([]byte, *storage.SecretWrap, error) {
+	// Read before consuming: the consume clears the ciphertext columns.
 	w, err := s.wraps.Get(ctx, id)
 	if err != nil {
 		return nil, nil, err
@@ -253,10 +298,11 @@ func (s *WrapService) Peek(ctx context.Context, id uuid.UUID) (*storage.SecretWr
 	return s.wraps.Get(ctx, id)
 }
 
-// WrapByAgent is the read-flow counterpart of the original Wrap. It's
-// called by the agent-side wrap-creation endpoint after the agent has
-// fetched a value via core/providers.GetValue. The audit Actor is the
-// agent ID so the trail shows which agent produced the wrap.
+// WrapByAgent is the read-flow counterpart of the original Wrap, with
+// the agent ID as the audit Actor. It does NOT check job ownership, the
+// key allowlist or duplicates: the HTTP endpoint goes through
+// RequestService.CreateAgentWrap → WrapForClaimedJob instead. Kept as a
+// primitive for seeding agent-produced wraps in tests.
 //
 // Caller is responsible for zeroing the plaintext slice — Wrap zeros
 // it internally on success, but on error the caller may want a chance
@@ -279,6 +325,8 @@ func (s *WrapService) auditRetrieveOutcome(ctx context.Context, agentID, wrapID,
 	case errors.Is(err, storage.ErrNotFound):
 		kind = "not_found"
 		status = storage.AuditStatusDenied
+	case errors.Is(err, storage.ErrJobNotClaimed):
+		kind = "job_not_claimed"
 	default:
 		status = storage.AuditStatusFailure
 	}
@@ -330,6 +378,11 @@ func aeadDecrypt(key, nonce, ciphertext []byte) ([]byte, error) {
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, err
+	}
+	// gcm.Open panics on a wrong-size nonce. A consumed wrap's cleared
+	// row (API-S-24) or a damaged row must fail, not crash the request.
+	if len(nonce) != gcm.NonceSize() || len(ciphertext) < gcm.Overhead() {
+		return nil, errors.New("wraps: stored ciphertext is malformed")
 	}
 	return gcm.Open(nil, nonce, ciphertext, nil)
 }

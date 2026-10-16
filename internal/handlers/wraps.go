@@ -102,6 +102,16 @@ func wrapErr(err error) error {
 		return fiber.NewError(fiber.StatusGone, "wrap expired")
 	case errors.Is(err, services.ErrRequestNotApproved):
 		return fiber.NewError(fiber.StatusConflict, "owning request is not approved")
+	case errors.Is(err, storage.ErrJobNotClaimed):
+		return fiber.NewError(fiber.StatusForbidden, "request is not dispatched to this agent")
+	case errors.Is(err, services.ErrWrapNotForAgent):
+		return fiber.NewError(fiber.StatusForbidden, "wrap is not retrievable by an agent")
+	case errors.Is(err, services.ErrKeyNotRequested):
+		return fiber.NewError(fiber.StatusForbidden, "key_name is not one of the request's target keys")
+	case errors.Is(err, storage.ErrDuplicateWrapKey):
+		return fiber.NewError(fiber.StatusConflict, "a wrap for this key already exists on the request")
+	case errors.Is(err, services.ErrWrapCreateNotRead):
+		return fiber.NewError(fiber.StatusBadRequest, "wrap creation only supported for read requests")
 	default:
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
@@ -239,10 +249,10 @@ type CreateResponse struct {
 // one wrap per key. The CP runs WrapService.Wrap which envelope-
 // encrypts via the KMS layer and persists.
 //
-// Authorization (today): AgentAuth middleware confirms the request is
-// from a valid agent. A stricter check — "this agent owns the job for
-// this request" — lands in a follow-up once jobs carry an assigned
-// agent ID.
+// Authorization: AgentAuth confirms the caller is a valid agent; then
+// RequestService.CreateAgentWrap requires the read request's job to be
+// claimed by THIS agent, key_name to be one of the request's target
+// keys, and no earlier wrap for the same key (H4, api#191).
 func (h *Wraps) Create(c fiber.Ctx) error {
 	agentID, ok := middleware.AgentIDFromContext(c.Context())
 	if !ok {
@@ -283,33 +293,12 @@ func (h *Wraps) Create(c fiber.Ctx) error {
 	}
 	defer zero(plaintext)
 
-	// Validate the request: must exist, must be a read request, must
-	// be in `approved` status. The agent should never be creating
-	// wraps against a pending or terminal request.
-	req, err := h.requests.Get(c.Context(), reqID)
+	// The request must exist, be an approved read request whose job THIS
+	// agent has claimed, and name key_name among its target keys; a key
+	// lands at most once per request.
+	wrap, err := h.requests.CreateAgentWrap(c.Context(), agentID, reqID, body.KeyName, plaintext)
 	if err != nil {
 		return wrapErr(err)
-	}
-	if req.Type != storage.AccessRequestTypeRead {
-		return fiber.NewError(fiber.StatusBadRequest, "wrap creation only supported for read requests")
-	}
-	if req.Status != storage.AccessRequestStatusApproved {
-		return fiber.NewError(fiber.StatusConflict, "owning request is not approved")
-	}
-
-	wf, err := h.requests.WorkflowFor(c.Context(), req)
-	if err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "load workflow: "+err.Error())
-	}
-
-	wrap, err := h.wraps.WrapByAgent(c.Context(), agentID, services.WrapRequest{
-		Plaintext: plaintext,
-		RequestID: &reqID,
-		KeyName:   body.KeyName,
-		TTL:       wf.WrapTTLApproved,
-	})
-	if err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "wrap: "+err.Error())
 	}
 
 	return c.Status(fiber.StatusCreated).JSON(CreateResponse{
@@ -321,6 +310,15 @@ func (h *Wraps) Create(c fiber.Ctx) error {
 		ExpiresAt:   wrap.ExpiresAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
 	})
 }
+
+// AES-256-GCM shape of an agent wire envelope (cipher.NewGCM defaults).
+const (
+	gcmStandardNonceSize = 12
+	gcmTagSize           = 16
+)
+
+// errInvalidEnvelope is the one message a malformed envelope gets.
+var errInvalidEnvelope = errors.New("invalid envelope")
 
 // envelopeError is a wrap-envelope failure whose Error() is a stable,
 // client-safe message. The cause (a KMS backend error carrying the
@@ -359,6 +357,12 @@ func (h *Wraps) unsealAgentEnvelope(ctx context.Context, env *CreateWrapEnvelope
 	if err != nil {
 		return nil, errors.New("dek_ciphertext is not valid base64")
 	}
+	// API-S-23: gcm.Open panics on a nonce that is not exactly the GCM
+	// nonce size. Check the shape before any KMS call and answer with
+	// one generic message.
+	if len(nonce) != gcmStandardNonceSize || len(ciphertext) < gcmTagSize {
+		return nil, errInvalidEnvelope
+	}
 
 	dek, err := h.kms.DecryptDataKey(ctx, dekCt, env.DEKKMSKeyID)
 	if err != nil {
@@ -376,6 +380,9 @@ func (h *Wraps) unsealAgentEnvelope(ctx context.Context, env *CreateWrapEnvelope
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, &envelopeError{msg: "ciphertext could not be authenticated", cause: err}
+	}
+	if len(nonce) != gcm.NonceSize() || len(ciphertext) < gcm.Overhead() {
+		return nil, errInvalidEnvelope
 	}
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {

@@ -532,6 +532,60 @@ func TestVerifyCrossTeam_ApprovedEnqueuesDestinationPatchJob(t *testing.T) {
 	}
 }
 
+// H4: cross_team executes as a patch job, so its fill wraps are
+// agent-destined. Only the agent holding that job can fetch them; any
+// other agent is refused without burning the wrap.
+func TestCrossTeam_FillWrapsServedOnlyToClaimingAgent(t *testing.T) {
+	h := buildCrossTeamHarness(t)
+	ctx := t.Context()
+	in := seedCrossTeamScope(t, h, "ct-h4")
+	req, err := h.reqSvc.SubmitCrossTeam(ctx, in)
+	if err != nil {
+		t.Fatalf("SubmitCrossTeam: %v", err)
+	}
+	if _, err := h.reqSvc.Fill(ctx, services.FillCrossTeamInput{
+		RequestID: req.ID, FillerID: "bob@example.com",
+		KeyValues: map[string][]byte{"DB_PASSWORD": []byte("ct-canary-value")},
+	}); err != nil {
+		t.Fatalf("Fill: %v", err)
+	}
+	if _, err := h.reqSvc.VerifyCrossTeam(ctx, services.VerifyCrossTeamInput{
+		RequestID: req.ID, ApproverID: "carol@example.com",
+		VotedAs: services.VotedAsSource, Decision: storage.ApprovalDecisionApprove,
+	}); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	got, _ := h.requestsR.Get(ctx, req.ID)
+	if got.Status != storage.AccessRequestStatusApproved || got.JobID == nil {
+		t.Fatalf("request not approved with a job: status=%s job=%v", got.Status, got.JobID)
+	}
+
+	agents := storage.NewAgents(h.pool)
+	mk := func(name string) uuid.UUID {
+		a := &storage.Agent{Name: name + "-" + uuid.NewString()[:8], SecretHash: []byte("h")}
+		if err := agents.Create(ctx, a); err != nil {
+			t.Fatalf("create agent: %v", err)
+		}
+		return a.ID
+	}
+	holder, other := mk("ct-holder"), mk("ct-other")
+	job, err := services.NewJobService(h.jobsR, storage.NewAuditEvents(h.pool)).Claim(ctx, holder)
+	if err != nil || job.ID != *got.JobID {
+		t.Fatalf("claim: job=%v err=%v; want the request's job", job, err)
+	}
+	ids, _ := h.wrapsR.ListIDsForRequest(ctx, req.ID)
+	if len(ids) != 1 {
+		t.Fatalf("fill wraps = %d want 1", len(ids))
+	}
+	if _, _, err := h.reqSvc.RetrieveWrap(ctx, ids[0], other); !errors.Is(err, storage.ErrJobNotClaimed) {
+		t.Fatalf("other agent: got %v want ErrJobNotClaimed", err)
+	}
+	pt, _, err := h.reqSvc.RetrieveWrap(ctx, ids[0], holder)
+	if err != nil || string(pt) != "ct-canary-value" {
+		t.Fatalf("holder fetch: err=%v", err)
+	}
+}
+
 func TestVerify_SourceApproveStillNeedsSecurityWhenRequired(t *testing.T) {
 	h := buildCrossTeamHarness(t)
 	ctx := t.Context()
