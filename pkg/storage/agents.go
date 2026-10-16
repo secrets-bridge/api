@@ -160,6 +160,12 @@ func (r *Agents) Create(ctx context.Context, a *Agent) error {
 // like Create. All the onboarding columns are nullable in the schema; empty
 // values land as NULL (capabilities defaults to []).
 func (r *Agents) CreateEnrolled(ctx context.Context, a *Agent) error {
+	return insertEnrolledAgent(ctx, r.pool, a)
+}
+
+// insertEnrolledAgent is CreateEnrolled's body over q (the pool, or the
+// enrollment transaction in AgentEnrollmentTokens.ConsumeAndCreateAgent).
+func insertEnrolledAgent(ctx context.Context, q rowQuerier, a *Agent) error {
 	if a.Name == "" {
 		return errors.New("storage: agent Name is required")
 	}
@@ -187,7 +193,7 @@ func (r *Agents) CreateEnrolled(ctx context.Context, a *Agent) error {
 		return fmt.Errorf("storage: marshal agent capabilities: %w", err)
 	}
 
-	const q = `
+	const insert = `
 		INSERT INTO agents (
 			name, scope, status, secret_hash, public_key, public_key_algorithm,
 			provider_connection_id, cluster_name, provider_type, region,
@@ -196,7 +202,7 @@ func (r *Agents) CreateEnrolled(ctx context.Context, a *Agent) error {
 			$7, NULLIF($8, ''), NULLIF($9, ''), NULLIF($10, ''),
 			NULLIF($11, ''), NULLIF($12, ''), $13)
 		RETURNING id, created_at, updated_at`
-	row := r.pool.QueryRow(ctx, q,
+	row := q.QueryRow(ctx, insert,
 		a.Name, scope, a.Status, a.SecretHash, a.PublicKey, a.PublicKeyAlgorithm,
 		a.ProviderConnectionID, a.ClusterName, a.ProviderType, a.Region,
 		a.AgentVersion, a.PublicKeyFingerprint, caps)

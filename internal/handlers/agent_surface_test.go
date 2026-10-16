@@ -1,0 +1,830 @@
+package handlers_test
+
+// Regression tests for the agent-facing surface (api#191 H4 + API-18,
+// plus API-S-21 / -23 / -24 / -27 and API-N-07 from the 2026-10 audit).
+//
+// The app below mirrors the /api/v1/agents route chain in cmd/api/main.go:
+// Recover at the top, the enroll route, then the AgentAuth-gated
+// /agents/:id group with the real Jobs / Wraps / Agents handlers. Every
+// service and repository is the production type over a real Postgres +
+// Redis, so the tests drive the same code path a running agent hits.
+
+import (
+	"bytes"
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
+
+	"github.com/secrets-bridge/api/internal/handlers"
+	"github.com/secrets-bridge/api/internal/middleware"
+	"github.com/secrets-bridge/api/internal/services"
+	"github.com/secrets-bridge/api/pkg/keymgmt"
+	"github.com/secrets-bridge/api/pkg/runtime"
+	"github.com/secrets-bridge/api/pkg/sealing"
+	"github.com/secrets-bridge/api/pkg/storage"
+)
+
+type agentSurface struct {
+	app      *fiber.App
+	pool     *storage.Pool
+	rdb      *runtime.Client
+	agentSvc *services.AgentService
+	reqSvc   *services.RequestService
+	jobsR    *storage.SyncJobs
+	connID   uuid.UUID
+}
+
+type surfaceAgent struct {
+	id     uuid.UUID
+	secret string
+	pub    []byte
+	priv   []byte
+}
+
+func bootstrapAgentSurface(t *testing.T) *agentSurface {
+	return bootstrapAgentSurfaceWith(t, nil)
+}
+
+// bootstrapAgentSurfaceWith lets a test wrap the agent repository the
+// AgentService reads through (the revocation race test gates Get).
+func bootstrapAgentSurfaceWith(t *testing.T, wrap func(*storage.Agents) storage.AgentRepository) *agentSurface {
+	t.Helper()
+	dbDSN := os.Getenv("TEST_DATABASE_URL")
+	redisURL := os.Getenv("TEST_REDIS_URL")
+	if dbDSN == "" || redisURL == "" {
+		t.Skip("TEST_DATABASE_URL and TEST_REDIS_URL required; skipping")
+	}
+	ctx := t.Context()
+
+	cfg := storage.Config{DSN: dbDSN, MaxConns: 16, ConnLifetime: 5 * time.Minute}
+	if err := storage.Migrate(ctx, cfg); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	pool, err := storage.Open(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	// Keep the system workflow + policy seeds; wipe everything this
+	// surface writes. CASCADE also clears the tables that reference
+	// these (reveal_sessions, project_provider_connections, ...).
+	const wipe = `
+		TRUNCATE TABLE
+			audit_events, sync_runs, sync_jobs, approvals,
+			access_requests, secret_wraps, agents,
+			agent_enrollment_tokens, provider_connections
+		RESTART IDENTITY CASCADE;
+		DELETE FROM policy_rules WHERE is_system = false;
+		DELETE FROM workflow_definitions WHERE is_system = false;`
+	if _, err := pool.Exec(ctx, wipe); err != nil {
+		t.Fatalf("wipe: %v", err)
+	}
+
+	rdb, err := runtime.Open(ctx, runtime.Config{
+		URL:       redisURL,
+		PoolSize:  8,
+		Namespace: fmt.Sprintf("sb-agentsurface-%d", time.Now().UnixNano()),
+	})
+	if err != nil {
+		t.Fatalf("Open runtime: %v", err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	masterKey := make([]byte, 32)
+	if _, err := rand.Read(masterKey); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	km, err := keymgmt.NewLocalKMS(masterKey)
+	if err != nil {
+		t.Fatalf("NewLocalKMS: %v", err)
+	}
+
+	agentsR := storage.NewAgents(pool)
+	var agentRepo storage.AgentRepository = agentsR
+	if wrap != nil {
+		agentRepo = wrap(agentsR)
+	}
+	auditR := storage.NewAuditEvents(pool)
+	jobsR := storage.NewSyncJobs(pool)
+	workflowsR := storage.NewWorkflows(pool)
+	wrapSvc := services.NewWrapService(storage.NewSecretWraps(pool), auditR, km)
+	policy := services.NewPolicyEngine(storage.NewPolicies(pool), workflowsR, auditR)
+	jobSvc := services.NewJobService(jobsR, auditR)
+	reqSvc := services.NewRequestService(storage.NewAccessRequests(pool), storage.NewApprovals(pool),
+		wrapSvc, workflowsR, policy, auditR, jobSvc)
+	jobSvc.OnCompleted(reqSvc.OnJobCompleted)
+	agentSvc := services.NewAgentService(agentRepo, auditR, rdb).
+		WithEnrollment(storage.NewAgentEnrollmentTokens(pool), storage.NewProviderConnections(pool))
+
+	var connID uuid.UUID
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO provider_connections (name, type, auth_method, scope, status)
+		VALUES ('tenant-a-uat', 'aws-sm', 'token', '{}'::jsonb, 'active') RETURNING id`).Scan(&connID); err != nil {
+		t.Fatalf("seed provider connection: %v", err)
+	}
+
+	app := fiber.New()
+	app.Use(middleware.Recover(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	v1 := app.Group("/api/v1")
+	agentsH := handlers.NewAgents(agentSvc)
+	jobsH := handlers.NewJobs(jobSvc)
+	wrapsH := handlers.NewWraps(reqSvc, wrapSvc, agentsR, km)
+	v1.Post("/agents/enroll", agentsH.Enroll)
+	agentRoutes := v1.Group("/agents/:id", middleware.AgentAuth(agentSvc))
+	agentRoutes.Post("/jobs/claim", jobsH.Claim)
+	agentRoutes.Post("/jobs/:job/complete", jobsH.Complete)
+	agentRoutes.Get("/wraps/:wrap_id", wrapsH.Retrieve)
+	agentRoutes.Post("/wraps", wrapsH.Create)
+	agentRoutes.Post("/dek", wrapsH.IssueDEK)
+
+	return &agentSurface{
+		app: app, pool: pool, rdb: rdb, agentSvc: agentSvc,
+		reqSvc: reqSvc, jobsR: jobsR, connID: connID,
+	}
+}
+
+// mint creates an agent. withKey registers an X25519 public key so
+// wrap retrievals come back sealed (the production default).
+func (fx *agentSurface) mint(t *testing.T, name string, withKey bool) surfaceAgent {
+	t.Helper()
+	in := services.MintInput{Name: name}
+	var a surfaceAgent
+	if withKey {
+		priv, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("x25519: %v", err)
+		}
+		a.priv = priv.Bytes()
+		a.pub = priv.PublicKey().Bytes()
+		in.PublicKey = a.pub
+		in.PublicKeyAlgorithm = "x25519"
+	}
+	m, err := fx.agentSvc.Mint(t.Context(), in)
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	a.id, a.secret = m.ID, m.AgentSecret
+	return a
+}
+
+func (fx *agentSurface) call(t *testing.T, method, path, secret string, body any) (int, []byte) {
+	t.Helper()
+	var rdr io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		rdr = bytes.NewReader(b)
+	}
+	req := httptest.NewRequest(method, path, rdr)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if secret != "" {
+		req.Header.Set("X-Agent-Secret", secret)
+	}
+	resp, err := fx.app.Test(req, fiber.TestConfig{Timeout: 20 * time.Second})
+	if err != nil {
+		t.Fatalf("app.Test %s %s: %v", method, path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	out, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, out
+}
+
+type claimedJob struct {
+	ID      uuid.UUID      `json:"id"`
+	JobType string         `json:"job_type"`
+	Payload map[string]any `json:"payload"`
+}
+
+func (fx *agentSurface) claim(t *testing.T, a surfaceAgent) claimedJob {
+	t.Helper()
+	code, body := fx.call(t, http.MethodPost, "/api/v1/agents/"+a.id.String()+"/jobs/claim", a.secret, nil)
+	if code != http.StatusOK {
+		t.Fatalf("claim = %d (%s); want 200", code, body)
+	}
+	var j claimedJob
+	if err := json.Unmarshal(body, &j); err != nil {
+		t.Fatalf("decode claim: %v", err)
+	}
+	return j
+}
+
+func (fx *agentSurface) complete(t *testing.T, a surfaceAgent, jobID uuid.UUID, status, errText string) int {
+	t.Helper()
+	code, _ := fx.call(t, http.MethodPost,
+		"/api/v1/agents/"+a.id.String()+"/jobs/"+jobID.String()+"/complete", a.secret,
+		map[string]any{"status": status, "error": errText})
+	return code
+}
+
+// envelope does what the agent's ReadExecutor does on the sealed path:
+// fetch a DEK, AES-256-GCM the value locally, ship ciphertext + nonce +
+// the KMS-wrapped DEK. nonce lets a test override the 12-byte nonce.
+func (fx *agentSurface) envelope(t *testing.T, a surfaceAgent, value []byte, nonce []byte) map[string]any {
+	t.Helper()
+	code, body := fx.call(t, http.MethodPost, "/api/v1/agents/"+a.id.String()+"/dek", a.secret, nil)
+	if code != http.StatusCreated {
+		t.Fatalf("dek = %d (%s)", code, body)
+	}
+	var dek handlers.DEKResponse
+	if err := json.Unmarshal(body, &dek); err != nil {
+		t.Fatalf("decode dek: %v", err)
+	}
+	key, _ := base64.StdEncoding.DecodeString(dek.Plaintext)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatalf("aes: %v", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("gcm: %v", err)
+	}
+	realNonce := make([]byte, gcm.NonceSize())
+	_, _ = rand.Read(realNonce)
+	ct := gcm.Seal(nil, realNonce, value, nil)
+	if nonce == nil {
+		nonce = realNonce
+	}
+	return map[string]any{
+		"algorithm":      "aes-256-gcm",
+		"ciphertext":     base64.StdEncoding.EncodeToString(ct),
+		"nonce":          base64.StdEncoding.EncodeToString(nonce),
+		"dek_ciphertext": dek.Ciphertext,
+		"dek_kms_key_id": dek.KeyID,
+	}
+}
+
+func (fx *agentSurface) postWrap(t *testing.T, a surfaceAgent, reqID uuid.UUID, key string, env map[string]any) (int, []byte) {
+	t.Helper()
+	return fx.call(t, http.MethodPost, "/api/v1/agents/"+a.id.String()+"/wraps", a.secret,
+		map[string]any{"request_id": reqID.String(), "key_name": key, "envelope": env})
+}
+
+func (fx *agentSurface) getWrap(t *testing.T, a surfaceAgent, wrapID string) (int, []byte) {
+	t.Helper()
+	return fx.call(t, http.MethodGet, "/api/v1/agents/"+a.id.String()+"/wraps/"+wrapID, a.secret, nil)
+}
+
+func (fx *agentSurface) approvedRead(t *testing.T, keys []string) *storage.AccessRequest {
+	t.Helper()
+	ctx := t.Context()
+	req, err := fx.reqSvc.SubmitRead(ctx, services.ReadInput{
+		RequesterID:        "alice",
+		ProjectID:          "team-alpha",
+		Environment:        "uat",
+		TargetProviderType: "vault",
+		TargetSecretRef:    "secret/data/team-alpha/uat/db",
+		TargetKeys:         keys,
+		Justification:      "agent surface regression",
+	})
+	if err != nil {
+		t.Fatalf("SubmitRead: %v", err)
+	}
+	if _, err := fx.reqSvc.Approve(ctx, req.ID, "bob", ""); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	out, err := fx.reqSvc.Get(ctx, req.ID)
+	if err != nil || out.JobID == nil {
+		t.Fatalf("approved read has no job (err=%v)", err)
+	}
+	return out
+}
+
+func (fx *agentSurface) approvedPatch(t *testing.T, kv map[string][]byte) *storage.AccessRequest {
+	t.Helper()
+	ctx := t.Context()
+	req, err := fx.reqSvc.Submit(ctx, services.PatchInput{
+		RequesterID:        "alice",
+		ProjectID:          "team-alpha",
+		Environment:        "uat",
+		TargetProviderType: "vault",
+		TargetSecretRef:    "secret/data/team-alpha/uat/db",
+		KeyValues:          kv,
+		Justification:      "agent surface regression",
+	})
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if _, err := fx.reqSvc.Approve(ctx, req.ID, "bob", ""); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	out, err := fx.reqSvc.Get(ctx, req.ID)
+	if err != nil || out.JobID == nil {
+		t.Fatalf("approved patch has no job (err=%v)", err)
+	}
+	return out
+}
+
+func (fx *agentSurface) countRows(t *testing.T, q string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := fx.pool.QueryRow(t.Context(), q, args...).Scan(&n); err != nil {
+		t.Fatalf("count %q: %v", q, err)
+	}
+	return n
+}
+
+func wrapIDsFromPayload(t *testing.T, j claimedJob) []string {
+	t.Helper()
+	raw, _ := j.Payload["wraps"].([]any)
+	out := make([]string, 0, len(raw))
+	for _, r := range raw {
+		m, _ := r.(map[string]any)
+		id, _ := m["wrap_id"].(string)
+		out = append(out, id)
+	}
+	if len(out) == 0 {
+		t.Fatalf("patch job payload carries no wraps: %v", j.Payload)
+	}
+	return out
+}
+
+// ---- happy paths --------------------------------------------------
+
+// Read flow end to end: agent claims, gets a DEK, posts sealed wraps for
+// the declared keys, completes; the requester reveals each value once.
+func TestAgentSurface_ReadFlow_HappyPath(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	ctx := t.Context()
+	a := fx.mint(t, "agent-a", true)
+	req := fx.approvedRead(t, []string{"DB_PASSWORD", "DB_USER"})
+
+	job := fx.claim(t, a)
+	if job.ID != *req.JobID || job.JobType != "read" {
+		t.Fatalf("claimed %s/%s; want read job %s", job.ID, job.JobType, req.JobID)
+	}
+	values := map[string]string{"DB_PASSWORD": "canary-read-pw-7f3a", "DB_USER": "svc-team-alpha"}
+	for k, v := range values {
+		if code, body := fx.postWrap(t, a, req.ID, k, fx.envelope(t, a, []byte(v), nil)); code != http.StatusCreated {
+			t.Fatalf("post wrap %s = %d (%s); want 201", k, code, body)
+		}
+	}
+	if code := fx.complete(t, a, job.ID, "succeeded", ""); code != http.StatusNoContent {
+		t.Fatalf("complete = %d; want 204", code)
+	}
+	got, _ := fx.reqSvc.Get(ctx, req.ID)
+	if got.Status != storage.AccessRequestStatusExecuted {
+		t.Fatalf("request status = %s; want executed", got.Status)
+	}
+
+	summaries, err := fx.reqSvc.WrapSummariesForRequest(ctx, req.ID)
+	if err != nil || len(summaries) != 2 {
+		t.Fatalf("summaries = %d (err=%v); want 2", len(summaries), err)
+	}
+	for _, s := range summaries {
+		pt, _, err := fx.reqSvc.RetrieveWrapForUser(ctx, req.ID, s.ID, "alice")
+		if err != nil {
+			t.Fatalf("RetrieveWrapForUser %s: %v", s.KeyName, err)
+		}
+		if string(pt) != values[s.KeyName] {
+			t.Fatalf("revealed %s does not match what the agent posted", s.KeyName)
+		}
+	}
+	// API-S-24: user-consumed wraps keep no ciphertext.
+	if n := fx.countRows(t, `SELECT count(*) FROM secret_wraps
+		WHERE request_id = $1 AND (octet_length(encrypted_value) > 0 OR octet_length(data_key_ciphertext) > 0)`, req.ID); n != 0 {
+		t.Fatalf("%d consumed read wraps still hold ciphertext", n)
+	}
+}
+
+// Patch flow end to end: agent claims the patch job, fetches each wrap
+// (sealed to its key), completes; consumed rows hold no ciphertext.
+func TestAgentSurface_PatchFlow_HappyPath(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	ctx := t.Context()
+	a := fx.mint(t, "agent-a", true)
+	req := fx.approvedPatch(t, map[string][]byte{"DB_PASSWORD": []byte("canary-patch-pw-91c2")})
+
+	job := fx.claim(t, a)
+	if job.ID != *req.JobID || job.JobType != "patch" {
+		t.Fatalf("claimed %s/%s; want patch job %s", job.ID, job.JobType, req.JobID)
+	}
+	for _, wid := range wrapIDsFromPayload(t, job) {
+		code, body := fx.getWrap(t, a, wid)
+		if code != http.StatusOK {
+			t.Fatalf("get wrap = %d (%s); want 200", code, body)
+		}
+		var p handlers.WrapPayload
+		if err := json.Unmarshal(body, &p); err != nil || p.Sealed == nil {
+			t.Fatalf("expected a sealed payload (err=%v)", err)
+		}
+		ct, _ := base64.StdEncoding.DecodeString(p.Sealed.Ciphertext)
+		nonce, _ := base64.StdEncoding.DecodeString(p.Sealed.Nonce)
+		eph, _ := base64.StdEncoding.DecodeString(p.Sealed.EphemeralPublicKey)
+		pt, err := sealing.Open(&sealing.Envelope{Ciphertext: ct, Nonce: nonce, EphemeralPublicKey: eph, Algorithm: p.Sealed.Algorithm}, a.priv, a.pub)
+		if err != nil || string(pt) != "canary-patch-pw-91c2" {
+			t.Fatalf("sealed wrap did not open to the submitted value (err=%v)", err)
+		}
+	}
+	// API-S-24: the agent-consumed wrap keeps no ciphertext.
+	if n := fx.countRows(t, `SELECT count(*) FROM secret_wraps
+		WHERE request_id = $1 AND consumed_at IS NOT NULL
+		  AND (octet_length(encrypted_value) > 0 OR octet_length(data_key_ciphertext) > 0)`, req.ID); n != 0 {
+		t.Fatalf("%d consumed patch wraps still hold ciphertext", n)
+	}
+	if code := fx.complete(t, a, job.ID, "succeeded", ""); code != http.StatusNoContent {
+		t.Fatalf("complete = %d; want 204", code)
+	}
+	got, _ := fx.reqSvc.Get(ctx, req.ID)
+	if got.Status != storage.AccessRequestStatusExecuted {
+		t.Fatalf("request status = %s; want executed", got.Status)
+	}
+}
+
+// ---- H4: dispatch scoping -----------------------------------------
+
+// Agent B cannot post a wrap into a read job agent A claimed, and no
+// agent can post before the job is claimed at all.
+func TestAgentSurface_OtherAgentCannotPostWrap(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	a := fx.mint(t, "agent-a", false)
+	b := fx.mint(t, "agent-b", false)
+	req := fx.approvedRead(t, []string{"DB_PASSWORD"})
+
+	// Not claimed yet: nobody may post.
+	if code, body := fx.postWrap(t, a, req.ID, "DB_PASSWORD", fx.envelope(t, a, []byte("injected"), nil)); code != http.StatusForbidden {
+		t.Fatalf("post before claim = %d (%s); want 403", code, body)
+	}
+
+	fx.claim(t, a)
+	if code, body := fx.postWrap(t, b, req.ID, "DB_PASSWORD", fx.envelope(t, b, []byte("injected"), nil)); code != http.StatusForbidden {
+		t.Fatalf("agent B post into A's job = %d (%s); want 403", code, body)
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM secret_wraps WHERE request_id = $1`, req.ID); n != 0 {
+		t.Fatalf("refused posts still created %d wraps", n)
+	}
+	// The claimer is still served (the 403 was about ownership).
+	if code, body := fx.postWrap(t, a, req.ID, "DB_PASSWORD", fx.envelope(t, a, []byte("real"), nil)); code != http.StatusCreated {
+		t.Fatalf("claimer post = %d (%s); want 201", code, body)
+	}
+}
+
+// Agent B cannot fetch (and so cannot burn) a patch wrap whose job agent
+// A claimed.
+func TestAgentSurface_OtherAgentCannotFetchWrap(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	a := fx.mint(t, "agent-a", false)
+	b := fx.mint(t, "agent-b", false)
+	req := fx.approvedPatch(t, map[string][]byte{"DB_PASSWORD": []byte("canary-patch-b")})
+
+	// Unclaimed job: refused, wrap untouched.
+	summaries, _ := fx.reqSvc.WrapSummariesForRequest(t.Context(), req.ID)
+	wid := summaries[0].ID.String()
+	if code, body := fx.getWrap(t, b, wid); code != http.StatusForbidden {
+		t.Fatalf("fetch before claim = %d (%s); want 403", code, body)
+	}
+
+	job := fx.claim(t, a)
+	wid = wrapIDsFromPayload(t, job)[0]
+	if code, body := fx.getWrap(t, b, wid); code != http.StatusForbidden {
+		t.Fatalf("agent B fetch of A's wrap = %d (%s); want 403", code, body)
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM secret_wraps WHERE id = $1 AND consumed_at IS NULL`, wid); n != 1 {
+		t.Fatal("refused fetch burned the wrap")
+	}
+	if code, body := fx.getWrap(t, a, wid); code != http.StatusOK {
+		t.Fatalf("claimer fetch = %d (%s); want 200", code, body)
+	}
+}
+
+// key_name must be one of the request's target_keys, and a key can be
+// posted once per request.
+func TestAgentSurface_UndeclaredAndDuplicateKeyRefused(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	a := fx.mint(t, "agent-a", false)
+	req := fx.approvedRead(t, []string{"DB_PASSWORD"})
+	fx.claim(t, a)
+
+	if code, body := fx.postWrap(t, a, req.ID, "ADMIN_TOKEN", fx.envelope(t, a, []byte("x"), nil)); code != http.StatusForbidden {
+		t.Fatalf("undeclared key = %d (%s); want 403", code, body)
+	}
+	if code, body := fx.postWrap(t, a, req.ID, "DB_PASSWORD", fx.envelope(t, a, []byte("first"), nil)); code != http.StatusCreated {
+		t.Fatalf("declared key = %d (%s); want 201", code, body)
+	}
+	if code, body := fx.postWrap(t, a, req.ID, "DB_PASSWORD", fx.envelope(t, a, []byte("second"), nil)); code != http.StatusConflict {
+		t.Fatalf("duplicate key = %d (%s); want 409", code, body)
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM secret_wraps WHERE request_id = $1`, req.ID); n != 1 {
+		t.Fatalf("wraps for request = %d; want exactly 1", n)
+	}
+	// The surviving wrap is the first value, not the duplicate.
+	summaries, _ := fx.reqSvc.WrapSummariesForRequest(t.Context(), req.ID)
+	pt, _, err := fx.reqSvc.RetrieveWrapForUser(t.Context(), req.ID, summaries[0].ID, "alice")
+	if err != nil || string(pt) != "first" {
+		t.Fatalf("requester got the wrong value (err=%v)", err)
+	}
+}
+
+// Concurrent duplicate posts for the same key: exactly one lands.
+func TestAgentSurface_ConcurrentDuplicateKeyOneWins(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	a := fx.mint(t, "agent-a", false)
+	req := fx.approvedRead(t, []string{"DB_PASSWORD"})
+	fx.claim(t, a)
+
+	envs := make([]map[string]any, 6)
+	for i := range envs {
+		envs[i] = fx.envelope(t, a, []byte(fmt.Sprintf("v-%d", i)), nil)
+	}
+	var created atomic.Int32
+	var wg sync.WaitGroup
+	for i := range envs {
+		wg.Add(1)
+		go func(env map[string]any) {
+			defer wg.Done()
+			if code, _ := fx.postWrap(t, a, req.ID, "DB_PASSWORD", env); code == http.StatusCreated {
+				created.Add(1)
+			}
+		}(envs[i])
+	}
+	wg.Wait()
+	if created.Load() != 1 {
+		t.Fatalf("concurrent duplicate posts created %d wraps; want 1", created.Load())
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM secret_wraps WHERE request_id = $1`, req.ID); n != 1 {
+		t.Fatalf("wraps for request = %d; want 1", n)
+	}
+}
+
+// Read-flow wraps are destined for the requester. No agent, not even
+// the one that produced them, may fetch (and burn) them.
+func TestAgentSurface_AgentCannotFetchUserDestinedWrap(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	a := fx.mint(t, "agent-a", false)
+	b := fx.mint(t, "agent-b", false)
+	req := fx.approvedRead(t, []string{"DB_PASSWORD"})
+	fx.claim(t, a)
+	code, body := fx.postWrap(t, a, req.ID, "DB_PASSWORD", fx.envelope(t, a, []byte("canary-user-only"), nil))
+	if code != http.StatusCreated {
+		t.Fatalf("post wrap = %d (%s)", code, body)
+	}
+	var cr handlers.CreateResponse
+	_ = json.Unmarshal(body, &cr)
+
+	for _, ag := range []surfaceAgent{a, b} {
+		if code, body := fx.getWrap(t, ag, cr.WrapID); code != http.StatusForbidden {
+			t.Fatalf("agent fetch of user wrap = %d (%s); want 403", code, body)
+		}
+	}
+	pt, _, err := fx.reqSvc.RetrieveWrapForUser(t.Context(), req.ID, uuid.MustParse(cr.WrapID), "alice")
+	if err != nil || string(pt) != "canary-user-only" {
+		t.Fatalf("requester could not reveal after refused agent fetches (err=%v)", err)
+	}
+}
+
+// ---- API-S-23: envelope validation --------------------------------
+
+func TestAgentSurface_BadNonceIs400NotPanic(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	a := fx.mint(t, "agent-a", false)
+	req := fx.approvedRead(t, []string{"DB_PASSWORD"})
+	fx.claim(t, a)
+
+	cases := map[string]func() map[string]any{
+		"short nonce": func() map[string]any { return fx.envelope(t, a, []byte("v"), []byte{1, 2, 3, 4}) },
+		"long nonce":  func() map[string]any { return fx.envelope(t, a, []byte("v"), make([]byte, 64)) },
+		"short ciphertext": func() map[string]any {
+			env := fx.envelope(t, a, []byte("v"), nil)
+			env["ciphertext"] = base64.StdEncoding.EncodeToString([]byte{9, 9, 9})
+			return env
+		},
+	}
+	for name, mk := range cases {
+		t.Run(name, func(t *testing.T) {
+			code, body := fx.postWrap(t, a, req.ID, "DB_PASSWORD", mk())
+			if code != http.StatusBadRequest {
+				t.Fatalf("status = %d (%s); want 400", code, body)
+			}
+			if strings.Contains(strings.ToLower(string(body)), "nonce length") {
+				t.Fatalf("400 body leaks crypto internals: %s", body)
+			}
+		})
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM secret_wraps WHERE request_id = $1`, req.ID); n != 0 {
+		t.Fatalf("malformed envelopes created %d wraps", n)
+	}
+}
+
+// ---- API-S-27: job error text -------------------------------------
+
+func TestAgentSurface_JobErrorTruncatedAndScrubbed(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	a := fx.mint(t, "agent-a", false)
+
+	t.Run("oversized", func(t *testing.T) {
+		fx.approvedRead(t, []string{"DB_PASSWORD"})
+		job := fx.claim(t, a)
+		raw := "get value: AccessDenied for AKIAABCDEFGHIJKLMNOP " + strings.Repeat("x", 200_000)
+		if code := fx.complete(t, a, job.ID, "failed", raw); code != http.StatusNoContent {
+			t.Fatalf("complete = %d; want 204", code)
+		}
+		got, err := fx.jobsR.Get(t.Context(), job.ID)
+		if err != nil {
+			t.Fatalf("get job: %v", err)
+		}
+		if len(got.Error) == 0 || len(got.Error) > 1024 {
+			t.Fatalf("stored job error is %d bytes; want 1..1024", len(got.Error))
+		}
+		if strings.Contains(got.Error, "AKIAABCDEFGHIJKLMNOP") {
+			t.Fatal("credential-shaped text stored raw in job error")
+		}
+	})
+
+	t.Run("nul byte", func(t *testing.T) {
+		fx.approvedRead(t, []string{"DB_PASSWORD"})
+		job := fx.claim(t, a)
+		if code := fx.complete(t, a, job.ID, "failed", "provider\x00 said no"); code != http.StatusNoContent {
+			t.Fatalf("complete with NUL in error = %d; want 204", code)
+		}
+	})
+}
+
+// ---- API-S-21: revocation -----------------------------------------
+
+func TestAgentSurface_RevokedAgentRejectedWithWarmCache(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	a := fx.mint(t, "agent-a", false)
+	claimPath := "/api/v1/agents/" + a.id.String() + "/jobs/claim"
+
+	if code, _ := fx.call(t, http.MethodPost, claimPath, a.secret, nil); code != http.StatusNoContent {
+		t.Fatalf("warm-up claim = %d; want 204", code)
+	}
+	if err := fx.agentSvc.Revoke(t.Context(), a.id, "admin-user-1", "test"); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+	if code, _ := fx.call(t, http.MethodPost, claimPath, a.secret, nil); code != http.StatusUnauthorized {
+		t.Fatalf("post-revoke claim = %d; want 401", code)
+	}
+}
+
+// gatedAgents blocks the first armed Get after it has read the row, so a
+// test can land a Revoke between the auth cache-fill's DB read and its
+// Redis write: the exact interleaving behind API-S-21.
+type gatedAgents struct {
+	*storage.Agents
+	armed   atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (g *gatedAgents) Get(ctx context.Context, id uuid.UUID) (*storage.Agent, error) {
+	a, err := g.Agents.Get(ctx, id)
+	if g.armed.CompareAndSwap(true, false) {
+		close(g.entered)
+		<-g.release
+	}
+	return a, err
+}
+
+func TestAgentSurface_RevokeRacingCacheFillStillRejects(t *testing.T) {
+	gate := &gatedAgents{entered: make(chan struct{}), release: make(chan struct{})}
+	fx := bootstrapAgentSurfaceWith(t, func(r *storage.Agents) storage.AgentRepository {
+		gate.Agents = r
+		return gate
+	})
+	a := fx.mint(t, "agent-a", false)
+	claimPath := "/api/v1/agents/" + a.id.String() + "/jobs/claim"
+
+	// Cold cache. The in-flight request reads the agent as active, then
+	// stalls before it can fill the cache.
+	gate.armed.Store(true)
+	done := make(chan int, 1)
+	go func() {
+		code, _ := fx.call(t, http.MethodPost, claimPath, a.secret, nil)
+		done <- code
+	}()
+	<-gate.entered
+	if err := fx.agentSvc.Revoke(t.Context(), a.id, "admin-user-1", "test"); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+	close(gate.release)
+	<-done // the in-flight request was admitted before revocation; fine
+
+	if code, _ := fx.call(t, http.MethodPost, claimPath, a.secret, nil); code != http.StatusUnauthorized {
+		t.Fatalf("claim after revoke = %d; want 401 (stale cache fill must not resurrect a revoked agent)", code)
+	}
+}
+
+// ---- API-N-07: rejected-auth audit rollup --------------------------
+
+func TestAgentSurface_RejectedAuthAuditRollup(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	a := fx.mint(t, "agent-a", false)
+
+	for i := 0; i < 100; i++ {
+		if code, _ := fx.call(t, http.MethodPost, "/api/v1/agents/"+a.id.String()+"/jobs/claim", "wrong-secret", nil); code != http.StatusUnauthorized {
+			t.Fatalf("bad secret = %d; want 401", code)
+		}
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM audit_events WHERE action = 'agent.auth.rejected' AND metadata->>'reason' = 'bad_secret'`); n != 1 {
+		t.Fatalf("100 bad-secret rejections wrote %d audit rows; want 1", n)
+	}
+
+	for i := 0; i < 100; i++ {
+		if code, _ := fx.call(t, http.MethodPost, "/api/v1/agents/"+uuid.NewString()+"/jobs/claim", "whatever", nil); code != http.StatusUnauthorized {
+			t.Fatalf("unknown agent = %d; want 401", code)
+		}
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM audit_events WHERE action = 'agent.auth.rejected' AND metadata->>'reason' = 'unknown_agent'`); n != 1 {
+		t.Fatalf("100 unknown-agent rejections (random ids) wrote %d audit rows; want 1", n)
+	}
+
+	for i := 0; i < 100; i++ {
+		code, _ := fx.call(t, http.MethodPost, "/api/v1/agents/enroll", "",
+			map[string]any{"enrollment_token": fmt.Sprintf("bogus-%d", i), "agent_name": "x"})
+		if code != http.StatusUnauthorized {
+			t.Fatalf("bogus enroll = %d; want 401", code)
+		}
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM audit_events WHERE action = 'agent.enrollment.rejected'`); n != 1 {
+		t.Fatalf("100 bogus enrollments wrote %d audit rows; want 1", n)
+	}
+
+	// A different reason is its own bucket: still audited (api#187).
+	if err := fx.agentSvc.Revoke(t.Context(), a.id, "admin-user-1", "test"); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+	fx.call(t, http.MethodPost, "/api/v1/agents/"+a.id.String()+"/jobs/claim", a.secret, nil)
+	if n := fx.countRows(t, `SELECT count(*) FROM audit_events WHERE action = 'agent.auth.rejected' AND metadata->>'reason' = 'revoked'`); n != 1 {
+		t.Fatalf("revoked rejection wrote %d audit rows; want 1", n)
+	}
+}
+
+// ---- API-18: enrollment -------------------------------------------
+
+// 8 concurrent enrolls per token (the audit's repro), over several
+// tokens: every round yields exactly one agent and no orphan rows. The
+// deterministic version of this race is in services
+// (TestEnroll_ConcurrentSameToken_NoOrphanAgents).
+func TestAgentSurface_ConcurrentEnrollOneToken(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	const rounds, n = 5, 8
+	for round := 1; round <= rounds; round++ {
+		tok, err := fx.agentSvc.GenerateEnrollmentToken(t.Context(), services.GenerateEnrollmentTokenInput{
+			ProviderConnectionID: fx.connID, CreatedBy: "admin-user-1",
+		})
+		if err != nil {
+			t.Fatalf("GenerateEnrollmentToken: %v", err)
+		}
+		codes := make([]int, n)
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				codes[i], _ = fx.call(t, http.MethodPost, "/api/v1/agents/enroll", "", map[string]any{
+					"enrollment_token": tok.Token,
+					"agent_name":       fmt.Sprintf("enroll-race-%d-%d", round, i),
+					"provider_type":    "aws-sm",
+				})
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+
+		created := 0
+		for _, c := range codes {
+			switch c {
+			case http.StatusCreated:
+				created++
+			case http.StatusConflict:
+			default:
+				t.Fatalf("round %d: unexpected enroll status %d (all: %v)", round, c, codes)
+			}
+		}
+		if created != 1 {
+			t.Fatalf("round %d: one token enrolled %d agents; want exactly 1 (codes %v)", round, created, codes)
+		}
+		if rows := fx.countRows(t, `SELECT count(*) FROM agents`); rows != round {
+			t.Fatalf("round %d: agents table has %d rows; want %d (no orphans)", round, rows, round)
+		}
+	}
+	if rows := fx.countRows(t, `SELECT count(*) FROM agent_enrollment_tokens t
+		JOIN agents a ON a.id = t.consumed_by_agent_id WHERE t.consumed_at IS NOT NULL`); rows != rounds {
+		t.Fatalf("%d tokens linked to an enrolled agent; want %d", rows, rounds)
+	}
+}

@@ -9,6 +9,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/secrets-bridge/api/pkg/sanitize"
 )
 
 // SyncJob mirrors a row in the sync_jobs table. The payload is opaque
@@ -186,6 +188,10 @@ func (r *SyncJobs) ClaimNext(ctx context.Context, agentID uuid.UUID, lease time.
 // ownership check (claimed_by = $2) prevents a leftover caller whose
 // lease has expired (and the job was re-claimed by someone else) from
 // overwriting the new owner's result.
+//
+// errMsg is agent-supplied free text. It is redacted, stripped of
+// control characters and capped at sanitize.JobMaxErrorLen before it
+// is written (API-S-27).
 func (r *SyncJobs) Complete(ctx context.Context, jobID, agentID uuid.UUID, status JobStatus, errMsg string) error {
 	switch status {
 	case JobStatusSucceeded, JobStatusFailed:
@@ -193,6 +199,7 @@ func (r *SyncJobs) Complete(ctx context.Context, jobID, agentID uuid.UUID, statu
 	default:
 		return fmt.Errorf("storage: Complete: invalid terminal status %q", status)
 	}
+	errMsg = sanitize.JobError(errMsg)
 
 	const q = `
 		UPDATE sync_jobs

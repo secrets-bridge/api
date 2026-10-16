@@ -15,6 +15,7 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -92,6 +93,9 @@ func NewAgentService(agents storage.AgentRepository, audit storage.AuditEventRep
 const (
 	cacheKindSecretHash = "agent-hash"
 	cacheKindLastSeen   = "agent-lastseen"
+	// Rollup slots for rejected agent auth / enrollment audits (API-N-07).
+	cacheKindAuthRejectAudit   = "agent-auth-reject-audit"
+	cacheKindEnrollRejectAudit = "agent-enroll-reject-audit"
 )
 
 // cachedSecretHash holds the marshalled form stored in Redis. We track
@@ -201,7 +205,7 @@ func (s *AgentService) Authenticate(ctx context.Context, id uuid.UUID, agentSecr
 			return err
 		}
 		cached = cachedSecretHash{Status: string(agent.Status), Hash: agent.SecretHash}
-		s.writeSecretHashCache(ctx, id, cached) // best-effort
+		s.fillSecretHashCache(ctx, id, cached) // best-effort
 	}
 
 	if cached.Status == string(storage.AgentStatusRevoked) {
@@ -223,14 +227,51 @@ func (s *AgentService) Authenticate(ctx context.Context, id uuid.UUID, agentSecr
 // auditAuthRejected records a metadata-only agent.auth.rejected event
 // (QA follow-up). No secret, hash, or header material — only the agent id
 // and a coarse reason code. Best-effort; never blocks the auth decision.
+//
+// Rolled up (API-N-07): the agent routes are reachable without a
+// credential, so at most one row per (agent id, reason) per
+// rejectAuditWindow is written. An unknown agent id is caller-chosen, so
+// those all share the "unknown" bucket; otherwise random ids would still
+// flood the append-only table.
 func (s *AgentService) auditAuthRejected(ctx context.Context, id uuid.UUID, reason string) {
+	subject := id.String()
+	if reason == "unknown_agent" {
+		subject = "unknown"
+	}
+	if !s.claimRejectAuditSlot(ctx, cacheKindAuthRejectAudit, subject, reason) {
+		return
+	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
 		Actor:    "agent:" + id.String(),
 		Action:   "agent.auth.rejected",
 		Resource: "agent:" + id.String(),
 		Status:   storage.AuditStatusDenied,
-		Metadata: map[string]any{"reason": reason},
+		Metadata: map[string]any{
+			"reason":                reason,
+			"rollup_window_seconds": int(rejectAuditWindow / time.Second),
+		},
 	})
+}
+
+// rejectAuditWindow is how long one rejected-auth audit row stands for
+// every identical rejection after it (API-N-07).
+const rejectAuditWindow = 60 * time.Second
+
+// claimRejectAuditSlot reports whether this (subject, reason) rejection
+// should be written to audit_events: the first one in each
+// rejectAuditWindow wins a Redis SET NX EX slot and the rest are folded
+// into it. Without Redis, or on any Redis error, it returns true:
+// auditability must not depend on the cache being up.
+func (s *AgentService) claimRejectAuditSlot(ctx context.Context, kind, subject, reason string) bool {
+	if s.rdb == nil {
+		return true
+	}
+	key := s.rdb.Key(kind, subject+":"+reason)
+	ok, err := s.rdb.Raw().SetNX(ctx, key, "1", rejectAuditWindow).Result()
+	if err != nil {
+		return true
+	}
+	return ok
 }
 
 // Heartbeat authenticates the agent and bumps last_seen_at. Best-effort
@@ -353,6 +394,28 @@ func (s *AgentService) readSecretHashCache(ctx context.Context, id uuid.UUID) (c
 		return cachedSecretHash{}, false, nil
 	}
 	return c, true, nil
+}
+
+// fillSecretHashCache primes the cache after a Postgres read, then
+// re-reads the row and drops the entry if it changed (API-S-21).
+//
+// Revoke deletes the cache entry only after its UPDATE commits. Without
+// the re-read, a fill whose Postgres read predates the revoke but whose
+// Redis write lands after that delete would serve the revoked agent as
+// active until the TTL. With it, every interleaving ends with no stale
+// entry: the re-read runs after our write, so either it sees the revoke
+// (we delete our own entry) or the revoke commits later and its delete
+// runs after our write. A failed re-read also drops the entry, so the
+// next call goes back to Postgres.
+func (s *AgentService) fillSecretHashCache(ctx context.Context, id uuid.UUID, c cachedSecretHash) {
+	if s.rdb == nil {
+		return
+	}
+	s.writeSecretHashCache(ctx, id, c)
+	fresh, err := s.agents.Get(ctx, id)
+	if err != nil || string(fresh.Status) != c.Status || !bytes.Equal(fresh.SecretHash, c.Hash) {
+		s.invalidateSecretHashCache(ctx, id)
+	}
 }
 
 func (s *AgentService) writeSecretHashCache(ctx context.Context, id uuid.UUID, c cachedSecretHash) {

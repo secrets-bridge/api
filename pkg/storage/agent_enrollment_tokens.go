@@ -43,9 +43,16 @@ type AgentEnrollmentTokenRepository interface {
 	// ErrEnrollmentTokenNotFound when no row matches.
 	GetByHash(ctx context.Context, tokenHash []byte) (*AgentEnrollmentToken, error)
 	// MarkConsumed atomically stamps consumed_at + consumed_by_agent_id
-	// only if the token is still unconsumed (single-use guard). Returns
-	// ErrEnrollmentTokenNotFound when the row is already consumed / gone.
+	// only if the token is still unconsumed, unrevoked and unexpired at
+	// `at` (single-use guard). Returns ErrEnrollmentTokenNotFound when
+	// the row is consumed / revoked / expired / gone.
 	MarkConsumed(ctx context.Context, id, agentID uuid.UUID, at time.Time) error
+	// ConsumeAndCreateAgent burns the token and inserts the enrolled
+	// agent in ONE transaction, token first (API-18): a losing
+	// concurrent enroll or a revoked/expired token never creates an
+	// agent row, and a failed insert rolls the consume back. Returns
+	// ErrEnrollmentTokenNotFound when the token cannot be consumed.
+	ConsumeAndCreateAgent(ctx context.Context, tokenID uuid.UUID, at time.Time, a *Agent) error
 	// Get resolves a token by id (admin revoke path). (api#179)
 	Get(ctx context.Context, id uuid.UUID) (*AgentEnrollmentToken, error)
 	// Revoke stamps revoked_at + revoked_by on an UNUSED, un-revoked token.
@@ -106,19 +113,62 @@ func (r *AgentEnrollmentTokens) GetByHash(ctx context.Context, tokenHash []byte)
 	return scanEnrollmentToken(r.pool.QueryRow(ctx, q, tokenHash))
 }
 
+// consumableTokenSQL is the single-use guard every consume applies: not
+// yet consumed, never revoked, and not expired at $2 (API-18).
+const consumableTokenSQL = `consumed_at IS NULL AND revoked_at IS NULL AND expires_at > $2`
+
 // MarkConsumed atomically burns the token (single-use). A no-op affecting
-// zero rows (already consumed) surfaces as ErrEnrollmentTokenNotFound.
+// zero rows (already consumed, revoked or expired) surfaces as
+// ErrEnrollmentTokenNotFound.
 func (r *AgentEnrollmentTokens) MarkConsumed(ctx context.Context, id, agentID uuid.UUID, at time.Time) error {
 	const q = `
 		UPDATE agent_enrollment_tokens
 		SET    consumed_at = $2, consumed_by_agent_id = $3
-		WHERE  id = $1 AND consumed_at IS NULL`
+		WHERE  id = $1 AND ` + consumableTokenSQL
 	tag, err := r.pool.Exec(ctx, q, id, at, agentID)
 	if err != nil {
 		return fmt.Errorf("storage: mark enrollment token consumed: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrEnrollmentTokenNotFound
+	}
+	return nil
+}
+
+// ConsumeAndCreateAgent burns the token, inserts the enrolled agent and
+// links the two, all in one transaction. The consume runs first and
+// holds the token row lock, so concurrent enrolls with one token
+// serialise on it: the first commits, the rest re-check the guard,
+// match nothing and roll back without ever inserting an agent.
+func (r *AgentEnrollmentTokens) ConsumeAndCreateAgent(ctx context.Context, tokenID uuid.UUID, at time.Time, a *Agent) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("storage: begin enrollment: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var consumed uuid.UUID
+	err = tx.QueryRow(ctx, `
+		UPDATE agent_enrollment_tokens
+		SET    consumed_at = $2
+		WHERE  id = $1 AND `+consumableTokenSQL+`
+		RETURNING id`, tokenID, at).Scan(&consumed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrEnrollmentTokenNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("storage: consume enrollment token: %w", err)
+	}
+	if err := insertEnrolledAgent(ctx, tx, a); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE agent_enrollment_tokens SET consumed_by_agent_id = $2 WHERE id = $1`,
+		tokenID, a.ID); err != nil {
+		return fmt.Errorf("storage: link enrollment token to agent: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("storage: commit enrollment: %w", err)
 	}
 	return nil
 }
