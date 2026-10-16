@@ -53,8 +53,13 @@ func NewOIDC(svc *services.OIDCService, sessions *services.SessionService, mode 
 //     for a strong second factor even when a SSO session is alive.
 //     The SPA hits this path when a Tier 2 endpoint returned
 //     `401 step_up_required`.
+//
+// `return_to` is reduced to a same-origin relative path (anything else
+// becomes "/") before it is stored. The state value is also set in a
+// short-lived HttpOnly cookie that Callback requires, so a callback
+// URL started in another browser can't sign this one in.
 func (h *OIDC) Start(c fiber.Ctx) error {
-	returnTo := strings.TrimSpace(c.Query("return_to"))
+	returnTo := services.SafeReturnTo(strings.TrimSpace(c.Query("return_to")))
 	stepUp := strings.TrimSpace(c.Query("step_up"))
 
 	var opts services.StepUpOptions
@@ -71,6 +76,7 @@ func (h *OIDC) Start(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "oidc start failed")
 	}
+	h.setStateCookie(c, authz.State)
 	return c.Redirect().Status(fiber.StatusFound).To(authz.RedirectURL)
 }
 
@@ -79,9 +85,14 @@ func (h *OIDC) Start(c fiber.Ctx) error {
 // issues a server-side session, sets the cookie, and 302s to the
 // caller's original return_to (or to "/" when none was supplied).
 //
+// The state query param must match the state cookie set by Start;
+// the cookie is cleared on every callback, success or not.
+//
 // Errors return a generic 401 to the browser; the audit log carries
 // the specific failure mode.
 func (h *OIDC) Callback(c fiber.Ctx) error {
+	boundState := c.Cookies(OIDCStateCookieName)
+	h.clearStateCookie(c)
 	if errStr := strings.TrimSpace(c.Query("error")); errStr != "" {
 		// The IdP rejected the authorize call (user cancelled, MFA
 		// failure, etc.). Audit happens in the service when callback
@@ -90,17 +101,13 @@ func (h *OIDC) Callback(c fiber.Ctx) error {
 	}
 	state := strings.TrimSpace(c.Query("state"))
 	code := strings.TrimSpace(c.Query("code"))
-	result, err := h.svc.HandleCallback(c.Context(), state, code, c.IP(), c.Get("User-Agent"))
+	result, err := h.svc.HandleCallback(c.Context(), state, boundState, code, c.IP(), c.Get("User-Agent"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusUnauthorized, "oidc callback failed")
 	}
 	h.setSessionCookie(c, result.Issued.CookieValue, result.Issued.AbsoluteExpiry)
 
-	target := result.ReturnTo
-	if target == "" {
-		target = "/"
-	}
-	return c.Redirect().Status(fiber.StatusFound).To(target)
+	return c.Redirect().Status(fiber.StatusFound).To(services.SafeReturnTo(result.ReturnTo))
 }
 
 // Logout handles POST /api/v1/auth/oidc/logout. RP-initiated:
@@ -138,6 +145,43 @@ func (h *OIDC) BackchannelLogout(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusUnauthorized, "logout_token rejected")
 	}
 	return c.SendStatus(fiber.StatusOK)
+}
+
+// OIDCStateCookieName carries the OIDC `state` from /start to
+// /callback so the callback can prove it was started by the same
+// browser (API-N-08, login CSRF).
+const OIDCStateCookieName = "sb_oidc_state"
+
+// setStateCookie binds the authorize state to this browser. SameSite
+// is Lax, not Strict: the IdP sends the browser back with a
+// cross-site top-level GET, which Strict would strip. Scoped to the
+// callback path and to the state TTL; Secure follows the session
+// cookie (off only for SB_ENV=dev).
+func (h *OIDC) setStateCookie(c fiber.Ctx, state string) {
+	ttl := h.svc.StateTTL()
+	c.Cookie(&fiber.Cookie{
+		Name:     OIDCStateCookieName,
+		Value:    state,
+		Path:     h.svc.StateCookiePath(),
+		Expires:  time.Now().Add(ttl),
+		MaxAge:   int(ttl.Seconds()),
+		HTTPOnly: true,
+		Secure:   h.cookieMode == CookieModeProd,
+		SameSite: fiber.CookieSameSiteLaxMode,
+	})
+}
+
+func (h *OIDC) clearStateCookie(c fiber.Ctx) {
+	c.Cookie(&fiber.Cookie{
+		Name:     OIDCStateCookieName,
+		Value:    "",
+		Path:     h.svc.StateCookiePath(),
+		Expires:  time.Unix(0, 0),
+		MaxAge:   -1,
+		HTTPOnly: true,
+		Secure:   h.cookieMode == CookieModeProd,
+		SameSite: fiber.CookieSameSiteLaxMode,
+	})
 }
 
 // --- cookie helpers (duplicated from Auth so we don't take a hard

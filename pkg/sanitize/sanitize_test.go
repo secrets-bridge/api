@@ -112,3 +112,25 @@ func TestDiscoverError_Idempotent(t *testing.T) {
 		t.Fatalf("not idempotent: once=%q twice=%q", once, twice)
 	}
 }
+
+func TestLogError_RedactsCredentialsAndKeepsContext(t *testing.T) {
+	in := `keymgmt: vault transit decrypt: URL: PUT https://vault.example.com/v1/transit/decrypt/sb-key token=hvs.CAESIabcdefghijklmnopqrstuvwxyz0123`
+	got := sanitize.LogError(in)
+	if strings.Contains(got, "hvs.CAESI") {
+		t.Fatalf("vault token survived: %q", got)
+	}
+	if !strings.Contains(got, "[REDACTED]") || !strings.Contains(got, "vault.example.com/v1/transit/decrypt/sb-key") {
+		t.Fatalf("log line lost its triage context: %q", got)
+	}
+}
+
+func TestLogError_RoomierCapThanDiscover(t *testing.T) {
+	in := strings.Repeat("e", sanitize.DiscoverMaxErrorLen*2)
+	if got := sanitize.LogError(in); len(got) != len(in) {
+		t.Fatalf("a %d-byte error should not be cut for the log; got %d", len(in), len(got))
+	}
+	long := strings.Repeat("e", sanitize.LogMaxErrorLen+100)
+	if got := sanitize.LogError(long); len(got) > sanitize.LogMaxErrorLen {
+		t.Fatalf("LogError len = %d; want <= %d", len(got), sanitize.LogMaxErrorLen)
+	}
+}

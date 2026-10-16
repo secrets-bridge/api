@@ -274,6 +274,10 @@ func (h *Wraps) Create(c fiber.Ctx) error {
 		// Wire-envelope path: unwrap the agent-supplied DEK envelope.
 		plaintext, err = h.unsealAgentEnvelope(c.Context(), body.Envelope)
 		if err != nil {
+			var ee *envelopeError
+			if errors.As(err, &ee) {
+				logInternalError(c, "wrap envelope rejected", ee.cause)
+			}
 			return fiber.NewError(fiber.StatusBadRequest, "envelope: "+err.Error())
 		}
 	}
@@ -318,6 +322,18 @@ func (h *Wraps) Create(c fiber.Ctx) error {
 	})
 }
 
+// envelopeError is a wrap-envelope failure whose Error() is a stable,
+// client-safe message. The cause (a KMS backend error carrying the
+// backend URL and key name, or a crypto error) is logged server side by
+// the caller and never returned to the agent (API-16).
+type envelopeError struct {
+	msg   string
+	cause error
+}
+
+func (e *envelopeError) Error() string { return e.msg }
+func (e *envelopeError) Unwrap() error { return e.cause }
+
 // unsealAgentEnvelope reverses what the agent did with the DEK that
 // /agents/:id/dek issued: KMS-decrypt the DEK ciphertext to recover
 // the plaintext data key, then AES-GCM-open the ciphertext.
@@ -346,7 +362,7 @@ func (h *Wraps) unsealAgentEnvelope(ctx context.Context, env *CreateWrapEnvelope
 
 	dek, err := h.kms.DecryptDataKey(ctx, dekCt, env.DEKKMSKeyID)
 	if err != nil {
-		return nil, errors.New("decrypt data key: " + err.Error())
+		return nil, &envelopeError{msg: "data key could not be decrypted", cause: err}
 	}
 	defer zero(dek)
 	if len(dek) != 32 {
@@ -355,15 +371,15 @@ func (h *Wraps) unsealAgentEnvelope(ctx context.Context, env *CreateWrapEnvelope
 
 	block, err := aes.NewCipher(dek)
 	if err != nil {
-		return nil, errors.New("aes cipher: " + err.Error())
+		return nil, &envelopeError{msg: "ciphertext could not be authenticated", cause: err}
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, errors.New("gcm: " + err.Error())
+		return nil, &envelopeError{msg: "ciphertext could not be authenticated", cause: err}
 	}
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return nil, errors.New("authenticate envelope ciphertext: " + err.Error())
+		return nil, &envelopeError{msg: "ciphertext could not be authenticated", cause: err}
 	}
 	return plaintext, nil
 }

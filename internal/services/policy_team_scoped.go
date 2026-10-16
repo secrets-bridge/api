@@ -543,7 +543,7 @@ func (e *PolicyEngine) auditTeamPolicySuccess(
 		meta["changed_keys"] = changedKeys
 	}
 	_ = e.audit.Append(ctx, &storage.AuditEvent{
-		Actor:         actorOrAdmin(actorID),
+		Actor:         auditActor(ctx, actorID),
 		Action:        action,
 		Resource:      "policy_rule:" + rule.ID.String(),
 		Status:        storage.AuditStatusSuccess,
@@ -571,7 +571,7 @@ func (e *PolicyEngine) auditPolicyDeniedOutOfTeamScope(
 		return
 	}
 	_ = e.audit.Append(ctx, &storage.AuditEvent{
-		Actor:         actorOrAdmin(actorID),
+		Actor:         auditActor(ctx, actorID),
 		Action:        "policy.denied_out_of_scope",
 		Resource:      "team:" + teamID.String(),
 		Status:        storage.AuditStatusFailure,
@@ -599,7 +599,7 @@ func (e *PolicyEngine) auditPolicyDeniedWorkflowNotAuthorableForTeam(
 		return
 	}
 	_ = e.audit.Append(ctx, &storage.AuditEvent{
-		Actor:         actorOrAdmin(actorID),
+		Actor:         auditActor(ctx, actorID),
 		Action:        "policy.denied_workflow_not_authorable",
 		Resource:      "workflow:" + workflowID.String(),
 		Status:        storage.AuditStatusFailure,

@@ -65,8 +65,8 @@ func (p *Probes) Healthz(c fiber.Ctx) error {
 // Readyz reports whether the api can serve real traffic. Each
 // registered check runs against a 2-second context deadline so a
 // stuck Postgres connect can't hold Readyz hostage. A single failed
-// check produces a 503 with per-check details so kubectl describe
-// surfaces which dependency is the problem.
+// check produces a 503 naming each failing check so it is clear which
+// dependency is the problem; the error detail is logged, not returned.
 func (p *Probes) Readyz(c fiber.Ctx) error {
 	if !p.gate.Load() {
 		return c.Status(fiber.StatusServiceUnavailable).
@@ -82,10 +82,15 @@ func (p *Probes) Readyz(c fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.Context(), 2*time.Second)
 	defer cancel()
 
+	// The check NAME is surfaced so an operator can see which
+	// dependency is down; the driver error is not. /readyz is public and
+	// a Postgres connect error names the DSN's user, database and host
+	// (API-16), so the detail goes to the server log only.
 	failures := map[string]string{}
 	for name, fn := range p.checks {
 		if err := fn(ctx); err != nil {
-			failures[name] = err.Error()
+			failures[name] = "unavailable"
+			logInternalError(c, "readiness check failed: "+name, err)
 		}
 	}
 	if len(failures) > 0 {

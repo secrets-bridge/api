@@ -1,0 +1,26 @@
+# Keep the build context to what `go build ./cmd/api` needs.
+.git
+.github
+.gitignore
+.dockerignore
+**/.env*
+**/*.md
+Dockerfile
+docker-compose*.yml
+hack/
+
+# local build and test output
+bin/
+dist/
+out/
+**/*.exe
+**/*.test
+**/*.prof
+**/coverage.*
+
+# editor and OS cruft
+**/.idea/
+**/.vscode/
+**/*.swp
+**/*~
+**/.DS_Store

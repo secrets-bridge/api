@@ -105,12 +105,23 @@ func denialReasonFor(err error) string {
 // "scoped binding is project-ownership work, not platform registry
 // administration" is visible at the codebase level.
 type ProjectProviderConnectionBindings struct {
-	svc *services.ProviderConnectionsService
+	svc       *services.ProviderConnectionsService
+	readScope projectReadScope
 }
 
 // NewProjectProviderConnectionBindings constructs the handler.
 func NewProjectProviderConnectionBindings(svc *services.ProviderConnectionsService) *ProjectProviderConnectionBindings {
 	return &ProjectProviderConnectionBindings{svc: svc}
+}
+
+// WithReadScope wires the project gate for List (API-N-04). A caller
+// covers the project through secret.list / secret.request (the dev env
+// page renders this card), integration.bind (scoped binders) or
+// integration.edit; anyone else gets 404. Returns the handler for
+// chaining.
+func (h *ProjectProviderConnectionBindings) WithReadScope(r auth.Resolver, tr auth.TeamScopeResolver) *ProjectProviderConnectionBindings {
+	h.readScope = newProjectReadScope(r, tr, auth.PermIntegrationBind, auth.PermIntegrationEdit)
+	return h
 }
 
 // ---- request / response shapes ------------------------------------
@@ -226,14 +237,22 @@ func (h *ProjectProviderConnectionBindings) Create(c fiber.Ctx) error {
 // metadata for the SPA's per-project card. Optional ?environment_id
 // narrows to env-specific + project-wide for one env.
 //
-// Auth: integration.bind OR integration.edit. Same projection for
-// both — the §5 lock keeps scope / auth_method / discovery fields out
-// regardless of permission.
+// Auth: the caller must cover the project (see WithReadScope), else 404
+// project_not_found. Same projection for every reader — the §5 lock
+// keeps scope / auth_method / discovery fields out regardless of
+// permission.
 func (h *ProjectProviderConnectionBindings) List(c fiber.Ctx) error {
 	projectID, err := uuid.Parse(c.Params("projectID"))
 	if err != nil {
 		return stableErr(c, fiber.StatusBadRequest, "bad_request",
 			"projectID is malformed", nil)
+	}
+	covered, err := h.readScope.covers(c, projectID)
+	if err != nil {
+		return err
+	}
+	if !covered {
+		return stableErr(c, fiber.StatusNotFound, "project_not_found", "project not found", nil)
 	}
 	var envFilter *uuid.UUID
 	if s := c.Query("environment_id"); s != "" {

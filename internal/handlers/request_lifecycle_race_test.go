@@ -1,6 +1,7 @@
 package handlers_test
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/handlers"
 	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/services"
@@ -38,15 +40,30 @@ import (
 
 const raceIterations = 30
 
+// lifecycleVoters grants every caller a global secret.approve and
+// secret.security.approve, so any approver may cast either cross-team
+// verify lane (API-N-01) and approve any read request. The lane and
+// approver-scope checks are proven elsewhere; this suite races allowed
+// callers.
+type lifecycleVoters struct{}
+
+func (lifecycleVoters) Resolve(context.Context, string) ([]auth.Grant, error) {
+	return []auth.Grant{
+		{Permission: string(auth.PermSecretApprove)},
+		{Permission: string(auth.PermSecretSecurityApprove)},
+	}, nil
+}
+
 type lifecycleFixture struct {
-	app      *fiber.App
-	pool     *storage.Pool
-	reqSvc   *services.RequestService
-	reqRepo  *storage.AccessRequests
-	wfRepo   *storage.Workflows
-	projRepo *storage.Projects
-	envRepo  *storage.Environments
-	teamRepo *storage.Teams
+	app          *fiber.App
+	pool         *storage.Pool
+	reqSvc       *services.RequestService
+	reqRepo      *storage.AccessRequests
+	wfRepo       *storage.Workflows
+	projRepo     *storage.Projects
+	envRepo      *storage.Environments
+	teamRepo     *storage.Teams
+	destBindings *storage.ProjectProviderConnections
 }
 
 func bootstrapLifecycle(t *testing.T) *lifecycleFixture {
@@ -98,12 +115,14 @@ func bootstrapLifecycle(t *testing.T) *lifecycleFixture {
 	projRepo := storage.NewProjects(pool)
 	envRepo := storage.NewEnvironments(pool)
 	teamRepo := storage.NewTeams(pool)
+	destBindings := storage.NewProjectProviderConnections(pool)
 	wrapSvc := services.NewWrapService(storage.NewSecretWraps(pool), auditRepo, km)
 	policyEng := services.NewPolicyEngine(storage.NewPolicies(pool), wfRepo, auditRepo)
 	jobSvc := services.NewJobService(storage.NewSyncJobs(pool), auditRepo)
 	reqSvc := services.NewRequestService(reqRepo, storage.NewApprovals(pool), wrapSvc, wfRepo, policyEng, auditRepo, jobSvc).
 		WithEnvironments(envRepo).
-		WithCrossTeamRepos(teamRepo, projRepo, envRepo, storage.NewProviderConnections(pool))
+		WithCrossTeamRepos(teamRepo, projRepo, envRepo, storage.NewProviderConnections(pool), destBindings).
+		WithApproverScope(lifecycleVoters{}, nil)
 	jobSvc.OnCompleted(reqSvc.OnJobCompleted)
 
 	requestsH := handlers.NewRequests(reqSvc)
@@ -120,7 +139,7 @@ func bootstrapLifecycle(t *testing.T) *lifecycleFixture {
 
 	return &lifecycleFixture{
 		app: app, pool: pool, reqSvc: reqSvc, reqRepo: reqRepo, wfRepo: wfRepo,
-		projRepo: projRepo, envRepo: envRepo, teamRepo: teamRepo,
+		projRepo: projRepo, envRepo: envRepo, teamRepo: teamRepo, destBindings: destBindings,
 	}
 }
 
@@ -532,6 +551,12 @@ func (fx *lifecycleFixture) crossTeamRequest(t *testing.T, slug string, fill boo
 		VALUES ($1, 'vault', 'token', '{"address":"https://vault.example.com"}'::jsonb, 'active')
 		RETURNING id`, slug+"-dest").Scan(&connID); err != nil {
 		t.Fatalf("provider connection: %v", err)
+	}
+	// The destination must be bound to the source project (API-N-03).
+	if _, err := fx.destBindings.Bind(ctx, storage.ProjectProviderConnectionBindingInput{
+		ProjectID: src.ID, ProviderConnectionID: connID,
+	}); err != nil {
+		t.Fatalf("bind destination: %v", err)
 	}
 
 	requester = uuid.NewString()

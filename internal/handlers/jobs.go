@@ -5,6 +5,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/services"
@@ -42,6 +43,12 @@ func (h *Jobs) Enqueue(c fiber.Ctx) error {
 	if err := c.Bind().JSON(&req); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
 	}
+	if req.JobType == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "job_type is required")
+	}
+	if !knownJobType(req.JobType) {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid job_type")
+	}
 	job, err := h.svc.Enqueue(c.Context(), services.EnqueueRequest{
 		AgentScope:    req.AgentScope,
 		JobType:       req.JobType,
@@ -50,13 +57,42 @@ func (h *Jobs) Enqueue(c fiber.Ctx) error {
 		CorrelationID: req.CorrelationID,
 	})
 	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		return enqueueErr(err)
 	}
 	return c.Status(fiber.StatusCreated).JSON(EnqueueResponse{
 		ID:            job.ID,
 		CorrelationID: job.CorrelationID,
 		Status:        string(job.Status),
 	})
+}
+
+// knownJobType mirrors the sync_jobs.job_type CHECK so a bad value is a
+// clear 400 here instead of a constraint error from Postgres.
+func knownJobType(t storage.JobType) bool {
+	switch t {
+	case storage.JobTypeSync, storage.JobTypeDiscover, storage.JobTypeVerify,
+		storage.JobTypeDelete, storage.JobTypePatch, storage.JobTypeRead:
+		return true
+	}
+	return false
+}
+
+// enqueueErr maps a storage failure on the admin enqueue path to a
+// stable client message (API-16). The raw pgx text names tables and
+// constraints, and on a connect failure the DSN's user, database and
+// host, so it never goes into the body. Client-caused violations stay
+// 400; anything else is a 500 whose detail the app error handler logs.
+func enqueueErr(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "23503": // foreign_key_violation: request_id
+			return fiber.NewError(fiber.StatusBadRequest, "request_id does not reference an existing request")
+		case "23514": // check_violation: job_type / status
+			return fiber.NewError(fiber.StatusBadRequest, "invalid job_type")
+		}
+	}
+	return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 }
 
 // ClaimResponse is what the agent receives after a successful claim.

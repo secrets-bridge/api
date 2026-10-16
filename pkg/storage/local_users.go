@@ -69,6 +69,28 @@ type LocalUserRepository interface {
 	// ClearLockout resets failed_login_count to 0 and clears
 	// locked_until. Called on every successful login.
 	ClearLockout(ctx context.Context, id uuid.UUID) error
+	// BeginLoginAttempt atomically reserves one password attempt for
+	// the account BEFORE the bcrypt compare runs. See the method doc
+	// on LocalUsers for the exact semantics.
+	BeginLoginAttempt(ctx context.Context, id uuid.UUID, threshold int, lockFor time.Duration, now time.Time) (*LoginAttempt, error)
+}
+
+// LoginAttempt is the outcome of BeginLoginAttempt.
+//
+// Allowed=true means the attempt was counted and the caller may run
+// the password compare. FailedLoginCount is the post-increment value
+// and LockedUntil is set when this attempt reached the threshold (the
+// lock is already in force for every concurrent attempt).
+//
+// Allowed=false means nothing was counted: the account is disabled,
+// currently locked, or gone. Disabled / LockedUntil / NotFound say
+// which, for the audit trail only.
+type LoginAttempt struct {
+	Allowed          bool
+	FailedLoginCount int
+	LockedUntil      *time.Time
+	Disabled         bool
+	NotFound         bool
 }
 
 // LocalUsers is the Postgres implementation of LocalUserRepository.
@@ -230,6 +252,60 @@ func (r *LocalUsers) Lock(ctx context.Context, id uuid.UUID, until time.Time) er
 		return ErrNotFound
 	}
 	return nil
+}
+
+// BeginLoginAttempt reserves one password attempt in a single
+// UPDATE ... RETURNING, before the caller pays for bcrypt (API-S-25).
+//
+// The row is only touched when the account is enabled and not locked
+// at `now` (an expired lock counts as unlocked). The counter goes up
+// by one and, when it reaches `threshold`, locked_until is pinned to
+// now+lockFor in the same statement. Postgres re-checks the WHERE
+// clause against the latest row version for concurrent UPDATEs, so
+// at most `threshold` attempts get through from a clean counter and
+// exactly one per lock window after a lock expires. A successful
+// compare must call ClearLockout to give the attempt back.
+func (r *LocalUsers) BeginLoginAttempt(ctx context.Context, id uuid.UUID, threshold int, lockFor time.Duration, now time.Time) (*LoginAttempt, error) {
+	if threshold <= 0 || lockFor <= 0 {
+		return nil, errors.New("storage: login attempt threshold and lock duration must be positive")
+	}
+	now = now.UTC()
+	const q = `
+		UPDATE local_users
+		   SET failed_login_count = failed_login_count + 1,
+		       locked_until = CASE WHEN failed_login_count + 1 >= $2 THEN $3 ELSE locked_until END
+		 WHERE id = $1
+		   AND disabled = FALSE
+		   AND (locked_until IS NULL OR locked_until <= $4)
+		RETURNING failed_login_count, locked_until`
+	var (
+		n      int
+		locked *time.Time
+	)
+	err := r.pool.QueryRow(ctx, q, id, threshold, now.Add(lockFor), now).Scan(&n, &locked)
+	if err == nil {
+		out := &LoginAttempt{Allowed: true, FailedLoginCount: n}
+		if n >= threshold {
+			out.LockedUntil = locked
+		}
+		return out, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("storage: begin login attempt: %w", err)
+	}
+	// Refused. Read the row back only to say why, for the audit trail.
+	cur, getErr := r.Get(ctx, id)
+	if getErr != nil {
+		if errors.Is(getErr, ErrNotFound) {
+			return &LoginAttempt{NotFound: true}, nil
+		}
+		return nil, getErr
+	}
+	return &LoginAttempt{
+		FailedLoginCount: cur.FailedLoginCount,
+		LockedUntil:      cur.LockedUntil,
+		Disabled:         cur.Disabled,
+	}, nil
 }
 
 // ClearLockout resets failed_login_count to 0 and clears

@@ -20,14 +20,18 @@
 //   GET  /api/v1/users/me/mfa/factors       SPA needs to know which
 //                                            factor kinds are enrolled
 //                                            to pick the verify path
-//   POST /api/v1/users/me/mfa/totp/...      enrollment must be
-//   POST /api/v1/users/me/mfa/webauthn/...  reachable BEFORE step-up
-//                                            (chicken-and-egg)
-//   DELETE /api/v1/users/me/mfa/factors/:id factor removal stays
-//                                            available
+//   POST /api/v1/users/me/mfa/totp/...      first-factor enrollment
+//   POST /api/v1/users/me/mfa/webauthn/...  must be reachable BEFORE
+//                                            any stamp (chicken-and-egg)
+//   DELETE /api/v1/users/me/mfa/factors/:id
 //   POST /api/v1/auth/logout                always allow sign-out
 //   POST /api/v1/auth/mfa/challenge         the gate's own ceremony
 //   POST /api/v1/auth/mfa/verify            ditto
+//
+// The /users/me/mfa/ carve-out only skips THIS gate. Once the user has
+// a factor, the enroll / confirm / delete routes still need a FRESH
+// stamp through their own route-level RequireFreshMFAForFactorChange
+// (api#191 H3).
 //
 // All other authenticated routes return:
 //
@@ -66,7 +70,7 @@ type MFAStampedEnrollment = MFAEnrollmentChecker
 var loginMFACarveOuts = []string{
 	"/api/v1/users/me",          // exact (also covers /users/me)
 	"/api/v1/users/me/projects", // exact
-	"/api/v1/users/me/mfa/",     // prefix — all MFA enrollment + factor list
+	"/api/v1/users/me/mfa/",     // prefix — MFA enrollment + factor list (factor changes have their own step-up gate)
 	"/api/v1/auth/logout",
 	"/api/v1/auth/mfa/",         // prefix — challenge + verify
 }

@@ -23,6 +23,12 @@
 //   - SoD matrix on Verify: caller ≠ requester_id, caller ≠
 //     filled_by_user_id; security vote ≠ source-vote actor on same
 //     request (enforced even when one user holds both perms).
+//   - Verify lanes are permission-gated (API-N-01): source needs
+//     secret.approve, security needs secret.security.approve, both at a
+//     scope covering the source project. Lanes are fixed by vote order
+//     (source first, then security) because approvals has no lane column.
+//   - The destination connection must be bound to the source project
+//     (API-N-03) and fill only accepts declared keys (API-S-07).
 //   - Workflow semantics frozen at submit time via the snap_*
 //     columns on access_requests — admin edits never change
 //     in-flight thresholds.
@@ -39,6 +45,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/pkg/storage"
 	"github.com/secrets-bridge/api/pkg/workflow"
 )
@@ -138,6 +145,25 @@ var (
 	// it cannot satisfy (requester→fill, requester→verify, filler→verify,
 	// source-vote actor→security-vote on same request, etc.).
 	ErrSeparationOfDuties = errors.New("services: separation of duties violation")
+	// ErrCrossTeamLaneForbidden — the caller does not hold the permission
+	// for the verify lane they named: secret.approve covering the source
+	// project for `source`, secret.security.approve covering it for
+	// `security` (API-N-01).
+	ErrCrossTeamLaneForbidden = errors.New("services: caller lacks the permission for this verify lane")
+	// ErrCrossTeamVoteOutOfTurn — the vote is not the lane the request
+	// needs next. The approvals table has no lane column, so lanes are
+	// fixed by order: the first approve is the source vote, the second
+	// (only when security approval is required) the security vote.
+	ErrCrossTeamVoteOutOfTurn = errors.New("services: cross_team vote is not the lane this request needs next")
+	// ErrCrossTeamPriorVoteInvalid — an approve already recorded on the
+	// request was cast by someone who does not hold that lane's
+	// permission (a vote written before API-N-01 was fixed, or a grant
+	// revoked since). It cannot count, so the request cannot complete;
+	// it must be rejected or cancelled and resubmitted.
+	ErrCrossTeamPriorVoteInvalid = errors.New("services: a recorded cross_team vote no longer holds its lane permission")
+	// ErrCrossTeamKeyNotDeclared — fill named a key outside the request's
+	// destination_keys (API-S-07).
+	ErrCrossTeamKeyNotDeclared = errors.New("services: fill key not declared on the request")
 )
 
 // --- optional deps for the cross_team flow -----------------------------------
@@ -177,18 +203,30 @@ type CrossTeamProviderConnectionLookup interface {
 	Get(ctx context.Context, id uuid.UUID) (*storage.ProviderConnection, error)
 }
 
-// WithCrossTeamRepos wires the three extra repositories cross_team
-// submit needs. Builder pattern matches WithEnvironments / WithGitOps.
+// CrossTeamDestinationBindingLookup is the slice of the
+// project_provider_connections repository used to prove the destination
+// connection is bound to the request's SOURCE project (API-N-03). The
+// storage repo's ListForProject satisfies it.
+type CrossTeamDestinationBindingLookup interface {
+	ListForProject(ctx context.Context, projectID uuid.UUID, envID *uuid.UUID) ([]storage.ProjectBindingDetail, error)
+}
+
+// WithCrossTeamRepos wires the extra repositories cross_team submit
+// needs. Builder pattern matches WithEnvironments / WithGitOps. A nil
+// destBindings makes every cross-team submit fail closed with
+// ErrCrossTeamDestinationUnbound.
 func (s *RequestService) WithCrossTeamRepos(
 	teams CrossTeamTeamLookup,
 	projects CrossTeamProjectLookup,
 	envs CrossTeamEnvLookup,
 	provConns CrossTeamProviderConnectionLookup,
+	destBindings CrossTeamDestinationBindingLookup,
 ) *RequestService {
 	s.ctTeams = teams
 	s.ctProjects = projects
 	s.ctEnvs = envs
 	s.ctProvConns = provConns
+	s.ctDestBindings = destBindings
 	return s
 }
 
@@ -217,6 +255,15 @@ func (s *RequestService) SubmitCrossTeam(ctx context.Context, in CrossTeamSubmit
 	if in.DestinationProviderConnectionID == uuid.Nil {
 		return nil, fmt.Errorf("%w: destination_provider_connection_id required", ErrInvalidInput)
 	}
+	// API-N-03: the source project anchors both the destination binding
+	// check below and the source approver's scope at verify time, so it
+	// is required. Stored in canonical form so policy selectors and the
+	// verify-time scope check compare like with like.
+	srcProjectID, err := uuid.Parse(in.ProjectID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: project_id (source project) must be a UUID", ErrInvalidInput)
+	}
+	in.ProjectID = srcProjectID.String()
 
 	if err := s.validateCrossTeamTargetChain(ctx, in); err != nil {
 		return nil, err
@@ -224,11 +271,14 @@ func (s *RequestService) SubmitCrossTeam(ctx context.Context, in CrossTeamSubmit
 	if err := s.validateCrossTeamDestination(ctx, in.DestinationProviderConnectionID); err != nil {
 		return nil, err
 	}
+	envID, envKind, _ := s.resolveEnvironment(ctx, in.ProjectID, in.Environment)
+	if err := s.requireCrossTeamDestinationBinding(ctx, srcProjectID, envID, in.DestinationProviderConnectionID); err != nil {
+		return nil, err
+	}
 	if err := s.enforceCrossTeamDestinationKeys(ctx, in); err != nil {
 		return nil, err
 	}
 
-	envID, envKind, _ := s.resolveEnvironment(ctx, in.ProjectID, in.Environment)
 	dec, err := s.policy.Resolve(ctx, Scope{
 		ProjectID:       in.ProjectID,
 		Environment:     in.Environment,
@@ -410,22 +460,70 @@ func (s *RequestService) validateCrossTeamDestination(ctx context.Context, id uu
 	return nil
 }
 
+// requireCrossTeamDestinationBinding refuses a destination provider
+// connection that is not bound to the source project (API-N-03 /
+// API-S-15). Same semantics as the submit drawer's destination dropdown:
+// a project-wide binding (environment_id NULL) always counts; an
+// environment-specific binding counts only for that source environment.
+// When the source environment is unknown only project-wide bindings
+// count. Fails closed when the binding repository isn't wired.
+func (s *RequestService) requireCrossTeamDestinationBinding(ctx context.Context, sourceProjectID uuid.UUID, sourceEnvID *uuid.UUID, connID uuid.UUID) error {
+	if s.ctDestBindings == nil {
+		return ErrCrossTeamDestinationUnbound
+	}
+	rows, err := s.ctDestBindings.ListForProject(ctx, sourceProjectID, sourceEnvID)
+	if err != nil {
+		return fmt.Errorf("services: check destination binding: %w", err)
+	}
+	for _, b := range rows {
+		if b.ProjectID != sourceProjectID || b.ProviderConnectionID != connID ||
+			b.Purpose != storage.ProjectProviderConnectionPurposeDestination {
+			continue
+		}
+		if b.EnvironmentID == nil {
+			return nil
+		}
+		if sourceEnvID != nil && *b.EnvironmentID == *sourceEnvID {
+			return nil
+		}
+	}
+	return ErrCrossTeamDestinationUnbound
+}
+
+// crossTeamSourceProject returns the request's source project — the
+// project the requester submitted from, whose provider connection is the
+// destination. It lives in target_scope.project_id (target_project_id is
+// the value provider's side). ok=false for legacy rows submitted without
+// one.
+func crossTeamSourceProject(req *storage.AccessRequest) (uuid.UUID, bool) {
+	raw, ok := req.TargetScope["project_id"].(string)
+	if !ok || raw == "" {
+		return uuid.Nil, false
+	}
+	id, err := uuid.Parse(raw)
+	if err != nil {
+		return uuid.Nil, false
+	}
+	return id, true
+}
+
 // Fill wraps Team B's values via WrapService and atomically
 // transitions the request to pending_verification. Plaintext flows
 // through WrapService only.
 func (s *RequestService) Fill(ctx context.Context, in FillCrossTeamInput) (*storage.AccessRequest, error) {
+	// Every exit path, including the refusals below, leaves no plaintext
+	// in the caller's map. zero is idempotent with the per-wrap zero.
+	defer func() {
+		for _, v := range in.KeyValues {
+			zero(v)
+		}
+	}()
 	if in.FillerID == "" {
 		return nil, fmt.Errorf("%w: filler_id required", ErrInvalidInput)
 	}
 	if len(in.KeyValues) == 0 {
 		return nil, fmt.Errorf("%w: key_values required", ErrInvalidInput)
 	}
-	// Whatever path returns, don't leave plaintext in the caller's map.
-	defer func() {
-		for _, v := range in.KeyValues {
-			zero(v)
-		}
-	}()
 
 	req, err := s.requests.Get(ctx, in.RequestID)
 	if err != nil {
@@ -457,6 +555,34 @@ func (s *RequestService) Fill(ctx context.Context, in FillCrossTeamInput) (*stor
 	// pending_values.
 	if err := s.enforceCrossTeamDestinationKeysForRequest(ctx, req); err != nil {
 		return nil, err
+	}
+
+	// API-S-07: the value provider may only supply the keys the request
+	// declared. Anything else would be wrapped and handed to the agent's
+	// patch job, writing keys nobody asked for or approved.
+	declared := make(map[string]struct{}, len(req.DestinationKeys))
+	for _, k := range req.DestinationKeys {
+		declared[k] = struct{}{}
+	}
+	undeclared := 0
+	for k := range in.KeyValues {
+		if _, ok := declared[k]; !ok {
+			undeclared++
+		}
+	}
+	if undeclared > 0 {
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:         "user:" + in.FillerID,
+			Action:        "request.cross_team.fill.rejected",
+			Resource:      "request:" + req.ID.String(),
+			Status:        storage.AuditStatusDenied,
+			CorrelationID: req.ID,
+			Metadata: map[string]any{
+				"reason":           "undeclared_key",
+				"undeclared_count": undeclared,
+			},
+		})
+		return nil, ErrCrossTeamKeyNotDeclared
 	}
 
 	if err := s.enforceRequestTTL(ctx, req, wf, in.FillerID, "fill"); err != nil {
@@ -562,9 +688,66 @@ func (s *RequestService) Refuse(ctx context.Context, in RefuseCrossTeamInput) (*
 	return updated, nil
 }
 
+// crossTeamLanes is the ordered list of votes a cross_team request needs.
+// v1 supports min_approvers ∈ {0, 1}, so it is one source vote, followed
+// by one security vote when the frozen workflow requires it.
+func crossTeamLanes(requiresSecurity bool) []VotedAs {
+	if requiresSecurity {
+		return []VotedAs{VotedAsSource, VotedAsSecurity}
+	}
+	return []VotedAs{VotedAsSource}
+}
+
+// crossTeamLaneHolder reports whether userID holds the permission behind
+// a verify lane on this request: secret.approve for the source lane,
+// secret.security.approve for the security lane, in both cases at a scope
+// covering the request's SOURCE project (the project whose destination
+// gets written). A global grant covers every project; project- and
+// team-scoped grants cover their projects, so scoped approvers keep
+// working. A legacy request with no source project needs a global grant.
+// Fails closed (false) when the approver resolver isn't wired.
+func (s *RequestService) crossTeamLaneHolder(ctx context.Context, userID string, lane VotedAs, req *storage.AccessRequest) (bool, error) {
+	if s.approverResolver == nil || userID == "" {
+		return false, nil
+	}
+	perm := auth.PermSecretApprove
+	if lane == VotedAsSecurity {
+		perm = auth.PermSecretSecurityApprove
+	}
+	access, err := auth.EffectiveProjectAccess(ctx, userID, perm, s.approverResolver, s.approverTeamScope)
+	if err != nil {
+		return false, fmt.Errorf("services: resolve %s lane access: %w", lane, err)
+	}
+	if pid, ok := crossTeamSourceProject(req); ok {
+		return access.Covers(pid), nil
+	}
+	return access.IsGlobal, nil
+}
+
+// approveVotes keeps the approve decisions, in the order they were cast.
+func approveVotes(approvals []*storage.Approval) []*storage.Approval {
+	out := make([]*storage.Approval, 0, len(approvals))
+	for _, a := range approvals {
+		if a.Decision == storage.ApprovalDecisionApprove {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 // VerifyCrossTeam casts a source or security vote on a
-// pending_verification cross_team request. Same actor cannot satisfy
-// both votes on the same request even when holding both perms.
+// pending_verification cross_team request.
+//
+// API-N-01: the caller must hold the permission of the lane they name
+// (see crossTeamLaneHolder) — the body can no longer pick a lane the
+// caller has no right to. The approvals table has no lane column, so the
+// lane of each approve is fixed by its position: the first approve is
+// the source vote and, when security approval is required, the second is
+// the security vote. A vote for any other lane is out of turn. Votes
+// already on the request are re-checked against their positional lane, so
+// one cast before this fix by someone without the permission never counts.
+// The same actor can never cast both votes, and neither the requester nor
+// the filler can vote at all.
 func (s *RequestService) VerifyCrossTeam(ctx context.Context, in VerifyCrossTeamInput) (*VerifyResponse, error) {
 	if in.ApproverID == "" {
 		return nil, fmt.Errorf("%w: approver_id required", ErrInvalidInput)
@@ -593,34 +776,50 @@ func (s *RequestService) VerifyCrossTeam(ctx context.Context, in VerifyCrossTeam
 		return nil, ErrSeparationOfDuties
 	}
 
-	requiresSecurity := req.SnapRequiresSecurityApproval != nil && *req.SnapRequiresSecurityApproval
-	minApprovers := 1
-	if req.SnapMinApprovers != nil {
-		minApprovers = int(*req.SnapMinApprovers)
+	holds, err := s.crossTeamLaneHolder(ctx, in.ApproverID, in.VotedAs, req)
+	if err != nil {
+		return nil, err
 	}
-	if minApprovers < 1 {
-		minApprovers = 1
+	if !holds {
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:         "user:" + in.ApproverID,
+			Action:        "request.cross_team.verify.denied",
+			Resource:      "request:" + req.ID.String(),
+			Status:        storage.AuditStatusDenied,
+			CorrelationID: req.ID,
+			Metadata: map[string]any{
+				"voted_as": string(in.VotedAs),
+				"decision": string(in.Decision),
+				"reason":   "lane_permission_missing",
+			},
+		})
+		return nil, ErrCrossTeamLaneForbidden
 	}
 
-	// Cross-actor SoD: the source-vote and security-vote on the same
-	// request must come from distinct actors even when one user holds
-	// both perms. Walk existing approvals + check vote_as metadata.
+	if req.SnapMinApprovers != nil && *req.SnapMinApprovers > 1 {
+		// Rejected at submit since Slice N; refuse rather than mis-count.
+		return nil, ErrCrossTeamMinApproversUnsupported
+	}
+	requiresSecurity := req.SnapRequiresSecurityApproval != nil && *req.SnapRequiresSecurityApproval
+	lanes := crossTeamLanes(requiresSecurity)
+	const sourceVotesNeeded = 1
+
+	// Same actor casting a second vote on the same request (even in the
+	// other lane, even holding both perms) is refused.
 	existing, err := s.approvals.ListByRequest(ctx, req.ID)
 	if err != nil {
 		return nil, fmt.Errorf("services: list approvals: %w", err)
 	}
 	for _, ap := range existing {
 		if ap.ApproverID == in.ApproverID && ap.Decision == storage.ApprovalDecisionApprove {
-			// Same actor casting two approve votes — refuse so audit
-			// rows stay distinct per vote lane.
 			return nil, ErrSeparationOfDuties
 		}
 	}
 
-	// Reject is a terminal short-circuit regardless of vote-lane. The
-	// vote and the transition are one conditional transaction, so a
-	// reject racing an approve or a cancel either wins outright or
-	// writes nothing.
+	// Reject is a terminal short-circuit from either lane, by anyone who
+	// holds the lane they named. The vote and the transition are one
+	// conditional transaction, so a reject racing an approve or a cancel
+	// either wins outright or writes nothing.
 	if in.Decision == storage.ApprovalDecisionReject {
 		reject := workflow.For(workflow.ActionVerifyReject)
 		if _, err := s.requests.CastVote(ctx, storage.CastVoteInput{
@@ -650,11 +849,39 @@ func (s *RequestService) VerifyCrossTeam(ctx context.Context, in VerifyCrossTeam
 			VoteRecorded:             true,
 			VotedAs:                  in.VotedAs,
 			SourceVotes:              0,
-			SourceVotesNeeded:        minApprovers,
+			SourceVotesNeeded:        sourceVotesNeeded,
 			SecurityApprovalRequired: requiresSecurity,
 			SecurityVotePresent:      false,
 			NextRequired:             []string{},
 		}, nil
+	}
+
+	// Approve path. The vote must be for the next open lane, and every
+	// approve already recorded must still hold its positional lane.
+	prior := approveVotes(existing)
+	if len(prior) >= len(lanes) || in.VotedAs != lanes[len(prior)] {
+		return nil, ErrCrossTeamVoteOutOfTurn
+	}
+	for i, ap := range prior {
+		ok, err := s.crossTeamLaneHolder(ctx, ap.ApproverID, lanes[i], req)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			_ = s.audit.Append(ctx, &storage.AuditEvent{
+				Actor:         "user:" + in.ApproverID,
+				Action:        "request.cross_team.verify.denied",
+				Resource:      "request:" + req.ID.String(),
+				Status:        storage.AuditStatusDenied,
+				CorrelationID: req.ID,
+				Metadata: map[string]any{
+					"voted_as":   string(in.VotedAs),
+					"reason":     "prior_vote_lane_permission_missing",
+					"prior_lane": string(lanes[i]),
+				},
+			})
+			return nil, ErrCrossTeamPriorVoteInvalid
+		}
 	}
 
 	// request_ttl bounds how long a request may wait for approval. Only
@@ -672,16 +899,17 @@ func (s *RequestService) VerifyCrossTeam(ctx context.Context, in VerifyCrossTeam
 		}
 	}
 
-	// Approve path. The vote, the count and the transition run in one
-	// transaction under the request row lock. The Approval struct
-	// doesn't carry a voted_as column today; for v1 the count uses
-	// approver_id distinctness — security vote is the vote whose actor
-	// differs from any source-vote actor's identity.
+	// The vote, the lane count and the transition run in one transaction
+	// under the request row lock, so concurrent votes are counted one at
+	// a time and exactly one caller can approve. Lanes are counted by
+	// position against the votes as locked (crossTeamLanesFilled): the
+	// prior votes verified above and this caller's own vote fill their
+	// lane; a vote that landed between the checks above and the lock was
+	// never verified and fills nothing, so a race can only leave the
+	// request short of a lane, never approve it on a vote that doesn't
+	// hold it. Decide must not do I/O, hence no permission lookups inside.
 	verify := workflow.For(workflow.ActionVerifyApprove)
-	var (
-		sourceVotes     int
-		securityPresent bool
-	)
+	var filled []bool
 	vote, err := s.requests.CastVote(ctx, storage.CastVoteInput{
 		Vote: &storage.Approval{
 			RequestID:  req.ID,
@@ -690,17 +918,24 @@ func (s *RequestService) VerifyCrossTeam(ctx context.Context, in VerifyCrossTeam
 			Comment:    in.Comment,
 		},
 		From: verify.From,
-		Decide: func(cur *storage.AccessRequest, votes []*storage.Approval) storage.AccessRequestStatus {
-			sourceVotes, securityPresent = countCrossTeamVotes(votes, in.ApproverID, in.VotedAs, cur)
-			if sourceVotes >= minApprovers && (!requiresSecurity || securityPresent) {
-				return verify.To
+		Decide: func(_ *storage.AccessRequest, votes []*storage.Approval) storage.AccessRequestStatus {
+			filled = crossTeamLanesFilled(approveVotes(votes), prior, lanes, in)
+			for _, f := range filled {
+				if !f {
+					return ""
+				}
 			}
-			return ""
+			return verify.To
 		},
 	})
 	if err != nil {
 		return nil, crossTeamVoteErr(err, "approval")
 	}
+	sourceVotes := 0
+	if filled[0] {
+		sourceVotes = 1
+	}
+	securityPresent := requiresSecurity && filled[1]
 
 	statusToSet := vote.Request.Status
 	if vote.Transitioned {
@@ -712,26 +947,33 @@ func (s *RequestService) VerifyCrossTeam(ctx context.Context, in VerifyCrossTeam
 		}
 		if s.jobs != nil {
 			if jerr := s.enqueueRequestJob(ctx, vote.Request); jerr != nil {
-				if errors.Is(jerr, ErrKeyNotAllowed) {
-					// api#169: a destination-key allowlist rejection at the
-					// execute boundary is a policy failure, not a transient
-					// enqueue error. No job was created (no provider write);
-					// transition the request to failed so it can't sit at
-					// approved waiting for a dispatch that must never run.
-					// Metadata-only — never the value, wrap, or payload.
+				switch {
+				case errors.Is(jerr, ErrKeyNotAllowed), errors.Is(jerr, ErrCrossTeamDestinationUnbound):
+					// api#169 / API-N-03: a destination-key allowlist
+					// rejection, or a destination no longer bound to the
+					// source project, at the execute boundary is a policy
+					// failure, not a transient enqueue error. No job was
+					// created (no provider write); transition the request to
+					// failed so it can't sit at approved waiting for a
+					// dispatch that must never run. Metadata-only — never
+					// the value, wrap, or payload.
 					fail := workflow.For(workflow.ActionFail)
 					if uerr := s.requests.TransitionStatus(ctx, req.ID, fail.From, fail.To); uerr == nil {
 						statusToSet = fail.To
 					}
+					action, reason := "request.cross_team.execute.key_rejected", "destination_key_not_allowed"
+					if errors.Is(jerr, ErrCrossTeamDestinationUnbound) {
+						action, reason = "request.cross_team.execute.destination_rejected", "destination_not_bound_to_source_project"
+					}
 					_ = s.audit.Append(ctx, &storage.AuditEvent{
 						Actor:         "user:" + in.ApproverID,
-						Action:        "request.cross_team.execute.key_rejected",
+						Action:        action,
 						Resource:      "request:" + req.ID.String(),
 						Status:        storage.AuditStatusFailure,
 						CorrelationID: req.ID,
-						Metadata:      map[string]any{"reason": "destination_key_not_allowed"},
+						Metadata:      map[string]any{"reason": reason},
 					})
-				} else {
+				default:
 					_ = s.audit.Append(ctx, &storage.AuditEvent{
 						Actor:         "user:" + in.ApproverID,
 						Action:        "request.cross_team.enqueue_job_failed",
@@ -754,14 +996,14 @@ func (s *RequestService) VerifyCrossTeam(ctx context.Context, in VerifyCrossTeam
 		Metadata: map[string]any{
 			"voted_as":                   string(in.VotedAs),
 			"source_votes":               sourceVotes,
-			"source_votes_needed":        minApprovers,
+			"source_votes_needed":        sourceVotesNeeded,
 			"security_approval_required": requiresSecurity,
 			"security_vote_present":      securityPresent,
 		},
 	})
 
 	nextRequired := []string{}
-	if sourceVotes < minApprovers {
+	if sourceVotes < sourceVotesNeeded {
 		nextRequired = append(nextRequired, "source_approval")
 	}
 	if requiresSecurity && !securityPresent {
@@ -773,7 +1015,7 @@ func (s *RequestService) VerifyCrossTeam(ctx context.Context, in VerifyCrossTeam
 		VoteRecorded:             true,
 		VotedAs:                  in.VotedAs,
 		SourceVotes:              sourceVotes,
-		SourceVotesNeeded:        minApprovers,
+		SourceVotesNeeded:        sourceVotesNeeded,
 		SecurityApprovalRequired: requiresSecurity,
 		SecurityVotePresent:      securityPresent,
 		NextRequired:             nextRequired,
@@ -795,60 +1037,25 @@ func crossTeamVoteErr(err error, what string) error {
 	}
 }
 
-// countCrossTeamVotes splits the approvals into source vs security
-// lanes. v1 uses the per-vote `voted_as` field via the audit_events
-// trail; the on-row count below works off approver_id distinctness +
-// the current call's VotedAs stamp. Since SoD already ensures the
-// source-vote and security-vote actors are distinct, the count is
-// unambiguous: every distinct approver_id contributes one source
-// vote unless flagged security by THIS call's caller.
-//
-// This is a v1 compromise — long-term, approvals should grow a
-// voted_as column. Today we infer from the call site.
-func countCrossTeamVotes(approvals []*storage.Approval, currentActor string, currentVotedAs VotedAs, _ *storage.AccessRequest) (sourceVotes int, securityPresent bool) {
-	// Distinct approver IDs that approved.
-	seen := map[string]bool{}
-	for _, a := range approvals {
-		if a.Decision != storage.ApprovalDecisionApprove {
-			continue
-		}
-		seen[a.ApproverID] = true
-	}
-	// If THIS call was security, the current actor counts as security
-	// not source; otherwise as source.
-	if currentVotedAs == VotedAsSecurity {
-		// security_present implied by the just-appended row.
-		securityPresent = true
-		// Source votes = distinct approvers minus this one.
-		for actor := range seen {
-			if actor != currentActor {
-				sourceVotes++
-			}
-		}
-		return sourceVotes, securityPresent
-	}
-	// source vote path: count distinct approvers as source; security
-	// votes from a previous call show up as "an extra approver_id"
-	// that didn't come from THIS call. We don't have a column to
-	// distinguish them, so v1 model: any pre-existing approver
-	// before THIS source vote that wasn't the current actor counts
-	// as a security vote IF the workflow requires it AND there's
-	// exactly one such other actor. Simpler: count distinct as
-	// source for v1, treat security as "any other approver who isn't
-	// this one." This works correctly when source min_approvers=1,
-	// which is the only case v1 supports (min_approvers > 1 is
-	// rejected at submit).
-	sourceVotes = len(seen)
-	// security_present is true iff there's at least one prior approver
-	// that is NOT the current actor (and the workflow required it).
-	for actor := range seen {
-		if actor != currentActor {
-			securityPresent = true
-			sourceVotes-- // the security vote isn't a source vote
-			break
+// crossTeamLanesFilled maps the ordered approve votes onto the required
+// lanes. Position i fills lanes[i] when it holds the same vote that was
+// verified for that position before the vote was cast (verified[i],
+// checked against the lane's permission by VerifyCrossTeam); the
+// current caller's position fills it only if it is the lane they named.
+// Any other vote at a position was not verified for it and fills
+// nothing. Votes past the last lane fill nothing. Pure, because it runs
+// inside CastVote's Decide under the request row lock.
+func crossTeamLanesFilled(approves, verified []*storage.Approval, lanes []VotedAs, current VerifyCrossTeamInput) []bool {
+	filled := make([]bool, len(lanes))
+	for i := 0; i < len(lanes) && i < len(approves); i++ {
+		switch {
+		case approves[i].ApproverID == current.ApproverID:
+			filled[i] = lanes[i] == current.VotedAs
+		case i < len(verified) && approves[i].ID == verified[i].ID:
+			filled[i] = true
 		}
 	}
-	return sourceVotes, securityPresent
+	return filled
 }
 
 // Inbox returns pending_values cross_team rows for the caller's

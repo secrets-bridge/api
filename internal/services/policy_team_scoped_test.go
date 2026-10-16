@@ -174,7 +174,7 @@ func TestCreateForTeamScopedAuthor_Gate1_OutOfScope_EmitsDeniedAudit_NoRuleID(t 
 		        metadata->>'scope',
 		        metadata->>'attempted_team_id'
 		   FROM audit_events
-		  WHERE action='policy.denied_out_of_scope' AND actor='mallory'
+		  WHERE action='policy.denied_out_of_scope' AND actor='user:mallory'
 		  ORDER BY occurred_at DESC LIMIT 1`,
 	).Scan(&hasRuleID, &scope, &attemptedTeamID); err != nil {
 		t.Fatal(err)
@@ -426,7 +426,7 @@ func TestCreateForTeamScopedAuthor_HappyPath_EmitsSuccessAuditWithScope(t *testi
 		        metadata->>'name',
 		        metadata->>'enabled'
 		   FROM audit_events
-		  WHERE action='policy.create' AND actor='alice'
+		  WHERE action='policy.create' AND actor='user:alice'
 		  ORDER BY occurred_at DESC LIMIT 1`,
 	).Scan(&scope, &teamID, &perm, &name, &enabled); err != nil {
 		t.Fatal(err)
@@ -665,7 +665,7 @@ func TestDeleteForTeamScopedAuthor_HappyPath_EmitsAuditWithScope(t *testing.T) {
 	if err := e.pool.QueryRow(e.ctx,
 		`SELECT metadata->>'scope', metadata->>'team_id'
 		   FROM audit_events
-		  WHERE action='policy.delete' AND actor='alice'
+		  WHERE action='policy.delete' AND actor='user:alice'
 		  ORDER BY occurred_at DESC LIMIT 1`,
 	).Scan(&scope, &teamID); err != nil {
 		t.Fatal(err)

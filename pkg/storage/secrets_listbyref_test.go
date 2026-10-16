@@ -40,13 +40,13 @@ func TestSecrets_ListByRef_MultipleClusters(t *testing.T) {
 	// Same secret_ref on two clusters — Slice C's lookup has to find
 	// both rows so the binding check can hit any matching project.
 	a := &storage.Secret{
-		ClusterName: "eks-egov-uat", ProviderType: "aws-sm",
-		SecretRef: "/eks/uat/billing/db", Status: storage.SecretStatusPresent,
+		ClusterName: "eks-tenant-a-uat", ProviderType: "aws-sm",
+		SecretRef: "/secrets/uat/billing/db", Status: storage.SecretStatusPresent,
 		Labels: map[string]any{},
 	}
 	b := &storage.Secret{
-		ClusterName: "eks-egov-prod", ProviderType: "aws-sm",
-		SecretRef: "/eks/uat/billing/db", Status: storage.SecretStatusPresent,
+		ClusterName: "eks-tenant-a-prod", ProviderType: "aws-sm",
+		SecretRef: "/secrets/uat/billing/db", Status: storage.SecretStatusPresent,
 		Labels: map[string]any{},
 	}
 	for _, s := range []*storage.Secret{a, b} {
@@ -55,7 +55,7 @@ func TestSecrets_ListByRef_MultipleClusters(t *testing.T) {
 		}
 	}
 
-	rows, err := repo.ListByRef(ctx, "aws-sm", "/eks/uat/billing/db")
+	rows, err := repo.ListByRef(ctx, "aws-sm", "/secrets/uat/billing/db")
 	if err != nil {
 		t.Fatalf("ListByRef: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestSecrets_ListByRef_MultipleClusters(t *testing.T) {
 		t.Fatalf("expected 2 matching rows across clusters, got %d", len(rows))
 	}
 	// Ordered by cluster_name for stable assertions.
-	if rows[0].ClusterName != "eks-egov-prod" || rows[1].ClusterName != "eks-egov-uat" {
+	if rows[0].ClusterName != "eks-tenant-a-prod" || rows[1].ClusterName != "eks-tenant-a-uat" {
 		t.Fatalf("expected ORDER BY cluster_name, got [%s, %s]",
 			rows[0].ClusterName, rows[1].ClusterName)
 	}
@@ -71,7 +71,7 @@ func TestSecrets_ListByRef_MultipleClusters(t *testing.T) {
 
 func TestSecrets_ListByRef_NoMatchReturnsEmpty(t *testing.T) {
 	repo := bootstrapSecretsRepo(t)
-	rows, err := repo.ListByRef(t.Context(), "aws-sm", "/eks/uat/nonexistent")
+	rows, err := repo.ListByRef(t.Context(), "aws-sm", "/secrets/uat/nonexistent")
 	if err != nil {
 		t.Fatalf("ListByRef: %v", err)
 	}
@@ -86,12 +86,12 @@ func TestSecrets_List_SecretIDsRestrictsToSet(t *testing.T) {
 
 	keep := &storage.Secret{
 		ClusterName: "c1", ProviderType: "aws-sm",
-		SecretRef: "/eks/uat/keep", Status: storage.SecretStatusPresent,
+		SecretRef: "/secrets/uat/keep", Status: storage.SecretStatusPresent,
 		Labels: map[string]any{},
 	}
 	skip := &storage.Secret{
 		ClusterName: "c1", ProviderType: "aws-sm",
-		SecretRef: "/eks/uat/skip", Status: storage.SecretStatusPresent,
+		SecretRef: "/secrets/uat/skip", Status: storage.SecretStatusPresent,
 		Labels: map[string]any{},
 	}
 	for _, s := range []*storage.Secret{keep, skip} {
@@ -107,7 +107,7 @@ func TestSecrets_List_SecretIDsRestrictsToSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	if len(rows) != 1 || rows[0].SecretRef != "/eks/uat/keep" {
+	if len(rows) != 1 || rows[0].SecretRef != "/secrets/uat/keep" {
 		t.Fatalf("expected only the kept row, got %+v", rows)
 	}
 
