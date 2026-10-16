@@ -193,8 +193,11 @@ func requestErr(err error) error {
 // KeyValues carries one plaintext per key; the server wraps each one
 // before it touches Postgres. The handler clears the map before
 // returning so the plaintext doesn't outlive the request goroutine.
+//
+// There is deliberately no requester field: the requester is the
+// authenticated session identity (API-N-02). A `requester_id` the SPA
+// still sends is ignored by the decoder.
 type SubmitRequestBody struct {
-	RequesterID          string            `json:"requester_id"`
 	ProjectID            string            `json:"project_id,omitempty"`
 	Environment          string            `json:"environment,omitempty"`
 	TargetProviderType   string            `json:"target_provider_type"`
@@ -205,7 +208,17 @@ type SubmitRequestBody struct {
 }
 
 // Submit handles POST /requests.
+//
+// The requester is the authenticated session identity, never a body
+// field. Storing a caller-supplied requester_id let a user holding
+// secret.request + secret.approve file a request as someone else and then
+// approve it, because the self-approval check compares against the stored
+// requester (API-N-02 / API-S-01).
 func (h *Requests) Submit(c fiber.Ctx) error {
+	requesterID, ok := auth.IdentityFromContext(c.Context())
+	if !ok {
+		return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+	}
 	var body SubmitRequestBody
 	if err := c.Bind().JSON(&body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
@@ -235,7 +248,7 @@ func (h *Requests) Submit(c fiber.Ctx) error {
 	}
 
 	req, err := h.svc.Submit(c.Context(), services.PatchInput{
-		RequesterID:          body.RequesterID,
+		RequesterID:          requesterID,
 		ProjectID:            body.ProjectID,
 		Environment:          body.Environment,
 		TargetProviderType:   body.TargetProviderType,
@@ -461,9 +474,9 @@ func (h *Requests) Reject(c fiber.Ctx) error {
 
 // SubmitReadRequestBody is the JSON sent by the UI when a user wants
 // to VIEW one or more keys from a provider secret. No values are sent —
-// the agent will fetch them after approval.
+// the agent will fetch them after approval. Like SubmitRequestBody it has
+// no requester field; the requester is the session identity (API-N-02).
 type SubmitReadRequestBody struct {
-	RequesterID          string         `json:"requester_id"`
 	ProjectID            string         `json:"project_id,omitempty"`
 	Environment          string         `json:"environment,omitempty"`
 	TargetProviderType   string         `json:"target_provider_type"`
@@ -473,8 +486,13 @@ type SubmitReadRequestBody struct {
 	Justification        string         `json:"justification"`
 }
 
-// SubmitRead handles POST /requests/read.
+// SubmitRead handles POST /requests/read. The requester is the session
+// identity, never a body field (API-N-02 / API-S-01).
 func (h *Requests) SubmitRead(c fiber.Ctx) error {
+	requesterID, ok := auth.IdentityFromContext(c.Context())
+	if !ok {
+		return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+	}
 	var body SubmitReadRequestBody
 	if err := c.Bind().JSON(&body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
@@ -483,7 +501,7 @@ func (h *Requests) SubmitRead(c fiber.Ctx) error {
 		return err
 	}
 	req, err := h.svc.SubmitRead(c.Context(), services.ReadInput{
-		RequesterID:          body.RequesterID,
+		RequesterID:          requesterID,
 		ProjectID:            body.ProjectID,
 		Environment:          body.Environment,
 		TargetProviderType:   body.TargetProviderType,

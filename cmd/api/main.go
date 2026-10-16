@@ -388,7 +388,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// CrossTeam*Lookup interfaces defined in services.
 	provConnRepo := storage.NewProviderConnections(pool)
 	bindingRepo := storage.NewProjectProviderConnections(pool)
-	requestSvc.WithCrossTeamRepos(teamRepo, projectRepo, environmentRepo, provConnRepo)
+	requestSvc.WithCrossTeamRepos(teamRepo, projectRepo, environmentRepo, provConnRepo, bindingRepo)
 
 	// Agent Onboarding MVP (api#178): wire enrollment-token generation +
 	// self-enrollment onto the existing agent service. Mutates the same
@@ -984,7 +984,16 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 			requireMFA,
 			crossTeamH.Refuse,
 		),
-		verify: hs(requireMFA, crossTeamH.Verify),
+		// API-N-01: verify needs a lane permission. The route gate
+		// refuses callers holding neither secret.approve nor
+		// secret.security.approve (before step-up, like approve/reject);
+		// VerifyCrossTeam then checks the exact lane the body names
+		// against the caller's grants on the request's source project.
+		verify: hs(
+			auth.RequireAnyOf(rbacResolver, auth.PermSecretApprove, auth.PermSecretSecurityApprove),
+			requireMFA,
+			crossTeamH.Verify,
+		),
 	}.register(v1)
 
 	// bySessionBucket keys a rate-limit bucket on the authenticated
