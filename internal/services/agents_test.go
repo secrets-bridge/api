@@ -4,7 +4,6 @@ package services_test
 // Requires both TEST_DATABASE_URL and TEST_REDIS_URL; SKIPs otherwise.
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -208,16 +207,10 @@ func TestHeartbeat_CachesLastSeenInRedis(t *testing.T) {
 	// (best-effort), so under CI's race-detector slowdown the
 	// cache write occasionally races past a one-shot Scan. A
 	// bounded poll keeps the test as strict but stops flaking.
-	scanCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
 	pattern := "*:agent-lastseen:" + minted.ID.String()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		keys, _, err := rdb.Raw().Scan(scanCtx, 0, pattern, 50).Result()
-		if err != nil {
-			t.Fatalf("Scan: %v", err)
-		}
-		if len(keys) > 0 {
+		if scanCacheKey(t, rdb, pattern) > 0 {
 			return
 		}
 		if time.Now().After(deadline) {
@@ -319,11 +312,71 @@ func TestRevoke_InvalidatesCache(t *testing.T) {
 	}
 }
 
+// scanCacheKey counts the keys matching pattern across the WHOLE
+// keyspace. A single SCAN call only returns one cursor page, so on a
+// shared test Redis that already holds other tests' keys the match can
+// sit on a later page: a one-page scan then misses it (flaky "not
+// written") or reports a cold cache that isn't.
 func scanCacheKey(t *testing.T, rdb *runtime.Client, pattern string) int {
 	t.Helper()
-	keys, _, err := rdb.Raw().Scan(t.Context(), 0, pattern, 100).Result()
-	if err != nil {
+	seen := map[string]struct{}{}
+	iter := rdb.Raw().Scan(t.Context(), 0, pattern, 500).Iterator()
+	for iter.Next(t.Context()) {
+		// A full SCAN may return a key twice if the keyspace resizes
+		// mid-scan, so count distinct keys.
+		seen[iter.Val()] = struct{}{}
+	}
+	if err := iter.Err(); err != nil {
 		t.Fatalf("Scan %q: %v", pattern, err)
 	}
-	return len(keys)
+	return len(seen)
+}
+
+// API-N-07: identical rejected auths are folded into one audit row per
+// window, but only while Redis can hold the rollup slot. With Redis
+// unreachable every rejection is still written (api#187 auditability
+// beats flood control), and auth itself keeps working off Postgres.
+func TestAuthenticate_RejectAuditRollup_FallsBackWithoutRedis(t *testing.T) {
+	svc, pool, _ := bootstrap(t)
+	ctx := t.Context()
+	minted, err := svc.Mint(ctx, services.MintInput{Name: "agent"})
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	count := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE action = 'agent.auth.rejected'`).Scan(&n); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		return n
+	}
+
+	for i := 0; i < 10; i++ {
+		if err := svc.Authenticate(ctx, minted.ID, "wrong"); !errors.Is(err, storage.ErrUnauthorized) {
+			t.Fatalf("wrong secret: %v", err)
+		}
+	}
+	if n := count(); n != 1 {
+		t.Fatalf("with Redis: %d rows for 10 identical rejections; want 1", n)
+	}
+
+	// Same service shape, Redis gone.
+	dead, err := runtime.Open(ctx, runtime.Config{URL: os.Getenv("TEST_REDIS_URL"), Namespace: "sb-test-dead"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	_ = dead.Close()
+	noRedis := services.NewAgentService(storage.NewAgents(pool), storage.NewAuditEvents(pool), dead)
+	for i := 0; i < 5; i++ {
+		if err := noRedis.Authenticate(ctx, minted.ID, "wrong"); !errors.Is(err, storage.ErrUnauthorized) {
+			t.Fatalf("wrong secret without Redis: %v", err)
+		}
+	}
+	if n := count(); n != 1+5 {
+		t.Fatalf("without Redis: %d rows; want %d (every rejection audited)", n, 1+5)
+	}
+	if err := noRedis.Authenticate(ctx, minted.ID, minted.AgentSecret); err != nil {
+		t.Fatalf("right secret without Redis: %v", err)
+	}
 }

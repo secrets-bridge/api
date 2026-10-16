@@ -3,6 +3,7 @@ package sanitize_test
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/secrets-bridge/api/pkg/sanitize"
 )
@@ -113,6 +114,40 @@ func TestDiscoverError_Idempotent(t *testing.T) {
 	}
 }
 
+// API-S-27: agent job errors are capped, redacted and safe to store.
+func TestJobError_CapsRedactsAndStripsControl(t *testing.T) {
+	if got := sanitize.JobError(""); got != "" {
+		t.Fatalf("empty input: got %q", got)
+	}
+	in := "get value: AccessDenied for AKIAABCDEFGHIJKLMNOP\x00 " + strings.Repeat("é", 100_000)
+	got := sanitize.JobError(in)
+	if len(got) > sanitize.JobMaxErrorLen {
+		t.Fatalf("len = %d; want <= %d", len(got), sanitize.JobMaxErrorLen)
+	}
+	if strings.Contains(got, "AKIAABCDEFGHIJKLMNOP") || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("credential not redacted: %q", got[:80])
+	}
+	if strings.ContainsRune(got, 0) {
+		t.Fatal("NUL survived")
+	}
+	if !utf8.ValidString(got) || !strings.HasSuffix(got, "...") {
+		t.Fatalf("truncation split a rune or lost its marker: %q", got[len(got)-8:])
+	}
+	short := "vault: 403 permission denied\non secret/data/team-alpha/uat/db"
+	if got := sanitize.JobError(short); got != short {
+		t.Fatalf("short error mutated: %q", got)
+	}
+}
+
+// A credential straddling the final cut is still redacted, not left as a
+// partial prefix.
+func TestJobError_CredentialAtCutPoint(t *testing.T) {
+	in := strings.Repeat("a", sanitize.JobMaxErrorLen-10) + "AKIAABCDEFGHIJKLMNOP"
+	if got := sanitize.JobError(in); strings.Contains(got, "AKIAABC") {
+		t.Fatalf("partial credential leaked at the cut: %q", got[len(got)-20:])
+	}
+}
+
 func TestLogError_RedactsCredentialsAndKeepsContext(t *testing.T) {
 	in := `keymgmt: vault transit decrypt: URL: PUT https://vault.example.com/v1/transit/decrypt/sb-key token=hvs.CAESIabcdefghijklmnopqrstuvwxyz0123`
 	got := sanitize.LogError(in)
@@ -132,5 +167,20 @@ func TestLogError_RoomierCapThanDiscover(t *testing.T) {
 	long := strings.Repeat("e", sanitize.LogMaxErrorLen+100)
 	if got := sanitize.LogError(long); len(got) > sanitize.LogMaxErrorLen {
 		t.Fatalf("LogError len = %d; want <= %d", len(got), sanitize.LogMaxErrorLen)
+	}
+}
+
+// A credential split by a control character must still be redacted: the
+// strip runs before redaction, so the two halves can't be glued back
+// together after the redaction pass has already missed them.
+func TestJobError_CredentialSplitByControlChar(t *testing.T) {
+	for _, in := range []string{
+		"vault: denied for AKIAABCDEFGH\x00IJKLMNOP",
+		"vault: denied for AKIAABCDEFGH\x07IJKLMNOP",
+	} {
+		got := sanitize.JobError(in)
+		if strings.Contains(got, "AKIAABCDEFGHIJKLMNOP") || !strings.Contains(got, "[REDACTED]") {
+			t.Fatalf("split credential survived: %q", got)
+		}
 	}
 }

@@ -48,6 +48,7 @@ func bootstrapPolicy(t *testing.T) (*services.PolicyEngine, *storage.Pool, *stor
 		DELETE FROM workflow_definitions WHERE is_system = false;
 		DELETE FROM user_roles;
 		DELETE FROM roles WHERE is_system = false;
+		DELETE FROM project_secrets;
 		DELETE FROM environments;
 		DELETE FROM projects;`
 	if _, err := pool.Exec(ctx, wipeWorkflow); err != nil {

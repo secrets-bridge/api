@@ -106,6 +106,8 @@ func seedUATEnvWithRule(t *testing.T, h *revealHarness, projectSlug string, ttlS
 	if err := h.polRepo.Create(ctx, rule); err != nil {
 		t.Fatalf("policy Create: %v", err)
 	}
+	// Direct reveal requires a read binding (api#191 H2).
+	bindSecretToEnv(t, h.pool, env, "billing/uat/db", nil)
 	return env
 }
 
@@ -374,6 +376,7 @@ func TestOpen_TTLDefaultsWhenPolicyZero(t *testing.T) {
 	if err := h.envRepo.Create(ctx, env); err != nil {
 		t.Fatalf("env Create: %v", err)
 	}
+	bindSecretToEnv(t, h.pool, env, "billing/uat/db", nil)
 	// SubmitDirectReveal requires policy.direct_reveal_allowed=true, so
 	// fall back to the standard read path + manual approval bump.
 	req, err := h.reqSvc.SubmitRead(ctx, services.ReadInput{

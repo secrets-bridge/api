@@ -68,8 +68,26 @@ type SecretWrapRepository interface {
 	// Returns ErrAlreadyConsumed when the row is already consumed and
 	// ErrExpired when the wrap has aged past expires_at. Both are
 	// observable, so the service layer can produce the right HTTP
-	// status to the agent.
+	// status to the agent. The consume also clears the ciphertext
+	// columns (API-S-24); callers read the row before consuming.
 	MarkConsumed(ctx context.Context, id, agentID uuid.UUID, at time.Time) error
+
+	// MarkConsumedForJob is MarkConsumed gated, in the same statement,
+	// on jobID being the wrap's request job, of jobType, and currently
+	// claimed by agentID (H4). Returns ErrJobNotClaimed when it is not;
+	// a refused call never burns the wrap.
+	MarkConsumedForJob(ctx context.Context, id, agentID, jobID uuid.UUID, jobType JobType, at time.Time) error
+
+	// CreateForClaimedJob inserts an agent-produced wrap only while
+	// jobID (the request's job, of jobType) is claimed by agentID and
+	// the request holds no other wrap for the same key_name (H4).
+	// Returns ErrJobNotClaimed or ErrDuplicateWrapKey.
+	CreateForClaimedJob(ctx context.Context, w *SecretWrap, jobID, agentID uuid.UUID, jobType JobType) error
+
+	// JobClaimedBy reports whether jobID is requestID's job, of jobType,
+	// and currently claimed by agentID. A read-only pre-check; the two
+	// methods above re-check atomically.
+	JobClaimedBy(ctx context.Context, jobID, requestID, agentID uuid.UUID, jobType JobType) (bool, error)
 
 	// MarkConsumedByUser is the user-bound counterpart of MarkConsumed.
 	// Used by the read flow's user-bound retrieval endpoint to
@@ -116,6 +134,15 @@ var ErrAlreadyConsumed = errors.New("storage: wrap already consumed")
 // ErrExpired signals the wrap has aged past its TTL.
 var ErrExpired = errors.New("storage: wrap expired")
 
+// ErrJobNotClaimed signals that the request's job is not currently
+// claimed by the calling agent, so the agent may not create or fetch
+// wraps for that request (H4).
+var ErrJobNotClaimed = errors.New("storage: request job is not claimed by this agent")
+
+// ErrDuplicateWrapKey signals that the request already holds a wrap for
+// the key an agent tried to post (H4).
+var ErrDuplicateWrapKey = errors.New("storage: request already has a wrap for this key")
+
 // SecretWraps is the Postgres implementation.
 type SecretWraps struct {
 	pool *Pool
@@ -128,13 +155,86 @@ func NewSecretWraps(pool *Pool) *SecretWraps { return &SecretWraps{pool: pool} }
 // honoured so callers running their own UUID generation can match
 // wraps to other entities they create in the same transaction.
 func (r *SecretWraps) Create(ctx context.Context, w *SecretWrap) error {
-	return insertSecretWrap(ctx, r.pool, w)
+	if err := prepareWrap(w); err != nil {
+		return err
+	}
+	return insertWrap(ctx, r.pool, w)
 }
 
-// insertSecretWrap writes one wrap row through q, which is the pool or
-// the transaction AccessRequests.FillWithWraps holds the request row
-// lock in.
-func insertSecretWrap(ctx context.Context, q querier, w *SecretWrap) error {
+// CreateForClaimedJob is the agent-side create (H4). One transaction:
+//
+//  1. Lock the job row FOR UPDATE, requiring it to be the request's job,
+//     of jobType, claimed by agentID with an unexpired lease (ClaimNext
+//     hands an expired claim to another agent). The lock serialises concurrent
+//     posts for the same job and holds off Complete / a re-claim until
+//     the insert commits, so a wrap can never land on a job the agent
+//     no longer owns.
+//  2. Refuse a second wrap for the same (request_id, key_name).
+//  3. Insert.
+func (r *SecretWraps) CreateForClaimedJob(ctx context.Context, w *SecretWrap, jobID, agentID uuid.UUID, jobType JobType) error {
+	if err := prepareWrap(w); err != nil {
+		return err
+	}
+	if w.RequestID == nil || w.KeyName == "" {
+		return errors.New("storage: request_id and key_name are required for an agent wrap")
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("storage: begin agent wrap create: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var locked uuid.UUID
+	err = tx.QueryRow(ctx, `
+		SELECT id FROM sync_jobs
+		WHERE id = $1 AND request_id = $2 AND claimed_by = $3
+		  AND status = 'claimed' AND job_type = $4
+		  AND claim_expires_at > now()
+		FOR UPDATE`, jobID, *w.RequestID, agentID, jobType).Scan(&locked)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrJobNotClaimed
+	}
+	if err != nil {
+		return fmt.Errorf("storage: lock job for agent wrap: %w", err)
+	}
+
+	var dup bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM secret_wraps WHERE request_id = $1 AND key_name = $2)`,
+		*w.RequestID, w.KeyName).Scan(&dup); err != nil {
+		return fmt.Errorf("storage: check duplicate wrap key: %w", err)
+	}
+	if dup {
+		return ErrDuplicateWrapKey
+	}
+	if err := insertWrap(ctx, tx, w); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("storage: commit agent wrap create: %w", err)
+	}
+	return nil
+}
+
+// JobClaimedBy reports whether jobID is requestID's job of jobType and
+// is currently claimed by agentID, lease not expired.
+func (r *SecretWraps) JobClaimedBy(ctx context.Context, jobID, requestID, agentID uuid.UUID, jobType JobType) (bool, error) {
+	var ok bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM sync_jobs
+			WHERE id = $1 AND request_id = $2 AND claimed_by = $3
+			  AND status = 'claimed' AND job_type = $4
+			  AND claim_expires_at > now())`,
+		jobID, requestID, agentID, jobType).Scan(&ok)
+	if err != nil {
+		return false, fmt.Errorf("storage: check job claim: %w", err)
+	}
+	return ok, nil
+}
+
+// prepareWrap validates a wrap and fills its defaults before insert.
+func prepareWrap(w *SecretWrap) error {
 	if len(w.EncryptedValue) == 0 || len(w.Nonce) == 0 || len(w.DataKeyCiphertext) == 0 {
 		return errors.New("storage: encrypted_value / nonce / data_key_ciphertext are required")
 	}
@@ -150,7 +250,11 @@ func insertSecretWrap(ctx context.Context, q querier, w *SecretWrap) error {
 	if w.IssuedVia == "" {
 		w.IssuedVia = WrapIssuedViaRequest
 	}
+	return nil
+}
 
+// insertWrap writes a prepared wrap through q (the pool or a tx).
+func insertWrap(ctx context.Context, q rowQuerier, w *SecretWrap) error {
 	const insertGenerated = `
 		INSERT INTO secret_wraps
 		  (request_id, environment_id, issued_via, key_name,
@@ -194,6 +298,13 @@ func (r *SecretWraps) Get(ctx context.Context, id uuid.UUID) (*SecretWrap, error
 	return scanSecretWrap(r.pool.QueryRow(ctx, q, id))
 }
 
+// clearCiphertextSQL is the SET fragment every consume applies
+// (API-S-24). The columns are NOT NULL, so the consume writes an empty
+// bytea: once the single-shot read has happened nothing on disk can be
+// decrypted, even before the expiry sweeper deletes the row. The nonce
+// is not secret and stays.
+const clearCiphertextSQL = `encrypted_value = ''::bytea, data_key_ciphertext = ''::bytea`
+
 // MarkConsumed atomically transitions to consumed. The single SQL
 // statement does ALL three checks (exists, not consumed, not expired)
 // so concurrent agents racing to retrieve the same wrap see consistent
@@ -201,7 +312,7 @@ func (r *SecretWraps) Get(ctx context.Context, id uuid.UUID) (*SecretWrap, error
 func (r *SecretWraps) MarkConsumed(ctx context.Context, id, agentID uuid.UUID, at time.Time) error {
 	const q = `
 		UPDATE secret_wraps
-		SET consumed_at = $3, consumed_by_agent = $2
+		SET consumed_at = $3, consumed_by_agent = $2, ` + clearCiphertextSQL + `
 		WHERE id = $1
 		  AND consumed_at IS NULL
 		  AND expires_at > $3`
@@ -212,8 +323,54 @@ func (r *SecretWraps) MarkConsumed(ctx context.Context, id, agentID uuid.UUID, a
 	if tag.RowsAffected() == 1 {
 		return nil
 	}
-	// Distinguish absent from already-consumed-or-expired so the
-	// service layer can produce the right HTTP status.
+	return r.consumeRefusal(ctx, id, at)
+}
+
+// MarkConsumedForJob consumes the wrap only when, in the same statement,
+// jobID is the wrap's request job, of jobType, and claimed by agentID
+// with an unexpired lease. Once the lease runs out ClaimNext may give the
+// job to another agent, so the old holder must not take the plaintext.
+func (r *SecretWraps) MarkConsumedForJob(ctx context.Context, id, agentID, jobID uuid.UUID, jobType JobType, at time.Time) error {
+	const q = `
+		UPDATE secret_wraps w
+		SET consumed_at = $3, consumed_by_agent = $2, ` + clearCiphertextSQL + `
+		WHERE w.id = $1
+		  AND w.consumed_at IS NULL
+		  AND w.expires_at > $3
+		  AND EXISTS (
+		      SELECT 1 FROM sync_jobs j
+		      WHERE j.id = $4 AND j.request_id = w.request_id
+		        AND j.claimed_by = $2 AND j.status = 'claimed' AND j.job_type = $5
+		        AND j.claim_expires_at > now())`
+	tag, err := r.pool.Exec(ctx, q, id, agentID, at, jobID, jobType)
+	if err != nil {
+		return fmt.Errorf("storage: mark consumed for job: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	// Ownership first: a non-owner learns nothing about the wrap's state.
+	cur, err := r.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if cur.RequestID == nil {
+		return ErrJobNotClaimed
+	}
+	owned, err := r.JobClaimedBy(ctx, jobID, *cur.RequestID, agentID, jobType)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return ErrJobNotClaimed
+	}
+	return r.consumeRefusal(ctx, id, at)
+}
+
+// consumeRefusal explains a consume UPDATE that matched no row.
+// Distinguishes absent from already-consumed-or-expired so the service
+// layer can produce the right HTTP status.
+func (r *SecretWraps) consumeRefusal(ctx context.Context, id uuid.UUID, at time.Time) error {
 	cur, getErr := r.Get(ctx, id)
 	if getErr != nil {
 		return getErr // ErrNotFound or DB error
@@ -234,7 +391,7 @@ func (r *SecretWraps) MarkConsumed(ctx context.Context, id, agentID uuid.UUID, a
 func (r *SecretWraps) MarkConsumedByUser(ctx context.Context, id uuid.UUID, userID string, at time.Time) error {
 	const q = `
 		UPDATE secret_wraps
-		SET consumed_at = $3, consumed_by_user = $2
+		SET consumed_at = $3, consumed_by_user = $2, ` + clearCiphertextSQL + `
 		WHERE id = $1
 		  AND consumed_at IS NULL
 		  AND expires_at > $3`
@@ -245,17 +402,7 @@ func (r *SecretWraps) MarkConsumedByUser(ctx context.Context, id uuid.UUID, user
 	if tag.RowsAffected() == 1 {
 		return nil
 	}
-	cur, getErr := r.Get(ctx, id)
-	if getErr != nil {
-		return getErr
-	}
-	if cur.ConsumedAt != nil {
-		return ErrAlreadyConsumed
-	}
-	if !cur.ExpiresAt.After(at) {
-		return ErrExpired
-	}
-	return ErrAlreadyConsumed
+	return r.consumeRefusal(ctx, id, at)
 }
 
 // SetExpiry shortens expires_at to expiresAt when that is earlier than
@@ -365,4 +512,14 @@ func scanSecretWrap(row interface {
 	w.ConsumedAt = consumedAt
 	w.ConsumedByAgent = consumedByAgent
 	return &w, nil
+}
+
+// insertSecretWrap validates and writes one wrap row through q, which is
+// the pool or the transaction AccessRequests.FillWithWraps holds the
+// request row lock in.
+func insertSecretWrap(ctx context.Context, q querier, w *SecretWrap) error {
+	if err := prepareWrap(w); err != nil {
+		return err
+	}
+	return insertWrap(ctx, q, w)
 }

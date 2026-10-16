@@ -28,6 +28,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// rowQuerier is the QueryRow slice shared by *Pool and pgx.Tx, so an
+// insert helper can run either standalone or inside a transaction.
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // Config carries everything storage needs to connect. Populated by
 // LoadConfig from environment variables; injected explicitly in tests.
 type Config struct {

@@ -89,3 +89,26 @@ func TestSeal_BadRecipientPubKey(t *testing.T) {
 		t.Fatal("expected error for malformed recipient pub key")
 	}
 }
+
+// A wrong-size nonce or a too-short ciphertext is an error, not a panic
+// inside gcm.Open.
+func TestOpen_MalformedNonceRejected(t *testing.T) {
+	pub, priv, err := sealing.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("GenerateRecipientKey: %v", err)
+	}
+	env, err := sealing.Seal([]byte("v"), pub)
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	for _, mutate := range []func(e sealing.Envelope) sealing.Envelope{
+		func(e sealing.Envelope) sealing.Envelope { e.Nonce = e.Nonce[:4]; return e },
+		func(e sealing.Envelope) sealing.Envelope { e.Nonce = append(e.Nonce, 1, 2, 3); return e },
+		func(e sealing.Envelope) sealing.Envelope { e.Ciphertext = e.Ciphertext[:3]; return e },
+	} {
+		bad := mutate(*env)
+		if _, err := sealing.Open(&bad, priv, pub); err == nil {
+			t.Fatal("malformed envelope opened")
+		}
+	}
+}

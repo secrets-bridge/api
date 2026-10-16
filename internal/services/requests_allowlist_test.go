@@ -182,30 +182,78 @@ func TestSubmitDirectReveal_EmptyKeysWithRestrictiveAllowlistRefused(t *testing.
 	}
 }
 
-func TestSubmitDirectReveal_NoBinding_PolicyOnlyPathUnchanged(t *testing.T) {
+// api#191 H2: this used to pin the vulnerable behaviour ("no binding =>
+// policy-only path still works"). A direct reveal now REQUIRES a read
+// binding for (project, provider, ref): no binding is refused before the
+// request row is written, and the refusal is audited.
+func TestSubmitDirectReveal_NoBinding_Refused(t *testing.T) {
 	reqSvc, pool, envRepo, workflows, policies := buildL3Harness(t)
-	reqSvc.WithProjectBindings(storage.NewProjectSecrets(pool), storage.NewSecrets(pool))
 	ctx := t.Context()
 
 	projectID := makeProjectForSvc(t, pool, "dr-allowlist-nobind")
 	env := newUATEnv(t, envRepo, projectID)
 	seedDirectRevealRule(t, pool, workflows, policies, projectID)
-	// No binding created — the allowlist lives on the binding and there
-	// is none, so the policy-only direct-reveal path is unchanged.
+	// No binding created.
 
-	req, err := reqSvc.SubmitDirectReveal(ctx, services.DirectRevealInput{
+	_, err := reqSvc.SubmitDirectReveal(ctx, services.DirectRevealInput{
 		RequesterID:        "alice-nobind@example.com",
 		Environment:        env,
 		TargetProviderType: "vault",
 		TargetSecretRef:    "billing/uat/db",
 		TargetKeys:         []string{"ANY_KEY"},
-		Justification:      "no binding => policy-only path still works",
+		Justification:      "no binding must be refused",
 	})
-	if err != nil {
-		t.Fatalf("SubmitDirectReveal (no binding): %v", err)
+	if !errors.Is(err, services.ErrSecretNotBound) {
+		t.Fatalf("got %v, want ErrSecretNotBound", err)
 	}
-	if req.Status != storage.AccessRequestStatusApproved {
-		t.Errorf("Status: got %q want approved", req.Status)
+
+	var rows, audits int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM access_requests WHERE requester_id = $1`, "alice-nobind@example.com",
+	).Scan(&rows); err != nil {
+		t.Fatalf("query requests: %v", err)
+	}
+	if rows != 0 {
+		t.Errorf("access_requests rows = %d; want 0", rows)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_events
+		  WHERE action = 'secret.reveal.direct.refused_binding'
+		    AND correlation_id = $1
+		    AND metadata->>'refusal_reason' = 'secret_not_bound'`, env.ID,
+	).Scan(&audits); err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	if audits != 1 {
+		t.Errorf("refused_binding audit rows = %d; want 1", audits)
+	}
+}
+
+// Fail closed: a RequestService without the binding repos wired cannot
+// prove a binding, so direct reveal is refused rather than skipped.
+func TestSubmitDirectReveal_BindingReposUnwired_Refused(t *testing.T) {
+	_, pool, envRepo, workflows, policies := buildL3Harness(t)
+	ctx := t.Context()
+	unwired := services.NewRequestService(
+		storage.NewAccessRequests(pool), storage.NewApprovals(pool), nil, workflows,
+		services.NewPolicyEngine(policies, workflows, storage.NewAuditEvents(pool)),
+		storage.NewAuditEvents(pool), nil,
+	)
+
+	projectID := makeProjectForSvc(t, pool, "dr-unwired")
+	env := newUATEnv(t, envRepo, projectID)
+	seedDirectRevealRule(t, pool, workflows, policies, projectID)
+
+	_, err := unwired.SubmitDirectReveal(ctx, services.DirectRevealInput{
+		RequesterID:        "alice-unwired@example.com",
+		Environment:        env,
+		TargetProviderType: "vault",
+		TargetSecretRef:    "billing/uat/db",
+		TargetKeys:         []string{"ANY_KEY"},
+		Justification:      "unwired repos must fail closed",
+	})
+	if !errors.Is(err, services.ErrSecretNotBound) {
+		t.Fatalf("got %v, want ErrSecretNotBound", err)
 	}
 }
 
@@ -215,13 +263,14 @@ func TestOpen_RefusesWrapOutsideAllowlist(t *testing.T) {
 	h := buildRevealHarness(t)
 	ctx := t.Context()
 
-	// The reveal harness's request service has NO allowlist gate wired,
-	// so a wrap for an out-of-allowlist key can exist — exactly the
-	// tampered/legacy-row scenario the second boundary defends against.
+	// The binding allows every key at submit time; it is tightened to
+	// QA_PROBE afterwards, so a wrap for an out-of-allowlist key exists —
+	// exactly the tightened/legacy-row scenario the second boundary
+	// defends against.
 	env := seedUATEnvWithRule(t, h, "rs-allowlist-deny", 60)
 	req := submitDirectRevealRequest(t, h, env, "alice", "SNEAKY_KEY")
 
-	bindSecretWithAllowedKeys(t, h.pool, env.ProjectID, "billing/uat/db", []string{"QA_PROBE"})
+	tightenEnvBinding(t, h.pool, env, "billing/uat/db", []string{"QA_PROBE"})
 	h.revealSvc.WithAllowlist(storage.NewProjectSecrets(h.pool), storage.NewSecrets(h.pool))
 
 	_, err := h.revealSvc.Open(ctx, services.OpenInput{UserID: "alice", RequestID: req.ID})
@@ -247,7 +296,7 @@ func TestOpen_AllowsWrapWithinAllowlist(t *testing.T) {
 	env := seedUATEnvWithRule(t, h, "rs-allowlist-ok", 60)
 	req := submitDirectRevealRequest(t, h, env, "alice", "QA_PROBE")
 
-	bindSecretWithAllowedKeys(t, h.pool, env.ProjectID, "billing/uat/db", []string{"QA_PROBE"})
+	tightenEnvBinding(t, h.pool, env, "billing/uat/db", []string{"QA_PROBE"})
 	h.revealSvc.WithAllowlist(storage.NewProjectSecrets(h.pool), storage.NewSecrets(h.pool))
 
 	resp, err := h.revealSvc.Open(ctx, services.OpenInput{UserID: "alice", RequestID: req.ID})

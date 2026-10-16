@@ -17,6 +17,8 @@ package sanitize
 import (
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // DiscoverMaxErrorLen caps stored discover errors. Postgres has no
@@ -86,6 +88,20 @@ func LogError(raw string) string {
 // scrub is the shared pipeline: redact credentials, strip JSON blobs,
 // truncate to max. The order is load-bearing (see DiscoverError).
 func scrub(raw string, max int) string {
+	out := redact(raw)
+
+	// Step 3: truncate. Trailing ellipsis makes the cap visible to
+	// operators reading the row in a dashboard.
+	if len(out) > max {
+		out = out[:max-3] + "..."
+	}
+
+	return strings.TrimSpace(out)
+}
+
+// redact runs steps 1 and 2 of the sanitizer: credential-shaped
+// substrings first, then large JSON blobs.
+func redact(raw string) string {
 	out := raw
 
 	// Step 1: redact credential-shaped substrings. Catches them
@@ -96,13 +112,51 @@ func scrub(raw string, max int) string {
 
 	// Step 2: strip large JSON blobs. Any remaining response body
 	// is collapsed to a marker before truncation runs.
-	out = jsonBlobPattern.ReplaceAllString(out, "{...body redacted...}")
+	return jsonBlobPattern.ReplaceAllString(out, "{...body redacted...}")
+}
 
-	// Step 3: truncate. Trailing ellipsis makes the cap visible to
-	// operators reading the row in a dashboard.
-	if len(out) > max {
-		out = out[:max-3] + "..."
+// JobMaxErrorLen caps the error text an agent reports when it completes
+// a job (API-S-27). The agent is the writer and the text is otherwise
+// unbounded, so the cap lives here, at the surface that persists it.
+const JobMaxErrorLen = 1024
+
+// jobErrorScanLen bounds how much agent text the redaction regexes see.
+// Anything past it can never reach the stored JobMaxErrorLen prefix, and
+// it is far enough past that prefix that a credential straddling the
+// final cut is still seen whole (and redacted) by step 1.
+const jobErrorScanLen = 16 * 1024
+
+// JobError sanitizes the free-text error an agent posts with a job
+// outcome before it is stored: credentials and large JSON blobs are
+// redacted exactly like DiscoverError, control characters (NUL breaks a
+// Postgres text/jsonb write) are dropped, and the result is capped at
+// JobMaxErrorLen bytes on a UTF-8 boundary.
+func JobError(raw string) string {
+	// Strip control characters BEFORE redacting: a credential split by a
+	// NUL or an ANSI escape would slip past the redaction patterns and
+	// then be glued back together by the strip.
+	out := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
+		}
+		if unicode.IsControl(r) || r == utf8.RuneError {
+			return -1
+		}
+		return r
+	}, truncateUTF8(raw, jobErrorScanLen, ""))
+	out = redact(out)
+	return strings.TrimSpace(truncateUTF8(out, JobMaxErrorLen, "..."))
+}
+
+// truncateUTF8 cuts s to at most max bytes without splitting a rune;
+// when it cuts, the result ends in suffix (counted inside max).
+func truncateUTF8(s string, max int, suffix string) string {
+	if len(s) <= max {
+		return s
 	}
-
-	return strings.TrimSpace(out)
+	cut := max - len(suffix)
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + suffix
 }

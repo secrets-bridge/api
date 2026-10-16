@@ -59,6 +59,16 @@ type RevealSessionService struct {
 	// depth against a request row that somehow carries a denied key.
 	bindings storage.ProjectSecretRepository
 	secrets  storage.SecretRepository
+
+	// Session lookup for the single-wrap retrieve gate
+	// (AuthorizeWrapRetrieve). Wire via WithWrapLookup.
+	sessionWraps revealSessionWrapLookup
+}
+
+// revealSessionWrapLookup is the slice of *storage.RevealSessions the
+// single-wrap retrieve gate needs.
+type revealSessionWrapLookup interface {
+	ListForUserWrap(ctx context.Context, userID string, wrapID uuid.UUID) ([]*storage.RevealSession, error)
 }
 
 // NewRevealSessionService wires a RevealSessionService to its deps.
@@ -96,6 +106,13 @@ func (s *RevealSessionService) WithEnvironments(envs storage.EnvironmentReposito
 func (s *RevealSessionService) WithAllowlist(bindings storage.ProjectSecretRepository, secrets storage.SecretRepository) *RevealSessionService {
 	s.bindings = bindings
 	s.secrets = secrets
+	return s
+}
+
+// WithWrapLookup wires the session lookup AuthorizeWrapRetrieve uses.
+// Returns the service for chaining.
+func (s *RevealSessionService) WithWrapLookup(l revealSessionWrapLookup) *RevealSessionService {
+	s.sessionWraps = l
 	return s
 }
 
@@ -152,7 +169,82 @@ var (
 	// ErrNotSessionOwner is returned by MarkExpired when the caller is
 	// not the user who opened the session. Maps to 403.
 	ErrNotSessionOwner = errors.New("services: caller does not own this reveal session")
+
+	// ErrRevealSessionRequired is returned by AuthorizeWrapRetrieve when a
+	// wrap of the reveal-session flow is fetched without an open,
+	// unexpired session of the caller that bundles it. Maps to 403.
+	ErrRevealSessionRequired = errors.New("services: wrap must be retrieved inside an open reveal session")
 )
+
+// AuthorizeWrapRetrieve gates the single-wrap plaintext fetch
+// (GET /requests/:id/wraps/:wrap_id) for wraps of the reveal-session
+// flow (API-S-20). The flow applies when sessionRequired is true (the
+// caller passes it for an auto-approved direct reveal) or the wrap was
+// ever bundled into one of the caller's reveal sessions. Then:
+//
+//   - an open session (expired_at NULL AND expires_at in the future) of
+//     the caller, for this request, bundling this wrap must exist, so the
+//     session TTL holds even before the worker sweeper advances the
+//     wrap's own expiry → else ErrRevealSessionRequired;
+//   - the same env-matching allowlist check Open runs must pass for the
+//     wrap's key (binding scoped to the request's environment, else a
+//     NULL-environment one; none → ErrSecretNotBound; key outside →
+//     ErrKeyNotAllowed).
+//
+// A wrap of the plain read flow (approver-approved, never bundled in a
+// session) passes untouched, as before. Every refusal is audited and
+// happens BEFORE the single-shot consume, so a refused fetch never burns
+// the wrap. Fails closed (error) when the session lookup isn't wired.
+func (s *RevealSessionService) AuthorizeWrapRetrieve(ctx context.Context, req *storage.AccessRequest, wrap *storage.SecretWrap, userID string, sessionRequired bool) error {
+	if s.sessionWraps == nil {
+		return errors.New("services: reveal session wrap lookup not wired")
+	}
+	sessions, err := s.sessionWraps.ListForUserWrap(ctx, userID, wrap.ID)
+	if err != nil {
+		return err
+	}
+	if !sessionRequired && len(sessions) == 0 {
+		return nil
+	}
+
+	now := s.now().UTC()
+	var open *storage.RevealSession
+	for _, sess := range sessions {
+		if sess.ExpiredAt == nil && now.Before(sess.ExpiresAt) &&
+			sess.AccessRequestID != nil && *sess.AccessRequestID == req.ID {
+			open = sess
+			break
+		}
+	}
+	if open == nil {
+		s.auditRetrieveRefused(ctx, userID, req, wrap, "no_open_session")
+		return ErrRevealSessionRequired
+	}
+	if reason, err := s.enforceWrapAllowlist(ctx, req, []storage.WrapSummary{{ID: wrap.ID, KeyName: wrap.KeyName}}); err != nil {
+		if reason != "" {
+			s.auditRetrieveRefused(ctx, userID, req, wrap, reason)
+		}
+		return err
+	}
+	return nil
+}
+
+// auditRetrieveRefused records a refused single-wrap fetch. Metadata
+// only: ids and the refusal reason, never a value.
+func (s *RevealSessionService) auditRetrieveRefused(ctx context.Context, userID string, req *storage.AccessRequest, wrap *storage.SecretWrap, reason string) {
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:         "user:" + userID,
+		Action:        "wrap.retrieve.refused_session",
+		Resource:      "wrap:" + wrap.ID.String(),
+		Status:        storage.AuditStatusDenied,
+		CorrelationID: req.ID,
+		Metadata: map[string]any{
+			"request_id":     req.ID.String(),
+			"wrap_id":        wrap.ID.String(),
+			"refusal_reason": reason,
+		},
+	})
+}
 
 // Open creates a new reveal session for the caller bundling every
 // unconsumed wrap of the given access_request. The wraps remain
@@ -210,9 +302,29 @@ func (s *RevealSessionService) Open(ctx context.Context, in OpenInput) (*RevealS
 		return nil, ErrAllWrapsConsumed
 	}
 
-	// Second-boundary allowlist gate: refuse to bundle a session if any
+	// Second-boundary allowlist gate: refuse to bundle a session if the
+	// request's secret is no longer bound in its environment, or any
 	// unconsumed wrap names a key outside the binding's allowed_keys.
-	if err := s.enforceWrapAllowlist(ctx, req, fresh); err != nil {
+	if reason, err := s.enforceWrapAllowlist(ctx, req, fresh); err != nil {
+		if reason != "" {
+			projectIDStr, _ := req.TargetScope["project_id"].(string)
+			_ = s.audit.Append(ctx, &storage.AuditEvent{
+				Actor:         "user:" + in.UserID,
+				Action:        "reveal.session.refused_binding",
+				Resource:      "request:" + req.ID.String(),
+				Status:        storage.AuditStatusFailure,
+				CorrelationID: req.ID,
+				Metadata: map[string]any{
+					"request_id":           req.ID.String(),
+					"environment_id":       req.EnvironmentID.String(),
+					"project_id":           projectIDStr,
+					"target_provider_type": req.TargetProviderType,
+					"target_secret_ref":    req.TargetSecretRef,
+					"wrap_count":           len(fresh),
+					"refusal_reason":       reason,
+				},
+			})
+		}
 		return nil, err
 	}
 
@@ -385,47 +497,51 @@ func clampRevealTTL(ttl int) int {
 	return ttl
 }
 
-// enforceWrapAllowlist refuses the reveal when any bundled wrap names a
-// key outside the project_secrets binding's allowed_keys. When the
-// allowlist repos aren't wired, the request carries no provider/ref, or
-// no binding exists for the request's (project, provider_type,
-// secret_ref), the check is skipped — there is nothing to enforce
-// against. A nil AllowedKeys means "all keys allowed".
-func (s *RevealSessionService) enforceWrapAllowlist(ctx context.Context, req *storage.AccessRequest, wraps []storage.WrapSummary) error {
+// enforceWrapAllowlist refuses the reveal when the request's secret has
+// no binding that governs it in the request's environment, or when any
+// bundled wrap names a key outside that binding's allowed_keys. The
+// binding is picked with the same environment rule as the submit gates
+// (GoverningBinding): the binding scoped to the request's environment,
+// else a legacy NULL-environment binding; a binding scoped to another
+// environment never applies. No governing binding → ErrSecretNotBound
+// (fail closed: a binding removed or re-scoped after submit stops the
+// reveal). A nil AllowedKeys means "all keys allowed".
+//
+// Skipped when the allowlist repos aren't wired (legacy tests) or the
+// request carries no provider/ref (cross_team: its destination keys are
+// re-checked at the fill and execute boundaries, api#169). Returns the
+// audit refusal reason alongside the error.
+func (s *RevealSessionService) enforceWrapAllowlist(ctx context.Context, req *storage.AccessRequest, wraps []storage.WrapSummary) (string, error) {
 	if s.bindings == nil || s.secrets == nil {
-		return nil
+		return "", nil
 	}
 	if req.TargetProviderType == "" || req.TargetSecretRef == "" {
-		return nil
+		return "", nil
 	}
 	projectID, err := projectIDFromRequest(req)
 	if err != nil {
-		return fmt.Errorf("services: project_id from request: %w", err)
+		return "", fmt.Errorf("services: project_id from request: %w", err)
 	}
-	catalog, err := s.secrets.ListByRef(ctx, req.TargetProviderType, req.TargetSecretRef)
+	cands, err := findProjectBindings(ctx, s.bindings, s.secrets, projectID, req.TargetProviderType, req.TargetSecretRef)
 	if err != nil {
-		return fmt.Errorf("services: resolve catalog for allowlist: %w", err)
+		return "", err
 	}
-	var binding *storage.ProjectSecret
-	for _, sec := range catalog {
-		b, err := s.bindings.Get(ctx, projectID, sec.ID)
-		if err == nil {
-			binding = b
-			break
+	sel := selectBinding(cands, req.EnvironmentID)
+	if sel == nil {
+		if len(cands) > 0 {
+			return bindingRefusalEnvMismatch, ErrSecretNotBound
 		}
-		if !errors.Is(err, storage.ErrNotFound) {
-			return fmt.Errorf("services: resolve binding for allowlist: %w", err)
-		}
+		return bindingRefusalNotBound, ErrSecretNotBound
 	}
-	if binding == nil || binding.AllowedKeys == nil {
-		return nil
+	if sel.binding.AllowedKeys == nil {
+		return "", nil
 	}
 	for _, w := range wraps {
-		if !keyInAllowlist(binding.AllowedKeys, w.KeyName) {
-			return fmt.Errorf("%w: %q", ErrKeyNotAllowed, w.KeyName)
+		if !keyInAllowlist(sel.binding.AllowedKeys, w.KeyName) {
+			return bindingRefusalKeyNotAllowed, fmt.Errorf("%w: %q", ErrKeyNotAllowed, w.KeyName)
 		}
 	}
-	return nil
+	return "", nil
 }
 
 // projectIDFromRequest pulls the project_id out of TargetScope. Open

@@ -230,6 +230,10 @@ func revealSessionErr(err error) error {
 		return fiber.NewError(fiber.StatusConflict, "request has no environment binding")
 	case errors.Is(err, services.ErrKeyNotAllowed):
 		return fiber.NewError(fiber.StatusForbidden, "a wrap in this request is not permitted by the binding allowlist")
+	case errors.Is(err, services.ErrSecretNotBound):
+		// Generic on purpose: "not bound" and "bound to another
+		// environment" look the same; the audit row has the reason.
+		return fiber.NewError(fiber.StatusForbidden, "the request's secret is not bound to its environment")
 	default:
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
