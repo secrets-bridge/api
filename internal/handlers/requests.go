@@ -199,6 +199,10 @@ func requestErr(err error) error {
 		// ErrSecretNotBound: no binding governs the request in its
 		// environment. Same body checkTenancy returns for that case.
 		return fiber.NewError(fiber.StatusForbidden, "out_of_scope_project")
+	case errors.Is(err, services.ErrBindingOpNotAllowed):
+		return fiber.NewError(fiber.StatusForbidden, "out_of_scope_op")
+	case errors.Is(err, services.ErrKeyNotAllowed):
+		return fiber.NewError(fiber.StatusForbidden, "out_of_scope_key")
 	case errors.Is(err, services.ErrNoDefaultWorkflow):
 		return fiber.NewError(fiber.StatusInternalServerError, "no policy matched and no default workflow exists")
 	case errors.Is(err, storage.ErrNotFound):

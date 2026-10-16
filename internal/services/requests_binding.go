@@ -219,45 +219,22 @@ func (s *RequestService) auditBindingRefusal(ctx context.Context, action, reques
 	})
 }
 
-// agentPayloadConfigKeys lists, per provider type, the ONLY
-// target_provider_config keys the agent accepts in a job payload (agent
-// internal/executor/resolvers.go vaultPayloadAllowlist and
-// awsPayloadAllowlist). Connection identity (address, namespace, auth,
-// region, roleArn, endpoint) is pinned on the agent and refused there, so
-// it is never put into a payload. Provider types not listed get an empty
-// config.
-var agentPayloadConfigKeys = map[string][]string{
-	string(storage.ProviderConnectionTypeVault): {"kvMount", "kvPrefix"},
-	string(storage.ProviderConnectionTypeAWSSM): {"tagFilter"},
-}
-
-// agentProviderConfig builds a job-payload provider config from
-// operator-controlled metadata, keeping only the keys the agent accepts
-// for providerType. Never nil.
-func agentProviderConfig(providerType string, src map[string]any) map[string]any {
-	out := map[string]any{}
-	for _, k := range agentPayloadConfigKeys[providerType] {
-		if v, ok := src[k]; ok && v != nil {
-			out[k] = v
-		}
-	}
-	return out
-}
-
 // boundProviderConfig derives the provider config for a read/patch
 // request from the catalog row of the binding that governs it in envID
 // (the config discovery recorded from the provider connection's scope),
 // filtered to the agent-accepted keys. It never looks at the request body
 // or the stored request row.
 //
-// It fails closed with ErrSecretNotBound when the project id does not
-// parse or no binding governs the request in envID: the binding was
-// removed, or only bindings scoped to other environments remain. It used
-// to fall back to the first candidate, which enqueued the job with
-// another environment's kvMount / kvPrefix. Only when the binding repos
-// are not wired (test wiring; the handler tenancy gate is off then too)
-// does it return an empty config, so the agent uses its pinned defaults.
-func (s *RequestService) boundProviderConfig(ctx context.Context, projectIDRaw string, envID *uuid.UUID, providerType, secretRef string) (map[string]any, error) {
+// It fails closed when the project id does not parse or no binding
+// governs the request in envID (ErrSecretNotBound: the binding was
+// removed, or only bindings scoped to other environments remain), and
+// when the governing binding no longer allows op (ErrBindingOpNotAllowed)
+// or one of keys (ErrKeyNotAllowed). It used to fall back to the first
+// candidate, which enqueued the job with another environment's kvMount /
+// kvPrefix. Only when the binding repos are not wired (test wiring; the
+// handler tenancy gate is off then too) does it return an empty config,
+// so the agent uses its pinned defaults.
+func (s *RequestService) boundProviderConfig(ctx context.Context, projectIDRaw string, envID *uuid.UUID, providerType, secretRef, op string, keys []string) (map[string]any, error) {
 	if s.bindings == nil || s.secrets == nil {
 		return map[string]any{}, nil
 	}
@@ -273,18 +250,40 @@ func (s *RequestService) boundProviderConfig(ctx context.Context, projectIDRaw s
 	if sel == nil {
 		return nil, ErrSecretNotBound
 	}
-	return agentProviderConfig(sel.secret.ProviderType, sel.secret.ProviderConfig), nil
+	if !keyInAllowlist(sel.binding.AllowedOps, op) {
+		return nil, ErrBindingOpNotAllowed
+	}
+	if err := checkBindingKeys(sel.binding, keys); err != nil {
+		return nil, err
+	}
+	return AgentJobProviderConfig(sel.secret.ProviderType, sel.secret.ProviderConfig), nil
+}
+
+// bindingRefusal reports whether err is a binding-gate refusal from
+// boundProviderConfig and, if so, its audit reason.
+func bindingRefusal(err error) (string, bool) {
+	switch {
+	case errors.Is(err, ErrSecretNotBound):
+		return "no_governing_binding", true
+	case errors.Is(err, ErrBindingOpNotAllowed):
+		return bindingRefusalOpNotAllowed, true
+	case errors.Is(err, ErrKeyNotAllowed):
+		return bindingRefusalKeyNotAllowed, true
+	}
+	return "", false
 }
 
 // failUnboundRequest is the enqueue-time half of the binding rule: when
-// enqueueRequestJob refuses with ErrSecretNotBound, no job exists and
-// none may run, so the request goes to failed instead of sitting at
-// approved. Metadata-only audit; returns true when the status changed.
-func (s *RequestService) failUnboundRequest(ctx context.Context, req *storage.AccessRequest, actor string) bool {
-	failed := false
+// enqueueRequestJob refuses because the governing binding is gone or no
+// longer allows the request's op or keys, no job exists and none may
+// run, so the request goes to failed instead of sitting at approved.
+// Metadata-only audit; "transitioned" is false when the status write did
+// not apply, so a request left at approved is visible in the audit log.
+func (s *RequestService) failUnboundRequest(ctx context.Context, req *storage.AccessRequest, actor, reason string) {
+	transitioned := false
 	if err := s.requests.UpdateStatus(ctx, req.ID, storage.AccessRequestStatusFailed); err == nil {
 		req.Status = storage.AccessRequestStatusFailed
-		failed = true
+		transitioned = true
 	}
 	envID := ""
 	if req.EnvironmentID != nil {
@@ -297,14 +296,14 @@ func (s *RequestService) failUnboundRequest(ctx context.Context, req *storage.Ac
 		Status:        storage.AuditStatusFailure,
 		CorrelationID: req.ID,
 		Metadata: map[string]any{
-			"reason":               "no_governing_binding",
+			"reason":               reason,
+			"transitioned":         transitioned,
 			"environment_id":       envID,
 			"target_provider_type": req.TargetProviderType,
 			"target_secret_ref":    req.TargetSecretRef,
 			"key_count":            len(req.TargetKeys),
 		},
 	})
-	return failed
 }
 
 // EnvReadInput is the per-env request endpoint's input
@@ -357,5 +356,5 @@ func (s *RequestService) SubmitEnvRead(ctx context.Context, in EnvReadInput) (*s
 		TargetSecretRef:    in.TargetSecretRef,
 		TargetKeys:         in.TargetKeys,
 		Justification:      in.Justification,
-	}, &envID, in.Environment.Kind, agentProviderConfig(bound.secret.ProviderType, bound.secret.ProviderConfig))
+	}, &envID, in.Environment.Kind, AgentJobProviderConfig(bound.secret.ProviderType, bound.secret.ProviderConfig))
 }

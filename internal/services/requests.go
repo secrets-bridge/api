@@ -256,7 +256,11 @@ func (s *RequestService) Submit(ctx context.Context, in PatchInput) (*storage.Ac
 
 	envID, envKind, _ := s.resolveEnvironment(ctx, in.ProjectID, in.Environment)
 
-	providerConfig, err := s.boundProviderConfig(ctx, in.ProjectID, envID, in.TargetProviderType, in.TargetSecretRef)
+	keyNames := make([]string, 0, len(in.KeyValues))
+	for k := range in.KeyValues {
+		keyNames = append(keyNames, k)
+	}
+	providerConfig, err := s.boundProviderConfig(ctx, in.ProjectID, envID, in.TargetProviderType, in.TargetSecretRef, storage.OpPatch, keyNames)
 	if err != nil {
 		return nil, err
 	}
@@ -354,7 +358,7 @@ func (s *RequestService) SubmitRead(ctx context.Context, in ReadInput) (*storage
 
 	envID, envKind, _ := s.resolveEnvironment(ctx, in.ProjectID, in.Environment)
 
-	providerConfig, err := s.boundProviderConfig(ctx, in.ProjectID, envID, in.TargetProviderType, in.TargetSecretRef)
+	providerConfig, err := s.boundProviderConfig(ctx, in.ProjectID, envID, in.TargetProviderType, in.TargetSecretRef, storage.OpRead, in.TargetKeys)
 	if err != nil {
 		return nil, err
 	}
@@ -565,7 +569,7 @@ func (s *RequestService) SubmitDirectReveal(ctx context.Context, in DirectReveal
 		WorkflowID:           &wfID,
 		EnvironmentID:        &envID,
 		TargetProviderType:   in.TargetProviderType,
-		TargetProviderConfig: agentProviderConfig(bound.secret.ProviderType, bound.secret.ProviderConfig),
+		TargetProviderConfig: AgentJobProviderConfig(bound.secret.ProviderType, bound.secret.ProviderConfig),
 		TargetSecretRef:      in.TargetSecretRef,
 		TargetKeys:           keys,
 		TargetScope: map[string]any{
@@ -582,8 +586,14 @@ func (s *RequestService) SubmitDirectReveal(ctx context.Context, in DirectReveal
 	// as the approval-flow enqueue: a 200 here with a missing job is
 	// still a real, durable request; operators retry via admin tools).
 	if s.jobs != nil {
-		if err := s.enqueueRequestJob(ctx, req); errors.Is(err, ErrSecretNotBound) {
-			s.failUnboundRequest(ctx, req, "user:"+in.RequesterID)
+		err := s.enqueueRequestJob(ctx, req)
+		if reason, refused := bindingRefusal(err); refused {
+			// The binding changed between the gate above and the
+			// enqueue. The request is failed and audited; the caller gets
+			// the same refusal the gate would have given, and no
+			// secret.reveal.direct.issued row is written.
+			s.failUnboundRequest(ctx, req, "user:"+in.RequesterID, reason)
+			return nil, err
 		} else if err != nil {
 			_ = s.audit.Append(ctx, &storage.AuditEvent{
 				Actor:         "user:" + in.RequesterID,
@@ -753,8 +763,9 @@ func (s *RequestService) Approve(ctx context.Context, requestID uuid.UUID, appro
 		// out-of-band if the job persistence fails. The exception is a
 		// request no binding governs any more: that is a policy refusal,
 		// not a transient error, so the request fails.
-		if err := s.enqueueRequestJob(ctx, req); errors.Is(err, ErrSecretNotBound) {
-			s.failUnboundRequest(ctx, req, "user:"+approverID)
+		err := s.enqueueRequestJob(ctx, req)
+		if reason, refused := bindingRefusal(err); refused {
+			s.failUnboundRequest(ctx, req, "user:"+approverID, reason)
 		} else if err != nil {
 			_ = s.audit.Append(ctx, &storage.AuditEvent{
 				Actor:         "user:" + approverID,
@@ -1212,7 +1223,11 @@ func (s *RequestService) enqueueRequestJob(ctx context.Context, req *storage.Acc
 	}
 	if req.Type == storage.AccessRequestTypePatch || req.Type == storage.AccessRequestTypeRead {
 		projectID, _ := req.TargetScope["project_id"].(string)
-		cfg, err := s.boundProviderConfig(ctx, projectID, req.EnvironmentID, req.TargetProviderType, req.TargetSecretRef)
+		op := storage.OpRead
+		if req.Type == storage.AccessRequestTypePatch {
+			op = storage.OpPatch
+		}
+		cfg, err := s.boundProviderConfig(ctx, projectID, req.EnvironmentID, req.TargetProviderType, req.TargetSecretRef, op, req.TargetKeys)
 		if err != nil {
 			return fmt.Errorf("derive provider config: %w", err)
 		}
