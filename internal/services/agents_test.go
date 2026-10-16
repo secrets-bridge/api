@@ -319,13 +319,15 @@ func TestRevoke_InvalidatesCache(t *testing.T) {
 // written") or reports a cold cache that isn't.
 func scanCacheKey(t *testing.T, rdb *runtime.Client, pattern string) int {
 	t.Helper()
-	n := 0
+	seen := map[string]struct{}{}
 	iter := rdb.Raw().Scan(t.Context(), 0, pattern, 500).Iterator()
 	for iter.Next(t.Context()) {
-		n++
+		// A full SCAN may return a key twice if the keyspace resizes
+		// mid-scan, so count distinct keys.
+		seen[iter.Val()] = struct{}{}
 	}
 	if err := iter.Err(); err != nil {
 		t.Fatalf("Scan %q: %v", pattern, err)
 	}
-	return n
+	return len(seen)
 }
