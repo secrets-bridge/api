@@ -835,14 +835,16 @@ func TestAgentSurface_ConcurrentEnrollOneToken(t *testing.T) {
 // ---- discovery upload identity ------------------------------------
 
 // enrollAgent enrolls an agent against a fresh provider connection of
-// connType, the way the agent binary does (cluster = SB_CLUSTER_NAME).
-func (fx *agentSurface) enrollAgent(t *testing.T, name, cluster, connType string) surfaceAgent {
+// connType whose admin-set cluster_name is connCluster. The agent declares
+// cluster at enroll the way the binary does (SB_CLUSTER_NAME); the token
+// carries no expected_cluster_name, so nothing checks the two agree.
+func (fx *agentSurface) enrollAgent(t *testing.T, name, cluster, connCluster, connType string) surfaceAgent {
 	t.Helper()
 	ctx := t.Context()
 	var connID uuid.UUID
 	if err := fx.pool.QueryRow(ctx, `
-		INSERT INTO provider_connections (name, type, auth_method, scope, status)
-		VALUES ($1, $2, 'token', '{}'::jsonb, 'active') RETURNING id`, "conn-"+name, connType).Scan(&connID); err != nil {
+		INSERT INTO provider_connections (name, type, auth_method, scope, status, cluster_name)
+		VALUES ($1, $2, 'token', '{}'::jsonb, 'active', NULLIF($3, '')) RETURNING id`, "conn-"+name, connType, connCluster).Scan(&connID); err != nil {
 		t.Fatalf("seed connection: %v", err)
 	}
 	tok, err := fx.agentSvc.GenerateEnrollmentToken(ctx, services.GenerateEnrollmentTokenInput{
@@ -877,8 +879,8 @@ func (fx *agentSurface) postDiscovery(t *testing.T, a surfaceAgent, cluster, pro
 // cannot write (or overwrite) rows that belong to agent B's cluster.
 func TestAgentSurface_DiscoveryUploadBoundToAgentIdentity(t *testing.T) {
 	fx := bootstrapAgentSurface(t)
-	a := fx.enrollAgent(t, "agent-a", "tenant-a-uat", "aws-sm")
-	b := fx.enrollAgent(t, "agent-b", "tenant-b-uat", "vault")
+	a := fx.enrollAgent(t, "agent-a", "tenant-a-uat", "tenant-a-uat", "aws-sm")
+	b := fx.enrollAgent(t, "agent-b", "tenant-b-uat", "tenant-b-uat", "vault")
 
 	// B's legit row exists first; A must not be able to overwrite it.
 	if code, body := fx.postDiscovery(t, b, "tenant-b-uat", "vault", "team-alpha/uat/db"); code != http.StatusOK {
@@ -901,7 +903,7 @@ func TestAgentSurface_DiscoveryUploadBoundToAgentIdentity(t *testing.T) {
 	}
 
 	// A's own identity still works, and an omitted cluster_name is filled
-	// from the agent record rather than refused.
+	// from the bound connection rather than refused.
 	if code, body := fx.postDiscovery(t, a, "tenant-a-uat", "aws-sm", "team-alpha/uat/api"); code != http.StatusOK {
 		t.Fatalf("agent A own upload = %d (%s); want 200", code, body)
 	}
@@ -910,6 +912,46 @@ func TestAgentSurface_DiscoveryUploadBoundToAgentIdentity(t *testing.T) {
 	}
 	if n := fx.countRows(t, `SELECT count(*) FROM secrets WHERE cluster_name = 'tenant-a-uat' AND provider_type = 'aws-sm'`); n != 2 {
 		t.Fatalf("tenant-a-uat/aws-sm rows = %d; want 2", n)
+	}
+}
+
+// B-2: an enrolled agent's discovery cluster is its bound connection's
+// cluster_name, not the cluster it declared at enroll. Before the fix a
+// uat-bound agent that enrolled declaring a prod cluster (the token had no
+// expected_cluster_name) could overwrite that cluster's catalog rows,
+// including the provider_config request jobs are derived from.
+func TestAgentSurface_DiscoveryClusterComesFromConnection(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	owner := fx.enrollAgent(t, "agent-prod", "tenant-b-prod", "tenant-b-prod", "vault")
+	rogue := fx.enrollAgent(t, "agent-rogue", "tenant-b-prod", "tenant-a-uat", "vault")
+
+	if code, body := fx.postDiscovery(t, owner, "tenant-b-prod", "vault", "team-beta/prod/db"); code != http.StatusOK {
+		t.Fatalf("owner upload = %d (%s); want 200", code, body)
+	}
+	if code, body := fx.postDiscovery(t, rogue, "tenant-b-prod", "vault", "team-beta/prod/db"); code != http.StatusForbidden {
+		t.Fatalf("uat-bound agent naming the cluster it declared at enroll = %d (%s); want 403", code, body)
+	}
+	if code, body := fx.postDiscovery(t, rogue, "", "vault", "team-alpha/uat/db"); code != http.StatusOK {
+		t.Fatalf("uat-bound agent without cluster_name = %d (%s); want 200", code, body)
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM secrets WHERE cluster_name = 'tenant-b-prod'`); n != 1 {
+		t.Fatalf("tenant-b-prod has %d catalog rows; want only the owner's 1", n)
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM secrets WHERE cluster_name = 'tenant-a-uat' AND secret_ref = 'team-alpha/uat/db'`); n != 1 {
+		t.Fatalf("omitted cluster_name was not filled from the connection (tenant-a-uat rows = %d)", n)
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM audit_events WHERE action = 'discovery.upsert' AND metadata->>'reason' = 'cluster_mismatch'`); n != 1 {
+		t.Fatalf("cluster_mismatch audit rows = %d; want 1", n)
+	}
+
+	// A connection without a cluster_name gives its agent no discovery
+	// identity; the agent's own claim is not used instead.
+	noCluster := fx.enrollAgent(t, "agent-nocluster", "tenant-b-prod", "", "vault")
+	if code, body := fx.postDiscovery(t, noCluster, "", "vault", "team-beta/prod/other"); code != http.StatusForbidden {
+		t.Fatalf("agent on a connection without cluster_name = %d (%s); want 403", code, body)
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM secrets WHERE secret_ref = 'team-beta/prod/other'`); n != 0 {
+		t.Fatalf("refused upload wrote %d rows", n)
 	}
 }
 

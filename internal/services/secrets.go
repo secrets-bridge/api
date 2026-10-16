@@ -64,9 +64,11 @@ var (
 // overwrite catalog rows (keyed by cluster, provider, ref) that belong
 // to another agent's cluster or provider.
 //
-//   - cluster: agents.cluster_name (set at enrollment), else the bound
-//     provider connection's cluster_name, else a legacy minted agent's
-//     scope.cluster.
+//   - cluster: the bound provider connection's cluster_name, which an
+//     admin set. Never agents.cluster_name for an enrolled agent: that is
+//     whatever the agent declared at enroll, checked only against an
+//     optional expected_cluster_name on the token. A legacy minted agent
+//     (no bound connection) uses agents.cluster_name, else scope.cluster.
 //   - provider type: the bound provider connection's type, else
 //     agents.provider_type, else a legacy agent's scope.provider /
 //     scope.providers.
@@ -116,25 +118,29 @@ func (s *SecretsService) agentDiscoveryIdentity(ctx context.Context, agentID uui
 		return "", nil, fmt.Errorf("services: load agent for discovery: %w", err)
 	}
 
-	cluster := row.ClusterName
+	var cluster string
 	var providers []string
 	if row.ProviderConnectionID != nil {
+		// Enrolled agent: both come from the bound connection. A
+		// connection with no cluster_name leaves the agent without a
+		// discovery identity rather than falling back to its own claim.
 		conn, err := s.provConns.Get(ctx, *row.ProviderConnectionID)
 		if err != nil {
 			return "", nil, fmt.Errorf("services: load agent provider connection: %w", err)
 		}
-		if cluster == "" {
-			cluster = conn.ClusterName
-		}
+		cluster = conn.ClusterName
 		providers = []string{string(conn.Type)}
-	} else if row.ProviderType != "" {
-		providers = []string{row.ProviderType}
-	}
-	if cluster == "" {
-		cluster, _ = agent.Scope["cluster"].(string)
-	}
-	if len(providers) == 0 {
-		providers = scopeProviders(agent.Scope)
+	} else {
+		// Legacy minted agent: an admin set its cluster and provider.
+		cluster = row.ClusterName
+		if cluster == "" {
+			cluster, _ = agent.Scope["cluster"].(string)
+		}
+		if row.ProviderType != "" {
+			providers = []string{row.ProviderType}
+		} else {
+			providers = scopeProviders(agent.Scope)
+		}
 	}
 	if cluster == "" || len(providers) == 0 {
 		return "", nil, ErrDiscoveryIdentityUnknown
