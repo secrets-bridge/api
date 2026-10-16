@@ -565,7 +565,7 @@ func revealPolicyFixture(t *testing.T, workflows *storage.Workflows, policies *s
 		Name: name,
 		Selector: map[string]any{
 			"environment_kind":  "non_prod",
-			"secret_ref_prefix": "/eks/uat/adss/",
+			"secret_ref_prefix": "/secrets/uat/team-alpha/",
 			"operation":         operation,
 		},
 		WorkflowID: wf.ID, Priority: priority, Enabled: true,
@@ -583,7 +583,7 @@ func revealPolicyFixture(t *testing.T, workflows *storage.Workflows, policies *s
 func directRevealScope() services.Scope {
 	return services.Scope{
 		EnvironmentKind: storage.EnvironmentKindNonProd,
-		SecretRefPrefix: "/eks/uat/adss/env",
+		SecretRefPrefix: "/secrets/uat/team-alpha/env",
 		Operation:       services.PolicySelectorOperationReveal,
 	}
 }

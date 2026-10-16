@@ -409,7 +409,7 @@ func observationToResponse(o *storage.GitOpsObservation) observationResponse {
 // the UI needs to bulk-create gitops_app_mappings rows.
 //
 // Optional query parameter:
-//   ?project=<name>   filter to a single ArgoCD project (e.g. "egov-uat")
+//   ?project=<name>   filter to a single ArgoCD project (e.g. "team-alpha")
 //
 // Returns 503 when the endpoint is disabled or the ArgoCD call fails;
 // the UI then renders "discovery unavailable" without retrying.

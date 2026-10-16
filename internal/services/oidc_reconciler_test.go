@@ -247,7 +247,7 @@ func TestReconcile_DisabledByEmptyClaim(t *testing.T) {
 }
 
 // TestReconcile_CaseInsensitiveGroupMatch pins the robustness fix that
-// landed after the qi UAT 2026-06-01 group-name-mismatch incident.
+// landed after a 2026-06-01 staging group-name-mismatch incident.
 // Authentik (and many IdPs) emit group names in whatever case the
 // operator typed in the admin UI. The configured map is normalised at
 // construction so any case combination resolves to the same role.
