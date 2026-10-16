@@ -378,28 +378,75 @@ func (h *ProviderConnections) Get(c fiber.Ctx) error {
 	return c.JSON(toAdminProjection(row))
 }
 
-// Update mutates an existing connection. Type is service-side immutable.
+// updateConnectionBody is the PUT input. Every field is optional: an
+// absent (or null) key keeps the stored value, a present key applies it,
+// including "" and false. scope, when present, replaces the whole map.
+// type is immutable and ignored. Before, the handler reused the create
+// shape, so an edit that left out discover_enabled switched discovery
+// off and one that left out cluster_name or description wiped them.
+type updateConnectionBody struct {
+	Name                    *string            `json:"name"`
+	AuthMethod              *string            `json:"auth_method"`
+	Scope                   *map[string]string `json:"scope"`
+	ClusterName             *string            `json:"cluster_name"`
+	Description             *string            `json:"description"`
+	Status                  *string            `json:"status"`
+	DiscoverEnabled         *bool              `json:"discover_enabled"`
+	DiscoverIntervalSeconds *int               `json:"discover_interval_seconds"`
+}
+
+// Update mutates an existing connection as a partial update over the
+// stored row; the service validates the merged result. Type is
+// service-side immutable.
 func (h *ProviderConnections) Update(c fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return stableErr(c, fiber.StatusBadRequest, "bad_request", "invalid id", nil)
 	}
-	var body createBody
+	var body updateConnectionBody
 	if err := json.Unmarshal(c.Body(), &body); err != nil {
 		return stableErr(c, fiber.StatusBadRequest, "bad_request",
 			"request body is not valid JSON", nil)
 	}
+	current, err := h.svc.Get(c.Context(), id)
+	if err != nil {
+		return mapServiceErr(c, err)
+	}
 	in := services.UpdateInput{
-		Name:                    body.Name,
-		AuthMethod:              body.AuthMethod,
-		Scope:                   body.Scope,
-		Status:                  storage.ProviderConnectionStatus(body.Status),
-		ClusterName:             body.ClusterName,
-		Description:             body.Description,
-		DiscoverEnabled:         body.DiscoverEnabled,
-		DiscoverIntervalSeconds: body.DiscoverIntervalSeconds,
+		Name:                    current.Name,
+		AuthMethod:              current.AuthMethod,
+		Scope:                   current.Scope,
+		Status:                  current.Status,
+		ClusterName:             current.ClusterName,
+		Description:             current.Description,
+		DiscoverEnabled:         current.DiscoverEnabled,
+		DiscoverIntervalSeconds: current.DiscoverIntervalSeconds,
 		ActorID:                 identityFromCtx(c),
 		CorrelationID:           uuid.New(),
+	}
+	if body.Name != nil {
+		in.Name = *body.Name
+	}
+	if body.AuthMethod != nil {
+		in.AuthMethod = *body.AuthMethod
+	}
+	if body.Scope != nil {
+		in.Scope = *body.Scope
+	}
+	if body.ClusterName != nil {
+		in.ClusterName = *body.ClusterName
+	}
+	if body.Description != nil {
+		in.Description = *body.Description
+	}
+	if body.Status != nil {
+		in.Status = storage.ProviderConnectionStatus(*body.Status)
+	}
+	if body.DiscoverEnabled != nil {
+		in.DiscoverEnabled = *body.DiscoverEnabled
+	}
+	if body.DiscoverIntervalSeconds != nil {
+		in.DiscoverIntervalSeconds = *body.DiscoverIntervalSeconds
 	}
 	row, err := h.svc.Update(c.Context(), id, in)
 	if err != nil {

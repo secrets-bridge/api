@@ -40,6 +40,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -197,12 +198,20 @@ type secretSummary struct {
 	Labels       map[string]string `json:"labels,omitempty"`
 }
 
+// updateBindingBody is the PUT input. Every field is optional and an
+// absent key keeps the stored value.
+//
+//   - allowed_keys: null = every key (the documented "all keys" value),
+//     a list = that allowlist, absent = unchanged. An omitted key used
+//     to be read as null, so any edit that left it out quietly widened
+//     an allowlist to every key.
+//   - allowed_ops: absent = unchanged; a present list must be non-empty.
+//   - environment_id: absent = unchanged; detaching is not offered
+//     (unbind and re-bind instead).
 type updateBindingBody struct {
-	AllowedKeys *[]string `json:"allowed_keys,omitempty"`
-	AllowedOps  []string  `json:"allowed_ops,omitempty"`
-	// Absent leaves the stored environment untouched; present sets it.
-	// Detaching is not offered — unbind and re-bind instead.
-	EnvironmentID *string `json:"environment_id,omitempty"`
+	AllowedKeys   optionalStrings `json:"allowed_keys"`
+	AllowedOps    *[]string       `json:"allowed_ops,omitempty"`
+	EnvironmentID *string         `json:"environment_id,omitempty"`
 }
 
 func bindingToBody(b *storage.ProjectSecret) bindingBody {
@@ -379,26 +388,33 @@ func (h *ProjectSecrets) Update(c fiber.Ctx) error {
 	}
 
 	var body updateBindingBody
-	if err := c.Bind().JSON(&body); err != nil {
+	if err := json.Unmarshal(c.Body(), &body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
 	}
 
-	ops := body.AllowedOps
-	if len(ops) == 0 {
-		// PUT replaces — refuse silent "no ops" since the schema
-		// CHECK refuses ARRAY[]::text[] anyway.
-		return fiber.NewError(fiber.StatusBadRequest, "allowed_ops must be non-empty")
-	}
-	if err := validateAllowedOps(ops); err != nil {
-		return err
+	current, err := h.bindings.Get(c.Context(), projectID, secretID)
+	if err != nil {
+		return mapProjectSecretErr(err, "binding not found")
 	}
 
-	var allowedKeys []string
-	if body.AllowedKeys != nil {
-		allowedKeys = *body.AllowedKeys
-		if len(allowedKeys) == 0 {
+	ops := current.AllowedOps
+	if body.AllowedOps != nil {
+		ops = *body.AllowedOps
+		if len(ops) == 0 {
+			// The schema CHECK refuses ARRAY[]::text[] anyway.
+			return fiber.NewError(fiber.StatusBadRequest, "allowed_ops must be non-empty")
+		}
+		if err := validateAllowedOps(ops); err != nil {
+			return err
+		}
+	}
+
+	allowedKeys := current.AllowedKeys
+	if body.AllowedKeys.Set {
+		allowedKeys = body.AllowedKeys.Value
+		if allowedKeys != nil && len(allowedKeys) == 0 {
 			return fiber.NewError(fiber.StatusBadRequest,
-				"allowed_keys must be omitted (all keys) or non-empty (allowlist)")
+				"allowed_keys must be null (all keys) or non-empty (allowlist)")
 		}
 	}
 

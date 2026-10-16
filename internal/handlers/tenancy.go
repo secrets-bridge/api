@@ -41,6 +41,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -182,25 +183,31 @@ func (h *Tenancy) CreateProject(c fiber.Ctx) error {
 
 // SetProjectTeam handles PUT /projects/:id/team — reassigns the
 // project's team_id (the typed FK introduced by 0018). Body shape:
-// `{"team_id": "<uuid>"}` or `{"team_id": null}` to un-scope.
+// `{"team_id": "<uuid>"}` or `{"team_id": null}` to un-scope. The key is
+// required: a body without it used to un-scope the project, dropping it
+// out of every team-scoped grant.
 func (h *Tenancy) SetProjectTeam(c fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	var body struct {
-		TeamID *uuid.UUID `json:"team_id"`
+		TeamID optionalUUID `json:"team_id"`
 	}
-	if err := c.Bind().JSON(&body); err != nil {
+	if err := json.Unmarshal(c.Body(), &body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
 	}
+	if !body.TeamID.Set {
+		return fiber.NewError(fiber.StatusBadRequest, "team_id is required (null removes the project from its team)")
+	}
+	teamID := body.TeamID.Value
 	// Read the current team for the audit: moving a project between
 	// teams changes which team-scoped grants reach it.
 	var before *uuid.UUID
 	if current, err := h.projects.Get(c.Context(), id); err == nil {
 		before = current.TeamID
 	}
-	if err := h.projects.SetTeam(c.Context(), id, body.TeamID); err != nil {
+	if err := h.projects.SetTeam(c.Context(), id, teamID); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "not found")
 		}
@@ -209,7 +216,7 @@ func (h *Tenancy) SetProjectTeam(c fiber.Ctx) error {
 	auditWrite(c, h.audit, "project.team.update", "project:"+id.String(), map[string]any{
 		"project_id":     id.String(),
 		"team_id_before": uuidPtrMeta(before),
-		"team_id_after":  uuidPtrMeta(body.TeamID),
+		"team_id_after":  uuidPtrMeta(teamID),
 	})
 	return c.SendStatus(fiber.StatusNoContent)
 }

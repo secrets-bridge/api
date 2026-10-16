@@ -33,6 +33,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -167,19 +168,42 @@ func (h *Teams) Get(c fiber.Ctx) error {
 	return c.JSON(teamToBody(t))
 }
 
-// Update handles PUT /teams/:id. Body fields: name, description,
-// parent_team_id. A nil/empty parent_team_id un-parents to the root.
+// teamUpdateBody is the PUT /teams/:id input. name is required.
+// description and parent_team_id are optional: absent keeps the stored
+// value, present applies it. parent_team_id: null moves the team to the
+// root. Before, an omitted parent_team_id silently re-parented the team
+// to the root, which changes which team-scoped grants reach its projects.
+type teamUpdateBody struct {
+	Name         string       `json:"name"`
+	Description  *string      `json:"description"`
+	ParentTeamID optionalUUID `json:"parent_team_id"`
+}
+
+// Update handles PUT /teams/:id. Body fields: name (required),
+// description, parent_team_id (null = root; absent = unchanged).
 func (h *Teams) Update(c fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	var body teamBody
-	if err := c.Bind().JSON(&body); err != nil {
+	var body teamUpdateBody
+	if err := json.Unmarshal(c.Body(), &body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
 	}
 	if body.Name == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "name is required")
+	}
+	current, err := h.teams.Get(c.Context(), id)
+	if err != nil {
+		return mapTeamErr(err)
+	}
+	description := current.Description
+	if body.Description != nil {
+		description = *body.Description
+	}
+	parent := current.ParentTeamID
+	if body.ParentTeamID.Set {
+		parent = body.ParentTeamID.Value
 	}
 	// R-follow-up #3 §2 C6 — when the lineage-audit-aware path is
 	// wired, use it so a parent change emits the transactional
@@ -187,13 +211,13 @@ func (h *Teams) Update(c fiber.Ctx) error {
 	// the team UPDATE.
 	if h.teamsConcrete != nil && h.audit != nil {
 		if err := h.teamsConcrete.UpdateWithLineageAudit(c.Context(), id,
-			body.Name, body.Description, body.ParentTeamID,
+			body.Name, description, parent,
 			identityFromCtx(c), h.audit,
 		); err != nil {
 			return mapTeamErr(err)
 		}
 	} else {
-		if err := h.teams.Update(c.Context(), id, body.Name, body.Description, body.ParentTeamID); err != nil {
+		if err := h.teams.Update(c.Context(), id, body.Name, description, parent); err != nil {
 			return mapTeamErr(err)
 		}
 	}
