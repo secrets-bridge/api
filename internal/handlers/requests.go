@@ -193,15 +193,17 @@ func requestErr(err error) error {
 // KeyValues carries one plaintext per key; the server wraps each one
 // before it touches Postgres. The handler clears the map before
 // returning so the plaintext doesn't outlive the request goroutine.
+//
+// A `target_provider_config` field in the body is ignored (API-S-04):
+// the job's provider config is derived from the bound catalog row.
 type SubmitRequestBody struct {
-	RequesterID          string            `json:"requester_id"`
-	ProjectID            string            `json:"project_id,omitempty"`
-	Environment          string            `json:"environment,omitempty"`
-	TargetProviderType   string            `json:"target_provider_type"`
-	TargetProviderConfig map[string]any    `json:"target_provider_config,omitempty"`
-	TargetSecretRef      string            `json:"target_secret_ref"`
-	KeyValues            map[string]string `json:"key_values"`
-	Justification        string            `json:"justification"`
+	RequesterID        string            `json:"requester_id"`
+	ProjectID          string            `json:"project_id,omitempty"`
+	Environment        string            `json:"environment,omitempty"`
+	TargetProviderType string            `json:"target_provider_type"`
+	TargetSecretRef    string            `json:"target_secret_ref"`
+	KeyValues          map[string]string `json:"key_values"`
+	Justification      string            `json:"justification"`
 }
 
 // Submit handles POST /requests.
@@ -235,14 +237,13 @@ func (h *Requests) Submit(c fiber.Ctx) error {
 	}
 
 	req, err := h.svc.Submit(c.Context(), services.PatchInput{
-		RequesterID:          body.RequesterID,
-		ProjectID:            body.ProjectID,
-		Environment:          body.Environment,
-		TargetProviderType:   body.TargetProviderType,
-		TargetProviderConfig: body.TargetProviderConfig,
-		TargetSecretRef:      body.TargetSecretRef,
-		KeyValues:            kv,
-		Justification:        body.Justification,
+		RequesterID:        body.RequesterID,
+		ProjectID:          body.ProjectID,
+		Environment:        body.Environment,
+		TargetProviderType: body.TargetProviderType,
+		TargetSecretRef:    body.TargetSecretRef,
+		KeyValues:          kv,
+		Justification:      body.Justification,
 	})
 	if err != nil {
 		return requestErr(err)
@@ -462,15 +463,16 @@ func (h *Requests) Reject(c fiber.Ctx) error {
 // SubmitReadRequestBody is the JSON sent by the UI when a user wants
 // to VIEW one or more keys from a provider secret. No values are sent —
 // the agent will fetch them after approval.
+//
+// A `target_provider_config` field in the body is ignored (API-S-04).
 type SubmitReadRequestBody struct {
-	RequesterID          string         `json:"requester_id"`
-	ProjectID            string         `json:"project_id,omitempty"`
-	Environment          string         `json:"environment,omitempty"`
-	TargetProviderType   string         `json:"target_provider_type"`
-	TargetProviderConfig map[string]any `json:"target_provider_config,omitempty"`
-	TargetSecretRef      string         `json:"target_secret_ref"`
-	TargetKeys           []string       `json:"target_keys,omitempty"`
-	Justification        string         `json:"justification"`
+	RequesterID        string   `json:"requester_id"`
+	ProjectID          string   `json:"project_id,omitempty"`
+	Environment        string   `json:"environment,omitempty"`
+	TargetProviderType string   `json:"target_provider_type"`
+	TargetSecretRef    string   `json:"target_secret_ref"`
+	TargetKeys         []string `json:"target_keys,omitempty"`
+	Justification      string   `json:"justification"`
 }
 
 // SubmitRead handles POST /requests/read.
@@ -483,14 +485,13 @@ func (h *Requests) SubmitRead(c fiber.Ctx) error {
 		return err
 	}
 	req, err := h.svc.SubmitRead(c.Context(), services.ReadInput{
-		RequesterID:          body.RequesterID,
-		ProjectID:            body.ProjectID,
-		Environment:          body.Environment,
-		TargetProviderType:   body.TargetProviderType,
-		TargetProviderConfig: body.TargetProviderConfig,
-		TargetSecretRef:      body.TargetSecretRef,
-		TargetKeys:           body.TargetKeys,
-		Justification:        body.Justification,
+		RequesterID:        body.RequesterID,
+		ProjectID:          body.ProjectID,
+		Environment:        body.Environment,
+		TargetProviderType: body.TargetProviderType,
+		TargetSecretRef:    body.TargetSecretRef,
+		TargetKeys:         body.TargetKeys,
+		Justification:      body.Justification,
 	})
 	if err != nil {
 		return requestErr(err)
@@ -787,6 +788,9 @@ func approvalToBody(a *storage.Approval) ApprovalBody {
 //   - caller scoped but project_id not in their access set → 403
 //   - secret_ref not bound to project_id                    → 403
 //   - any requested key not in binding.allowed_keys         → 403
+//   - no key named against a restrictive allowed_keys       → 403
+//     (an empty read target_keys means "every key", which
+//     would bypass the allowlist; same rule as direct reveal)
 //   - op not in binding.allowed_ops                         → 403
 //   - happy path                                            → nil
 func (h *Requests) checkTenancy(c fiber.Ctx, projectIDRaw, providerType, secretRef string, requestedKeys []string, op string) error {
@@ -848,8 +852,13 @@ func (h *Requests) checkTenancy(c fiber.Ctx, projectIDRaw, providerType, secretR
 		return fiber.NewError(fiber.StatusForbidden, "out_of_scope_op")
 	}
 
-	// Step 4: every requested key in allowed_keys (when non-null)?
+	// Step 4: every requested key in allowed_keys (when non-null)? An
+	// empty key list against a restrictive allowlist is refused: the read
+	// executor treats it as "every key in the bundle".
 	if binding.AllowedKeys != nil {
+		if len(requestedKeys) == 0 {
+			return fiber.NewError(fiber.StatusForbidden, "out_of_scope_key")
+		}
 		for _, k := range requestedKeys {
 			if !containsString(binding.AllowedKeys, k) {
 				return fiber.NewError(fiber.StatusForbidden, "out_of_scope_key")

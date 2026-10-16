@@ -128,6 +128,8 @@ func TestSubmitDirectReveal_HappyPath_AutoExecutes(t *testing.T) {
 	if err := policies.Create(ctx, rule); err != nil {
 		t.Fatalf("policy Create: %v", err)
 	}
+	// Direct reveal requires a read binding (api#191 H2).
+	bindSecretToEnv(t, pool, uatEnv, "billing/uat/db", nil)
 
 	req, err := reqSvc.SubmitDirectReveal(ctx, services.DirectRevealInput{
 		RequesterID:        "alice@example.com",

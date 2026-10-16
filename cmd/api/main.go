@@ -396,10 +396,13 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// mint/heartbeat/auth paths are untouched.
 	agentSvc.WithEnrollment(storage.NewAgentEnrollmentTokens(pool), provConnRepo)
 
-	// Enforce the project_secrets allowed_keys allowlist on both
-	// plaintext-reveal boundaries: submit-time (direct reveal) and
-	// unwrap-time (bulk reveal session). Without these a direct reveal
-	// could name a key the binding does not permit.
+	// Enforce the project_secrets binding on both plaintext-reveal
+	// boundaries: submit-time (direct reveal + per-env request: a read
+	// binding for this project/environment is REQUIRED and keys must be
+	// inside its allowlist) and unwrap-time (bulk reveal session). The
+	// same repos derive each read/patch job's provider config from the
+	// bound catalog row. Without them the direct-reveal and per-env
+	// request submits fail closed.
 	requestSvc.WithProjectBindings(projectSecretsRepo, secretsRepo)
 	revealSessionSvc.WithAllowlist(projectSecretsRepo, secretsRepo)
 
@@ -539,10 +542,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// Slice L4 — per-env dev endpoints. Sits next to meH; consumes the
 	// project + env model + project_secrets binding + RequestService's
 	// SubmitDirectReveal path.
+	// The per-env request endpoint runs the same caller-scope step as
+	// POST /requests/read before the service-level binding gate (api#154).
 	devSecretsH := handlers.NewDevSecrets(
 		projectRepo, environmentRepo, projectSecretsRepo, secretsRepo,
 		requestSvc,
-	)
+	).WithScope(rbacResolver, teamScopeResolver)
 
 	// Session service (Slice A2). Owns the HttpOnly cookie auth path
 	// that replaces JWT-in-sessionStorage. Postgres is the source of

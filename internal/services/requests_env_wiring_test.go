@@ -39,8 +39,11 @@ func buildL3Harness(t *testing.T) (*services.RequestService, *storage.Pool, *sto
 	jobsRepo := storage.NewSyncJobs(pool)
 	jobSvc := services.NewJobService(jobsRepo, auditRepo)
 
+	// Bindings wired like cmd/api/main.go: direct reveal requires a read
+	// binding and fails closed without these repos.
 	reqSvc := services.NewRequestService(requestRepo, approvalRepo, wrapSvc, workflows, engine, auditRepo, jobSvc).
-		WithEnvironments(envRepo)
+		WithEnvironments(envRepo).
+		WithProjectBindings(storage.NewProjectSecrets(pool), storage.NewSecrets(pool))
 
 	return reqSvc, pool, envRepo, workflows, policies
 }
