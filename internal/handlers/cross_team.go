@@ -375,6 +375,10 @@ func crossTeamErr(err error) error {
 		return fiber.NewError(fiber.StatusBadRequest, "cross_team_invalid_target")
 	case errors.Is(err, services.ErrCrossTeamDestinationUnbound):
 		return fiber.NewError(fiber.StatusForbidden, "cross_team_destination_unbound")
+	case errors.Is(err, services.ErrConnectionDisabled):
+		// A disabled destination connection is a state conflict, not a
+		// server fault; it used to fall through to the 500 default.
+		return fiber.NewError(fiber.StatusConflict, "provider_connection_disabled")
 	case errors.Is(err, services.ErrCrossTeamKeysEmpty):
 		return fiber.NewError(fiber.StatusBadRequest, "cross_team_keys_empty")
 	case errors.Is(err, services.ErrKeyNotAllowed):

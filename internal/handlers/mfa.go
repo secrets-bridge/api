@@ -186,9 +186,16 @@ func (h *MFA) EnrollTOTP(c fiber.Ctx) error {
 			accountName = u.Email
 		}
 	}
+	if strings.TrimSpace(body.Label) == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "label required")
+	}
 	out, err := h.totp.Enroll(c.Context(), uid, body.Label, accountName)
 	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		// Past the label check every failure is internal (KMS data
+		// key, Redis pending-challenge write). API-16: a generic 500;
+		// the app error handler logs the detail, which can carry the
+		// KMS backend URL and key name.
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(TOTPEnrollResponse{
 		ChallengeID:     out.ChallengeID,

@@ -221,6 +221,19 @@ func mapPolicyServiceErr(c fiber.Ctx, err error) error {
 	return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 }
 
+// scopedWorkflowNotFound turns a missing workflow on the scoped
+// create / update path into the same 403 envelope the team-anchored
+// path returns for not-found, disabled and not-authorable workflows.
+// Without it the wrapped storage not-found fell through to a 500. Only
+// the workflow lookup can produce storage.ErrNotFound on these paths
+// (the rule lookup maps its own not-found to ErrPolicyNotFound).
+func scopedWorkflowNotFound(err error, workflowID uuid.UUID) error {
+	if errors.Is(err, storage.ErrNotFound) {
+		return &services.WorkflowNotAuthorableDetail{WorkflowID: workflowID}
+	}
+	return err
+}
+
 // ---- handler type --------------------------------------------------
 
 // ProjectPolicyRules owns the project-anchored scoped policy.author
@@ -463,6 +476,7 @@ func (h *ProjectPolicyRules) Create(c fiber.Ctx) error {
 		CorrelationID: uuid.New(),
 	})
 	if err != nil {
+		err = scopedWorkflowNotFound(err, workflowID)
 		if reason := policyDenialReasonFor(err); reason != "" {
 			policyRulesDeniedTotal.WithLabelValues(reason).Inc()
 		}
@@ -603,6 +617,9 @@ func (h *ProjectPolicyRules) Update(c fiber.Ctx) error {
 
 	rule, err := h.engine.UpdateForScopedAuthor(c.Context(), in)
 	if err != nil {
+		if in.WorkflowID != nil {
+			err = scopedWorkflowNotFound(err, *in.WorkflowID)
+		}
 		if reason := policyDenialReasonFor(err); reason != "" {
 			policyRulesDeniedTotal.WithLabelValues(reason).Inc()
 		}
@@ -730,9 +747,13 @@ func (h *ProjectPolicyRules) History(c fiber.Ctx) error {
 
 	entries, hasMore, err := h.history.ListForRule(c.Context(), ruleID, rule, limit)
 	if err != nil {
+		// API-16: stableErr writes the body itself (it skips the app
+		// error handler), so the storage detail is logged here and the
+		// client gets a fixed message.
+		logInternalError(c, "policy rule history failed", err)
 		return stableErr(c, fiber.StatusInternalServerError,
 			"history_internal_error",
-			err.Error(), nil)
+			"policy rule history is temporarily unavailable", nil)
 	}
 
 	policyRuleHistoryViewsTotal.WithLabelValues(scopeProject).Inc()

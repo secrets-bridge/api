@@ -262,6 +262,7 @@ func (h *TeamPolicyRules) requireTeamPolicyScope(c fiber.Ctx, teamID uuid.UUID, 
 	access, err := auth.EffectiveTeamAccess(c.Context(), actor, auth.PermPolicyAuthor,
 		h.engine.AuthorResolver(), h.engine.AuthorTeamScope())
 	if err != nil {
+		logInternalError(c, "resolve team access failed", err)
 		return stableErr(c, fiber.StatusInternalServerError, "internal_error",
 			"could not resolve team access", nil)
 	}
@@ -618,9 +619,13 @@ func (h *TeamPolicyRules) History(c fiber.Ctx) error {
 
 	entries, hasMore, err := h.history.ListForRule(c.Context(), ruleID, rule, limit)
 	if err != nil {
+		// API-16: stableErr writes the body itself (it skips the app
+		// error handler), so the storage detail is logged here and the
+		// client gets a fixed message.
+		logInternalError(c, "policy rule history failed", err)
 		return stableErr(c, fiber.StatusInternalServerError,
 			"history_internal_error",
-			err.Error(), nil)
+			"policy rule history is temporarily unavailable", nil)
 	}
 
 	policyRuleHistoryViewsTotal.WithLabelValues(scopeTeam).Inc()
