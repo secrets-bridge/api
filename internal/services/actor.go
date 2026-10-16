@@ -14,7 +14,7 @@ func auditActorFromContext(ctx context.Context) string {
 
 // auditActor formats an explicit acting user id for the audit actor
 // column ("user:<id>"); with no id it falls back to the request context
-// (agent / anonymous / system). It replaces actorOrAdmin, which wrote the
+// (agent / anonymous / system:background). It replaces actorOrAdmin, which wrote the
 // bare id (unresolvable in the audit UI) or a literal "admin".
 func auditActor(ctx context.Context, userID string) string {
 	if userID != "" {

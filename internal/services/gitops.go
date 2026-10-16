@@ -95,7 +95,7 @@ func (s *GitOpsService) Start(ctx context.Context, request *storage.AccessReques
 	}
 	if request.SecretMappingID == nil {
 		_ = s.audit.Append(ctx, &storage.AuditEvent{
-			Actor:         "system",
+			Actor:         "system:gitops",
 			Action:        "request.gitops_observation_skipped",
 			Resource:      "request:" + request.ID.String(),
 			Status:        storage.AuditStatusSuccess,
@@ -107,7 +107,7 @@ func (s *GitOpsService) Start(ctx context.Context, request *storage.AccessReques
 	mappings, err := s.mappings.ListForSecretMapping(ctx, *request.SecretMappingID)
 	if err != nil {
 		_ = s.audit.Append(ctx, &storage.AuditEvent{
-			Actor:         "system",
+			Actor:         "system:gitops",
 			Action:        "request.gitops_observation_failed",
 			Resource:      "request:" + request.ID.String(),
 			Status:        storage.AuditStatusFailure,
@@ -118,7 +118,7 @@ func (s *GitOpsService) Start(ctx context.Context, request *storage.AccessReques
 	}
 	if len(mappings) == 0 {
 		_ = s.audit.Append(ctx, &storage.AuditEvent{
-			Actor:         "system",
+			Actor:         "system:gitops",
 			Action:        "request.gitops_observation_skipped",
 			Resource:      "request:" + request.ID.String(),
 			Status:        storage.AuditStatusSuccess,
@@ -140,7 +140,7 @@ func (s *GitOpsService) Start(ctx context.Context, request *storage.AccessReques
 		}
 		if err := s.observations.Create(ctx, o); err != nil {
 			_ = s.audit.Append(ctx, &storage.AuditEvent{
-				Actor:         "system",
+				Actor:         "system:gitops",
 				Action:        "request.gitops_observation_failed",
 				Resource:      "request:" + request.ID.String(),
 				Status:        storage.AuditStatusFailure,
@@ -155,7 +155,7 @@ func (s *GitOpsService) Start(ctx context.Context, request *storage.AccessReques
 		created++
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:         "system",
+		Actor:         "system:gitops",
 		Action:        "request.gitops_observation_started",
 		Resource:      "request:" + request.ID.String(),
 		Status:        storage.AuditStatusSuccess,

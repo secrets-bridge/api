@@ -208,3 +208,18 @@ func (r *Sessions) ListActiveForUser(ctx context.Context, userID uuid.UUID, now 
 	}
 	return out, rows.Err()
 }
+
+// UserIDForSession returns the user a session belongs to, revoked or
+// not. Used to attribute session-level audit events (session.mfa_stamped)
+// to "user:<id>" rather than to the session. Not on SessionRepository:
+// callers type-assert for it so other implementations stay unchanged.
+func (r *Sessions) UserIDForSession(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	var userID uuid.UUID
+	if err := r.pool.QueryRow(ctx, `SELECT user_id FROM sessions WHERE id = $1`, id).Scan(&userID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, ErrNotFound
+		}
+		return uuid.Nil, fmt.Errorf("storage: session user: %w", err)
+	}
+	return userID, nil
+}

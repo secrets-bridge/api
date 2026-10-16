@@ -67,6 +67,15 @@ func (h *Teams) WithLineageAudit(t *storage.Teams, a *storage.AuditEvents) *Team
 	return h
 }
 
+// auditRepo returns the audit repository as the interface auditWrite
+// takes, keeping a nil *AuditEvents from becoming a non-nil interface.
+func (h *Teams) auditRepo() storage.AuditEventRepository {
+	if h.audit == nil {
+		return nil
+	}
+	return h.audit
+}
+
 // --- request / response shapes --------------------------------------
 
 type teamBody struct {
@@ -139,6 +148,10 @@ func (h *Teams) Create(c fiber.Ctx) error {
 	if err := h.teams.Create(c.Context(), t); err != nil {
 		return mapTeamErr(err)
 	}
+	auditWrite(c, h.auditRepo(), "team.create", "team:"+t.ID.String(), map[string]any{
+		"team_id":        t.ID.String(),
+		"parent_team_id": uuidPtrMeta(t.ParentTeamID),
+	})
 	return c.Status(fiber.StatusCreated).JSON(teamToBody(t))
 }
 
@@ -225,6 +238,24 @@ func (h *Teams) Update(c fiber.Ctx) error {
 	if err != nil {
 		return mapTeamErr(err)
 	}
+	changed := []string{}
+	if current.Name != t.Name {
+		changed = append(changed, "name")
+	}
+	if current.Description != t.Description {
+		changed = append(changed, "description")
+	}
+	if uuidPtrMeta(current.ParentTeamID) != uuidPtrMeta(t.ParentTeamID) {
+		changed = append(changed, "parent_team_id")
+	}
+	// A parent change also emits the policy.team_lineage_changed event
+	// above; this row records the team write itself.
+	auditWrite(c, h.auditRepo(), "team.update", "team:"+id.String(), map[string]any{
+		"team_id":               id.String(),
+		"changed_keys":          changed,
+		"parent_team_id_before": uuidPtrMeta(current.ParentTeamID),
+		"parent_team_id_after":  uuidPtrMeta(t.ParentTeamID),
+	})
 	return c.JSON(teamToBody(t))
 }
 
@@ -245,6 +276,10 @@ func (h *Teams) UpdateStatus(c fiber.Ctx) error {
 	if err := h.teams.UpdateStatus(c.Context(), id, status); err != nil {
 		return mapTeamErr(err)
 	}
+	auditWrite(c, h.auditRepo(), "team.status.update", "team:"+id.String(), map[string]any{
+		"team_id": id.String(),
+		"status":  string(status),
+	})
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
@@ -255,9 +290,17 @@ func (h *Teams) Delete(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
+	var parent *uuid.UUID
+	if current, err := h.teams.Get(c.Context(), id); err == nil {
+		parent = current.ParentTeamID
+	}
 	if err := h.teams.Delete(c.Context(), id); err != nil {
 		return mapTeamErr(err)
 	}
+	auditWrite(c, h.auditRepo(), "team.delete", "team:"+id.String(), map[string]any{
+		"team_id":        id.String(),
+		"parent_team_id": uuidPtrMeta(parent),
+	})
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
@@ -282,6 +325,10 @@ func (h *Teams) AddMember(c fiber.Ctx) error {
 	if err := h.teams.AddMember(c.Context(), teamID, body.UserID, createdBy); err != nil {
 		return mapTeamErr(err)
 	}
+	auditWrite(c, h.auditRepo(), "team.member.add", "team:"+teamID.String(), map[string]any{
+		"team_id": teamID.String(),
+		"user_id": body.UserID.String(),
+	})
 	return c.SendStatus(fiber.StatusCreated)
 }
 
@@ -315,6 +362,10 @@ func (h *Teams) RemoveMember(c fiber.Ctx) error {
 	if err := h.teams.RemoveMember(c.Context(), teamID, userID); err != nil {
 		return mapTeamErr(err)
 	}
+	auditWrite(c, h.auditRepo(), "team.member.remove", "team:"+teamID.String(), map[string]any{
+		"team_id": teamID.String(),
+		"user_id": userID.String(),
+	})
 	return c.SendStatus(fiber.StatusNoContent)
 }
 

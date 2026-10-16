@@ -116,22 +116,31 @@ type CompleteRequest struct {
 // is observable). Rejects requests from a non-owning agent with
 // storage.ErrUnauthorized.
 func (s *JobService) Complete(ctx context.Context, agentID uuid.UUID, req CompleteRequest) error {
+	// The job carries its request's correlation id (set at enqueue).
+	// Read it first so the completion rows stay on the request's audit
+	// chain; uuid.Nil (job not found) lets storage assign one.
+	var corr uuid.UUID
+	if job, err := s.jobs.Get(ctx, req.JobID); err == nil {
+		corr = job.CorrelationID
+	}
 	err := s.jobs.Complete(ctx, req.JobID, agentID, req.Status, req.Error)
 	switch {
 	case errors.Is(err, storage.ErrAlreadyComplete):
 		_ = s.audit.Append(ctx, &storage.AuditEvent{
-			Actor:    "agent:" + agentID.String(),
-			Action:   "job.complete.idempotent",
-			Resource: "job:" + req.JobID.String(),
-			Status:   storage.AuditStatusSuccess,
+			Actor:         "agent:" + agentID.String(),
+			Action:        "job.complete.idempotent",
+			Resource:      "job:" + req.JobID.String(),
+			Status:        storage.AuditStatusSuccess,
+			CorrelationID: corr,
 		})
 		return nil
 	case errors.Is(err, storage.ErrUnauthorized):
 		_ = s.audit.Append(ctx, &storage.AuditEvent{
-			Actor:    "agent:" + agentID.String(),
-			Action:   "job.complete",
-			Resource: "job:" + req.JobID.String(),
-			Status:   storage.AuditStatusDenied,
+			Actor:         "agent:" + agentID.String(),
+			Action:        "job.complete",
+			Resource:      "job:" + req.JobID.String(),
+			Status:        storage.AuditStatusDenied,
+			CorrelationID: corr,
 		})
 		return err
 	case err != nil:
@@ -139,10 +148,11 @@ func (s *JobService) Complete(ctx context.Context, agentID uuid.UUID, req Comple
 	}
 
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "agent:" + agentID.String(),
-		Action:   "job.complete",
-		Resource: "job:" + req.JobID.String(),
-		Status:   auditStatusFor(req.Status),
+		Actor:         "agent:" + agentID.String(),
+		Action:        "job.complete",
+		Resource:      "job:" + req.JobID.String(),
+		Status:        auditStatusFor(req.Status),
+		CorrelationID: corr,
 		Metadata: map[string]any{
 			"job_status": string(req.Status),
 		},
