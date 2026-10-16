@@ -109,13 +109,31 @@ type AccessRequestListFilter struct {
 }
 
 // AccessRequestRepository is the read/write surface.
+//
+// Every status change goes through a conditional write: TransitionStatus,
+// CastVote, FillWithWraps, Fill, Refuse and SweepFillExpired all match
+// on the current status, so a caller acting on a stale read can't
+// overwrite a decision that already landed. There is deliberately no
+// unconditional status setter on this interface.
 type AccessRequestRepository interface {
 	Create(ctx context.Context, r *AccessRequest) error
 	Get(ctx context.Context, id uuid.UUID) (*AccessRequest, error)
 	List(ctx context.Context, f AccessRequestListFilter) ([]*AccessRequest, error)
-	UpdateStatus(ctx context.Context, id uuid.UUID, status AccessRequestStatus) error
 	SetJobID(ctx context.Context, id, jobID uuid.UUID) error
 	SetRejectReason(ctx context.Context, id uuid.UUID, reason string) error
+
+	// TransitionStatus moves the request to `to` only while its status
+	// is one of `from`. Returns ErrStatusConflict when the row exists in
+	// another status, ErrNotFound when it doesn't exist.
+	TransitionStatus(ctx context.Context, id uuid.UUID, from []AccessRequestStatus, to AccessRequestStatus) error
+	// CastVote records one approve/reject vote and, when the caller's
+	// Decide says so, the status transition it triggers, in a single
+	// transaction holding the request row lock. See CastVoteInput.
+	CastVote(ctx context.Context, in CastVoteInput) (*CastVoteResult, error)
+	// FillWithWraps stores Team B's sealed wraps and moves a cross_team
+	// request out of pending_values in one transaction, so the wraps
+	// exist only if the fill wins. See FillInput.
+	FillWithWraps(ctx context.Context, in FillInput) error
 
 	// --- Slice N1 cross_team methods ---
 
@@ -174,6 +192,56 @@ var ErrFillWindowExpired = errors.New("storage: cross_team fill window expired")
 // row isn't in pending_values, or by any future cross_team state
 // mutation that doesn't match the expected source state.
 var ErrCrossTeamStatusInvalidTransition = errors.New("storage: cross_team status invalid transition")
+
+// ErrStatusConflict is returned by the conditional status writes when
+// the request exists but its current status is not one the transition
+// may start from: another caller approved, rejected, cancelled or
+// expired it first. Handlers map it to 409.
+var ErrStatusConflict = errors.New("storage: access_request status does not allow this transition")
+
+// CastVoteInput is one approve/reject vote for CastVote.
+type CastVoteInput struct {
+	// Vote is the row to insert. RequestID, ApproverID and Decision are
+	// required; ID and CreatedAt are filled in.
+	Vote *Approval
+	// From lists the statuses the vote may be cast in. Checked against
+	// the locked row, so it is authoritative.
+	From []AccessRequestStatus
+	// Decide runs inside the transaction after the vote row is written,
+	// with the locked request and every vote on it (the new one
+	// included). It returns the status to move to, or "" to leave the
+	// status alone. It must not do I/O.
+	Decide func(req *AccessRequest, votes []*Approval) AccessRequestStatus
+	// RejectReason, when non-empty, is stamped on the row together with
+	// the transition.
+	RejectReason string
+}
+
+// CastVoteResult reports what CastVote did.
+type CastVoteResult struct {
+	// Request is the row as of the commit (status updated when
+	// Transitioned).
+	Request *AccessRequest
+	// Votes is every vote on the request, the new one included.
+	Votes []*Approval
+	// Transitioned is true only for the one caller whose vote moved the
+	// status. Side effects of the transition (job enqueue, wrap TTLs)
+	// belong to that caller alone.
+	Transitioned bool
+}
+
+// FillInput is the data FillWithWraps writes.
+type FillInput struct {
+	ID             uuid.UUID
+	From           []AccessRequestStatus
+	To             AccessRequestStatus
+	FilledByUserID string
+	FillComment    string
+	FilledAt       time.Time
+	// Wraps are sealed but not yet stored. Each one is inserted with
+	// RequestID = ID inside the fill transaction.
+	Wraps []*SecretWrap
+}
 
 // AccessRequests is the Postgres implementation.
 type AccessRequests struct {
@@ -281,6 +349,10 @@ func (r *AccessRequests) List(ctx context.Context, f AccessRequestListFilter) ([
 	return out, rows.Err()
 }
 
+// UpdateStatus overwrites the status unconditionally. It is NOT part of
+// AccessRequestRepository, so lifecycle code can't reach it; it stays
+// on the concrete type for test fixtures that need to force a row into
+// a given state. Lifecycle code uses TransitionStatus / CastVote.
 func (r *AccessRequests) UpdateStatus(ctx context.Context, id uuid.UUID, status AccessRequestStatus) error {
 	const q = `UPDATE access_requests SET status = $2 WHERE id = $1`
 	tag, err := r.pool.Exec(ctx, q, id, status)
@@ -315,6 +387,186 @@ func (r *AccessRequests) SetRejectReason(ctx context.Context, id uuid.UUID, reas
 		return ErrNotFound
 	}
 	return nil
+}
+
+// TransitionStatus is the single-statement conditional status write:
+// `UPDATE … WHERE id = $1 AND status = ANY($from)`. When nothing
+// matched it tells "gone" (ErrNotFound) apart from "someone else moved
+// it first" (ErrStatusConflict).
+func (r *AccessRequests) TransitionStatus(ctx context.Context, id uuid.UUID, from []AccessRequestStatus, to AccessRequestStatus) error {
+	if len(from) == 0 || to == "" {
+		return errors.New("storage: TransitionStatus needs from and to statuses")
+	}
+	const q = `UPDATE access_requests SET status = $2 WHERE id = $1 AND status = ANY($3::text[])`
+	tag, err := r.pool.Exec(ctx, q, id, string(to), statusStrings(from))
+	if err != nil {
+		return fmt.Errorf("storage: transition access_request status: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	return statusConflict(ctx, r.pool, id)
+}
+
+// CastVote inserts the vote and applies the transition Decide asks for
+// in one transaction that holds the access_requests row lock
+// (SELECT … FOR NO KEY UPDATE). Concurrent votes on the same request
+// queue on that lock, so each one sees the status and the vote count
+// the previous one committed:
+//
+//   - a vote that arrives after the request left From fails with
+//     ErrStatusConflict and its vote row is never written;
+//   - the threshold is crossed by exactly one caller, which is the only
+//     one with Transitioned = true;
+//   - a duplicate vote by the same approver fails with
+//     ErrApprovalExists (unique index), the transaction rolls back.
+func (r *AccessRequests) CastVote(ctx context.Context, in CastVoteInput) (*CastVoteResult, error) {
+	if in.Vote == nil || in.Decide == nil || len(in.From) == 0 {
+		return nil, errors.New("storage: CastVote needs a vote, a from-status set and a Decide func")
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("storage: begin vote tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	cur, err := scanAccessRequest(tx.QueryRow(ctx, accessRequestSelect+` WHERE id = $1 FOR NO KEY UPDATE`, in.Vote.RequestID))
+	if err != nil {
+		return nil, err
+	}
+	if !statusIn(cur.Status, in.From) {
+		return nil, fmt.Errorf("%w (current status %q)", ErrStatusConflict, cur.Status)
+	}
+	if err := insertApproval(ctx, tx, in.Vote); err != nil {
+		return nil, err
+	}
+	votes, err := listApprovals(ctx, tx, cur.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	res := &CastVoteResult{Request: cur, Votes: votes}
+	if to := in.Decide(cur, votes); to != "" {
+		// The row is locked, so the status guard can't miss; it stays as
+		// a second line of defence.
+		const q = `
+			UPDATE access_requests
+			SET status = $2,
+			    reject_reason = COALESCE(NULLIF($4, ''), reject_reason)
+			WHERE id = $1 AND status = ANY($3::text[])
+			RETURNING updated_at`
+		err := tx.QueryRow(ctx, q, cur.ID, string(to), statusStrings(in.From), in.RejectReason).Scan(&cur.UpdatedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrStatusConflict
+		}
+		if err != nil {
+			return nil, fmt.Errorf("storage: apply vote transition: %w", err)
+		}
+		cur.Status = to
+		if in.RejectReason != "" {
+			cur.RejectReason = in.RejectReason
+		}
+		res.Transitioned = true
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("storage: commit vote: %w", err)
+	}
+	return res, nil
+}
+
+// FillWithWraps is the transactional Fill: under the request row lock
+// it checks type, status and fill window, inserts every sealed wrap
+// against the request and moves it to in.To. If any step fails nothing
+// is written, so a filler that loses a race (to another filler, a
+// refuse, a cancel or the fill-window sweeper) leaves no wraps behind.
+//
+// Errors mirror Fill: ErrCrossTeamStatusInvalidTransition for a
+// non-cross_team row, ErrCrossTeamAlreadyFilled when the status is not
+// in From, ErrFillWindowExpired when fill_expires_at has passed.
+func (r *AccessRequests) FillWithWraps(ctx context.Context, in FillInput) error {
+	if len(in.From) == 0 || in.To == "" {
+		return errors.New("storage: FillWithWraps needs from and to statuses")
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("storage: begin fill tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	cur, err := scanAccessRequest(tx.QueryRow(ctx, accessRequestSelect+` WHERE id = $1 FOR NO KEY UPDATE`, in.ID))
+	if err != nil {
+		return err
+	}
+	if cur.Type != AccessRequestTypeCrossTeam {
+		return ErrCrossTeamStatusInvalidTransition
+	}
+	if !statusIn(cur.Status, in.From) {
+		return ErrCrossTeamAlreadyFilled
+	}
+	if cur.FillExpiresAt == nil || !cur.FillExpiresAt.After(in.FilledAt) {
+		return ErrFillWindowExpired
+	}
+
+	for _, w := range in.Wraps {
+		id := in.ID
+		w.RequestID = &id
+		if err := insertSecretWrap(ctx, tx, w); err != nil {
+			return fmt.Errorf("storage: insert fill wrap: %w", err)
+		}
+	}
+
+	const q = `
+		UPDATE access_requests
+		SET status = $2,
+		    filled_by_user_id = $3,
+		    fill_comment = NULLIF($4, ''),
+		    filled_at = $5
+		WHERE id = $1
+		  AND type = 'cross_team'
+		  AND status = ANY($6::text[])
+		  AND fill_expires_at > $5`
+	tag, err := tx.Exec(ctx, q, in.ID, string(in.To), in.FilledByUserID, in.FillComment, in.FilledAt, statusStrings(in.From))
+	if err != nil {
+		return fmt.Errorf("storage: fill cross_team request: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrCrossTeamAlreadyFilled
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("storage: commit fill: %w", err)
+	}
+	return nil
+}
+
+// statusConflict runs after a conditional write matched no row and
+// tells a missing request apart from one in another status.
+func statusConflict(ctx context.Context, q querier, id uuid.UUID) error {
+	var cur AccessRequestStatus
+	err := q.QueryRow(ctx, `SELECT status FROM access_requests WHERE id = $1`, id).Scan(&cur)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("storage: probe access_request status: %w", err)
+	}
+	return fmt.Errorf("%w (current status %q)", ErrStatusConflict, cur)
+}
+
+func statusIn(s AccessRequestStatus, set []AccessRequestStatus) bool {
+	for _, x := range set {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+func statusStrings(set []AccessRequestStatus) []string {
+	out := make([]string, len(set))
+	for i, s := range set {
+		out[i] = string(s)
+	}
+	return out
 }
 
 const accessRequestSelect = `

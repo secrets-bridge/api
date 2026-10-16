@@ -171,7 +171,9 @@ func requestErr(err error) error {
 		return fiber.NewError(fiber.StatusForbidden, "requester cannot approve own request")
 	case errors.Is(err, services.ErrDuplicateVote):
 		return fiber.NewError(fiber.StatusConflict, "approver has already voted on this request")
-	case errors.Is(err, services.ErrRequestNotPending):
+	case errors.Is(err, services.ErrRequestExpired):
+		return fiber.NewError(fiber.StatusGone, "request_expired")
+	case errors.Is(err, services.ErrRequestNotPending), errors.Is(err, storage.ErrStatusConflict):
 		return fiber.NewError(fiber.StatusConflict, "request is not pending")
 	case errors.Is(err, services.ErrNotRequester):
 		return fiber.NewError(fiber.StatusForbidden, "only the original requester can cancel")

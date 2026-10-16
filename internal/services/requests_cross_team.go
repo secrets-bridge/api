@@ -40,6 +40,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/secrets-bridge/api/pkg/storage"
+	"github.com/secrets-bridge/api/pkg/workflow"
 )
 
 // --- input / output shapes ---------------------------------------------------
@@ -419,6 +420,12 @@ func (s *RequestService) Fill(ctx context.Context, in FillCrossTeamInput) (*stor
 	if len(in.KeyValues) == 0 {
 		return nil, fmt.Errorf("%w: key_values required", ErrInvalidInput)
 	}
+	// Whatever path returns, don't leave plaintext in the caller's map.
+	defer func() {
+		for _, v := range in.KeyValues {
+			zero(v)
+		}
+	}()
 
 	req, err := s.requests.Get(ctx, in.RequestID)
 	if err != nil {
@@ -452,11 +459,22 @@ func (s *RequestService) Fill(ctx context.Context, in FillCrossTeamInput) (*stor
 		return nil, err
 	}
 
-	// Wrap each plaintext under workflow.wrap_ttl_created. Same
-	// envelope-encrypted path the patch flow uses; values never touch
-	// access_requests.
+	if err := s.enforceRequestTTL(ctx, req, wf, in.FillerID, "fill"); err != nil {
+		if errors.Is(err, storage.ErrStatusConflict) {
+			return nil, fmt.Errorf("%w: %w", storage.ErrCrossTeamAlreadyFilled, err)
+		}
+		return nil, err
+	}
+
+	// Seal each plaintext under workflow.wrap_ttl_created (same envelope
+	// path the patch flow uses; values never touch access_requests),
+	// then store the wraps and the status change in one transaction.
+	// Wrapping first and transitioning after used to leave a losing
+	// filler's wraps attached to the request, where they rode along in
+	// the patch job next to the winner's.
+	sealed := make([]*storage.SecretWrap, 0, len(in.KeyValues))
 	for k, v := range in.KeyValues {
-		_, werr := s.wraps.Wrap(ctx, WrapRequest{
+		w, werr := s.wraps.Seal(ctx, WrapRequest{
 			Plaintext: v,
 			RequestID: &req.ID,
 			KeyName:   k,
@@ -467,11 +485,23 @@ func (s *RequestService) Fill(ctx context.Context, in FillCrossTeamInput) (*stor
 		if werr != nil {
 			return nil, fmt.Errorf("services: wrap key %q: %w", k, werr)
 		}
+		sealed = append(sealed, w)
 	}
 
-	now := s.now().UTC()
-	if err := s.requests.Fill(ctx, in.RequestID, in.FillerID, in.FillComment, now); err != nil {
+	fill := workflow.For(workflow.ActionFill)
+	if err := s.requests.FillWithWraps(ctx, storage.FillInput{
+		ID:             in.RequestID,
+		From:           fill.From,
+		To:             fill.To,
+		FilledByUserID: in.FillerID,
+		FillComment:    in.FillComment,
+		FilledAt:       s.now().UTC(),
+		Wraps:          sealed,
+	}); err != nil {
 		return nil, err
+	}
+	for _, w := range sealed {
+		s.wraps.RecordCreated(ctx, w, "user:"+in.FillerID, wf.WrapTTLCreated)
 	}
 
 	keyNames := make([]string, 0, len(in.KeyValues))
@@ -587,21 +617,23 @@ func (s *RequestService) VerifyCrossTeam(ctx context.Context, in VerifyCrossTeam
 		}
 	}
 
-	// Reject is a terminal short-circuit regardless of vote-lane.
+	// Reject is a terminal short-circuit regardless of vote-lane. The
+	// vote and the transition are one conditional transaction, so a
+	// reject racing an approve or a cancel either wins outright or
+	// writes nothing.
 	if in.Decision == storage.ApprovalDecisionReject {
-		if err := s.approvals.Append(ctx, &storage.Approval{
-			RequestID:  req.ID,
-			ApproverID: in.ApproverID,
-			Decision:   storage.ApprovalDecisionReject,
-			Comment:    in.Comment,
+		reject := workflow.For(workflow.ActionVerifyReject)
+		if _, err := s.requests.CastVote(ctx, storage.CastVoteInput{
+			Vote: &storage.Approval{
+				RequestID:  req.ID,
+				ApproverID: in.ApproverID,
+				Decision:   storage.ApprovalDecisionReject,
+				Comment:    in.Comment,
+			},
+			From:   reject.From,
+			Decide: func(*storage.AccessRequest, []*storage.Approval) storage.AccessRequestStatus { return reject.To },
 		}); err != nil {
-			if errors.Is(err, storage.ErrApprovalExists) {
-				return nil, ErrDuplicateVote
-			}
-			return nil, fmt.Errorf("services: append rejection: %w", err)
-		}
-		if err := s.requests.UpdateStatus(ctx, req.ID, storage.AccessRequestStatusRejected); err != nil {
-			return nil, fmt.Errorf("services: mark rejected: %w", err)
+			return nil, crossTeamVoteErr(err, "rejection")
 		}
 		_ = s.refreshWrapsForRequest(ctx, req.ID, 5*time.Minute)
 		_ = s.audit.Append(ctx, &storage.AuditEvent{
@@ -625,48 +657,61 @@ func (s *RequestService) VerifyCrossTeam(ctx context.Context, in VerifyCrossTeam
 		}, nil
 	}
 
-	// Approve path. Append the vote then count.
-	if err := s.approvals.Append(ctx, &storage.Approval{
-		RequestID:  req.ID,
-		ApproverID: in.ApproverID,
-		Decision:   storage.ApprovalDecisionApprove,
-		Comment:    in.Comment,
-	}); err != nil {
-		if errors.Is(err, storage.ErrApprovalExists) {
-			return nil, ErrDuplicateVote
+	// request_ttl bounds how long a request may wait for approval. Only
+	// the approve vote moves it forward; a reject still closes it.
+	if req.WorkflowID != nil {
+		wf, err := s.workflows.Get(ctx, *req.WorkflowID)
+		if err != nil {
+			return nil, fmt.Errorf("services: load workflow: %w", err)
 		}
-		return nil, fmt.Errorf("services: append approval: %w", err)
+		if err := s.enforceRequestTTL(ctx, req, wf, in.ApproverID, "verify"); err != nil {
+			if errors.Is(err, storage.ErrStatusConflict) {
+				return nil, fmt.Errorf("%w: %w", storage.ErrCrossTeamStatusInvalidTransition, err)
+			}
+			return nil, err
+		}
 	}
 
-	// Re-list to count after the append. The Approval struct doesn't
-	// carry a voted_as column today; we treat the LATEST vote's actor
-	// as the security vote when the matching audit shows it. For v1
-	// the count uses approver_id distinctness — security vote is the
-	// vote whose actor differs from any source-vote actor's identity.
-	approvals, err := s.approvals.ListByRequest(ctx, req.ID)
+	// Approve path. The vote, the count and the transition run in one
+	// transaction under the request row lock. The Approval struct
+	// doesn't carry a voted_as column today; for v1 the count uses
+	// approver_id distinctness — security vote is the vote whose actor
+	// differs from any source-vote actor's identity.
+	verify := workflow.For(workflow.ActionVerifyApprove)
+	var (
+		sourceVotes     int
+		securityPresent bool
+	)
+	vote, err := s.requests.CastVote(ctx, storage.CastVoteInput{
+		Vote: &storage.Approval{
+			RequestID:  req.ID,
+			ApproverID: in.ApproverID,
+			Decision:   storage.ApprovalDecisionApprove,
+			Comment:    in.Comment,
+		},
+		From: verify.From,
+		Decide: func(cur *storage.AccessRequest, votes []*storage.Approval) storage.AccessRequestStatus {
+			sourceVotes, securityPresent = countCrossTeamVotes(votes, in.ApproverID, in.VotedAs, cur)
+			if sourceVotes >= minApprovers && (!requiresSecurity || securityPresent) {
+				return verify.To
+			}
+			return ""
+		},
+	})
 	if err != nil {
-		return nil, fmt.Errorf("services: list approvals: %w", err)
-	}
-	sourceVotes, securityPresent := countCrossTeamVotes(approvals, in.ApproverID, in.VotedAs, req)
-
-	statusToSet := req.Status
-	if sourceVotes >= minApprovers && (!requiresSecurity || securityPresent) {
-		statusToSet = storage.AccessRequestStatusApproved
+		return nil, crossTeamVoteErr(err, "approval")
 	}
 
-	if statusToSet == storage.AccessRequestStatusApproved && req.Status != statusToSet {
-		if err := s.requests.UpdateStatus(ctx, req.ID, statusToSet); err != nil {
-			return nil, fmt.Errorf("services: mark approved: %w", err)
-		}
+	statusToSet := vote.Request.Status
+	if vote.Transitioned {
 		// Wraps TTL refresh to the workflow's approved-TTL. Same
 		// posture as the patch flow: failure audited, not bubbled.
 		wf, wferr := s.workflows.Get(ctx, *req.WorkflowID)
 		if wferr == nil {
 			_ = s.refreshWrapsForRequest(ctx, req.ID, wf.WrapTTLApproved)
 		}
-		fresh, _ := s.requests.Get(ctx, req.ID)
-		if s.jobs != nil && fresh != nil {
-			if jerr := s.enqueueRequestJob(ctx, fresh); jerr != nil {
+		if s.jobs != nil {
+			if jerr := s.enqueueRequestJob(ctx, vote.Request); jerr != nil {
 				if errors.Is(jerr, ErrKeyNotAllowed) {
 					// api#169: a destination-key allowlist rejection at the
 					// execute boundary is a policy failure, not a transient
@@ -674,8 +719,9 @@ func (s *RequestService) VerifyCrossTeam(ctx context.Context, in VerifyCrossTeam
 					// transition the request to failed so it can't sit at
 					// approved waiting for a dispatch that must never run.
 					// Metadata-only — never the value, wrap, or payload.
-					if uerr := s.requests.UpdateStatus(ctx, req.ID, storage.AccessRequestStatusFailed); uerr == nil {
-						statusToSet = storage.AccessRequestStatusFailed
+					fail := workflow.For(workflow.ActionFail)
+					if uerr := s.requests.TransitionStatus(ctx, req.ID, fail.From, fail.To); uerr == nil {
+						statusToSet = fail.To
 					}
 					_ = s.audit.Append(ctx, &storage.AuditEvent{
 						Actor:         "user:" + in.ApproverID,
@@ -732,6 +778,21 @@ func (s *RequestService) VerifyCrossTeam(ctx context.Context, in VerifyCrossTeam
 		SecurityVotePresent:      securityPresent,
 		NextRequired:             nextRequired,
 	}, nil
+}
+
+// crossTeamVoteErr maps a CastVote failure on the verify path to the
+// cross-team error vocabulary: a duplicate vote stays ErrDuplicateVote,
+// a status conflict (someone else decided, cancelled or expired the
+// request first) becomes ErrCrossTeamStatusInvalidTransition (409).
+func crossTeamVoteErr(err error, what string) error {
+	switch {
+	case errors.Is(err, storage.ErrApprovalExists):
+		return ErrDuplicateVote
+	case errors.Is(err, storage.ErrStatusConflict):
+		return fmt.Errorf("%w: %w", storage.ErrCrossTeamStatusInvalidTransition, err)
+	default:
+		return fmt.Errorf("services: record %s: %w", what, err)
+	}
 }
 
 // countCrossTeamVotes splits the approvals into source vs security

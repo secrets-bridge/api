@@ -387,7 +387,9 @@ func crossTeamErr(err error) error {
 		return fiber.NewError(fiber.StatusConflict, "cross_team_already_filled")
 	case errors.Is(err, storage.ErrFillWindowExpired):
 		return fiber.NewError(fiber.StatusConflict, "fill_window_expired")
-	case errors.Is(err, storage.ErrCrossTeamStatusInvalidTransition):
+	case errors.Is(err, services.ErrRequestExpired):
+		return fiber.NewError(fiber.StatusGone, "request_expired")
+	case errors.Is(err, storage.ErrCrossTeamStatusInvalidTransition), errors.Is(err, storage.ErrStatusConflict):
 		return fiber.NewError(fiber.StatusConflict, "cross_team_status_invalid_transition")
 	case errors.Is(err, services.ErrDuplicateVote):
 		return fiber.NewError(fiber.StatusConflict, "duplicate_vote")

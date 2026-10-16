@@ -77,8 +77,11 @@ type SecretWrapRepository interface {
 	// semantics; same error mapping.
 	MarkConsumedByUser(ctx context.Context, id uuid.UUID, userID string, at time.Time) error
 
-	// SetExpiry updates expires_at. Called by the workflow engine
-	// during state transitions (request approved → shorter TTL).
+	// SetExpiry moves expires_at EARLIER, never later: the stored value
+	// becomes LEAST(expires_at, expiresAt). Called by the workflow engine
+	// on state transitions and by reveal-session expiry. Consumed wraps
+	// are left untouched (ErrAlreadyConsumed); an already-expired wrap
+	// stays expired.
 	SetExpiry(ctx context.Context, id uuid.UUID, expiresAt time.Time) error
 
 	// DeleteExpired removes rows past their expiry. Returns the
@@ -125,6 +128,13 @@ func NewSecretWraps(pool *Pool) *SecretWraps { return &SecretWraps{pool: pool} }
 // honoured so callers running their own UUID generation can match
 // wraps to other entities they create in the same transaction.
 func (r *SecretWraps) Create(ctx context.Context, w *SecretWrap) error {
+	return insertSecretWrap(ctx, r.pool, w)
+}
+
+// insertSecretWrap writes one wrap row through q, which is the pool or
+// the transaction AccessRequests.FillWithWraps holds the request row
+// lock in.
+func insertSecretWrap(ctx context.Context, q querier, w *SecretWrap) error {
 	if len(w.EncryptedValue) == 0 || len(w.Nonce) == 0 || len(w.DataKeyCiphertext) == 0 {
 		return errors.New("storage: encrypted_value / nonce / data_key_ciphertext are required")
 	}
@@ -157,13 +167,13 @@ func (r *SecretWraps) Create(ctx context.Context, w *SecretWrap) error {
 		RETURNING created_at`
 
 	if w.ID == uuid.Nil {
-		return r.pool.QueryRow(ctx, insertGenerated,
+		return q.QueryRow(ctx, insertGenerated,
 			w.RequestID, w.EnvironmentID, w.IssuedVia, w.KeyName,
 			w.EncryptedValue, w.Nonce, w.DataKeyCiphertext,
 			w.KMSKeyID, w.Algorithm, w.ContentHash, w.ByteLength, w.ExpiresAt,
 		).Scan(&w.ID, &w.CreatedAt)
 	}
-	return r.pool.QueryRow(ctx, insertWithID,
+	return q.QueryRow(ctx, insertWithID,
 		w.ID, w.RequestID, w.EnvironmentID, w.IssuedVia, w.KeyName,
 		w.EncryptedValue, w.Nonce, w.DataKeyCiphertext,
 		w.KMSKeyID, w.Algorithm, w.ContentHash, w.ByteLength, w.ExpiresAt,
@@ -248,12 +258,15 @@ func (r *SecretWraps) MarkConsumedByUser(ctx context.Context, id uuid.UUID, user
 	return ErrAlreadyConsumed
 }
 
-// SetExpiry updates expires_at. Used by the workflow engine when state
-// transitions shorten the wrap's TTL.
+// SetExpiry shortens expires_at to expiresAt when that is earlier than
+// the stored value. It never extends: a later deadline is a no-op, so a
+// state transition can't revive a wrap that already expired (the row
+// may sit around until the worker's wraps-expired sweep deletes it).
+// Consumed wraps are not touched.
 func (r *SecretWraps) SetExpiry(ctx context.Context, id uuid.UUID, expiresAt time.Time) error {
 	const q = `
 		UPDATE secret_wraps
-		SET expires_at = $2
+		SET expires_at = LEAST(expires_at, $2)
 		WHERE id = $1 AND consumed_at IS NULL`
 	tag, err := r.pool.Exec(ctx, q, id, expiresAt)
 	if err != nil {

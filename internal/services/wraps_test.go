@@ -203,19 +203,38 @@ func TestRetrieve_ConcurrentAgents_ExactlyOneWins(t *testing.T) {
 	}
 }
 
-func TestRefresh_ExtendsExpiry(t *testing.T) {
+// Refresh only ever shortens. It used to overwrite expires_at with
+// now+TTL, which let a state transition stretch a live wrap or revive
+// an expired one; storage now keeps LEAST(expires_at, now+TTL).
+func TestRefresh_NeverExtendsExpiry(t *testing.T) {
 	svc, _, pool := bootstrapWraps(t)
 	ctx := t.Context()
-	w, _ := svc.Wrap(ctx, services.WrapRequest{Plaintext: []byte("v"), TTL: time.Minute})
-
-	original := w.ExpiresAt
-	if err := svc.Refresh(ctx, w.ID, 24*time.Hour); err != nil {
-		t.Fatalf("Refresh: %v", err)
+	w, err := svc.Wrap(ctx, services.WrapRequest{Plaintext: []byte("v"), TTL: time.Hour})
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
 	}
-	var got time.Time
-	_ = pool.QueryRow(ctx, `SELECT expires_at FROM secret_wraps WHERE id = $1`, w.ID).Scan(&got)
-	if !got.After(original) {
-		t.Fatalf("Refresh did not extend expires_at: original=%v new=%v", original, got)
+	readExpiry := func() time.Time {
+		t.Helper()
+		var got time.Time
+		if err := pool.QueryRow(ctx, `SELECT expires_at FROM secret_wraps WHERE id = $1`, w.ID).Scan(&got); err != nil {
+			t.Fatalf("read expires_at: %v", err)
+		}
+		return got
+	}
+
+	original := readExpiry()
+	if err := svc.Refresh(ctx, w.ID, 24*time.Hour); err != nil {
+		t.Fatalf("Refresh longer: %v", err)
+	}
+	if got := readExpiry(); !got.Equal(original) {
+		t.Fatalf("Refresh extended expires_at: original=%v new=%v", original, got)
+	}
+
+	if err := svc.Refresh(ctx, w.ID, time.Minute); err != nil {
+		t.Fatalf("Refresh shorter: %v", err)
+	}
+	if got := readExpiry(); !got.Before(original) || got.After(time.Now().Add(2*time.Minute)) {
+		t.Fatalf("Refresh did not shorten expires_at: original=%v new=%v", original, got)
 	}
 }
 

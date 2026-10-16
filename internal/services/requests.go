@@ -10,9 +10,14 @@
 // State machine:
 //
 //	pending --approve(≥ MinApprovers)--> approved --(agent claims)--> executed
-//	   |                  ^                  |
+//	   |                                     |
 //	   |--reject------>rejected              |--fail-->failed
-//	   |--cancel----->cancelled              |--ttl--->expired
+//	   |--cancel----->cancelled
+//	   |--request_ttl->expired
+//
+// The allowed-from set of every transition lives in pkg/workflow and
+// each status change is a conditional write in pkg/storage, so two
+// callers racing on one request leave exactly one outcome.
 //
 // Every state transition emits an audit event with the same
 // CorrelationID — the access_request UUID — so the entire lifecycle
@@ -29,6 +34,7 @@ import (
 
 	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/pkg/storage"
+	"github.com/secrets-bridge/api/pkg/workflow"
 )
 
 // JobEnqueuer is the slice of *JobService that RequestService needs.
@@ -224,6 +230,11 @@ var (
 	// the UI can render the precise reason. Requires WithApproverScope
 	// to be wired; nil resolver leaves the check disabled (legacy).
 	ErrOutOfScopeProject = errors.New("services: approver out of scope for request project")
+	// ErrRequestExpired is returned when a forward move (approve,
+	// cross-team verify approve, fill) hits a request older than its
+	// workflow's request_ttl. The request is marked expired by the same
+	// call. Handlers map it to 410 `request_expired`.
+	ErrRequestExpired = errors.New("services: request expired (request_ttl elapsed)")
 )
 
 // Submit creates a patch request, wraps each key's plaintext under
@@ -681,33 +692,48 @@ func (s *RequestService) Approve(ctx context.Context, requestID uuid.UUID, appro
 		}
 	}
 
-	if err := s.approvals.Append(ctx, &storage.Approval{
-		RequestID:  requestID,
-		ApproverID: approverID,
-		Decision:   storage.ApprovalDecisionApprove,
-		Comment:    comment,
-	}); err != nil {
-		if errors.Is(err, storage.ErrApprovalExists) {
-			return nil, ErrDuplicateVote
-		}
-		return nil, fmt.Errorf("services: append approval: %w", err)
-	}
-
-	counts, err := s.approvals.Counts(ctx, requestID)
-	if err != nil {
-		return nil, fmt.Errorf("services: count approvals: %w", err)
+	if err := s.enforceRequestTTL(ctx, req, wf, approverID, "approve"); err != nil {
+		return nil, asNotPending(err)
 	}
 
 	threshold := wf.MinApprovers
 	if threshold < 1 {
 		threshold = 1
 	}
-	if counts.Approves >= threshold {
-		if err := s.requests.UpdateStatus(ctx, requestID, storage.AccessRequestStatusApproved); err != nil {
-			return nil, fmt.Errorf("services: mark approved: %w", err)
+	// The vote, the threshold count and the transition run in one
+	// transaction under the request row lock, so concurrent approvers
+	// and a concurrent reject/cancel see each other's committed result:
+	// exactly one caller crosses the threshold and owns the side
+	// effects below.
+	approve := workflow.For(workflow.ActionApprove)
+	vote, err := s.requests.CastVote(ctx, storage.CastVoteInput{
+		Vote: &storage.Approval{
+			RequestID:  requestID,
+			ApproverID: approverID,
+			Decision:   storage.ApprovalDecisionApprove,
+			Comment:    comment,
+		},
+		From: approve.From,
+		Decide: func(_ *storage.AccessRequest, votes []*storage.Approval) storage.AccessRequestStatus {
+			if countDecisions(votes, storage.ApprovalDecisionApprove) >= threshold {
+				return approve.To
+			}
+			return ""
+		},
+	})
+	if err != nil {
+		if errors.Is(err, storage.ErrApprovalExists) {
+			return nil, ErrDuplicateVote
 		}
-		req.Status = storage.AccessRequestStatusApproved
+		if errors.Is(err, storage.ErrStatusConflict) {
+			return nil, asNotPending(err)
+		}
+		return nil, fmt.Errorf("services: record approval: %w", err)
+	}
+	req = vote.Request
+	approves := countDecisions(vote.Votes, storage.ApprovalDecisionApprove)
 
+	if vote.Transitioned {
 		// Refresh every wrap tied to this request to the approved TTL.
 		// On failure we log via audit but don't roll back the approval —
 		// the wrap could still be picked up by the agent before its
@@ -747,9 +773,9 @@ func (s *RequestService) Approve(ctx context.Context, requestID uuid.UUID, appro
 		Status:        storage.AuditStatusSuccess,
 		CorrelationID: requestID,
 		Metadata: map[string]any{
-			"approves":       counts.Approves,
-			"required":       threshold,
-			"became_approved": req.Status == storage.AccessRequestStatusApproved,
+			"approves":        approves,
+			"required":        threshold,
+			"became_approved": vote.Transitioned,
 		},
 	})
 	return req, nil
@@ -785,25 +811,30 @@ func (s *RequestService) Reject(ctx context.Context, requestID uuid.UUID, approv
 		return nil, err
 	}
 
-	if err := s.approvals.Append(ctx, &storage.Approval{
-		RequestID:  requestID,
-		ApproverID: approverID,
-		Decision:   storage.ApprovalDecisionReject,
-		Comment:    reason,
-	}); err != nil {
+	// Vote + reject_reason + status in one conditional transaction; a
+	// reject that loses to a concurrent approve/cancel writes nothing.
+	reject := workflow.For(workflow.ActionReject)
+	vote, err := s.requests.CastVote(ctx, storage.CastVoteInput{
+		Vote: &storage.Approval{
+			RequestID:  requestID,
+			ApproverID: approverID,
+			Decision:   storage.ApprovalDecisionReject,
+			Comment:    reason,
+		},
+		From:         reject.From,
+		Decide:       func(*storage.AccessRequest, []*storage.Approval) storage.AccessRequestStatus { return reject.To },
+		RejectReason: reason,
+	})
+	if err != nil {
 		if errors.Is(err, storage.ErrApprovalExists) {
 			return nil, ErrDuplicateVote
 		}
-		return nil, fmt.Errorf("services: append rejection: %w", err)
+		if errors.Is(err, storage.ErrStatusConflict) {
+			return nil, asNotPending(err)
+		}
+		return nil, fmt.Errorf("services: record rejection: %w", err)
 	}
-	if err := s.requests.SetRejectReason(ctx, requestID, reason); err != nil {
-		return nil, fmt.Errorf("services: set reject_reason: %w", err)
-	}
-	if err := s.requests.UpdateStatus(ctx, requestID, storage.AccessRequestStatusRejected); err != nil {
-		return nil, fmt.Errorf("services: mark rejected: %w", err)
-	}
-	req.Status = storage.AccessRequestStatusRejected
-	req.RejectReason = reason
+	req = vote.Request
 
 	// Shrink TTL on every wrap so the encrypted plaintext is purged
 	// quickly. 5 minutes matches the claimed-TTL constant — short
@@ -851,10 +882,14 @@ func (s *RequestService) Cancel(ctx context.Context, requestID uuid.UUID, actorI
 	if actorID != req.RequesterID {
 		return nil, ErrNotRequester
 	}
-	if err := s.requests.UpdateStatus(ctx, requestID, storage.AccessRequestStatusCancelled); err != nil {
+	cancel := workflow.For(workflow.ActionCancel)
+	if err := s.requests.TransitionStatus(ctx, requestID, cancel.From, cancel.To); err != nil {
+		if errors.Is(err, storage.ErrStatusConflict) {
+			return nil, asNotPending(err)
+		}
 		return nil, fmt.Errorf("services: cancel: %w", err)
 	}
-	req.Status = storage.AccessRequestStatusCancelled
+	req.Status = cancel.To
 	if err := s.refreshWrapsForRequest(ctx, requestID, 5*time.Minute); err != nil {
 		_ = s.audit.Append(ctx, &storage.AuditEvent{
 			Actor:         "user:" + actorID,
@@ -1043,9 +1078,84 @@ func (s *RequestService) checkApproverScope(ctx context.Context, approverID stri
 	return ErrOutOfScopeProject
 }
 
-// refreshWrapsForRequest extends/shrinks every wrap tied to the
-// request. The wrap layer takes the new TTL relative to now, so this
-// produces a consistent expires_at across all wraps in the request.
+// enforceRequestTTL implements the workflow's request_ttl: a request
+// that is still undecided at created_at + request_ttl expires instead
+// of moving forward. It is called before a forward move (approve,
+// cross-team verify approve, fill). Past the deadline it marks the
+// request expired through the conditional ActionExpire transition,
+// shrinks any wraps, audits `request.expire` and returns
+// ErrRequestExpired. If another caller closed the request first the
+// storage ErrStatusConflict comes back for the caller to map.
+//
+// A workflow without a positive request_ttl (not reachable through the
+// admin API, which requires one) is not enforced.
+func (s *RequestService) enforceRequestTTL(ctx context.Context, req *storage.AccessRequest, wf *storage.WorkflowDefinition, actorID, attempted string) error {
+	if wf == nil || wf.RequestTTL <= 0 {
+		return nil
+	}
+	deadline := req.CreatedAt.Add(wf.RequestTTL)
+	if s.now().Before(deadline) {
+		return nil
+	}
+	expire := workflow.For(workflow.ActionExpire)
+	if err := s.requests.TransitionStatus(ctx, req.ID, expire.From, expire.To); err != nil {
+		if errors.Is(err, storage.ErrStatusConflict) {
+			return err
+		}
+		return fmt.Errorf("services: expire request: %w", err)
+	}
+	req.Status = expire.To
+
+	if err := s.refreshWrapsForRequest(ctx, req.ID, 5*time.Minute); err != nil {
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:         "system:request_ttl",
+			Action:        "request.refresh_ttl_failed",
+			Resource:      "request:" + req.ID.String(),
+			Status:        storage.AuditStatusFailure,
+			CorrelationID: req.ID,
+			Metadata:      map[string]any{"error": err.Error(), "phase": "expired"},
+		})
+	}
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:         "system:request_ttl",
+		Action:        "request.expire",
+		Resource:      "request:" + req.ID.String(),
+		Status:        storage.AuditStatusSuccess,
+		CorrelationID: req.ID,
+		Metadata: map[string]any{
+			"reason":              "request_ttl",
+			"request_ttl_seconds": int64(wf.RequestTTL.Seconds()),
+			"deadline":            deadline.UTC().Format(time.RFC3339),
+			"triggered_by":        "user:" + actorID,
+			"attempted_action":    attempted,
+		},
+	})
+	return ErrRequestExpired
+}
+
+// asNotPending folds a storage status conflict into ErrRequestNotPending
+// (409 "request is not pending") while keeping the storage sentinel in
+// the chain. Other errors pass through unchanged.
+func asNotPending(err error) error {
+	if errors.Is(err, storage.ErrStatusConflict) {
+		return fmt.Errorf("%w: %w", ErrRequestNotPending, err)
+	}
+	return err
+}
+
+func countDecisions(votes []*storage.Approval, d storage.ApprovalDecision) int {
+	n := 0
+	for _, v := range votes {
+		if v.Decision == d {
+			n++
+		}
+	}
+	return n
+}
+
+// refreshWrapsForRequest caps every wrap tied to the request at newTTL
+// from now. Storage only ever shortens (LEAST), so this never extends
+// or revives a wrap.
 func (s *RequestService) refreshWrapsForRequest(ctx context.Context, requestID uuid.UUID, newTTL time.Duration) error {
 	wrapIDs, err := s.wraps.ListIDsForRequest(ctx, requestID)
 	if err != nil {
@@ -1077,16 +1187,20 @@ func (s *RequestService) OnJobCompleted(ctx context.Context, job *storage.SyncJo
 	if job.JobType != storage.JobTypePatch && job.JobType != storage.JobTypeRead {
 		return
 	}
-	var target storage.AccessRequestStatus
+	var outcome workflow.Transition
 	switch job.Status {
 	case storage.JobStatusSucceeded:
-		target = storage.AccessRequestStatusExecuted
+		outcome = workflow.For(workflow.ActionExecute)
 	case storage.JobStatusFailed:
-		target = storage.AccessRequestStatusFailed
+		outcome = workflow.For(workflow.ActionFail)
 	default:
 		return
 	}
-	if err := s.requests.UpdateStatus(ctx, *job.RequestID, target); err != nil {
+	target := outcome.To
+	// Only an approved request can take the job outcome; anything else
+	// (already executed by a duplicate completion, or closed) is
+	// refused and audited below instead of being overwritten.
+	if err := s.requests.TransitionStatus(ctx, *job.RequestID, outcome.From, target); err != nil {
 		_ = s.audit.Append(ctx, &storage.AuditEvent{
 			Actor:         "system",
 			Action:        "request.transition_failed",
