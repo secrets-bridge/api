@@ -477,11 +477,14 @@ func (h *ProviderConnections) DiscoverNow(c fiber.Ctx) error {
 	}
 
 	corrID := uuid.New()
+	// The scope is the connection shape ({address, mount, ...}); the agent
+	// pins its connection and refuses those keys, so store only what it
+	// accepts.
 	payload := map[string]any{
-		"connection_id":         id.String(),
-		"target_provider_type":  string(row.Type),
-		"target_provider_config": row.Scope,
-		"cluster_name":          row.ClusterName,
+		"connection_id":          id.String(),
+		"target_provider_type":   string(row.Type),
+		"target_provider_config": services.AgentJobProviderConfig(string(row.Type), row.Scope),
+		"cluster_name":           row.ClusterName,
 	}
 	job, err := h.jobs.Enqueue(c.Context(), services.EnqueueRequest{
 		AgentScope:    map[string]any{"cluster": row.ClusterName},

@@ -1198,12 +1198,11 @@ func (s *RequestService) enqueueRequestJob(ctx context.Context, req *storage.Acc
 				return err
 			}
 		}
-		cfg := make(map[string]any, len(conn.Scope))
-		for k, v := range conn.Scope {
-			cfg[k] = v
-		}
+		// The connection scope is {address, mount, ...}; the agent pins its
+		// connection and fails a job that carries those keys, so pass only
+		// the keys it accepts (kvMount/kvPrefix for vault).
 		payload["target_provider_type"] = string(conn.Type)
-		payload["target_provider_config"] = cfg
+		payload["target_provider_config"] = AgentJobProviderConfig(string(conn.Type), conn.Scope)
 		payload["target_secret_ref"] = req.DestinationSecretRef
 		payload["target_keys"] = req.DestinationKeys
 		summaries, err := s.wraps.ListSummariesForRequest(ctx, req.ID)
