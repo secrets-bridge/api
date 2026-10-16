@@ -4,7 +4,6 @@ package services_test
 // Requires both TEST_DATABASE_URL and TEST_REDIS_URL; SKIPs otherwise.
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -208,16 +207,10 @@ func TestHeartbeat_CachesLastSeenInRedis(t *testing.T) {
 	// (best-effort), so under CI's race-detector slowdown the
 	// cache write occasionally races past a one-shot Scan. A
 	// bounded poll keeps the test as strict but stops flaking.
-	scanCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
 	pattern := "*:agent-lastseen:" + minted.ID.String()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		keys, _, err := rdb.Raw().Scan(scanCtx, 0, pattern, 50).Result()
-		if err != nil {
-			t.Fatalf("Scan: %v", err)
-		}
-		if len(keys) > 0 {
+		if scanCacheKey(t, rdb, pattern) > 0 {
 			return
 		}
 		if time.Now().After(deadline) {
@@ -319,11 +312,20 @@ func TestRevoke_InvalidatesCache(t *testing.T) {
 	}
 }
 
+// scanCacheKey counts the keys matching pattern across the WHOLE
+// keyspace. A single SCAN call only returns one cursor page, so on a
+// shared test Redis that already holds other tests' keys the match can
+// sit on a later page: a one-page scan then misses it (flaky "not
+// written") or reports a cold cache that isn't.
 func scanCacheKey(t *testing.T, rdb *runtime.Client, pattern string) int {
 	t.Helper()
-	keys, _, err := rdb.Raw().Scan(t.Context(), 0, pattern, 100).Result()
-	if err != nil {
+	n := 0
+	iter := rdb.Raw().Scan(t.Context(), 0, pattern, 500).Iterator()
+	for iter.Next(t.Context()) {
+		n++
+	}
+	if err := iter.Err(); err != nil {
 		t.Fatalf("Scan %q: %v", pattern, err)
 	}
-	return len(keys)
+	return n
 }
