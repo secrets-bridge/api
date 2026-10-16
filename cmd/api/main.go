@@ -516,6 +516,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// grants expand the same way as on the catalog read path.
 	requestsH = requestsH.
 		WithTenancyGate(projectSecretsRepo, secretsRepo, rbacResolver).
+		// API-S-03: an env-scoped binding only governs a request made in
+		// its own environment.
+		WithTenancyEnvironments(environmentRepo).
 		WithTeamScope(teamScopeResolver).
 		// Best-effort display-name enrichment for the approver verify
 		// panel (ui#87 follow-up) — team/project/env/connection names +

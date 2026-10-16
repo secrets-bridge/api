@@ -57,18 +57,25 @@ type boundSecret struct {
 }
 
 // projectBindingCandidates returns every (binding, catalog row) pair that
+// binds (providerType, secretRef) to projectID. Callers must have checked
+// that the repos are wired.
+func (s *RequestService) projectBindingCandidates(ctx context.Context, projectID uuid.UUID, providerType, secretRef string) ([]boundSecret, error) {
+	return findProjectBindings(ctx, s.bindings, s.secrets, projectID, providerType, secretRef)
+}
+
+// findProjectBindings returns every (binding, catalog row) pair that
 // binds (providerType, secretRef) to projectID, in catalog order
 // (cluster_name). The catalog identity is (cluster, provider_type, ref),
-// so the same ref discovered on two clusters can yield two candidates.
-// Callers must have checked that the repos are wired.
-func (s *RequestService) projectBindingCandidates(ctx context.Context, projectID uuid.UUID, providerType, secretRef string) ([]boundSecret, error) {
-	catalog, err := s.secrets.ListByRef(ctx, providerType, secretRef)
+// so the same ref discovered on two clusters can yield two candidates,
+// each bound to a different environment.
+func findProjectBindings(ctx context.Context, bindings storage.ProjectSecretRepository, secrets storage.SecretRepository, projectID uuid.UUID, providerType, secretRef string) ([]boundSecret, error) {
+	catalog, err := secrets.ListByRef(ctx, providerType, secretRef)
 	if err != nil {
 		return nil, fmt.Errorf("services: resolve catalog for binding: %w", err)
 	}
 	var out []boundSecret
 	for _, sec := range catalog {
-		b, err := s.bindings.Get(ctx, projectID, sec.ID)
+		b, err := bindings.Get(ctx, projectID, sec.ID)
 		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
 				continue
@@ -80,27 +87,47 @@ func (s *RequestService) projectBindingCandidates(ctx context.Context, projectID
 	return out, nil
 }
 
-// selectBinding picks the binding that governs a request in envID:
+// GoverningBinding returns the index of the binding that governs a
+// request made in envID, or -1 when none may govern it. This is the one
+// environment rule every binding gate uses (direct reveal, the per-env
+// request endpoint, the POST /requests tenancy gate, the reveal-session
+// allowlist):
 //
 //   - a binding scoped to envID wins;
 //   - otherwise a legacy binding with a NULL environment_id (pre-Slice-L3
-//     row) applies, and the URL environment keeps deciding exactly as it
-//     did before;
-//   - a binding scoped to a DIFFERENT environment never applies when
-//     strict. Non-strict callers (provider-config derivation for a row
-//     that was already authorized) fall back to the first candidate.
-func selectBinding(cands []boundSecret, envID *uuid.UUID, strict bool) *boundSecret {
+//     row) applies, and the request's environment keeps deciding exactly
+//     as it did before;
+//   - a binding scoped to a DIFFERENT environment never applies, and with
+//     no environment (envID nil) no env-scoped binding applies. A secret
+//     bound to prod therefore cannot be requested or revealed under a
+//     non-prod environment (API-S-03).
+func GoverningBinding(bindings []*storage.ProjectSecret, envID *uuid.UUID) int {
 	if envID != nil {
-		for i := range cands {
-			if e := cands[i].binding.EnvironmentID; e != nil && *e == *envID {
-				return &cands[i]
+		for i, b := range bindings {
+			if b.EnvironmentID != nil && *b.EnvironmentID == *envID {
+				return i
 			}
 		}
-		for i := range cands {
-			if cands[i].binding.EnvironmentID == nil {
-				return &cands[i]
-			}
+	}
+	for i, b := range bindings {
+		if b.EnvironmentID == nil {
+			return i
 		}
+	}
+	return -1
+}
+
+// selectBinding applies GoverningBinding to (binding, catalog row)
+// candidates. Non-strict callers (provider-config derivation for a row
+// that was already authorized) fall back to the first candidate when no
+// binding governs; strict callers get nil.
+func selectBinding(cands []boundSecret, envID *uuid.UUID, strict bool) *boundSecret {
+	bindings := make([]*storage.ProjectSecret, len(cands))
+	for i := range cands {
+		bindings[i] = cands[i].binding
+	}
+	if i := GoverningBinding(bindings, envID); i >= 0 {
+		return &cands[i]
 	}
 	if strict || len(cands) == 0 {
 		return nil

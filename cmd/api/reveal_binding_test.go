@@ -58,6 +58,9 @@ type revealBindingFx struct {
 	prod      uuid.UUID
 	requester uuid.UUID
 	cookie    string
+
+	uatWorkflow  uuid.UUID
+	prodWorkflow uuid.UUID
 }
 
 func bootstrapRevealBinding(t *testing.T) *revealBindingFx {
@@ -202,15 +205,37 @@ func bootstrapRevealBinding(t *testing.T) *revealBindingFx {
 	}); err != nil {
 		t.Fatalf("policy Create: %v", err)
 	}
+	fx.uatWorkflow = wf.ID
+
+	// Policy: tenant-a/prod gets a stricter workflow of its own, so a
+	// test can tell which environment's workflow a request was given.
+	prodWF := &storage.WorkflowDefinition{
+		Name: "rb-prod-wf", MinApprovers: 2, AllowSelfApproval: false,
+		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
+		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
+	}
+	if err := storage.NewWorkflows(pool).Create(ctx, prodWF); err != nil {
+		t.Fatalf("prod workflow Create: %v", err)
+	}
+	if err := storage.NewPolicies(pool).Create(ctx, &storage.PolicyRule{
+		Name:       "rb-prod",
+		Selector:   map[string]any{"project_id": project.ID.String(), "environment": "prod"},
+		WorkflowID: prodWF.ID,
+		Priority:   500,
+		Enabled:    true,
+	}); err != nil {
+		t.Fatalf("prod policy Create: %v", err)
+	}
+	fx.prodWorkflow = prodWF.ID
 
 	// Catalog rows + bindings.
 	discovered := map[string]any{"address": "https://vault.example.com", "kvMount": "kv", "kvPrefix": "team-alpha"}
 	secretsRepo := storage.NewSecrets(pool)
 	bindings := storage.NewProjectSecrets(pool)
-	seed := func(ref string, envID *uuid.UUID, keys []string, ops []string, bind bool) {
+	seedOn := func(cluster, ref string, envID *uuid.UUID, keys []string, ops []string, bind bool) {
 		t.Helper()
 		sec := &storage.Secret{
-			ClusterName: "tenant-a-uat", ProviderType: "vault", SecretRef: ref,
+			ClusterName: cluster, ProviderType: "vault", SecretRef: ref,
 			ProviderConfig: discovered, Status: storage.SecretStatusPresent,
 		}
 		if err := secretsRepo.Upsert(ctx, sec); err != nil {
@@ -226,11 +251,21 @@ func bootstrapRevealBinding(t *testing.T) *revealBindingFx {
 			t.Fatalf("Bind %s: %v", ref, err)
 		}
 	}
+	seed := func(ref string, envID *uuid.UUID, keys []string, ops []string, bind bool) {
+		t.Helper()
+		seedOn("tenant-a-uat", ref, envID, keys, ops, bind)
+	}
 	seed("team-alpha/uat/db", &uat.ID, []string{"DB_PASSWORD"}, []string{storage.OpRead}, true)
-	seed("team-alpha/uat/legacy", nil, nil, []string{storage.OpRead}, true)
+	seed("team-alpha/uat/legacy", nil, nil, []string{storage.OpRead, storage.OpPatch}, true)
 	seed("team-alpha/uat/patch", &uat.ID, nil, []string{storage.OpPatch}, true)
-	seed("team-alpha/prod/db", &prod.ID, nil, []string{storage.OpRead}, true)
+	seed("team-alpha/prod/db", &prod.ID, nil, []string{storage.OpRead, storage.OpPatch}, true)
 	seed("team-alpha/uat/unbound", nil, nil, nil, false)
+	// One ref discovered on two clusters: the prod-cluster row is bound to
+	// the prod env with every key allowed, the uat-cluster row to the uat
+	// env with only DB_PASSWORD. "tenant-a-prod" sorts first, so a gate
+	// that takes the first binding regardless of env picks the prod one.
+	seedOn("tenant-a-prod", "team-alpha/shared/db", &prod.ID, nil, []string{storage.OpRead}, true)
+	seedOn("tenant-a-uat", "team-alpha/shared/db", &uat.ID, []string{"DB_PASSWORD"}, []string{storage.OpRead}, true)
 	// Env-scoped bindings would block other packages' wipes that delete
 	// environments without clearing project_secrets first.
 	t.Cleanup(func() {
@@ -584,5 +619,198 @@ func TestDirectReveal_ProdStillRefusedAndAudited(t *testing.T) {
 	}
 	if n := fx.countRequests(t); n != 0 {
 		t.Errorf("access_requests rows = %d; want 0", n)
+	}
+}
+
+// wrapForAgent simulates the agent posting one wrap (fake value) for a
+// request, the way POST /agents/:id/wraps would after a read job.
+func (fx *revealBindingFx) wrapForAgent(t *testing.T, requestID, key string) {
+	t.Helper()
+	rid := uuid.MustParse(requestID)
+	if _, err := fx.wrapSvc.WrapByAgent(t.Context(), uuid.New(), services.WrapRequest{
+		Plaintext: []byte(rbFakeValue), RequestID: &rid, KeyName: key, TTL: 10 * time.Minute,
+	}); err != nil {
+		t.Fatalf("WrapByAgent %s: %v", key, err)
+	}
+}
+
+func (fx *revealBindingFx) openRevealSession(t *testing.T, requestID string) (int, map[string]any) {
+	t.Helper()
+	return fx.post(t, "/api/v1/reveal-sessions", map[string]any{"access_request_id": requestID})
+}
+
+func (fx *revealBindingFx) countWraps(t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := fx.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM secret_wraps w JOIN access_requests r ON r.id = w.request_id WHERE r.requester_id = $1`,
+		fx.requester.String()).Scan(&n); err != nil {
+		t.Fatalf("count wraps: %v", err)
+	}
+	return n
+}
+
+// API-S-03 on the generic request paths: the POST /requests tenancy gate
+// used to take the first binding regardless of environment, so a secret
+// bound only to prod could be requested (read or patch) under the
+// non-prod environment name and get that environment's laxer workflow.
+// An env-scoped binding now only governs in its own environment; a
+// NULL-environment binding keeps the old behaviour; and a request the
+// binding does allow gets the workflow of that environment.
+func TestRequests_ProdBoundRefUnderNonProdEnvRefused(t *testing.T) {
+	fx := bootstrapRevealBinding(t)
+	ctx := t.Context()
+
+	read := func(env, ref string) (int, map[string]any) {
+		b := map[string]any{
+			"requester_id":         fx.requester.String(),
+			"project_id":           fx.project.String(),
+			"target_provider_type": "vault",
+			"target_secret_ref":    ref,
+			"target_keys":          []string{"DB_PASSWORD"},
+			"justification":        "env-scoped tenancy regression",
+		}
+		if env != "" {
+			b["environment"] = env
+		}
+		return fx.post(t, "/api/v1/requests/read", b)
+	}
+
+	if st, body := read("uat", "team-alpha/prod/db"); st != http.StatusForbidden {
+		t.Errorf("read of prod-bound ref under env=uat = %d body=%v; want 403", st, body)
+	}
+	if st, body := read("", "team-alpha/prod/db"); st != http.StatusForbidden {
+		t.Errorf("read of prod-bound ref with no environment = %d body=%v; want 403", st, body)
+	}
+	if st, body := read("does-not-exist", "team-alpha/prod/db"); st != http.StatusForbidden {
+		t.Errorf("read of prod-bound ref under unknown env = %d body=%v; want 403", st, body)
+	}
+	st, body := fx.post(t, "/api/v1/requests", map[string]any{
+		"requester_id":         fx.requester.String(),
+		"project_id":           fx.project.String(),
+		"environment":          "uat",
+		"target_provider_type": "vault",
+		"target_secret_ref":    "team-alpha/prod/db",
+		"key_values":           map[string]string{"DB_PASSWORD": rbFakeValue},
+		"justification":        "env-scoped tenancy regression (patch)",
+	})
+	if st != http.StatusForbidden {
+		t.Errorf("patch of prod-bound ref under env=uat = %d body=%v; want 403", st, body)
+	}
+	if n := fx.countRequests(t); n != 0 {
+		t.Fatalf("access_requests rows = %d; want 0 after refusals", n)
+	}
+	if n := fx.countWraps(t); n != 0 {
+		t.Fatalf("secret_wraps rows = %d; want 0 after refusals", n)
+	}
+
+	// The binding's own environment is allowed, and the request gets that
+	// environment's workflow (the stricter prod one), not uat's.
+	st, resp := read("prod", "team-alpha/prod/db")
+	if st != http.StatusCreated {
+		t.Fatalf("read of prod-bound ref under env=prod = %d body=%v; want 201", st, resp)
+	}
+	reqID, _ := resp["id"].(string)
+	var envID, wfID uuid.UUID
+	if err := fx.pool.QueryRow(ctx,
+		`SELECT environment_id, workflow_id FROM access_requests WHERE id = $1`, reqID).Scan(&envID, &wfID); err != nil {
+		t.Fatalf("load request: %v", err)
+	}
+	if envID != fx.prod || wfID != fx.prodWorkflow {
+		t.Errorf("request env=%s workflow=%s; want prod env %s with prod workflow %s", envID, wfID, fx.prod, fx.prodWorkflow)
+	}
+
+	// Legacy NULL-environment binding: unchanged, with or without an env.
+	for _, env := range []string{"uat", ""} {
+		if st, resp := read(env, "team-alpha/uat/legacy"); st != http.StatusCreated {
+			t.Errorf("read of legacy NULL-env binding under env=%q = %d body=%v; want 201", env, st, resp)
+		}
+	}
+}
+
+// The reveal-session allowlist (second boundary) used to take the first
+// binding for the ref regardless of environment. With the same ref bound
+// to prod (every key) on one cluster and to uat (DB_PASSWORD only) on
+// another, a uat request bundling a non-allowlisted wrap was checked
+// against the prod binding and opened. It must use the binding of the
+// request's environment.
+func TestRevealSession_AllowlistUsesEnvMatchingBinding(t *testing.T) {
+	fx := bootstrapRevealBinding(t)
+
+	st, resp := fx.directReveal(t, fx.uat, revealBody("team-alpha/shared/db", "DB_PASSWORD"))
+	if st != http.StatusCreated {
+		t.Fatalf("direct reveal of shared ref under uat = %d body=%v; want 201", st, resp)
+	}
+	reqID, _ := resp["request_id"].(string)
+	fx.wrapForAgent(t, reqID, "DB_PASSWORD")
+	fx.wrapForAgent(t, reqID, "API_TOKEN") // outside the uat binding's allowlist
+
+	if st, body := fx.openRevealSession(t, reqID); st != http.StatusForbidden {
+		t.Fatalf("open reveal session with a non-allowlisted wrap = %d body=%v; want 403 (uat binding governs)", st, body)
+	}
+	if n := fx.countAudit(t, "reveal.session.refused_binding", "key_not_allowed"); n != 1 {
+		t.Errorf("reveal.session.refused_binding/key_not_allowed audit rows = %d; want 1", n)
+	}
+
+	// Control: the same ref with only the allowlisted wrap opens fine.
+	st, resp = fx.directReveal(t, fx.uat, revealBody("team-alpha/shared/db", "DB_PASSWORD"))
+	if st != http.StatusCreated {
+		t.Fatalf("second direct reveal = %d body=%v; want 201", st, resp)
+	}
+	okID, _ := resp["request_id"].(string)
+	fx.wrapForAgent(t, okID, "DB_PASSWORD")
+	if st, body := fx.openRevealSession(t, okID); st != http.StatusCreated {
+		t.Errorf("open reveal session with only allowlisted wraps = %d body=%v; want 201", st, body)
+	}
+}
+
+// Fail closed at the unwrap boundary: when no binding governs the
+// request's environment any more (re-scoped to another environment, or
+// removed after submit), the reveal session is refused and audited.
+func TestRevealSession_FailsClosedWhenNoBindingGoverns(t *testing.T) {
+	fx := bootstrapRevealBinding(t)
+	ctx := t.Context()
+
+	st, resp := fx.directReveal(t, fx.uat, revealBody("team-alpha/uat/db", "DB_PASSWORD"))
+	if st != http.StatusCreated {
+		t.Fatalf("direct reveal = %d body=%v; want 201", st, resp)
+	}
+	reqID, _ := resp["request_id"].(string)
+	fx.wrapForAgent(t, reqID, "DB_PASSWORD")
+
+	// Re-scope the binding to prod after submit.
+	if _, err := fx.pool.Exec(ctx,
+		`UPDATE project_secrets SET environment_id = $1
+		  WHERE project_id = $2 AND secret_id = (SELECT id FROM secrets WHERE secret_ref = 'team-alpha/uat/db')`,
+		fx.prod, fx.project); err != nil {
+		t.Fatalf("re-scope binding: %v", err)
+	}
+	if st, body := fx.openRevealSession(t, reqID); st != http.StatusForbidden {
+		t.Errorf("open after binding re-scoped to prod = %d body=%v; want 403", st, body)
+	}
+	if n := fx.countAudit(t, "reveal.session.refused_binding", "binding_env_mismatch"); n != 1 {
+		t.Errorf("refused_binding/binding_env_mismatch audit rows = %d; want 1", n)
+	}
+
+	// Remove the binding entirely.
+	if _, err := fx.pool.Exec(ctx,
+		`DELETE FROM project_secrets
+		  WHERE project_id = $1 AND secret_id = (SELECT id FROM secrets WHERE secret_ref = 'team-alpha/uat/db')`,
+		fx.project); err != nil {
+		t.Fatalf("unbind: %v", err)
+	}
+	if st, body := fx.openRevealSession(t, reqID); st != http.StatusForbidden {
+		t.Errorf("open after binding removed = %d body=%v; want 403", st, body)
+	}
+	if n := fx.countAudit(t, "reveal.session.refused_binding", "secret_not_bound"); n != 1 {
+		t.Errorf("refused_binding/secret_not_bound audit rows = %d; want 1", n)
+	}
+
+	var sessions int
+	if err := fx.pool.QueryRow(ctx, `SELECT count(*) FROM reveal_sessions WHERE access_request_id = $1`, reqID).Scan(&sessions); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if sessions != 0 {
+		t.Errorf("reveal_sessions rows = %d; want 0", sessions)
 	}
 }

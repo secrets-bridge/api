@@ -210,9 +210,29 @@ func (s *RevealSessionService) Open(ctx context.Context, in OpenInput) (*RevealS
 		return nil, ErrAllWrapsConsumed
 	}
 
-	// Second-boundary allowlist gate: refuse to bundle a session if any
+	// Second-boundary allowlist gate: refuse to bundle a session if the
+	// request's secret is no longer bound in its environment, or any
 	// unconsumed wrap names a key outside the binding's allowed_keys.
-	if err := s.enforceWrapAllowlist(ctx, req, fresh); err != nil {
+	if reason, err := s.enforceWrapAllowlist(ctx, req, fresh); err != nil {
+		if reason != "" {
+			projectIDStr, _ := req.TargetScope["project_id"].(string)
+			_ = s.audit.Append(ctx, &storage.AuditEvent{
+				Actor:         "user:" + in.UserID,
+				Action:        "reveal.session.refused_binding",
+				Resource:      "request:" + req.ID.String(),
+				Status:        storage.AuditStatusFailure,
+				CorrelationID: req.ID,
+				Metadata: map[string]any{
+					"request_id":           req.ID.String(),
+					"environment_id":       req.EnvironmentID.String(),
+					"project_id":           projectIDStr,
+					"target_provider_type": req.TargetProviderType,
+					"target_secret_ref":    req.TargetSecretRef,
+					"wrap_count":           len(fresh),
+					"refusal_reason":       reason,
+				},
+			})
+		}
 		return nil, err
 	}
 
@@ -378,47 +398,51 @@ func clampRevealTTL(ttl int) int {
 	return ttl
 }
 
-// enforceWrapAllowlist refuses the reveal when any bundled wrap names a
-// key outside the project_secrets binding's allowed_keys. When the
-// allowlist repos aren't wired, the request carries no provider/ref, or
-// no binding exists for the request's (project, provider_type,
-// secret_ref), the check is skipped — there is nothing to enforce
-// against. A nil AllowedKeys means "all keys allowed".
-func (s *RevealSessionService) enforceWrapAllowlist(ctx context.Context, req *storage.AccessRequest, wraps []storage.WrapSummary) error {
+// enforceWrapAllowlist refuses the reveal when the request's secret has
+// no binding that governs it in the request's environment, or when any
+// bundled wrap names a key outside that binding's allowed_keys. The
+// binding is picked with the same environment rule as the submit gates
+// (GoverningBinding): the binding scoped to the request's environment,
+// else a legacy NULL-environment binding; a binding scoped to another
+// environment never applies. No governing binding → ErrSecretNotBound
+// (fail closed: a binding removed or re-scoped after submit stops the
+// reveal). A nil AllowedKeys means "all keys allowed".
+//
+// Skipped when the allowlist repos aren't wired (legacy tests) or the
+// request carries no provider/ref (cross_team: its destination keys are
+// re-checked at the fill and execute boundaries, api#169). Returns the
+// audit refusal reason alongside the error.
+func (s *RevealSessionService) enforceWrapAllowlist(ctx context.Context, req *storage.AccessRequest, wraps []storage.WrapSummary) (string, error) {
 	if s.bindings == nil || s.secrets == nil {
-		return nil
+		return "", nil
 	}
 	if req.TargetProviderType == "" || req.TargetSecretRef == "" {
-		return nil
+		return "", nil
 	}
 	projectID, err := projectIDFromRequest(req)
 	if err != nil {
-		return fmt.Errorf("services: project_id from request: %w", err)
+		return "", fmt.Errorf("services: project_id from request: %w", err)
 	}
-	catalog, err := s.secrets.ListByRef(ctx, req.TargetProviderType, req.TargetSecretRef)
+	cands, err := findProjectBindings(ctx, s.bindings, s.secrets, projectID, req.TargetProviderType, req.TargetSecretRef)
 	if err != nil {
-		return fmt.Errorf("services: resolve catalog for allowlist: %w", err)
+		return "", err
 	}
-	var binding *storage.ProjectSecret
-	for _, sec := range catalog {
-		b, err := s.bindings.Get(ctx, projectID, sec.ID)
-		if err == nil {
-			binding = b
-			break
+	sel := selectBinding(cands, req.EnvironmentID, true)
+	if sel == nil {
+		if len(cands) > 0 {
+			return bindingRefusalEnvMismatch, ErrSecretNotBound
 		}
-		if !errors.Is(err, storage.ErrNotFound) {
-			return fmt.Errorf("services: resolve binding for allowlist: %w", err)
-		}
+		return bindingRefusalNotBound, ErrSecretNotBound
 	}
-	if binding == nil || binding.AllowedKeys == nil {
-		return nil
+	if sel.binding.AllowedKeys == nil {
+		return "", nil
 	}
 	for _, w := range wraps {
-		if !keyInAllowlist(binding.AllowedKeys, w.KeyName) {
-			return fmt.Errorf("%w: %q", ErrKeyNotAllowed, w.KeyName)
+		if !keyInAllowlist(sel.binding.AllowedKeys, w.KeyName) {
+			return bindingRefusalKeyNotAllowed, fmt.Errorf("%w: %q", ErrKeyNotAllowed, w.KeyName)
 		}
 	}
-	return nil
+	return "", nil
 }
 
 // projectIDFromRequest pulls the project_id out of TargetScope. Open
