@@ -412,6 +412,53 @@ func TestApprove_BindingNarrowedAfterSubmitFailsRequest(t *testing.T) {
 	}
 }
 
+// A patch refused at approve keeps no long-lived wraps: approve sets them
+// to WrapTTLApproved (1h here) before the enqueue, and the refusal caps
+// them at 5 minutes like Reject and Cancel. Before the fix they stayed at
+// the approved TTL.
+func TestApprove_UnboundPatchShortensWraps(t *testing.T) {
+	reqSvc, pool, envRepo, workflows, policies := buildL3Harness(t)
+	ctx := t.Context()
+	projectID := makeProjectForSvc(t, pool, "b1-wrapttl")
+	uat := newUATEnv(t, envRepo, projectID)
+	seedApproveRule(t, workflows, policies, projectID, "b1-wrapttl")
+	sec := bindSecretToEnv(t, pool, uat, "team-alpha/uat/wrapttl", nil)
+
+	req, err := reqSvc.Submit(ctx, services.PatchInput{
+		RequesterID: "b1-wrapttl@example.com", ProjectID: projectID.String(), Environment: "uat",
+		TargetProviderType: "vault", TargetSecretRef: "team-alpha/uat/wrapttl",
+		KeyValues:     map[string][]byte{"DB_PASSWORD": []byte("not-a-real-value"), "DB_USER": []byte("not-a-real-user")},
+		Justification: "patch refused at approve",
+	})
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	// the binding goes read-only before anyone approves
+	if err := storage.NewProjectSecrets(pool).Update(ctx, projectID, sec.ID, nil, []string{storage.OpRead}, nil); err != nil {
+		t.Fatalf("narrow binding: %v", err)
+	}
+	got, err := reqSvc.Approve(ctx, req.ID, "approver-"+uuid.NewString()[:8], "ok")
+	if err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if got.Status != storage.AccessRequestStatusFailed {
+		t.Fatalf("status = %s; want failed", got.Status)
+	}
+
+	var wraps int
+	var latest time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*), coalesce(max(expires_at), now()) FROM secret_wraps WHERE request_id = $1`, req.ID).Scan(&wraps, &latest); err != nil {
+		t.Fatalf("read wraps: %v", err)
+	}
+	if wraps != 2 {
+		t.Fatalf("wraps = %d; want 2", wraps)
+	}
+	if limit := time.Now().Add(5*time.Minute + 30*time.Second); latest.After(limit) {
+		t.Errorf("latest wrap expires in %s; want <= 5m after the refusal", time.Until(latest).Round(time.Second))
+	}
+}
+
 // A legacy binding with no environment still governs, with or without an
 // environment on the request, so approve dispatches as before.
 func TestApprove_LegacyNullEnvBindingDispatches(t *testing.T) {
