@@ -50,6 +50,11 @@ type DevSecrets struct {
 	secrets         storage.SecretRepository
 	requests        *services.RequestService
 	readScope       projectReadScope
+
+	// Optional caller-scope check for SubmitEnvRequest (step 1 of the
+	// POST /requests tenancy gate). Wire via WithScope; nil skips it.
+	resolver  auth.Resolver
+	teamScope auth.TeamScopeResolver
 }
 
 // NewDevSecrets binds the handler.
@@ -74,6 +79,16 @@ func NewDevSecrets(
 // cover the project gets 404. Returns the handler for chaining.
 func (h *DevSecrets) WithReadScope(r auth.Resolver, tr auth.TeamScopeResolver) *DevSecrets {
 	h.readScope = newProjectReadScope(r, tr)
+	return h
+}
+
+// WithScope wires the caller-scope check SubmitEnvRequest runs before
+// the service-level binding gate: the caller's secret.request grant must
+// cover the URL project (the same step 1 POST /requests/read runs in
+// checkTenancy). Team-scoped grants expand through tr when set.
+func (h *DevSecrets) WithScope(r auth.Resolver, tr auth.TeamScopeResolver) *DevSecrets {
+	h.resolver = r
+	h.teamScope = tr
 	return h
 }
 
@@ -170,13 +185,16 @@ func (h *DevSecrets) ListEnvSecrets(c fiber.Ctx) error {
 
 // DevRequestBody is the input shape for both SubmitEnvRequest and
 // DirectReveal. The URL provides project + env_id; the body carries
-// provider details + justification + (optional) target keys.
+// provider type + secret ref + justification + (optional) target keys.
+//
+// A `target_provider_config` field in the body is ignored (API-S-04):
+// the agent honours kvMount/kvPrefix from a job payload, so the job's
+// provider config is derived from the bound catalog row instead.
 type DevRequestBody struct {
-	TargetProviderType   string         `json:"target_provider_type"`
-	TargetProviderConfig map[string]any `json:"target_provider_config"`
-	TargetSecretRef      string         `json:"target_secret_ref"`
-	TargetKeys           []string       `json:"target_keys"`
-	Justification        string         `json:"justification"`
+	TargetProviderType string   `json:"target_provider_type"`
+	TargetSecretRef    string   `json:"target_secret_ref"`
+	TargetKeys         []string `json:"target_keys"`
+	Justification      string   `json:"justification"`
 }
 
 // DevRequestResponse is the shape returned by SubmitEnvRequest +
@@ -192,9 +210,14 @@ type DevRequestResponse struct {
 }
 
 // SubmitEnvRequest handles POST /projects/:id/environments/:env_id/request.
-// Wraps the existing RequestService.SubmitRead with project_id +
-// env name resolved from the URL. The standard approval lifecycle
-// applies — the request lands in `pending`.
+// Submits a read request for the project + environment in the URL. The
+// standard approval lifecycle applies — the request lands in `pending`.
+//
+// It runs the same tenancy gate as POST /requests/read (api#154): the
+// caller's secret.request must cover the project, the secret must be
+// bound for read to this project in this environment, and every key must
+// be inside a restrictive allowlist (RequestService.SubmitEnvRead).
+// Refusals use the same stable 403 bodies as checkTenancy.
 func (h *DevSecrets) SubmitEnvRequest(c fiber.Ctx) error {
 	projectID, envID, err := parseProjectAndEnv(c)
 	if err != nil {
@@ -221,21 +244,37 @@ func (h *DevSecrets) SubmitEnvRequest(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "justification is required")
 	}
 
-	req, err := h.requests.SubmitRead(c.Context(), services.ReadInput{
-		RequesterID:          requesterID,
-		ProjectID:            projectID.String(),
-		Environment:          env.Name,
-		TargetProviderType:   body.TargetProviderType,
-		TargetProviderConfig: body.TargetProviderConfig,
-		TargetSecretRef:      body.TargetSecretRef,
-		TargetKeys:           body.TargetKeys,
-		Justification:        body.Justification,
+	if h.resolver != nil {
+		access, err := auth.EffectiveProjectAccess(c.Context(), requesterID, auth.PermSecretRequest, h.resolver, h.teamScope)
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+		}
+		if !access.Covers(projectID) {
+			return fiber.NewError(fiber.StatusForbidden, "out_of_scope_project")
+		}
+	}
+
+	req, err := h.requests.SubmitEnvRead(c.Context(), services.EnvReadInput{
+		RequesterID:        requesterID,
+		Environment:        env,
+		TargetProviderType: body.TargetProviderType,
+		TargetSecretRef:    body.TargetSecretRef,
+		TargetKeys:         body.TargetKeys,
+		Justification:      body.Justification,
 	})
 	if err != nil {
-		if errors.Is(err, services.ErrInvalidInput) {
+		switch {
+		case errors.Is(err, services.ErrInvalidInput):
 			return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		case errors.Is(err, services.ErrSecretNotBound):
+			return fiber.NewError(fiber.StatusForbidden, "out_of_scope_project")
+		case errors.Is(err, services.ErrBindingOpNotAllowed):
+			return fiber.NewError(fiber.StatusForbidden, "out_of_scope_op")
+		case errors.Is(err, services.ErrKeyNotAllowed):
+			return fiber.NewError(fiber.StatusForbidden, "out_of_scope_key")
+		default:
+			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 		}
-		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 	return c.Status(fiber.StatusCreated).JSON(DevRequestResponse{
 		RequestID: req.ID.String(),
@@ -277,13 +316,12 @@ func (h *DevSecrets) DirectReveal(c fiber.Ctx) error {
 	}
 
 	req, err := h.requests.SubmitDirectReveal(c.Context(), services.DirectRevealInput{
-		RequesterID:          requesterID,
-		Environment:          env,
-		TargetProviderType:   body.TargetProviderType,
-		TargetProviderConfig: body.TargetProviderConfig,
-		TargetSecretRef:      body.TargetSecretRef,
-		TargetKeys:           body.TargetKeys,
-		Justification:        body.Justification,
+		RequesterID:        requesterID,
+		Environment:        env,
+		TargetProviderType: body.TargetProviderType,
+		TargetSecretRef:    body.TargetSecretRef,
+		TargetKeys:         body.TargetKeys,
+		Justification:      body.Justification,
 	})
 	if err != nil {
 		switch {
@@ -293,6 +331,11 @@ func (h *DevSecrets) DirectReveal(c fiber.Ctx) error {
 			return fiber.NewError(fiber.StatusForbidden, "direct reveal is not permitted on prod environments")
 		case errors.Is(err, services.ErrDirectRevealNotAllowed):
 			return fiber.NewError(fiber.StatusForbidden, "matched policy does not permit direct reveal")
+		case errors.Is(err, services.ErrSecretNotBound), errors.Is(err, services.ErrBindingOpNotAllowed):
+			// One generic message for "not bound", "bound to another
+			// environment" and "bound without read"; the audit row
+			// (secret.reveal.direct.refused_binding) has the reason.
+			return fiber.NewError(fiber.StatusForbidden, "secret is not available for reveal in this environment")
 		case errors.Is(err, services.ErrKeyNotAllowed):
 			return fiber.NewError(fiber.StatusForbidden, "requested key is not permitted by the binding allowlist")
 		default:

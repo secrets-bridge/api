@@ -47,6 +47,12 @@ type Requests struct {
 	resolver  auth.Resolver
 	teamScope auth.TeamScopeResolver
 
+	// tenancyEnvs resolves the body's (project_id, environment name) so
+	// the tenancy gate can apply the binding's environment scope. Unwired
+	// = no environment can be resolved, so only NULL-environment
+	// bindings can govern (fail closed for env-scoped bindings).
+	tenancyEnvs envByName
+
 	// Optional display-name resolvers (ui#87 follow-up). Narrow Get-only
 	// slices of the respective repositories; all best-effort.
 	teamNames teamNamer
@@ -75,6 +81,11 @@ type userNamer interface {
 	Get(context.Context, uuid.UUID) (*storage.LocalUser, error)
 }
 
+// envByName is the narrow environment lookup the tenancy gate needs.
+type envByName interface {
+	GetByProjectAndName(ctx context.Context, projectID uuid.UUID, name string) (*storage.Environment, error)
+}
+
 // NewRequests binds a handler to its service.
 func NewRequests(svc *services.RequestService) *Requests { return &Requests{svc: svc} }
 
@@ -85,6 +96,15 @@ func (h *Requests) WithTenancyGate(b storage.ProjectSecretRepository, s storage.
 	h.bindings = b
 	h.secrets = s
 	h.resolver = r
+	return h
+}
+
+// WithTenancyEnvironments wires the environment lookup the tenancy gate
+// uses to honour a binding's environment scope (API-S-03 on POST
+// /requests + /requests/read): an env-scoped binding only governs a
+// request made in its own environment.
+func (h *Requests) WithTenancyEnvironments(e envByName) *Requests {
+	h.tenancyEnvs = e
 	return h
 }
 
@@ -175,8 +195,14 @@ func requestErr(err error) error {
 		return fiber.NewError(fiber.StatusConflict, "request is not pending")
 	case errors.Is(err, services.ErrNotRequester):
 		return fiber.NewError(fiber.StatusForbidden, "only the original requester can cancel")
-	case errors.Is(err, services.ErrOutOfScopeProject):
+	case errors.Is(err, services.ErrOutOfScopeProject), errors.Is(err, services.ErrSecretNotBound):
+		// ErrSecretNotBound: no binding governs the request in its
+		// environment. Same body checkTenancy returns for that case.
 		return fiber.NewError(fiber.StatusForbidden, "out_of_scope_project")
+	case errors.Is(err, services.ErrBindingOpNotAllowed):
+		return fiber.NewError(fiber.StatusForbidden, "out_of_scope_op")
+	case errors.Is(err, services.ErrKeyNotAllowed):
+		return fiber.NewError(fiber.StatusForbidden, "out_of_scope_key")
 	case errors.Is(err, services.ErrNoDefaultWorkflow):
 		return fiber.NewError(fiber.StatusInternalServerError, "no policy matched and no default workflow exists")
 	case errors.Is(err, storage.ErrNotFound):
@@ -197,14 +223,16 @@ func requestErr(err error) error {
 // There is deliberately no requester field: the requester is the
 // authenticated session identity (API-N-02). A `requester_id` the SPA
 // still sends is ignored by the decoder.
+//
+// A `target_provider_config` field in the body is ignored (API-S-04):
+// the job's provider config is derived from the bound catalog row.
 type SubmitRequestBody struct {
-	ProjectID            string            `json:"project_id,omitempty"`
-	Environment          string            `json:"environment,omitempty"`
-	TargetProviderType   string            `json:"target_provider_type"`
-	TargetProviderConfig map[string]any    `json:"target_provider_config,omitempty"`
-	TargetSecretRef      string            `json:"target_secret_ref"`
-	KeyValues            map[string]string `json:"key_values"`
-	Justification        string            `json:"justification"`
+	ProjectID          string            `json:"project_id,omitempty"`
+	Environment        string            `json:"environment,omitempty"`
+	TargetProviderType string            `json:"target_provider_type"`
+	TargetSecretRef    string            `json:"target_secret_ref"`
+	KeyValues          map[string]string `json:"key_values"`
+	Justification      string            `json:"justification"`
 }
 
 // Submit handles POST /requests.
@@ -243,19 +271,18 @@ func (h *Requests) Submit(c fiber.Ctx) error {
 	for k := range kv {
 		keysForCheck = append(keysForCheck, k)
 	}
-	if err := h.checkTenancy(c, body.ProjectID, body.TargetProviderType, body.TargetSecretRef, keysForCheck, storage.OpPatch); err != nil {
+	if err := h.checkTenancy(c, body.ProjectID, body.Environment, body.TargetProviderType, body.TargetSecretRef, keysForCheck, storage.OpPatch); err != nil {
 		return err
 	}
 
 	req, err := h.svc.Submit(c.Context(), services.PatchInput{
-		RequesterID:          requesterID,
-		ProjectID:            body.ProjectID,
-		Environment:          body.Environment,
-		TargetProviderType:   body.TargetProviderType,
-		TargetProviderConfig: body.TargetProviderConfig,
-		TargetSecretRef:      body.TargetSecretRef,
-		KeyValues:            kv,
-		Justification:        body.Justification,
+		RequesterID:        requesterID,
+		ProjectID:          body.ProjectID,
+		Environment:        body.Environment,
+		TargetProviderType: body.TargetProviderType,
+		TargetSecretRef:    body.TargetSecretRef,
+		KeyValues:          kv,
+		Justification:      body.Justification,
 	})
 	if err != nil {
 		return requestErr(err)
@@ -476,14 +503,15 @@ func (h *Requests) Reject(c fiber.Ctx) error {
 // to VIEW one or more keys from a provider secret. No values are sent —
 // the agent will fetch them after approval. Like SubmitRequestBody it has
 // no requester field; the requester is the session identity (API-N-02).
+//
+// A `target_provider_config` field in the body is ignored (API-S-04).
 type SubmitReadRequestBody struct {
-	ProjectID            string         `json:"project_id,omitempty"`
-	Environment          string         `json:"environment,omitempty"`
-	TargetProviderType   string         `json:"target_provider_type"`
-	TargetProviderConfig map[string]any `json:"target_provider_config,omitempty"`
-	TargetSecretRef      string         `json:"target_secret_ref"`
-	TargetKeys           []string       `json:"target_keys,omitempty"`
-	Justification        string         `json:"justification"`
+	ProjectID          string   `json:"project_id,omitempty"`
+	Environment        string   `json:"environment,omitempty"`
+	TargetProviderType string   `json:"target_provider_type"`
+	TargetSecretRef    string   `json:"target_secret_ref"`
+	TargetKeys         []string `json:"target_keys,omitempty"`
+	Justification      string   `json:"justification"`
 }
 
 // SubmitRead handles POST /requests/read. The requester is the session
@@ -497,18 +525,17 @@ func (h *Requests) SubmitRead(c fiber.Ctx) error {
 	if err := c.Bind().JSON(&body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
 	}
-	if err := h.checkTenancy(c, body.ProjectID, body.TargetProviderType, body.TargetSecretRef, body.TargetKeys, storage.OpRead); err != nil {
+	if err := h.checkTenancy(c, body.ProjectID, body.Environment, body.TargetProviderType, body.TargetSecretRef, body.TargetKeys, storage.OpRead); err != nil {
 		return err
 	}
 	req, err := h.svc.SubmitRead(c.Context(), services.ReadInput{
-		RequesterID:          requesterID,
-		ProjectID:            body.ProjectID,
-		Environment:          body.Environment,
-		TargetProviderType:   body.TargetProviderType,
-		TargetProviderConfig: body.TargetProviderConfig,
-		TargetSecretRef:      body.TargetSecretRef,
-		TargetKeys:           body.TargetKeys,
-		Justification:        body.Justification,
+		RequesterID:        requesterID,
+		ProjectID:          body.ProjectID,
+		Environment:        body.Environment,
+		TargetProviderType: body.TargetProviderType,
+		TargetSecretRef:    body.TargetSecretRef,
+		TargetKeys:         body.TargetKeys,
+		Justification:      body.Justification,
 	})
 	if err != nil {
 		return requestErr(err)
@@ -581,6 +608,11 @@ func retrieveUserWrapErr(err error) error {
 		return fiber.NewError(fiber.StatusConflict, "request not retrievable in current state")
 	case errors.Is(err, services.ErrNotRequestOwner):
 		return fiber.NewError(fiber.StatusForbidden, "only the original requester may retrieve")
+	case errors.Is(err, services.ErrRevealSessionRequired):
+		return fiber.NewError(fiber.StatusForbidden, "this wrap can only be revealed inside an open reveal session")
+	case errors.Is(err, services.ErrSecretNotBound), errors.Is(err, services.ErrKeyNotAllowed):
+		// Generic on purpose; the audit row has the reason.
+		return fiber.NewError(fiber.StatusForbidden, "this wrap is not permitted by the binding for its environment")
 	default:
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
@@ -804,10 +836,21 @@ func approvalToBody(a *storage.Approval) ApprovalBody {
 //   - body.project_id missing/invalid  → 400
 //   - caller scoped but project_id not in their access set → 403
 //   - secret_ref not bound to project_id                    → 403
+//   - only bindings scoped to another environment than the
+//     body's `environment` (or no environment given)        → 403
+//     (services.GoverningBinding: an env-scoped binding only
+//     governs in its own environment; a NULL-environment
+//     binding keeps the old behaviour. The service resolves
+//     the same environment name for the workflow/policy
+//     lookup, so the workflow is the one for the environment
+//     the binding allows — API-S-03)
 //   - any requested key not in binding.allowed_keys         → 403
+//   - no key named against a restrictive allowed_keys       → 403
+//     (an empty read target_keys means "every key", which
+//     would bypass the allowlist; same rule as direct reveal)
 //   - op not in binding.allowed_ops                         → 403
 //   - happy path                                            → nil
-func (h *Requests) checkTenancy(c fiber.Ctx, projectIDRaw, providerType, secretRef string, requestedKeys []string, op string) error {
+func (h *Requests) checkTenancy(c fiber.Ctx, projectIDRaw, envName, providerType, secretRef string, requestedKeys []string, op string) error {
 	if h.bindings == nil || h.secrets == nil || h.resolver == nil {
 		return nil
 	}
@@ -834,40 +877,57 @@ func (h *Requests) checkTenancy(c fiber.Ctx, projectIDRaw, providerType, secretR
 		}
 	}
 
-	// Step 2: find a binding for (project, provider_type, secret_ref).
+	// Step 2: find the binding that governs (project, provider_type,
+	// secret_ref) in the request's environment.
 	//
 	// The catalog row identity is (cluster_name, provider_type, secret_ref);
-	// the same ref can exist on multiple clusters. Look up every match
-	// and accept the first row that has a binding to this project.
+	// the same ref can exist on multiple clusters, each bound to a
+	// different environment. Collect every binding this project holds on
+	// a matching row, then pick by environment (API-S-03): the binding
+	// scoped to the request's environment, else a NULL-environment one.
+	// A binding scoped to another environment never governs, so a
+	// prod-bound secret can't be requested under a non-prod environment
+	// name to get that environment's laxer workflow.
 	secrets, err := h.secrets.ListByRef(c.Context(), providerType, secretRef)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
-	if len(secrets) == 0 {
-		return fiber.NewError(fiber.StatusForbidden, "out_of_scope_project")
-	}
-	var binding *storage.ProjectSecret
+	var bound []*storage.ProjectSecret
 	for _, s := range secrets {
 		b, err := h.bindings.Get(c.Context(), projectID, s.ID)
 		if err == nil {
-			binding = b
-			break
+			bound = append(bound, b)
+			continue
 		}
 		if !errors.Is(err, storage.ErrNotFound) {
 			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 		}
 	}
-	if binding == nil {
+	if len(bound) == 0 {
 		return fiber.NewError(fiber.StatusForbidden, "out_of_scope_project")
 	}
+	envID, err := h.tenancyEnvID(c, projectID, envName)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	idx := services.GoverningBinding(bound, envID)
+	if idx < 0 {
+		return fiber.NewError(fiber.StatusForbidden, "out_of_scope_project")
+	}
+	binding := bound[idx]
 
 	// Step 3: requested op allowed?
 	if !containsString(binding.AllowedOps, op) {
 		return fiber.NewError(fiber.StatusForbidden, "out_of_scope_op")
 	}
 
-	// Step 4: every requested key in allowed_keys (when non-null)?
+	// Step 4: every requested key in allowed_keys (when non-null)? An
+	// empty key list against a restrictive allowlist is refused: the read
+	// executor treats it as "every key in the bundle".
 	if binding.AllowedKeys != nil {
+		if len(requestedKeys) == 0 {
+			return fiber.NewError(fiber.StatusForbidden, "out_of_scope_key")
+		}
 		for _, k := range requestedKeys {
 			if !containsString(binding.AllowedKeys, k) {
 				return fiber.NewError(fiber.StatusForbidden, "out_of_scope_key")
@@ -875,6 +935,25 @@ func (h *Requests) checkTenancy(c fiber.Ctx, projectIDRaw, providerType, secretR
 		}
 	}
 	return nil
+}
+
+// tenancyEnvID resolves the body's environment name within the project
+// the same way RequestService does for the workflow lookup
+// (GetByProjectAndName). nil when no name was given, the lookup isn't
+// wired, or the name doesn't exist in the project — in all three cases
+// only a NULL-environment binding can govern the request.
+func (h *Requests) tenancyEnvID(c fiber.Ctx, projectID uuid.UUID, envName string) (*uuid.UUID, error) {
+	if envName == "" || h.tenancyEnvs == nil {
+		return nil, nil
+	}
+	env, err := h.tenancyEnvs.GetByProjectAndName(c.Context(), projectID, envName)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &env.ID, nil
 }
 
 func containsString(set []string, target string) bool {

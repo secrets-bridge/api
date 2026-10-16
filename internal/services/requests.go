@@ -79,12 +79,16 @@ type RequestService struct {
 	ctProvConns    CrossTeamProviderConnectionLookup
 	ctDestBindings CrossTeamDestinationBindingLookup
 
-	// Project-binding allowlist gate. Both nil = no allowed_keys
-	// enforcement on the direct-reveal path (legacy tests). Wire via
-	// WithProjectBindings from main so a direct reveal cannot name a
-	// key outside the binding's allowed_keys allowlist.
+	// Project-binding gate + provider-config source. Wire via
+	// WithProjectBindings from main. Both nil = direct reveal and the
+	// per-env request fail closed (no binding can be proven), cross-team
+	// allowlist checks are skipped, and jobs get an empty provider config.
 	bindings storage.ProjectSecretRepository
 	secrets  storage.SecretRepository
+
+	// Reveal-session gate on the single-wrap retrieve (API-S-20). nil =
+	// off (legacy tests). Wire via WithRevealSessionGate from main.
+	revealGate RevealSessionGate
 }
 
 // NewRequestService wires a RequestService to its dependencies. The
@@ -121,10 +125,11 @@ func (s *RequestService) WithGitOps(g GitOpsStarter) *RequestService {
 }
 
 // WithProjectBindings wires the project_secrets + secrets-catalog
-// repositories so SubmitDirectReveal enforces the binding's
-// allowed_keys allowlist before creating the auto-approved request.
-// When either is nil the enforcement is skipped (back-compat for tests
-// that never build a catalog). Returns the service for chaining.
+// repositories. SubmitDirectReveal and SubmitEnvRead REQUIRE a read
+// binding through them and fail closed when they are not wired; the
+// cross-team allowlist checks skip when unwired (back-compat). They also
+// feed the job-payload provider config derivation (empty config when
+// unwired). Returns the service for chaining.
 func (s *RequestService) WithProjectBindings(bindings storage.ProjectSecretRepository, secrets storage.SecretRepository) *RequestService {
 	s.bindings = bindings
 	s.secrets = secrets
@@ -182,15 +187,18 @@ func (s *RequestService) WithApproverScope(r auth.Resolver, tr auth.TeamScopeRes
 //
 // KeyValues is map[keyName]plaintext. The service zeroes each entry
 // after wrapping; callers MUST NOT reuse the slices.
+//
+// There is deliberately no provider config field: the config a job
+// carries is derived from the bound catalog row, never taken from the
+// requester (API-S-04).
 type PatchInput struct {
-	RequesterID          string
-	ProjectID            string
-	Environment          string
-	TargetProviderType   string
-	TargetProviderConfig map[string]any
-	TargetSecretRef      string
-	KeyValues            map[string][]byte
-	Justification        string
+	RequesterID        string
+	ProjectID          string
+	Environment        string
+	TargetProviderType string
+	TargetSecretRef    string
+	KeyValues          map[string][]byte
+	Justification      string
 }
 
 // ReadInput is the data the UI POSTs to submit a read request. There
@@ -200,15 +208,16 @@ type PatchInput struct {
 // requester wants to view. An empty list means "all keys in the
 // bundle" — the agent's ReadExecutor returns one wrap per key in
 // whatever GetValue brings back.
+//
+// No provider config field, same reason as PatchInput (API-S-04).
 type ReadInput struct {
-	RequesterID          string
-	ProjectID            string
-	Environment          string
-	TargetProviderType   string
-	TargetProviderConfig map[string]any
-	TargetSecretRef      string
-	TargetKeys           []string
-	Justification        string
+	RequesterID        string
+	ProjectID          string
+	Environment        string
+	TargetProviderType string
+	TargetSecretRef    string
+	TargetKeys         []string
+	Justification      string
 }
 
 // Sentinel errors. Map to HTTP at the handler layer.
@@ -247,6 +256,15 @@ func (s *RequestService) Submit(ctx context.Context, in PatchInput) (*storage.Ac
 
 	envID, envKind, _ := s.resolveEnvironment(ctx, in.ProjectID, in.Environment)
 
+	keyNames := make([]string, 0, len(in.KeyValues))
+	for k := range in.KeyValues {
+		keyNames = append(keyNames, k)
+	}
+	providerConfig, err := s.boundProviderConfig(ctx, in.ProjectID, envID, in.TargetProviderType, in.TargetSecretRef, storage.OpPatch, keyNames)
+	if err != nil {
+		return nil, err
+	}
+
 	dec, err := s.policy.Resolve(ctx, Scope{
 		ProjectID:       in.ProjectID,
 		Environment:     in.Environment,
@@ -273,7 +291,7 @@ func (s *RequestService) Submit(ctx context.Context, in PatchInput) (*storage.Ac
 		WorkflowID:           &wfID,
 		EnvironmentID:        envID,
 		TargetProviderType:   in.TargetProviderType,
-		TargetProviderConfig: in.TargetProviderConfig,
+		TargetProviderConfig: providerConfig,
 		TargetSecretRef:      in.TargetSecretRef,
 		TargetKeys:           keys,
 		TargetScope: map[string]any{
@@ -340,6 +358,18 @@ func (s *RequestService) SubmitRead(ctx context.Context, in ReadInput) (*storage
 
 	envID, envKind, _ := s.resolveEnvironment(ctx, in.ProjectID, in.Environment)
 
+	providerConfig, err := s.boundProviderConfig(ctx, in.ProjectID, envID, in.TargetProviderType, in.TargetSecretRef, storage.OpRead, in.TargetKeys)
+	if err != nil {
+		return nil, err
+	}
+	return s.createReadRequest(ctx, in, envID, envKind, providerConfig)
+}
+
+// createReadRequest resolves the read workflow and writes the pending
+// read request row + its request.submit audit. Shared by SubmitRead and
+// SubmitEnvRead; the caller has resolved the environment and derived the
+// provider config.
+func (s *RequestService) createReadRequest(ctx context.Context, in ReadInput, envID *uuid.UUID, envKind storage.EnvironmentKind, providerConfig map[string]any) (*storage.AccessRequest, error) {
 	dec, err := s.policy.Resolve(ctx, Scope{
 		ProjectID:       in.ProjectID,
 		Environment:     in.Environment,
@@ -366,7 +396,7 @@ func (s *RequestService) SubmitRead(ctx context.Context, in ReadInput) (*storage
 		WorkflowID:           &wfID,
 		EnvironmentID:        envID,
 		TargetProviderType:   in.TargetProviderType,
-		TargetProviderConfig: in.TargetProviderConfig,
+		TargetProviderConfig: providerConfig,
 		TargetSecretRef:      in.TargetSecretRef,
 		TargetKeys:           keys,
 		TargetScope: map[string]any{
@@ -400,14 +430,16 @@ func (s *RequestService) SubmitRead(ctx context.Context, in ReadInput) (*storage
 // the approval workflow on a non-prod env. The handler resolves the
 // env_id from the URL and hands the resulting Environment to the
 // service so the kind check happens before any policy lookup.
+//
+// No provider config field: the job's config is derived from the bound
+// catalog row, never from the requester (API-S-04).
 type DirectRevealInput struct {
-	RequesterID          string
-	Environment          *storage.Environment // already loaded by the handler
-	TargetProviderType   string
-	TargetProviderConfig map[string]any
-	TargetSecretRef      string
-	TargetKeys           []string
-	Justification        string
+	RequesterID        string
+	Environment        *storage.Environment // already loaded by the handler
+	TargetProviderType string
+	TargetSecretRef    string
+	TargetKeys         []string
+	Justification      string
 }
 
 // ErrDirectRevealOnProd is returned when SubmitDirectReveal is called
@@ -438,7 +470,10 @@ var ErrKeyNotAllowed = errors.New("services: requested key is not in the binding
 //      auto-execute path.
 //   2. PolicyEngine returns `DirectRevealAllowed=true` — the policy
 //      rule explicitly opts in for this scope.
-//   3. (Permission `secret.reveal.direct` is enforced by the handler
+//   3. A project_secrets READ binding governs (project, provider, ref)
+//      in this environment, and every key is inside its allowlist
+//      (requireReadBinding, api#191 H2 + API-S-03). Fails closed.
+//   4. (Permission `secret.reveal.direct` is enforced by the handler
 //       layer via `auth.Require` BEFORE the request reaches this
 //       method — service stays unaware of identity perms.)
 //
@@ -503,11 +538,19 @@ func (s *RequestService) SubmitDirectReveal(ctx context.Context, in DirectReveal
 		return nil, ErrDirectRevealNotAllowed
 	}
 
-	// Gate 3 — binding allowlist. A direct reveal must not name a key
-	// outside the project_secrets binding's allowed_keys. Refuses BEFORE
-	// the auto-approved request row is written, so no wrap job is ever
-	// enqueued for a denied key.
-	if err := s.enforceBindingAllowedKeys(ctx, in.Environment.ProjectID, in.TargetProviderType, in.TargetSecretRef, in.TargetKeys); err != nil {
+	// Gate 3 — read binding (api#191 H2, API-S-03). The secret must be
+	// bound for read to this project; an env-scoped binding only governs
+	// in its own environment, so Gate 1's kind check above is the check on
+	// the binding's environment (a prod-bound secret cannot be revealed
+	// through a non-prod URL). Every key must be inside the binding's
+	// allowlist. Refuses BEFORE the auto-approved request row is written,
+	// so no read job is ever enqueued, and the refusal is audited.
+	bound, reason, err := s.requireReadBinding(ctx, in.Environment, in.TargetProviderType, in.TargetSecretRef, in.TargetKeys)
+	if err != nil {
+		if reason != "" {
+			s.auditBindingRefusal(ctx, "secret.reveal.direct.refused_binding", in.RequesterID, in.Environment,
+				in.TargetProviderType, in.TargetSecretRef, len(in.TargetKeys), reason)
+		}
 		return nil, err
 	}
 
@@ -526,7 +569,7 @@ func (s *RequestService) SubmitDirectReveal(ctx context.Context, in DirectReveal
 		WorkflowID:           &wfID,
 		EnvironmentID:        &envID,
 		TargetProviderType:   in.TargetProviderType,
-		TargetProviderConfig: in.TargetProviderConfig,
+		TargetProviderConfig: AgentJobProviderConfig(bound.secret.ProviderType, bound.secret.ProviderConfig),
 		TargetSecretRef:      in.TargetSecretRef,
 		TargetKeys:           keys,
 		TargetScope: map[string]any{
@@ -543,7 +586,15 @@ func (s *RequestService) SubmitDirectReveal(ctx context.Context, in DirectReveal
 	// as the approval-flow enqueue: a 200 here with a missing job is
 	// still a real, durable request; operators retry via admin tools).
 	if s.jobs != nil {
-		if err := s.enqueueRequestJob(ctx, req); err != nil {
+		err := s.enqueueRequestJob(ctx, req)
+		if reason, refused := bindingRefusal(err); refused {
+			// The binding changed between the gate above and the
+			// enqueue. The request is failed and audited; the caller gets
+			// the same refusal the gate would have given, and no
+			// secret.reveal.direct.issued row is written.
+			s.failUnboundRequest(ctx, req, "user:"+in.RequesterID, reason)
+			return nil, err
+		} else if err != nil {
 			_ = s.audit.Append(ctx, &storage.AuditEvent{
 				Actor:         "user:" + in.RequesterID,
 				Action:        "request.direct_reveal.enqueue_failed",
@@ -579,53 +630,34 @@ func (s *RequestService) SubmitDirectReveal(ctx context.Context, in DirectReveal
 	return req, nil
 }
 
-// enforceBindingAllowedKeys refuses a reveal whose requested keys fall
-// outside the project_secrets binding's allowed_keys allowlist. It
+// enforceBindingAllowedKeys refuses a cross-team destination whose keys
+// fall outside the project_secrets binding's allowed_keys allowlist. It
 // resolves the binding for (projectID, providerType, secretRef) exactly
 // like the /requests tenancy gate: match the catalog row(s) by
-// (provider_type, secret_ref), then look for a binding owned by the
+// (provider_type, secret_ref), then take the first binding owned by the
 // project.
 //
-// Enforcement rules:
+// Enforcement rules (the plaintext-read paths use the stricter
+// requireReadBinding instead, which refuses a missing binding):
 //   - repos not wired          → skip (legacy tests)
 //   - no binding for the pair  → skip (the allowlist lives on the
-//     binding and there is none; the policy-only direct-reveal path is
-//     unchanged)
+//     binding and there is none)
 //   - binding.AllowedKeys nil  → every key the secret exposes is allowed
 //   - restrictive allowlist    → every requested key must be present,
-//     AND an empty request is refused: an empty target_keys means
-//     "reveal every key", which would bypass a restrictive allowlist.
+//     AND an empty request is refused: an empty key list means
+//     "every key", which would bypass a restrictive allowlist.
 func (s *RequestService) enforceBindingAllowedKeys(ctx context.Context, projectID uuid.UUID, providerType, secretRef string, requestedKeys []string) error {
 	if s.bindings == nil || s.secrets == nil {
 		return nil
 	}
-	catalog, err := s.secrets.ListByRef(ctx, providerType, secretRef)
+	cands, err := s.projectBindingCandidates(ctx, projectID, providerType, secretRef)
 	if err != nil {
-		return fmt.Errorf("services: resolve catalog for allowlist: %w", err)
+		return err
 	}
-	var binding *storage.ProjectSecret
-	for _, sec := range catalog {
-		b, err := s.bindings.Get(ctx, projectID, sec.ID)
-		if err == nil {
-			binding = b
-			break
-		}
-		if !errors.Is(err, storage.ErrNotFound) {
-			return fmt.Errorf("services: resolve binding for allowlist: %w", err)
-		}
-	}
-	if binding == nil || binding.AllowedKeys == nil {
+	if len(cands) == 0 {
 		return nil
 	}
-	if len(requestedKeys) == 0 {
-		return fmt.Errorf("%w: target_keys must be named within the binding allowlist", ErrKeyNotAllowed)
-	}
-	for _, k := range requestedKeys {
-		if !keyInAllowlist(binding.AllowedKeys, k) {
-			return fmt.Errorf("%w: %q", ErrKeyNotAllowed, k)
-		}
-	}
-	return nil
+	return checkBindingKeys(cands[0].binding, requestedKeys)
 }
 
 func keyInAllowlist(allowed []string, target string) bool {
@@ -728,8 +760,13 @@ func (s *RequestService) Approve(ctx context.Context, requestID uuid.UUID, appro
 		// Enqueue the patch job so an agent can pick it up. Same
 		// failure posture as TTL refresh: audit-on-failure but don't
 		// roll back the approval — operators can re-issue the enqueue
-		// out-of-band if the job persistence fails.
-		if err := s.enqueueRequestJob(ctx, req); err != nil {
+		// out-of-band if the job persistence fails. The exception is a
+		// request no binding governs any more: that is a policy refusal,
+		// not a transient error, so the request fails.
+		err := s.enqueueRequestJob(ctx, req)
+		if reason, refused := bindingRefusal(err); refused {
+			s.failUnboundRequest(ctx, req, "user:"+approverID, reason)
+		} else if err != nil {
 			_ = s.audit.Append(ctx, &storage.AuditEvent{
 				Actor:         "user:" + approverID,
 				Action:        "request.enqueue_job_failed",
@@ -1000,7 +1037,38 @@ func (s *RequestService) RetrieveWrapForUser(ctx context.Context, requestID, wra
 		return nil, nil, ErrRequestNotApproved
 	}
 
+	// API-S-20: wraps of the reveal-session flow are only handed out
+	// inside an open session of the caller, under the session's
+	// env-matching allowlist. A direct reveal is the only path that makes
+	// a read request approved with no approve vote (Approve always appends
+	// the vote before flipping the status), so zero approve votes marks it
+	// — that also covers direct reveals submitted before this check
+	// existed. Runs before the single-shot consume.
+	if s.revealGate != nil {
+		counts, err := s.approvals.Counts(ctx, req.ID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("services: count approvals: %w", err)
+		}
+		if err := s.revealGate.AuthorizeWrapRetrieve(ctx, req, wrap, userID, counts.Approves == 0); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	return s.wraps.RetrieveByUser(ctx, wrapID, userID)
+}
+
+// RevealSessionGate is the slice of *RevealSessionService the single-wrap
+// retrieve path consults (API-S-20).
+type RevealSessionGate interface {
+	AuthorizeWrapRetrieve(ctx context.Context, req *storage.AccessRequest, wrap *storage.SecretWrap, userID string, sessionRequired bool) error
+}
+
+// WithRevealSessionGate wires the reveal-session check into
+// RetrieveWrapForUser. nil leaves it off (legacy tests); main always
+// wires it. Returns the service for chaining.
+func (s *RequestService) WithRevealSessionGate(g RevealSessionGate) *RequestService {
+	s.revealGate = g
+	return s
 }
 
 // checkApproverScope enforces that approverID holds PermSecretApprove
@@ -1140,13 +1208,30 @@ func (s *RequestService) enqueueRequestJob(ctx context.Context, req *storage.Acc
 		return errors.New("services: no JobEnqueuer wired")
 	}
 
+	// The provider config is NEVER req.TargetProviderConfig: rows written
+	// before API-S-04 carry whatever the requester posted (the agent
+	// honours kvMount/kvPrefix from a payload). Read and patch jobs get
+	// the config derived from the bound catalog row at enqueue time;
+	// cross_team overrides it from the destination connection below.
 	payload := map[string]any{
 		"request_id":             req.ID.String(),
 		"target_provider_type":   req.TargetProviderType,
-		"target_provider_config": req.TargetProviderConfig,
+		"target_provider_config": map[string]any{},
 		"target_secret_ref":      req.TargetSecretRef,
 		"target_keys":            req.TargetKeys,
 		"target_scope":           req.TargetScope,
+	}
+	if req.Type == storage.AccessRequestTypePatch || req.Type == storage.AccessRequestTypeRead {
+		projectID, _ := req.TargetScope["project_id"].(string)
+		op := storage.OpRead
+		if req.Type == storage.AccessRequestTypePatch {
+			op = storage.OpPatch
+		}
+		cfg, err := s.boundProviderConfig(ctx, projectID, req.EnvironmentID, req.TargetProviderType, req.TargetSecretRef, op, req.TargetKeys)
+		if err != nil {
+			return fmt.Errorf("derive provider config: %w", err)
+		}
+		payload["target_provider_config"] = cfg
 	}
 
 	var jobType storage.JobType
