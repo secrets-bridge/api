@@ -569,6 +569,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		services.MFAVerifyConfig{},
 	)
 	authMFAH := handlers.NewAuthMFA(mfaVerifySvc)
+	// H3: factor deletes go through the audited service path.
+	mfaH = mfaH.WithFactorDeleter(mfaVerifySvc)
 	// Slice H5: /users/me carries `mfa_enrolled` so the SPA can route
 	// brand-new users to /me/mfa instead of leaving them stuck on a
 	// step-up modal with nothing to verify with. Single source of
@@ -896,24 +898,17 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		requireMFA,
 		devSecretsH.DirectReveal)
 
-	// Slice H2 (api#64): user-self MFA enrollment + management. No
-	// RBAC gate — every authenticated user manages their OWN factors.
-	// Handler derives the user id from the session, never from the
-	// body, so cross-user paths are structurally impossible.
-	v1.Get("/users/me/mfa/factors", mfaH.List)
-	v1.Delete("/users/me/mfa/factors/:id", mfaH.Delete)
-	v1.Post("/users/me/mfa/totp/enroll", mfaH.EnrollTOTP)
-	v1.Post("/users/me/mfa/totp/confirm", mfaH.ConfirmTOTP)
-	v1.Post("/users/me/mfa/webauthn/register/start", mfaH.EnrollWebAuthnStart)
-	v1.Post("/users/me/mfa/webauthn/register/finish", mfaH.EnrollWebAuthnFinish)
-
-	// Slice H4: step-up verification — the SOLE path post-H4 that
-	// stamps `last_mfa_at` on a session. /auth/mfa/challenge mints
-	// the per-kind nonce (TOTP ticket OR WebAuthn assertion options),
-	// /auth/mfa/verify consumes the user's response and stamps on
-	// success. Same cookie auth chain as /users/me/mfa/*.
-	v1.Post("/auth/mfa/challenge", authMFAH.Challenge)
-	v1.Post("/auth/mfa/verify", authMFAH.Verify)
+	// MFA self-service (/users/me/mfa/*) and step-up (/auth/mfa/*).
+	// The chains live in mfa_routes.go so the route tests drive the
+	// exact wiring main uses.
+	registerMFARoutes(v1, mfaRouteDeps{
+		factors:    mfaH,
+		verify:     authMFAH,
+		stepUp:     sessionSvc,
+		enrollment: mfaVerifySvc,
+		rdb:        rdb,
+		logger:     logger,
+	})
 
 	v1.Post("/environments", auth.Require(auth.PermTeamEdit, rbacResolver), tenancyH.CreateEnvironment)
 	v1.Get("/environments", tenancyH.ListEnvironments)
