@@ -857,14 +857,14 @@ func scopeCoversInline(user, request map[string]string) bool {
 	return true
 }
 
-// identityFromCtx returns the caller's identity string or "admin"
-// when not set (e.g. legacy callers during the auth-middleware
-// transition).
+// identityFromCtx returns the caller's raw identity, or "" when there is
+// none. Callers use it as the acting user id (scope checks, created_by
+// columns), never as an audit actor: that comes from auth.AuditActor.
+// It used to fall back to "admin", which put a fake user id into both
+// the scope checks and the audit log (API-15).
 func identityFromCtx(c fiber.Ctx) string {
-	if id, ok := auth.IdentityFromContext(c.Context()); ok && id != "" {
-		return id
-	}
-	return "admin"
+	id, _ := auth.IdentityFromContext(c.Context())
+	return id
 }
 
 // silence unused-import noise during incremental editing.

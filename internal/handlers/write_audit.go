@@ -34,12 +34,8 @@ func auditWrite(c fiber.Ctx, repo storage.AuditEventRepository, action, resource
 	if repo == nil {
 		return
 	}
-	actor := sessionActor(c)
-	if actor == "" {
-		actor = "anonymous"
-	}
 	evt := &storage.AuditEvent{
-		Actor:         actor,
+		Actor:         auth.AuditActor(c.Context()),
 		Action:        action,
 		Resource:      resource,
 		Status:        storage.AuditStatusSuccess,

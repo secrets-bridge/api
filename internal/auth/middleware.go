@@ -274,3 +274,26 @@ func ScopeFromJSONBody(keys ...string) ScopeFn {
 		return out, nil
 	}
 }
+
+// AuditActor names who caused an action, for the audit log's actor
+// column, from the request context (API-15):
+//
+//	"user:<id>"   an authenticated session or bearer caller
+//	"agent:<id>"  an agent authenticated by AgentAuth
+//	"anonymous"   an HTTP request with no identity
+//	"system"      no request identity at all (boot, background work)
+//
+// It is the single place audit actors are derived from a context, so a
+// row never says "admin" or a bare id that the audit UI can't resolve.
+func AuditActor(ctx context.Context) string {
+	if id, ok := IdentityFromContext(ctx); ok {
+		return "user:" + id
+	}
+	if agentID, ok := middleware.AgentIDFromContext(ctx); ok {
+		return "agent:" + agentID.String()
+	}
+	if _, inRequest := ctx.Value(middleware.CtxKeyActor).(string); inRequest {
+		return "anonymous"
+	}
+	return "system"
+}

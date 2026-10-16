@@ -58,4 +58,23 @@ func TestAuditActor_FromContext(t *testing.T) {
 	if got := actorOf("job.enqueue", "job:"+job.ID.String()); got != "system" {
 		t.Errorf("background job.enqueue actor = %q, want system", got)
 	}
+
+	// Revoke with no revoking user used to fall back to "admin".
+	if err := agents.Revoke(t.Context(), m.ID, "", "test"); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if got := actorOf("agent.revoked", "agent:"+m.ID.String()); got != "system" {
+		t.Errorf("agent.revoked without a revoker = %q, want system", got)
+	}
+
+	// An unauthenticated HTTP request (session layer stored "anonymous")
+	// is attributed as such, not as system.
+	anonCtx := context.WithValue(t.Context(), middleware.CtxKeyActor, "anonymous")
+	job, err = jobs.Enqueue(anonCtx, services.EnqueueRequest{JobType: storage.JobTypeSync})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if got := actorOf("job.enqueue", "job:"+job.ID.String()); got != "anonymous" {
+		t.Errorf("anonymous-request job.enqueue actor = %q, want anonymous", got)
+	}
 }

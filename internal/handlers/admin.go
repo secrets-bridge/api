@@ -1085,12 +1085,8 @@ func (h *Admin) auditAdminPolicy(c fiber.Ctx, action string, p *storage.PolicyRu
 	if len(changedKeys) > 0 {
 		meta["changed_keys"] = changedKeys
 	}
-	actor := identityFromCtx(c)
-	if actor == "" {
-		actor = "admin"
-	}
 	_ = h.audit.Append(c.Context(), &storage.AuditEvent{
-		Actor:    actor,
+		Actor:    auth.AuditActor(c.Context()),
 		Action:   action,
 		Resource: "policy_rule:" + p.ID.String(),
 		Status:   storage.AuditStatusSuccess,

@@ -4,20 +4,21 @@ import (
 	"context"
 
 	"github.com/secrets-bridge/api/internal/auth"
-	"github.com/secrets-bridge/api/internal/middleware"
 )
 
-// auditActorFromContext names who caused a service action, read from the
-// request context the handler passed down (API-15): "user:<id>" for a
-// session or bearer caller, "agent:<id>" for an agent-authenticated call,
-// and "system" when neither is present (boot, background work). It
-// replaces the hard-coded "admin" these audit rows used to carry.
+// auditActorFromContext names who caused a service action from the
+// request context the handler passed down (API-15). See auth.AuditActor.
 func auditActorFromContext(ctx context.Context) string {
-	if id, ok := auth.IdentityFromContext(ctx); ok {
-		return "user:" + id
+	return auth.AuditActor(ctx)
+}
+
+// auditActor formats an explicit acting user id for the audit actor
+// column ("user:<id>"); with no id it falls back to the request context
+// (agent / anonymous / system). It replaces actorOrAdmin, which wrote the
+// bare id (unresolvable in the audit UI) or a literal "admin".
+func auditActor(ctx context.Context, userID string) string {
+	if userID != "" {
+		return "user:" + userID
 	}
-	if agentID, ok := middleware.AgentIDFromContext(ctx); ok {
-		return "agent:" + agentID.String()
-	}
-	return "system"
+	return auditActorFromContext(ctx)
 }

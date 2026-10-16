@@ -311,10 +311,7 @@ func (s *AgentService) Revoke(ctx context.Context, id uuid.UUID, revokedBy, reas
 	}
 	s.invalidateSecretHashCache(ctx, id)
 
-	actor := "admin"
-	if revokedBy != "" {
-		actor = "user:" + revokedBy
-	}
+	actor := auditActor(ctx, revokedBy)
 	meta := map[string]any{
 		"agent_id": id.String(),
 		"reason":   reason,

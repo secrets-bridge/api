@@ -212,7 +212,7 @@ func (h *Teams) Update(c fiber.Ctx) error {
 	if h.teamsConcrete != nil && h.audit != nil {
 		if err := h.teamsConcrete.UpdateWithLineageAudit(c.Context(), id,
 			body.Name, description, parent,
-			identityFromCtx(c), h.audit,
+			auth.AuditActor(c.Context()), h.audit,
 		); err != nil {
 			return mapTeamErr(err)
 		}
