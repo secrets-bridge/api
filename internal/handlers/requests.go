@@ -693,7 +693,7 @@ type RequestBody struct {
 	SnapMinApprovers                *int16     `json:"snap_min_approvers,omitempty"`
 
 	// Human-readable display names resolved best-effort for the approver
-	// verify panel (ui#87 follow-up) so it shows "QA-CrossTeam-B" not a
+	// verify panel (ui#87 follow-up) so it shows "team-beta" not a
 	// UUID. Populated only when the name resolvers are wired; the UI
 	// falls back to the ids above when a name is absent. Still metadata —
 	// names + emails, never values.

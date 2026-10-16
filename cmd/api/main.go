@@ -634,7 +634,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// Rate limit per architect Q7 + NAT-aware tuning (Slice A1):
 	// 30 attempts / 60s per source IP. The architect's original
 	// 5/60s assumed each user has their own public IP; many ISPs
-	// (notably Iraqi CGNAT deployments) put dozens of legitimate
+	// (notably carrier-grade NAT deployments) put dozens of legitimate
 	// users behind one egress. The per-IP layer is an anti-scan
 	// measure; per-account brute force is defended durably in
 	// Postgres by `LockoutPolicy` (5 wrong → 15 min lock) which is

@@ -5,8 +5,8 @@
 // for the wrap retrieval path.
 //
 // Limits per architect's Q7 decision (see project_secrets_bridge_resume_state.md),
-// adjusted for shared-NAT environments (Iraqi ISPs put many users
-// behind one CGNAT public IP — a strict per-IP cap would lock out
+// adjusted for shared-NAT environments (some ISPs put many users
+// behind one carrier-grade NAT public IP — a strict per-IP cap would lock out
 // every legitimate user behind the same egress):
 //
 //   - login        30 /  60s per-IP    (anti-scan; per-account lockout

@@ -535,7 +535,7 @@ func NewRoleReconcilerForTest(
 // IdP group names often differ in case from the deployer's expectation
 // (`SB-Admins` from one IdP, `sb-admins` in the SB_OIDC_GROUP_MAP);
 // silent name mismatch is the most common cause of zero-grant SSO
-// users seen in the field (qi UAT 2026-06-01). Values are preserved
+// users seen in the field (a staging deployment, 2026-06-01). Values are preserved
 // verbatim because they map to internal role names (admin / approver /
 // developer) that the api creates and so are always lowercase by
 // convention. If two configured keys collapse to the same lower-cased

@@ -130,7 +130,7 @@ type Config struct {
 	//
 	// REFUSED at boot when SB_ENV=production — see ValidateMFADevFlag.
 	// Drop the flag once Slice H4 (real /auth/mfa/{challenge,verify})
-	// is live and qi UAT operators have enrolled a real factor.
+	// is live and staging operators have enrolled a real factor.
 	MFADevAllowPwd bool
 
 	// MFATOTPIssuer is rendered in the otpauth:// URI's `issuer=` param
@@ -275,7 +275,7 @@ func splitCommaTrim(raw string) []string {
 }
 
 // ValidateMFADevFlag refuses to honor SB_MFA_DEV_ALLOW_PWD=true when
-// SB_ENV != "dev". The flag exists to unblock the qi UAT pilot while
+// SB_ENV != "dev". The flag exists to unblock a staging pilot while
 // Slice H4 is being built; it MUST NOT be set in production. main.go
 // calls this at boot so a forgotten flag fails the rollout loudly
 // instead of silently downgrading the step-up posture.

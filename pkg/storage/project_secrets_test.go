@@ -49,7 +49,7 @@ func seedSecret(t *testing.T, secrets *storage.Secrets, ref string) uuid.UUID {
 	t.Helper()
 	ctx := t.Context()
 	s := &storage.Secret{
-		ClusterName:  "eks-egov-uat",
+		ClusterName:  "eks-tenant-a-uat",
 		ProviderType: "aws-sm",
 		SecretRef:    ref,
 		Status:       storage.SecretStatusPresent,
@@ -73,7 +73,7 @@ func seedProject(t *testing.T, projects *storage.Projects, name string) uuid.UUI
 func TestBind_HappyPath_AllKeysAllowed(t *testing.T) {
 	repo, projects, secrets, _ := bootstrapProjectSecrets(t)
 	projectID := seedProject(t, projects, "billing")
-	secretID := seedSecret(t, secrets, "/eks/uat/billing/db")
+	secretID := seedSecret(t, secrets, "/secrets/uat/billing/db")
 
 	b := &storage.ProjectSecret{
 		ProjectID:   projectID,
@@ -93,7 +93,7 @@ func TestBind_HappyPath_AllKeysAllowed(t *testing.T) {
 func TestBind_RejectsEmptyAllowedKeys(t *testing.T) {
 	repo, projects, secrets, _ := bootstrapProjectSecrets(t)
 	projectID := seedProject(t, projects, "billing")
-	secretID := seedSecret(t, secrets, "/eks/uat/billing/db")
+	secretID := seedSecret(t, secrets, "/secrets/uat/billing/db")
 
 	b := &storage.ProjectSecret{
 		ProjectID:   projectID,
@@ -109,7 +109,7 @@ func TestBind_RejectsEmptyAllowedKeys(t *testing.T) {
 func TestBind_RejectsEmptyAllowedOps(t *testing.T) {
 	repo, projects, secrets, _ := bootstrapProjectSecrets(t)
 	projectID := seedProject(t, projects, "billing")
-	secretID := seedSecret(t, secrets, "/eks/uat/billing/db")
+	secretID := seedSecret(t, secrets, "/secrets/uat/billing/db")
 
 	b := &storage.ProjectSecret{
 		ProjectID:  projectID,
@@ -124,7 +124,7 @@ func TestBind_RejectsEmptyAllowedOps(t *testing.T) {
 func TestBind_DuplicateReturnsErrAlreadyExists(t *testing.T) {
 	repo, projects, secrets, _ := bootstrapProjectSecrets(t)
 	projectID := seedProject(t, projects, "billing")
-	secretID := seedSecret(t, secrets, "/eks/uat/billing/db")
+	secretID := seedSecret(t, secrets, "/secrets/uat/billing/db")
 
 	first := &storage.ProjectSecret{
 		ProjectID: projectID, SecretID: secretID,
@@ -146,7 +146,7 @@ func TestBind_SameSecretMultipleProjects(t *testing.T) {
 	repo, projects, secrets, _ := bootstrapProjectSecrets(t)
 	billing := seedProject(t, projects, "billing")
 	reporting := seedProject(t, projects, "reporting")
-	shared := seedSecret(t, secrets, "/eks/uat/shared/db")
+	shared := seedSecret(t, secrets, "/secrets/uat/shared/db")
 
 	for _, projID := range []uuid.UUID{billing, reporting} {
 		b := &storage.ProjectSecret{
@@ -171,7 +171,7 @@ func TestBind_SameSecretMultipleProjects(t *testing.T) {
 func TestUpdate_RewritesKeysAndOps(t *testing.T) {
 	repo, projects, secrets, _ := bootstrapProjectSecrets(t)
 	projectID := seedProject(t, projects, "billing")
-	secretID := seedSecret(t, secrets, "/eks/uat/billing/db")
+	secretID := seedSecret(t, secrets, "/secrets/uat/billing/db")
 
 	if err := repo.Bind(t.Context(), &storage.ProjectSecret{
 		ProjectID: projectID, SecretID: secretID,
@@ -200,7 +200,7 @@ func TestUpdate_RewritesKeysAndOps(t *testing.T) {
 func TestUpdate_AbsentBindingReturnsErrNotFound(t *testing.T) {
 	repo, projects, secrets, _ := bootstrapProjectSecrets(t)
 	projectID := seedProject(t, projects, "billing")
-	secretID := seedSecret(t, secrets, "/eks/uat/billing/db")
+	secretID := seedSecret(t, secrets, "/secrets/uat/billing/db")
 	if err := repo.Update(t.Context(), projectID, secretID, nil,
 		[]string{storage.OpRead}, nil); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
@@ -210,7 +210,7 @@ func TestUpdate_AbsentBindingReturnsErrNotFound(t *testing.T) {
 func TestUnbind_DropsRow(t *testing.T) {
 	repo, projects, secrets, _ := bootstrapProjectSecrets(t)
 	projectID := seedProject(t, projects, "billing")
-	secretID := seedSecret(t, secrets, "/eks/uat/billing/db")
+	secretID := seedSecret(t, secrets, "/secrets/uat/billing/db")
 	_ = repo.Bind(t.Context(), &storage.ProjectSecret{
 		ProjectID: projectID, SecretID: secretID,
 		AllowedOps: []string{storage.OpRead},
@@ -229,10 +229,10 @@ func TestListSecretIDsForProjects_UnionsAcrossProjects(t *testing.T) {
 	billing := seedProject(t, projects, "billing")
 	reporting := seedProject(t, projects, "reporting")
 
-	billDB := seedSecret(t, secrets, "/eks/uat/billing/db")
-	billAPI := seedSecret(t, secrets, "/eks/uat/billing/api")
-	repDB := seedSecret(t, secrets, "/eks/uat/reporting/db")
-	_ = seedSecret(t, secrets, "/eks/uat/orphan/db") // not bound to any project
+	billDB := seedSecret(t, secrets, "/secrets/uat/billing/db")
+	billAPI := seedSecret(t, secrets, "/secrets/uat/billing/api")
+	repDB := seedSecret(t, secrets, "/secrets/uat/reporting/db")
+	_ = seedSecret(t, secrets, "/secrets/uat/orphan/db") // not bound to any project
 
 	for _, b := range []storage.ProjectSecret{
 		{ProjectID: billing, SecretID: billDB, AllowedOps: []string{storage.OpRead}},
