@@ -69,6 +69,10 @@ func secretsErr(err error) error {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	case errors.Is(err, storage.ErrNotFound):
 		return fiber.NewError(fiber.StatusNotFound, "not found")
+	case errors.Is(err, services.ErrDiscoveryIdentityMismatch):
+		return fiber.NewError(fiber.StatusForbidden, "discovery batch does not match this agent's cluster or provider")
+	case errors.Is(err, services.ErrDiscoveryIdentityUnknown):
+		return fiber.NewError(fiber.StatusForbidden, "agent has no cluster or provider identity for discovery")
 	default:
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
@@ -123,7 +127,9 @@ func (h *Secrets) BulkUpsert(c fiber.Ctx) error {
 		})
 	}
 
-	res, err := h.svc.Upsert(c.Context(), "agent:"+agentID.String(), services.BulkInput{
+	// cluster_name / provider_type are checked against (and filled from)
+	// the authenticated agent's own record, never trusted as sent.
+	res, err := h.svc.UpsertForAgent(c.Context(), agentID, services.BulkInput{
 		ClusterName:    body.ClusterName,
 		ProviderType:   body.ProviderType,
 		ProviderConfig: body.ProviderConfig,

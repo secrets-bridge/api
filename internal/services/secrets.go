@@ -10,6 +10,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -23,6 +24,160 @@ type SecretsService struct {
 	secrets storage.SecretRepository
 	audit   storage.AuditEventRepository
 	now     func() time.Time
+
+	// Agent identity for the agent-side upload. Both nil unless
+	// WithAgentIdentity is called; UpsertForAgent refuses without them.
+	agents    DiscoveryAgentLookup
+	provConns AgentProviderConnectionLookup
+}
+
+// DiscoveryAgentLookup is the slice of the agents repository discovery
+// needs: the admin projection (cluster_name, provider_type, bound
+// connection) and the legacy row with its scope.
+type DiscoveryAgentLookup interface {
+	Get(ctx context.Context, id uuid.UUID) (*storage.Agent, error)
+	GetAdmin(ctx context.Context, id uuid.UUID) (*storage.AgentAdminRow, error)
+}
+
+// WithAgentIdentity wires the lookups UpsertForAgent uses to pin a
+// discovery batch to the uploading agent's own cluster + provider type.
+// Returns the service for chaining.
+func (s *SecretsService) WithAgentIdentity(agents DiscoveryAgentLookup, provConns AgentProviderConnectionLookup) *SecretsService {
+	s.agents = agents
+	s.provConns = provConns
+	return s
+}
+
+// Discovery identity sentinels. Both map to HTTP 403.
+var (
+	// ErrDiscoveryIdentityMismatch: the batch names a cluster or provider
+	// type that is not the uploading agent's own.
+	ErrDiscoveryIdentityMismatch = errors.New("services: discovery batch does not match the agent's cluster or provider")
+	// ErrDiscoveryIdentityUnknown: the agent's record carries no cluster
+	// or no provider type to pin the batch to.
+	ErrDiscoveryIdentityUnknown = errors.New("services: agent has no cluster or provider identity for discovery")
+)
+
+// UpsertForAgent is the agent-side discovery upload. cluster_name and
+// provider_type are not taken from the batch: they come from the
+// authenticated agent's own record, so one agent cannot write or
+// overwrite catalog rows (keyed by cluster, provider, ref) that belong
+// to another agent's cluster or provider.
+//
+//   - cluster: agents.cluster_name (set at enrollment), else the bound
+//     provider connection's cluster_name, else a legacy minted agent's
+//     scope.cluster.
+//   - provider type: the bound provider connection's type, else
+//     agents.provider_type, else a legacy agent's scope.provider /
+//     scope.providers.
+//
+// A batch that names a different cluster or provider type is refused
+// (ErrDiscoveryIdentityMismatch); an omitted cluster_name is filled in.
+// An agent whose record yields no cluster or no provider type cannot
+// upload (ErrDiscoveryIdentityUnknown). Refusals are audited.
+func (s *SecretsService) UpsertForAgent(ctx context.Context, agentID uuid.UUID, in BulkInput) (*BulkResult, error) {
+	actor := "agent:" + agentID.String()
+	cluster, providers, err := s.agentDiscoveryIdentity(ctx, agentID)
+	if err != nil {
+		if errors.Is(err, ErrDiscoveryIdentityUnknown) {
+			s.auditDiscoveryRefused(ctx, actor, "agent_identity_unknown")
+		}
+		return nil, err
+	}
+	if in.ClusterName != "" && in.ClusterName != cluster {
+		s.auditDiscoveryRefused(ctx, actor, "cluster_mismatch")
+		return nil, ErrDiscoveryIdentityMismatch
+	}
+	providerType := in.ProviderType
+	if providerType == "" && len(providers) == 1 {
+		providerType = providers[0]
+	}
+	if !stringIn(providers, providerType) {
+		s.auditDiscoveryRefused(ctx, actor, "provider_type_mismatch")
+		return nil, ErrDiscoveryIdentityMismatch
+	}
+	in.ClusterName = cluster
+	in.ProviderType = providerType
+	return s.Upsert(ctx, actor, in)
+}
+
+// agentDiscoveryIdentity resolves the cluster and the provider types an
+// agent may publish discovery for. See UpsertForAgent for the order.
+func (s *SecretsService) agentDiscoveryIdentity(ctx context.Context, agentID uuid.UUID) (string, []string, error) {
+	if s.agents == nil || s.provConns == nil {
+		return "", nil, errors.New("services: discovery agent identity not configured")
+	}
+	row, err := s.agents.GetAdmin(ctx, agentID)
+	if err != nil {
+		return "", nil, fmt.Errorf("services: load agent for discovery: %w", err)
+	}
+	agent, err := s.agents.Get(ctx, agentID)
+	if err != nil {
+		return "", nil, fmt.Errorf("services: load agent for discovery: %w", err)
+	}
+
+	cluster := row.ClusterName
+	var providers []string
+	if row.ProviderConnectionID != nil {
+		conn, err := s.provConns.Get(ctx, *row.ProviderConnectionID)
+		if err != nil {
+			return "", nil, fmt.Errorf("services: load agent provider connection: %w", err)
+		}
+		if cluster == "" {
+			cluster = conn.ClusterName
+		}
+		providers = []string{string(conn.Type)}
+	} else if row.ProviderType != "" {
+		providers = []string{row.ProviderType}
+	}
+	if cluster == "" {
+		cluster, _ = agent.Scope["cluster"].(string)
+	}
+	if len(providers) == 0 {
+		providers = scopeProviders(agent.Scope)
+	}
+	if cluster == "" || len(providers) == 0 {
+		return "", nil, ErrDiscoveryIdentityUnknown
+	}
+	return cluster, providers, nil
+}
+
+// scopeProviders reads a legacy minted agent's scope.provider (string)
+// and scope.providers (list of strings). Anything else is ignored.
+func scopeProviders(scope map[string]any) []string {
+	var out []string
+	if p, ok := scope["provider"].(string); ok && p != "" {
+		out = append(out, p)
+	}
+	if list, ok := scope["providers"].([]any); ok {
+		for _, v := range list {
+			if p, ok := v.(string); ok && p != "" {
+				out = append(out, p)
+			}
+		}
+	}
+	return out
+}
+
+func stringIn(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// auditDiscoveryRefused records a metadata-only denial: actor + reason
+// code, never the batch's claimed values or any ref.
+func (s *SecretsService) auditDiscoveryRefused(ctx context.Context, actor, reason string) {
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    actor,
+		Action:   "discovery.upsert",
+		Resource: actor,
+		Status:   storage.AuditStatusDenied,
+		Metadata: map[string]any{"reason": reason},
+	})
 }
 
 // NewSecretsService binds the service to its dependencies.

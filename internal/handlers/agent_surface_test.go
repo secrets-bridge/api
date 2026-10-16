@@ -91,7 +91,7 @@ func bootstrapAgentSurfaceWith(t *testing.T, wrap func(*storage.Agents) storage.
 		TRUNCATE TABLE
 			audit_events, sync_runs, sync_jobs, approvals,
 			access_requests, secret_wraps, agents,
-			agent_enrollment_tokens, provider_connections
+			agent_enrollment_tokens, provider_connections, secrets
 		RESTART IDENTITY CASCADE;
 		DELETE FROM policy_rules WHERE is_system = false;
 		DELETE FROM workflow_definitions WHERE is_system = false;`
@@ -155,6 +155,9 @@ func bootstrapAgentSurfaceWith(t *testing.T, wrap func(*storage.Agents) storage.
 	agentRoutes.Get("/wraps/:wrap_id", wrapsH.Retrieve)
 	agentRoutes.Post("/wraps", wrapsH.Create)
 	agentRoutes.Post("/dek", wrapsH.IssueDEK)
+	secretsH := handlers.NewSecrets(services.NewSecretsService(storage.NewSecrets(pool), auditR).
+		WithAgentIdentity(agentsR, storage.NewProviderConnections(pool)))
+	agentRoutes.Post("/secrets/bulk", secretsH.BulkUpsert)
 
 	return &agentSurface{
 		app: app, pool: pool, rdb: rdb, agentSvc: agentSvc,
@@ -826,5 +829,130 @@ func TestAgentSurface_ConcurrentEnrollOneToken(t *testing.T) {
 	if rows := fx.countRows(t, `SELECT count(*) FROM agent_enrollment_tokens t
 		JOIN agents a ON a.id = t.consumed_by_agent_id WHERE t.consumed_at IS NOT NULL`); rows != rounds {
 		t.Fatalf("%d tokens linked to an enrolled agent; want %d", rows, rounds)
+	}
+}
+
+// ---- discovery upload identity ------------------------------------
+
+// enrollAgent enrolls an agent against a fresh provider connection of
+// connType, the way the agent binary does (cluster = SB_CLUSTER_NAME).
+func (fx *agentSurface) enrollAgent(t *testing.T, name, cluster, connType string) surfaceAgent {
+	t.Helper()
+	ctx := t.Context()
+	var connID uuid.UUID
+	if err := fx.pool.QueryRow(ctx, `
+		INSERT INTO provider_connections (name, type, auth_method, scope, status)
+		VALUES ($1, $2, 'token', '{}'::jsonb, 'active') RETURNING id`, "conn-"+name, connType).Scan(&connID); err != nil {
+		t.Fatalf("seed connection: %v", err)
+	}
+	tok, err := fx.agentSvc.GenerateEnrollmentToken(ctx, services.GenerateEnrollmentTokenInput{
+		ProviderConnectionID: connID, CreatedBy: "admin-user-1",
+	})
+	if err != nil {
+		t.Fatalf("GenerateEnrollmentToken: %v", err)
+	}
+	res, err := fx.agentSvc.Enroll(ctx, services.EnrollInput{
+		Token: tok.Token, AgentName: name, ClusterName: cluster, ProviderType: connType,
+	})
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	return surfaceAgent{id: res.AgentID, secret: res.AgentToken}
+}
+
+func (fx *agentSurface) postDiscovery(t *testing.T, a surfaceAgent, cluster, providerType, ref string) (int, []byte) {
+	t.Helper()
+	body := map[string]any{
+		"provider_type": providerType,
+		"items":         []map[string]any{{"secret_ref": ref, "labels": map[string]any{"team": "team-alpha"}}},
+	}
+	if cluster != "" {
+		body["cluster_name"] = cluster
+	}
+	return fx.call(t, http.MethodPost, "/api/v1/agents/"+a.id.String()+"/secrets/bulk", a.secret, body)
+}
+
+// An agent writes catalog rows only under its own cluster and provider
+// type, taken from its agents row / bound provider connection. Agent A
+// cannot write (or overwrite) rows that belong to agent B's cluster.
+func TestAgentSurface_DiscoveryUploadBoundToAgentIdentity(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	a := fx.enrollAgent(t, "agent-a", "tenant-a-uat", "aws-sm")
+	b := fx.enrollAgent(t, "agent-b", "tenant-b-uat", "vault")
+
+	// B's legit row exists first; A must not be able to overwrite it.
+	if code, body := fx.postDiscovery(t, b, "tenant-b-uat", "vault", "team-alpha/uat/db"); code != http.StatusOK {
+		t.Fatalf("agent B own upload = %d (%s); want 200", code, body)
+	}
+	if code, body := fx.postDiscovery(t, a, "tenant-b-uat", "vault", "team-alpha/uat/db"); code != http.StatusForbidden {
+		t.Fatalf("agent A with B's cluster+provider = %d (%s); want 403", code, body)
+	}
+	if code, body := fx.postDiscovery(t, a, "tenant-b-uat", "aws-sm", "team-alpha/uat/injected"); code != http.StatusForbidden {
+		t.Fatalf("agent A with B's cluster = %d (%s); want 403", code, body)
+	}
+	if code, body := fx.postDiscovery(t, a, "tenant-a-uat", "vault", "team-alpha/uat/injected"); code != http.StatusForbidden {
+		t.Fatalf("agent A with a foreign provider type = %d (%s); want 403", code, body)
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM secrets WHERE cluster_name = 'tenant-b-uat'`); n != 1 {
+		t.Fatalf("tenant-b-uat has %d catalog rows; want only B's own 1", n)
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM secrets WHERE secret_ref = 'team-alpha/uat/injected'`); n != 0 {
+		t.Fatalf("refused uploads wrote %d rows", n)
+	}
+
+	// A's own identity still works, and an omitted cluster_name is filled
+	// from the agent record rather than refused.
+	if code, body := fx.postDiscovery(t, a, "tenant-a-uat", "aws-sm", "team-alpha/uat/api"); code != http.StatusOK {
+		t.Fatalf("agent A own upload = %d (%s); want 200", code, body)
+	}
+	if code, body := fx.postDiscovery(t, a, "", "aws-sm", "team-alpha/uat/cache"); code != http.StatusOK {
+		t.Fatalf("agent A upload without cluster_name = %d (%s); want 200", code, body)
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM secrets WHERE cluster_name = 'tenant-a-uat' AND provider_type = 'aws-sm'`); n != 2 {
+		t.Fatalf("tenant-a-uat/aws-sm rows = %d; want 2", n)
+	}
+}
+
+// Legacy direct-mint agents (no provider connection) are bound to what
+// their agents row holds: scope.cluster plus scope.provider(s). A row
+// that names no cluster or no provider cannot upload at all.
+func TestAgentSurface_DiscoveryUploadLegacyMintedAgent(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	mint := func(name string, scope map[string]any) surfaceAgent {
+		m, err := fx.agentSvc.Mint(t.Context(), services.MintInput{Name: name, Scope: scope})
+		if err != nil {
+			t.Fatalf("Mint: %v", err)
+		}
+		return surfaceAgent{id: m.ID, secret: m.AgentSecret}
+	}
+	full := mint("legacy-full", map[string]any{"cluster": "legacy-c", "provider": "vault"})
+	list := mint("legacy-list", map[string]any{"cluster": "legacy-d", "providers": []any{"vault", "aws-sm"}})
+	clusterOnly := mint("legacy-cluster-only", map[string]any{"cluster": "legacy-e"})
+	bare := mint("legacy-bare", nil)
+
+	cases := []struct {
+		name     string
+		agent    surfaceAgent
+		cluster  string
+		provider string
+		want     int
+	}{
+		{"own scope", full, "legacy-c", "vault", http.StatusOK},
+		{"other cluster", full, "tenant-a-uat", "vault", http.StatusForbidden},
+		{"other provider", full, "legacy-c", "aws-sm", http.StatusForbidden},
+		{"provider from list", list, "legacy-d", "aws-sm", http.StatusOK},
+		{"provider not in list", list, "legacy-d", "gcp-sm", http.StatusForbidden},
+		{"no provider in row", clusterOnly, "legacy-e", "vault", http.StatusForbidden},
+		{"empty row", bare, "anything", "vault", http.StatusForbidden},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if code, body := fx.postDiscovery(t, tc.agent, tc.cluster, tc.provider, "legacy/"+tc.name); code != tc.want {
+				t.Fatalf("status = %d (%s); want %d", code, body, tc.want)
+			}
+		})
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM secrets WHERE cluster_name NOT IN ('legacy-c', 'legacy-d')`); n != 0 {
+		t.Fatalf("%d rows written outside the legacy agents' own clusters", n)
 	}
 }
