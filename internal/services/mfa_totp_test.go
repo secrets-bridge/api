@@ -24,6 +24,15 @@ import (
 // Redis containers. SKIP when either env var is missing.
 func bootstrapTOTP(t *testing.T) (*services.TOTPService, storage.UserMFAFactorRepository, storage.LocalUserRepository, *storage.Pool, *clockSource) {
 	t.Helper()
+	svc, factors, users, pool, clk, _ := bootstrapTOTPWithPolicy(t, services.TOTPConfig{})
+	return svc, factors, users, pool, clk
+}
+
+// bootstrapTOTPWithPolicy is bootstrapTOTP with the lockout knobs of
+// `policy` applied, and the Redis client returned so a test can break
+// it.
+func bootstrapTOTPWithPolicy(t *testing.T, policy services.TOTPConfig) (*services.TOTPService, storage.UserMFAFactorRepository, storage.LocalUserRepository, *storage.Pool, *clockSource, *runtime.Client) {
+	t.Helper()
 	dbDSN := os.Getenv("TEST_DATABASE_URL")
 	redisURL := os.Getenv("TEST_REDIS_URL")
 	if dbDSN == "" || redisURL == "" {
@@ -75,10 +84,12 @@ func bootstrapTOTP(t *testing.T) (*services.TOTPService, storage.UserMFAFactorRe
 	audit := storage.NewAuditEvents(pool)
 	clk := &clockSource{now: time.Unix(1_700_000_000, 0).UTC()}
 	svc := services.NewTOTPService(factors, km, audit, rdb, services.TOTPConfig{
-		Issuer: "Secrets Bridge (test)",
-		Clock:  clk.Now,
+		Issuer:           "Secrets Bridge (test)",
+		Clock:            clk.Now,
+		LockoutThreshold: policy.LockoutThreshold,
+		LockoutDuration:  policy.LockoutDuration,
 	})
-	return svc, factors, users, pool, clk
+	return svc, factors, users, pool, clk, rdb
 }
 
 // clockSource lets tests advance time deterministically through the
@@ -255,6 +266,10 @@ func TestTOTP_Verify_SkewWindow_AcceptsPreviousAndNextStep(t *testing.T) {
 	secret := readTOTPSecret(t, out.SecretBase32)
 	factor, _ := svc.ConfirmEnroll(ctx, uid, out.ChallengeID, expectedCode(t, secret, clk.Now()))
 
+	// The confirm code's step is spent (M4 step reuse), so move two
+	// steps on before probing the window around "now".
+	clk.Advance(60 * time.Second)
+
 	// Code from the PREVIOUS step (user's watch is 30s behind).
 	codePrev := expectedCode(t, secret, clk.Now().Add(-30*time.Second))
 	if err := svc.Verify(ctx, factor.ID, codePrev); err != nil {
@@ -269,6 +284,93 @@ func TestTOTP_Verify_SkewWindow_AcceptsPreviousAndNextStep(t *testing.T) {
 	codeFar := expectedCode(t, secret, clk.Now().Add(-90*time.Second))
 	if err := svc.Verify(ctx, factor.ID, codeFar); !errors.Is(err, services.ErrTOTPInvalidCode) {
 		t.Fatalf("far-skew code: want ErrTOTPInvalidCode, got %v", err)
+	}
+}
+
+// M4: RFC 6238 §5.2, a code is accepted once. The confirm code is
+// spent at enrollment, a verified code cannot be replayed, and an
+// older step cannot follow a newer one.
+func TestTOTP_Verify_RejectsReplayedStep(t *testing.T) {
+	svc, _, users, _, clk := bootstrapTOTP(t)
+	ctx := t.Context()
+	uid := seedTOTPUser(t, users, "alice@example.com")
+	out, _ := svc.Enroll(ctx, uid, "phone", "alice@example.com")
+	secret := readTOTPSecret(t, out.SecretBase32)
+	factor, err := svc.ConfirmEnroll(ctx, uid, out.ChallengeID, expectedCode(t, secret, clk.Now()))
+	if err != nil {
+		t.Fatalf("ConfirmEnroll: %v", err)
+	}
+
+	err = svc.Verify(ctx, factor.ID, expectedCode(t, secret, clk.Now()))
+	if !errors.Is(err, services.ErrTOTPCodeReused) || !errors.Is(err, services.ErrTOTPInvalidCode) {
+		t.Fatalf("confirm code at verify: want ErrTOTPCodeReused (an ErrTOTPInvalidCode), got %v", err)
+	}
+	clk.Advance(60 * time.Second)
+	code := expectedCode(t, secret, clk.Now())
+	if err := svc.Verify(ctx, factor.ID, code); err != nil {
+		t.Fatalf("first use: %v", err)
+	}
+	if err := svc.Verify(ctx, factor.ID, code); !errors.Is(err, services.ErrTOTPCodeReused) {
+		t.Fatalf("replay: want ErrTOTPCodeReused, got %v", err)
+	}
+	if err := svc.Verify(ctx, factor.ID, expectedCode(t, secret, clk.Now().Add(-30*time.Second))); !errors.Is(err, services.ErrTOTPCodeReused) {
+		t.Fatalf("older step: want ErrTOTPCodeReused, got %v", err)
+	}
+}
+
+// M4: the lockout knobs are honoured, and the lock refuses the correct
+// code until the window passes.
+func TestTOTP_Verify_LockoutPolicy(t *testing.T) {
+	svc, _, users, _, clk, _ := bootstrapTOTPWithPolicy(t, services.TOTPConfig{
+		LockoutThreshold: 2,
+		LockoutDuration:  time.Minute,
+	})
+	ctx := t.Context()
+	uid := seedTOTPUser(t, users, "alice@example.com")
+	out, _ := svc.Enroll(ctx, uid, "phone", "alice@example.com")
+	secret := readTOTPSecret(t, out.SecretBase32)
+	factor, err := svc.ConfirmEnroll(ctx, uid, out.ChallengeID, expectedCode(t, secret, clk.Now()))
+	if err != nil {
+		t.Fatalf("ConfirmEnroll: %v", err)
+	}
+	clk.Advance(60 * time.Second)
+	wrong := "000000"
+	if wrong == expectedCode(t, secret, clk.Now()) {
+		wrong = "000001"
+	}
+	for i := 0; i < 2; i++ {
+		if err := svc.Verify(ctx, factor.ID, wrong); !errors.Is(err, services.ErrTOTPInvalidCode) {
+			t.Fatalf("wrong #%d: want ErrTOTPInvalidCode, got %v", i+1, err)
+		}
+	}
+	if err := svc.Verify(ctx, factor.ID, expectedCode(t, secret, clk.Now())); !errors.Is(err, services.ErrTOTPLocked) {
+		t.Fatalf("correct code while locked: want ErrTOTPLocked, got %v", err)
+	}
+	clk.Advance(61 * time.Second)
+	if err := svc.Verify(ctx, factor.ID, expectedCode(t, secret, clk.Now())); err != nil {
+		t.Fatalf("after lockout: %v", err)
+	}
+}
+
+// M4: the guard is a per-user auth control. With Redis down the
+// correct code is refused, not waved through.
+func TestTOTP_Verify_GuardUnavailable_FailsClosed(t *testing.T) {
+	svc, factors, users, _, clk, rdb := bootstrapTOTPWithPolicy(t, services.TOTPConfig{})
+	ctx := t.Context()
+	uid := seedTOTPUser(t, users, "alice@example.com")
+	out, _ := svc.Enroll(ctx, uid, "phone", "alice@example.com")
+	secret := readTOTPSecret(t, out.SecretBase32)
+	factor, err := svc.ConfirmEnroll(ctx, uid, out.ChallengeID, expectedCode(t, secret, clk.Now()))
+	if err != nil {
+		t.Fatalf("ConfirmEnroll: %v", err)
+	}
+	clk.Advance(60 * time.Second)
+	_ = rdb.Close()
+	if err := svc.Verify(ctx, factor.ID, expectedCode(t, secret, clk.Now())); !errors.Is(err, services.ErrMFAGuardUnavailable) {
+		t.Fatalf("redis down: want ErrMFAGuardUnavailable, got %v", err)
+	}
+	if got, _ := factors.Get(ctx, factor.ID); got.LastUsedAt != nil {
+		t.Fatal("refused verify must not touch last_used_at")
 	}
 }
 

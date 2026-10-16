@@ -317,7 +317,15 @@ func (s *MFAVerifyService) Verify(ctx context.Context, sessionID, userID uuid.UU
 		}
 		if err := s.totp.Verify(ctx, *req.FactorID, req.Code); err != nil {
 			// TOTP.Verify emits its own granular audit; this layer
-			// surfaces the generic outcome.
+			// surfaces the generic outcome. A locked factor and an
+			// unavailable attempt guard keep their own errors so the
+			// SPA can tell "wait" from "wrong code" (M4).
+			switch {
+			case errors.Is(err, ErrTOTPLocked):
+				return ErrMFALocked
+			case errors.Is(err, ErrMFAGuardUnavailable):
+				return ErrMFAGuardUnavailable
+			}
 			return ErrMFAInvalid
 		}
 	case string(ChallengeKindWebAuthn):
