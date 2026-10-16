@@ -164,7 +164,7 @@ func (s *AgentService) Mint(ctx context.Context, in MintInput) (*MintedAgent, er
 		meta["public_key_algorithm"] = in.PublicKeyAlgorithm
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "admin", // wired to real auth in #10
+		Actor:    auditActorFromContext(ctx),
 		Action:   "agent.mint",
 		Resource: "agent:" + agent.ID.String(),
 		Status:   storage.AuditStatusSuccess,
@@ -311,10 +311,7 @@ func (s *AgentService) Revoke(ctx context.Context, id uuid.UUID, revokedBy, reas
 	}
 	s.invalidateSecretHashCache(ctx, id)
 
-	actor := "admin"
-	if revokedBy != "" {
-		actor = "user:" + revokedBy
-	}
+	actor := auditActor(ctx, revokedBy)
 	meta := map[string]any{
 		"agent_id": id.String(),
 		"reason":   reason,

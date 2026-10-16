@@ -337,7 +337,7 @@ func (s *SettingsService) Set(ctx context.Context, in SetInput) (*PlatformSettin
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO audit_events (actor, action, resource, status, metadata, correlation_id)
 		 VALUES ($1, $2, $3, 'success', $4::jsonb, $5::uuid)`,
-		in.ActorID,
+		auditActor(ctx, in.ActorID),
 		"platform_setting.update",
 		"platform_setting:"+in.Key,
 		auditJSON,

@@ -565,7 +565,7 @@ func (s *ProviderConnectionsService) Create(ctx context.Context, in CreateInput)
 		return nil, err
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:         actorOrAdmin(in.ActorID),
+		Actor:         auditActor(ctx, in.ActorID),
 		Action:        "provider_connection.create",
 		Resource:      "provider_connection:" + created.ID.String(),
 		Status:        storage.AuditStatusSuccess,
@@ -613,7 +613,7 @@ func (s *ProviderConnectionsService) Update(ctx context.Context, id uuid.UUID, i
 		return nil, err
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:         actorOrAdmin(in.ActorID),
+		Actor:         auditActor(ctx, in.ActorID),
 		Action:        "provider_connection.update",
 		Resource:      "provider_connection:" + updated.ID.String(),
 		Status:        storage.AuditStatusSuccess,
@@ -654,7 +654,7 @@ func (s *ProviderConnectionsService) Delete(ctx context.Context, id uuid.UUID, a
 		return counts, err
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:         actorOrAdmin(actorID),
+		Actor:         auditActor(ctx, actorID),
 		Action:        "provider_connection.delete",
 		Resource:      "provider_connection:" + existing.ID.String(),
 		Status:        storage.AuditStatusSuccess,
@@ -701,7 +701,7 @@ func (s *ProviderConnectionsService) Bind(ctx context.Context, in BindInput) (*s
 		envIDMeta = b.EnvironmentID.String()
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    actorOrAdmin(in.ActorID),
+		Actor:    auditActor(ctx, in.ActorID),
 		Action:   "provider_connection.bind",
 		Resource: "provider_connection:" + in.ConnectionID.String(),
 		Status:   storage.AuditStatusSuccess,
@@ -729,7 +729,7 @@ func (s *ProviderConnectionsService) Unbind(ctx context.Context, bindingID uuid.
 		envIDMeta = b.EnvironmentID.String()
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    actorOrAdmin(actorID),
+		Actor:    auditActor(ctx, actorID),
 		Action:   "provider_connection.unbind",
 		Resource: "provider_connection:" + b.ProviderConnectionID.String(),
 		Status:   storage.AuditStatusSuccess,
@@ -801,7 +801,7 @@ func (s *ProviderConnectionsService) MarkDiscoverFinished(ctx context.Context, i
 		return err
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "worker",
+		Actor:    auditActorFromContext(ctx),
 		Action:   "provider_connection.discover_finished",
 		Resource: "provider_connection:" + id.String(),
 		Status:   storage.AuditStatusSuccess,
@@ -843,12 +843,6 @@ func (s *ProviderConnectionsService) OnDiscoverJobCompleted(ctx context.Context,
 
 // ---- helpers ------------------------------------------------------
 
-func actorOrAdmin(id string) string {
-	if id == "" {
-		return "admin"
-	}
-	return id
-}
 
 // diffChangedKeys returns the column names that differ between an
 // existing row and the incoming Update input. Used for the audit

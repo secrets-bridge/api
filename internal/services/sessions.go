@@ -102,13 +102,28 @@ func (s *SessionService) MarkMFA(ctx context.Context, sessionID uuid.UUID, at ti
 		return fmt.Errorf("services: touch last_mfa_at: %w", err)
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "session:" + sessionID.String(),
+		Actor:    s.sessionUserActor(ctx, sessionID),
 		Action:   "session.mfa_stamped",
 		Resource: "session:" + sessionID.String(),
 		Status:   storage.AuditStatusSuccess,
 		Metadata: map[string]any{"at": at.UTC().Format(time.RFC3339Nano)},
 	})
 	return nil
+}
+
+// sessionUserActor attributes a session-level event to the session's
+// user ("user:<id>"), so it lines up with the rest of that user's audit
+// trail. Falls back to the request context when the repository can't
+// resolve the owner.
+func (s *SessionService) sessionUserActor(ctx context.Context, sessionID uuid.UUID) string {
+	if r, ok := s.sessions.(interface {
+		UserIDForSession(context.Context, uuid.UUID) (uuid.UUID, error)
+	}); ok {
+		if uid, err := r.UserIDForSession(ctx, sessionID); err == nil {
+			return "user:" + uid.String()
+		}
+	}
+	return auditActorFromContext(ctx)
 }
 
 // HasFreshMFA reports whether the session's `last_mfa_at` is within

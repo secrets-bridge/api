@@ -243,7 +243,7 @@ func (s *ProviderConnectionsService) auditBindingCreate(
 		envIDMeta = b.EnvironmentID.String()
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:         actorOrAdmin(actorID),
+		Actor:         auditActor(ctx, actorID),
 		Action:        "binding.create",
 		Resource:      "provider_connection_binding:" + b.ID.String(),
 		Status:        storage.AuditStatusSuccess,
@@ -286,7 +286,7 @@ func (s *ProviderConnectionsService) auditBindingDelete(
 	// envKind is always present (we just dereferenced env to get here).
 	meta["self_service_bindable"] = selfServiceBindable
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:         actorOrAdmin(actorID),
+		Actor:         auditActor(ctx, actorID),
 		Action:        "binding.delete",
 		Resource:      "provider_connection_binding:" + b.ID.String(),
 		Status:        storage.AuditStatusSuccess,
@@ -311,7 +311,7 @@ func (s *ProviderConnectionsService) auditDeniedOutOfScope(
 		envIDMeta = envID.String()
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:         actorOrAdmin(actorID),
+		Actor:         auditActor(ctx, actorID),
 		Action:        "binding.denied_out_of_scope",
 		Resource:      "project:" + projectID.String(),
 		Status:        storage.AuditStatusFailure,

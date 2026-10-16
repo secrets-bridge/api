@@ -1088,7 +1088,7 @@ func (s *RequestService) OnJobCompleted(ctx context.Context, job *storage.SyncJo
 	}
 	if err := s.requests.UpdateStatus(ctx, *job.RequestID, target); err != nil {
 		_ = s.audit.Append(ctx, &storage.AuditEvent{
-			Actor:         "system",
+			Actor:         "system:request-lifecycle",
 			Action:        "request.transition_failed",
 			Resource:      "request:" + job.RequestID.String(),
 			Status:        storage.AuditStatusFailure,
@@ -1102,7 +1102,7 @@ func (s *RequestService) OnJobCompleted(ctx context.Context, job *storage.SyncJo
 		return
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:         "system",
+		Actor:         "system:request-lifecycle",
 		Action:        "request.transition",
 		Resource:      "request:" + job.RequestID.String(),
 		Status:        storage.AuditStatusSuccess,

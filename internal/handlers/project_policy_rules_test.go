@@ -301,7 +301,7 @@ func TestScopedCreate_OutOfScope_403_DeniedCounterIncrement_NoRuleIDInAudit(t *t
 	var hasRuleID bool
 	if err := h.pool.QueryRow(t.Context(),
 		`SELECT metadata ? 'policy_rule_id' FROM audit_events
-		 WHERE action='policy.denied_out_of_scope' AND actor='alice'
+		 WHERE action='policy.denied_out_of_scope' AND actor='user:alice'
 		 ORDER BY occurred_at DESC LIMIT 1`,
 	).Scan(&hasRuleID); err != nil {
 		t.Fatal(err)

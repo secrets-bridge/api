@@ -151,18 +151,23 @@ func (h *GitOps) GetArgoCDEndpoint(c fiber.Ctx) error {
 }
 
 // SetArgoCDEndpointEnabled handles PUT /argocd-endpoints/:id/enabled.
+// The body must carry "enabled" (true or false). A body without it used
+// to read as false and quietly disable the endpoint.
 func (h *GitOps) SetArgoCDEndpointEnabled(c fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid UUID")
 	}
 	var body struct {
-		Enabled bool `json:"enabled"`
+		Enabled *bool `json:"enabled"`
 	}
 	if err := c.Bind().JSON(&body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
 	}
-	if err := h.endpoints.SetEnabled(c.Context(), id, body.Enabled); err != nil {
+	if body.Enabled == nil {
+		return fiber.NewError(fiber.StatusBadRequest, "enabled is required (true or false)")
+	}
+	if err := h.endpoints.SetEnabled(c.Context(), id, *body.Enabled); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "argocd endpoint not found")
 		}

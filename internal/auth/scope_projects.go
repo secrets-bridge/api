@@ -18,9 +18,9 @@ import (
 //	                    may be empty — then they see no rows).
 //
 // Project IDs that don't parse as UUIDs are silently dropped. A grant
-// with a project_id key that is empty string is treated as global —
-// matches the existing scopeCovers convention where an empty value
-// inside a scope key is wildcard-like.
+// whose stored scope carries an empty or non-string value never reaches
+// this point: RepoResolver drops it (API-N-06), so it covers nothing
+// rather than reading as global.
 type ProjectAccess struct {
 	IsGlobal   bool
 	ProjectIDs []uuid.UUID
@@ -168,31 +168,55 @@ func (pa ProjectAccess) Covers(projectID uuid.UUID) bool {
 // empty result (IsGlobal=false, no ProjectIDs) means "sees nothing" — a
 // list returns empty, a detail returns 404.
 func ReadableProjectAccess(ctx context.Context, userID string, r Resolver, tr TeamScopeResolver) (ProjectAccess, error) {
-	list, err := EffectiveProjectAccess(ctx, userID, PermSecretList, r, tr)
+	return ProjectAccessForAny(ctx, userID, r, tr, PermSecretList, PermSecretRequest)
+}
+
+// ProjectAccessForAny is the union of the caller's project access across
+// perms: global on any of them yields global, otherwise the granted
+// project sets are unioned and deduped. Grants are resolved once.
+//
+// Read endpoints whose audience is wider than the developer view use it
+// to add the permission that manages the resource, e.g. the project
+// policy-rule reads accept ReadableProjectAccess plus policy.author, so a
+// scoped author can still read the rules they write.
+func ProjectAccessForAny(ctx context.Context, userID string, r Resolver, tr TeamScopeResolver, perms ...Permission) (ProjectAccess, error) {
+	if userID == "" {
+		return ProjectAccess{}, nil
+	}
+	if r == nil {
+		return ProjectAccess{}, fmt.Errorf("auth: ProjectAccessForAny called with nil Resolver")
+	}
+	grants, err := r.Resolve(ctx, userID)
 	if err != nil {
-		return ProjectAccess{}, err
+		return ProjectAccess{}, fmt.Errorf("auth: resolve grants for %q: %w", userID, err)
 	}
-	if list.IsGlobal {
-		return ProjectAccess{IsGlobal: true}, nil
-	}
-	req, err := EffectiveProjectAccess(ctx, userID, PermSecretRequest, r, tr)
-	if err != nil {
-		return ProjectAccess{}, err
-	}
-	if req.IsGlobal {
-		return ProjectAccess{IsGlobal: true}, nil
-	}
+	resolved := resolvedGrants(grants)
 	pa := ProjectAccess{}
 	seen := map[uuid.UUID]struct{}{}
-	for _, id := range append(append([]uuid.UUID{}, list.ProjectIDs...), req.ProjectIDs...) {
-		if _, ok := seen[id]; ok {
-			continue
+	for _, perm := range perms {
+		one, err := EffectiveProjectAccess(ctx, userID, perm, resolved, tr)
+		if err != nil {
+			return ProjectAccess{}, err
 		}
-		seen[id] = struct{}{}
-		pa.ProjectIDs = append(pa.ProjectIDs, id)
+		if one.IsGlobal {
+			return ProjectAccess{IsGlobal: true}, nil
+		}
+		for _, id := range one.ProjectIDs {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			pa.ProjectIDs = append(pa.ProjectIDs, id)
+		}
 	}
 	return pa, nil
 }
+
+// resolvedGrants replays an already-resolved grant list so one request
+// does not hit user_roles once per permission.
+type resolvedGrants []Grant
+
+func (g resolvedGrants) Resolve(context.Context, string) ([]Grant, error) { return g, nil }
 
 // EffectiveTeamAccess returns the team subtree the caller can act on
 // for `perm`. Each team_id-scoped grant is expanded through its

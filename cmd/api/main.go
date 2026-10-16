@@ -529,6 +529,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	tenancyH = tenancyH.WithScope(rbacResolver, teamScopeResolver)
 	projectSecretsH = projectSecretsH.WithScope(rbacResolver, teamScopeResolver)
 
+	// API-N-05: project, environment and project-secret binding writes
+	// emit an audit event with the session actor. (Role, user-role and
+	// workflow writes audit through adminH.WithAudit above.)
+	tenancyH = tenancyH.WithAudit(auditRepo)
+	projectSecretsH = projectSecretsH.WithAudit(auditRepo)
+
 	// "What are my projects?" projection (api#43 Slice D) — drives the
 	// UI project switcher.
 	meH := handlers.NewMe(projectRepo, rbacResolver).
@@ -542,7 +548,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	devSecretsH := handlers.NewDevSecrets(
 		projectRepo, environmentRepo, projectSecretsRepo, secretsRepo,
 		requestSvc,
-	)
+	).WithReadScope(rbacResolver, teamScopeResolver) // API-N-04: env secret list is project-scoped
 
 	// Session service (Slice A2). Owns the HttpOnly cookie auth path
 	// that replaces JWT-in-sessionStorage. Postgres is the source of
@@ -1122,7 +1128,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// The existing admin routes above stay on integration.edit;
 	// these are integration.bind scoped to (project, env) (handler
 	// runs the locked 7-gate / 3-gate chains inline).
-	pcbH := handlers.NewProjectProviderConnectionBindings(pcSvc)
+	pcbH := handlers.NewProjectProviderConnectionBindings(pcSvc).
+		WithReadScope(rbacResolver, teamScopeResolver) // API-N-04
 	v1.Post("/projects/:projectID/provider-connection-bindings", pcbH.Create)
 	v1.Get("/projects/:projectID/provider-connection-bindings", pcbH.List)
 	v1.Delete("/projects/:projectID/provider-connection-bindings/:bindingID", pcbH.Delete)
@@ -1151,7 +1158,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		auth.Require(auth.PermPolicyEdit, rbacResolver), adminH.PolicyHistory)
 
 	pprH := handlers.NewProjectPolicyRules(policyEng, policyRepo, settingsSvc).
-		WithHistory(policyHistorySvc, auditRepo)
+		WithHistory(policyHistorySvc, auditRepo).
+		WithReadScope(rbacResolver, teamScopeResolver) // API-N-04
 	v1.Post("/projects/:projectID/policy-rules", pprH.Create)
 	v1.Get("/projects/:projectID/policy-rules", pprH.List)
 	v1.Get("/projects/:projectID/policy-rules/:ruleID", pprH.Get)
