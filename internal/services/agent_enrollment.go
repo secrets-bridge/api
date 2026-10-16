@@ -148,10 +148,7 @@ func (s *AgentService) RevokeEnrollmentToken(ctx context.Context, id uuid.UUID, 
 	if err := s.enrollTokens.Revoke(ctx, id, revokedBy, s.now().UTC()); err != nil {
 		return err // already consumed/revoked → ErrEnrollmentTokenNotFound → 409
 	}
-	actor := "admin"
-	if revokedBy != "" {
-		actor = "user:" + revokedBy
-	}
+	actor := auditActor(ctx, revokedBy)
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
 		Actor:         actor,
 		Action:        "agent.enrollment_token.revoked",

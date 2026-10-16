@@ -34,12 +34,14 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
@@ -145,6 +147,10 @@ func (h *Admin) CreateRole(c fiber.Ctx) error {
 	if err := h.roles.Create(c.Context(), r); err != nil {
 		return adminErr(err)
 	}
+	auditWrite(c, h.audit, "role.create", "role:"+r.ID.String(), map[string]any{
+		"role_id":     r.ID.String(),
+		"permissions": nonNilStrings(r.Permissions),
+	})
 	return c.Status(fiber.StatusCreated).JSON(roleToBody(r))
 }
 
@@ -175,6 +181,9 @@ func (h *Admin) GetRole(c fiber.Ctx) error {
 }
 
 // UpdateRolePermissionsBody is the body for PUT /roles/:id/permissions.
+// The list replaces the role's permissions, so the key is required: a
+// body without it used to strip every permission from the role. Send []
+// to clear on purpose.
 type UpdateRolePermissionsBody struct {
 	Permissions []string `json:"permissions"`
 }
@@ -185,31 +194,61 @@ func (h *Admin) UpdateRolePermissions(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	var body UpdateRolePermissionsBody
-	if err := c.Bind().JSON(&body); err != nil {
+	var body struct {
+		Permissions *[]string `json:"permissions"`
+	}
+	if err := json.Unmarshal(c.Body(), &body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
 	}
-	if err := h.roles.UpdatePermissions(c.Context(), id, body.Permissions); err != nil {
+	if body.Permissions == nil {
+		return fiber.NewError(fiber.StatusBadRequest, "permissions is required (send [] to remove every permission)")
+	}
+	perms := *body.Permissions
+	// Read the current list so the audit records what was added and
+	// removed, which is the privilege change a reviewer cares about.
+	existing, err := h.roles.Get(c.Context(), id)
+	if err != nil {
 		return adminErr(err)
 	}
+	if err := h.roles.UpdatePermissions(c.Context(), id, perms); err != nil {
+		return adminErr(err)
+	}
+	added, removed := stringSetDiff(existing.Permissions, perms)
+	auditWrite(c, h.audit, "role.permissions.update", "role:"+id.String(), map[string]any{
+		"role_id":             id.String(),
+		"permissions_added":   added,
+		"permissions_removed": removed,
+	})
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
-// DeleteRole handles DELETE /roles/:id.
+// DeleteRole handles DELETE /roles/:id. Deleting a role also drops every
+// user_roles row that pointed at it (FK ON DELETE CASCADE).
 func (h *Admin) DeleteRole(c fiber.Ctx) error {
 	id, err := parseID(c, "id")
 	if err != nil {
 		return err
 	}
+	existing, getErr := h.roles.Get(c.Context(), id)
 	if err := h.roles.Delete(c.Context(), id); err != nil {
 		return adminErr(err)
 	}
+	meta := map[string]any{"role_id": id.String()}
+	if getErr == nil && existing != nil {
+		meta["permissions"] = nonNilStrings(existing.Permissions)
+	}
+	auditWrite(c, h.audit, "role.delete", "role:"+id.String(), meta)
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
 // ---- user_roles ------------------------------------------------------
 
 // GrantUserRoleBody is the body of POST /user-roles.
+//
+// GrantedBy is accepted for wire compatibility but IGNORED: provenance is
+// the session actor (API-N-05). Trusting it let an admin label a grant
+// "system:oidc", the marker the OIDC role reconciler uses to decide which
+// rows it owns.
 type GrantUserRoleBody struct {
 	UserID    string         `json:"user_id"`
 	RoleID    uuid.UUID      `json:"role_id"`
@@ -243,14 +282,41 @@ func (h *Admin) GrantUserRole(c fiber.Ctx) error {
 	if body.UserID == "" || body.RoleID == uuid.Nil {
 		return fiber.NewError(fiber.StatusBadRequest, "user_id and role_id are required")
 	}
+	// API-N-06: allowed keys only, non-empty string values, UUIDs where
+	// an id is expected. A malformed scope used to collapse to {} at
+	// evaluation time and act as a global grant.
+	scope, err := auth.NormalizeGrantScope(body.Scope)
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
 	ur := &storage.UserRole{
 		UserID: body.UserID, RoleID: body.RoleID,
-		Scope: body.Scope, GrantedBy: body.GrantedBy,
+		Scope: scope, GrantedBy: sessionActor(c),
 	}
 	if err := h.userRoles.Grant(c.Context(), ur); err != nil {
 		return adminErr(err)
 	}
+	auditWrite(c, h.audit, "user_role.grant", "user_role:"+ur.ID.String(), userRoleAuditMeta(ur))
 	return c.Status(fiber.StatusCreated).JSON(userRoleToBody(ur))
+}
+
+// userRoleAuditMeta is the ids-and-shape view of an assignment for audit
+// metadata: who, which role, and the scope's keys plus its id values.
+// Free-text scope values (environment, secret_ref_prefix) stay out.
+func userRoleAuditMeta(ur *storage.UserRole) map[string]any {
+	meta := map[string]any{
+		"user_role_id": ur.ID.String(),
+		"user_id":      ur.UserID,
+		"role_id":      ur.RoleID.String(),
+		"scope_keys":   sortedKeys(ur.Scope),
+		"granted_by":   ur.GrantedBy,
+	}
+	for _, k := range []string{auth.ScopeKeyProjectID, auth.ScopeKeyTeamID} {
+		if v, ok := ur.Scope[k].(string); ok {
+			meta[k] = v
+		}
+	}
+	return meta
 }
 
 // RevokeUserRole handles DELETE /user-roles/:id.
@@ -259,9 +325,15 @@ func (h *Admin) RevokeUserRole(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	// Load first so the audit names the user and role that lost access.
+	existing, err := h.userRoles.Get(c.Context(), id)
+	if err != nil {
+		return adminErr(err)
+	}
 	if err := h.userRoles.Revoke(c.Context(), id); err != nil {
 		return adminErr(err)
 	}
+	auditWrite(c, h.audit, "user_role.revoke", "user_role:"+id.String(), userRoleAuditMeta(existing))
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
@@ -325,8 +397,15 @@ type WorkflowBody struct {
 	// Send `true` or `false` to flip the flag explicitly. On Create,
 	// nil collapses to false (default-deny).
 	ScopedPolicyAuthorable *bool `json:"scoped_policy_authorable,omitempty"`
-	CreatedAt              time.Time `json:"created_at,omitempty"`
-	UpdatedAt              time.Time `json:"updated_at,omitempty"`
+	// Cross-team knobs (Slice N1). Before these were on the wire there
+	// was no way to set them through the API, and every PUT reset them
+	// to the column defaults. Not omitempty: a false security vote must
+	// be visible, not inferred from silence. On create, 0 fill_ttl means
+	// the 86400s default.
+	FillTTLSeconds           int       `json:"fill_ttl_seconds"`
+	RequiresSecurityApproval bool      `json:"requires_security_approval"`
+	CreatedAt                time.Time `json:"created_at,omitempty"`
+	UpdatedAt                time.Time `json:"updated_at,omitempty"`
 }
 
 func workflowToBody(w *storage.WorkflowDefinition) WorkflowBody {
@@ -344,8 +423,10 @@ func workflowToBody(w *storage.WorkflowDefinition) WorkflowBody {
 		IsDefault:            w.IsDefault, Enabled: w.Enabled, IsSystem: w.IsSystem,
 		// Always emit the current value on the wire so clients that
 		// preserve via copy-then-PUT round-trip correctly.
-		ScopedPolicyAuthorable: &spa,
-		CreatedAt:              w.CreatedAt, UpdatedAt: w.UpdatedAt,
+		ScopedPolicyAuthorable:   &spa,
+		FillTTLSeconds:           w.FillTTLSeconds,
+		RequiresSecurityApproval: w.RequiresSecurityApproval,
+		CreatedAt:                w.CreatedAt, UpdatedAt: w.UpdatedAt,
 	}
 }
 
@@ -361,6 +442,8 @@ func bodyToWorkflow(b WorkflowBody) *storage.WorkflowDefinition {
 		AllowSelfApproval:    b.AllowSelfApproval,
 		NotificationChannels: b.NotificationChannels,
 		IsDefault:            b.IsDefault, Enabled: b.Enabled,
+		FillTTLSeconds:           b.FillTTLSeconds,
+		RequiresSecurityApproval: b.RequiresSecurityApproval,
 	}
 	// R-follow-up #1 (api#118) — explicit field on create collapses
 	// nil to false (default-deny). Caller hits the explicit-merge
@@ -384,10 +467,19 @@ func (h *Admin) CreateWorkflow(c fiber.Ctx) error {
 		body.WrapTTLClaimedSec <= 0 || body.RequestTTLSec <= 0 {
 		return fiber.NewError(fiber.StatusBadRequest, "all TTLs must be positive seconds")
 	}
+	if body.FillTTLSeconds < 0 {
+		return fiber.NewError(fiber.StatusBadRequest, "fill_ttl_seconds must be positive (omit for the default)")
+	}
+	if body.MinApprovers < 0 {
+		return fiber.NewError(fiber.StatusBadRequest, "min_approvers must not be negative")
+	}
 	w := bodyToWorkflow(body)
 	if err := h.workflows.Create(c.Context(), w); err != nil {
 		return adminErr(err)
 	}
+	auditWrite(c, h.audit, "workflow.create", "workflow:"+w.ID.String(), map[string]any{
+		"workflow_id": w.ID.String(),
+	})
 	return c.Status(fiber.StatusCreated).JSON(workflowToBody(w))
 }
 
@@ -442,38 +534,160 @@ func (h *Admin) GetWorkflow(c fiber.Ctx) error {
 	return c.JSON(workflowToBody(w))
 }
 
-// UpdateWorkflow handles PUT /workflows/:id. is_default flips require
-// a separate atomic operation (not in this PR) so they're ignored here.
+// workflowUpdateBody is the PUT /workflows/:id input. Every field is
+// optional: absent (or null) keeps the stored value, present applies it,
+// including an explicit false or 0. approver_role_id additionally takes
+// an explicit null to clear the approver role.
 //
-// R-follow-up #1 (api#118) preserve semantic: ScopedPolicyAuthorable
-// is *bool on the body. Nil = preserve (Get the existing value, set on
-// the patched struct). Explicit true/false = flip. Critical for rolling
-// deploys where older admin clients don't yet know about the field —
-// without the preserve they'd silently opt out every workflow.
+// name, is_default and is_system are not updatable here (is_default
+// flips need their own atomic operation, name was never written by
+// Update) and are ignored if sent.
+type workflowUpdateBody struct {
+	Description              *string      `json:"description"`
+	MinApprovers             *int         `json:"min_approvers"`
+	ApproverRoleID           optionalUUID `json:"approver_role_id"`
+	WrapTTLCreatedSec        *int64       `json:"wrap_ttl_created_seconds"`
+	WrapTTLApprovedSec       *int64       `json:"wrap_ttl_approved_seconds"`
+	WrapTTLClaimedSec        *int64       `json:"wrap_ttl_claimed_seconds"`
+	RequestTTLSec            *int64       `json:"request_ttl_seconds"`
+	RequireJustification     *bool        `json:"require_justification"`
+	AllowSelfApproval        *bool        `json:"allow_self_approval"`
+	NotificationChannels     *[]string    `json:"notification_channels"`
+	Enabled                  *bool        `json:"enabled"`
+	ScopedPolicyAuthorable   *bool        `json:"scoped_policy_authorable"`
+	FillTTLSeconds           *int         `json:"fill_ttl_seconds"`
+	RequiresSecurityApproval *bool        `json:"requires_security_approval"`
+}
+
+// UpdateWorkflow handles PUT /workflows/:id as a partial update.
+//
+// The handler used to build the row from the body alone, so any field a
+// client left out was written back as its zero value: TTLs went to 0s,
+// approver_role_id was cleared, and requires_security_approval (never on
+// the wire) reset to false on every edit, silently dropping the security
+// vote on prod cross-team requests. Now the stored row is the base and
+// only the keys present in the body change it.
 func (h *Admin) UpdateWorkflow(c fiber.Ctx) error {
 	id, err := parseID(c, "id")
 	if err != nil {
 		return err
 	}
-	var body WorkflowBody
-	if err := c.Bind().JSON(&body); err != nil {
+	var body workflowUpdateBody
+	if err := json.Unmarshal(c.Body(), &body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
 	}
-	w := bodyToWorkflow(body)
-	w.ID = id
-	if body.ScopedPolicyAuthorable == nil {
-		// Preserve via Get → merge. Cost: one extra DB round-trip
-		// per Update. Acceptable for an admin path.
-		existing, err := h.workflows.Get(c.Context(), id)
-		if err != nil {
-			return adminErr(err)
+	for name, ttl := range map[string]*int64{
+		"wrap_ttl_created_seconds":  body.WrapTTLCreatedSec,
+		"wrap_ttl_approved_seconds": body.WrapTTLApprovedSec,
+		"wrap_ttl_claimed_seconds":  body.WrapTTLClaimedSec,
+		"request_ttl_seconds":       body.RequestTTLSec,
+	} {
+		if ttl != nil && *ttl <= 0 {
+			return fiber.NewError(fiber.StatusBadRequest, name+" must be positive seconds")
 		}
-		w.ScopedPolicyAuthorable = existing.ScopedPolicyAuthorable
 	}
-	if err := h.workflows.Update(c.Context(), w); err != nil {
+	if body.MinApprovers != nil && *body.MinApprovers < 0 {
+		return fiber.NewError(fiber.StatusBadRequest, "min_approvers must not be negative")
+	}
+	if body.FillTTLSeconds != nil && *body.FillTTLSeconds <= 0 {
+		return fiber.NewError(fiber.StatusBadRequest, "fill_ttl_seconds must be positive")
+	}
+
+	existing, err := h.workflows.Get(c.Context(), id)
+	if err != nil {
 		return adminErr(err)
 	}
+	w := *existing
+	w.NotificationChannels = append([]string(nil), existing.NotificationChannels...)
+	if body.Description != nil {
+		w.Description = *body.Description
+	}
+	if body.MinApprovers != nil {
+		w.MinApprovers = *body.MinApprovers
+	}
+	if body.ApproverRoleID.Set {
+		w.ApproverRoleID = body.ApproverRoleID.Value
+	}
+	if body.WrapTTLCreatedSec != nil {
+		w.WrapTTLCreated = time.Duration(*body.WrapTTLCreatedSec) * time.Second
+	}
+	if body.WrapTTLApprovedSec != nil {
+		w.WrapTTLApproved = time.Duration(*body.WrapTTLApprovedSec) * time.Second
+	}
+	if body.WrapTTLClaimedSec != nil {
+		w.WrapTTLClaimed = time.Duration(*body.WrapTTLClaimedSec) * time.Second
+	}
+	if body.RequestTTLSec != nil {
+		w.RequestTTL = time.Duration(*body.RequestTTLSec) * time.Second
+	}
+	if body.RequireJustification != nil {
+		w.RequireJustification = *body.RequireJustification
+	}
+	if body.AllowSelfApproval != nil {
+		w.AllowSelfApproval = *body.AllowSelfApproval
+	}
+	if body.NotificationChannels != nil {
+		w.NotificationChannels = *body.NotificationChannels
+	}
+	if body.Enabled != nil {
+		w.Enabled = *body.Enabled
+	}
+	if body.ScopedPolicyAuthorable != nil {
+		w.ScopedPolicyAuthorable = *body.ScopedPolicyAuthorable
+	}
+	if body.FillTTLSeconds != nil {
+		w.FillTTLSeconds = *body.FillTTLSeconds
+	}
+	if body.RequiresSecurityApproval != nil {
+		w.RequiresSecurityApproval = *body.RequiresSecurityApproval
+	}
+	if err := h.workflows.Update(c.Context(), &w); err != nil {
+		return adminErr(err)
+	}
+	auditWrite(c, h.audit, "workflow.update", "workflow:"+id.String(), map[string]any{
+		"workflow_id":  id.String(),
+		"changed_keys": workflowChangedKeys(existing, &w),
+	})
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// workflowChangedKeys names the columns workflows.Update rewrote with a
+// different value. Names only, no values, matching the
+// provider_connection.update convention.
+func workflowChangedKeys(before, after *storage.WorkflowDefinition) []string {
+	changed := []string{}
+	add := func(key string, differs bool) {
+		if differs {
+			changed = append(changed, key)
+		}
+	}
+	add("description", before.Description != after.Description)
+	add("min_approvers", before.MinApprovers != after.MinApprovers)
+	add("approver_role_id", uuidPtrMeta(before.ApproverRoleID) != uuidPtrMeta(after.ApproverRoleID))
+	add("wrap_ttl_created_seconds", before.WrapTTLCreated != after.WrapTTLCreated)
+	add("wrap_ttl_approved_seconds", before.WrapTTLApproved != after.WrapTTLApproved)
+	add("wrap_ttl_claimed_seconds", before.WrapTTLClaimed != after.WrapTTLClaimed)
+	add("request_ttl_seconds", before.RequestTTL != after.RequestTTL)
+	add("require_justification", before.RequireJustification != after.RequireJustification)
+	add("allow_self_approval", before.AllowSelfApproval != after.AllowSelfApproval)
+	add("notification_channels", !sameStrings(before.NotificationChannels, after.NotificationChannels))
+	add("enabled", before.Enabled != after.Enabled)
+	add("fill_ttl_seconds", before.FillTTLSeconds != after.FillTTLSeconds)
+	add("requires_security_approval", before.RequiresSecurityApproval != after.RequiresSecurityApproval)
+	add("scoped_policy_authorable", before.ScopedPolicyAuthorable != after.ScopedPolicyAuthorable)
+	return changed
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // DeleteWorkflow handles DELETE /workflows/:id.
@@ -485,6 +699,9 @@ func (h *Admin) DeleteWorkflow(c fiber.Ctx) error {
 	if err := h.workflows.Delete(c.Context(), id); err != nil {
 		return adminErr(err)
 	}
+	auditWrite(c, h.audit, "workflow.delete", "workflow:"+id.String(), map[string]any{
+		"workflow_id": id.String(),
+	})
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
@@ -708,36 +925,78 @@ func (h *Admin) GetPolicy(c fiber.Ctx) error {
 	return c.JSON(policyToBody(p))
 }
 
-// UpdatePolicy handles PUT /policies/:id.
+// policyUpdateBody is the PUT /policies/:id input. Every field is
+// optional: absent (or null) keeps the stored value, present applies it,
+// including false / 0. project_id and team_id are not accepted (anchors
+// are immutable; delete and re-create to move a rule).
+type policyUpdateBody struct {
+	Name                *string         `json:"name"`
+	Selector            *map[string]any `json:"selector"`
+	WorkflowID          *uuid.UUID      `json:"workflow_id"`
+	Priority            *int            `json:"priority"`
+	Enabled             *bool           `json:"enabled"`
+	DirectRevealAllowed *bool           `json:"direct_reveal_allowed"`
+	RequiresMFA         *bool           `json:"requires_mfa"`
+	RevealTTLSeconds    *int            `json:"reveal_ttl_seconds"`
+}
+
+// UpdatePolicy handles PUT /policies/:id as a partial update.
 //
-// R-follow-up #3: Update reads the existing row and preserves its
-// anchor — `team_id` and `project_id` from the body are IGNORED to
-// keep anchor immutability consistent with the storage layer's
-// `ErrAnchorImmutable`. Admin who wants to change a rule's anchor
-// deletes and re-creates.
+// The stored rule is the base and only keys present in the body change
+// it. The handler used to write the body verbatim, so an omitted key
+// reset its column: the selector to {} (match everything), enabled and
+// direct_reveal_allowed / requires_mfa to false, priority to 0.
+//
+// R-follow-up #3: the anchor (project_id / team_id) is preserved from
+// the stored row, consistent with storage's ErrAnchorImmutable.
 func (h *Admin) UpdatePolicy(c fiber.Ctx) error {
 	id, err := parseID(c, "id")
 	if err != nil {
 		return err
 	}
-	var body PolicyBody
-	if err := c.Bind().JSON(&body); err != nil {
+	var upd policyUpdateBody
+	if err := json.Unmarshal(c.Body(), &upd); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
 	}
-	if err := validatePolicyAccessFields(body); err != nil {
-		return err
+	if upd.Name != nil && *upd.Name == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "name must not be empty")
 	}
-	// Load the existing row so we can preserve the anchor (and run
-	// team-rule selector safety if the row is team-anchored, since
-	// the body may rewrite selector keys).
+	if upd.WorkflowID != nil && *upd.WorkflowID == uuid.Nil {
+		return fiber.NewError(fiber.StatusBadRequest, "workflow_id must not be empty")
+	}
 	existing, err := h.policies.Get(c.Context(), id)
 	if err != nil {
 		return adminErr(err)
 	}
-	// Anchor immutability — apply existing anchor to validation +
-	// the patched rule.
-	body.ProjectID = existing.ProjectID
-	body.TeamID = existing.TeamID
+	body := policyToBody(existing)
+	if upd.Name != nil {
+		body.Name = *upd.Name
+	}
+	if upd.Selector != nil {
+		body.Selector = *upd.Selector
+	}
+	if upd.WorkflowID != nil {
+		body.WorkflowID = *upd.WorkflowID
+	}
+	if upd.Priority != nil {
+		body.Priority = *upd.Priority
+	}
+	if upd.Enabled != nil {
+		body.Enabled = *upd.Enabled
+	}
+	if upd.DirectRevealAllowed != nil {
+		body.DirectRevealAllowed = *upd.DirectRevealAllowed
+	}
+	if upd.RequiresMFA != nil {
+		body.RequiresMFA = *upd.RequiresMFA
+	}
+	if upd.RevealTTLSeconds != nil {
+		body.RevealTTLSeconds = *upd.RevealTTLSeconds
+	}
+	// Validate the merged rule, the same checks a create runs.
+	if err := validatePolicyAccessFields(body); err != nil {
+		return err
+	}
 	if field, d := policySelectorEnumReject(body); d != nil {
 		return stableErr(c, fiber.StatusBadRequest, "policy_scope_too_broad",
 			"selector."+field+" is not in the policy selector enum",
@@ -826,12 +1085,8 @@ func (h *Admin) auditAdminPolicy(c fiber.Ctx, action string, p *storage.PolicyRu
 	if len(changedKeys) > 0 {
 		meta["changed_keys"] = changedKeys
 	}
-	actor := identityFromCtx(c)
-	if actor == "" {
-		actor = "admin"
-	}
 	_ = h.audit.Append(c.Context(), &storage.AuditEvent{
-		Actor:    actor,
+		Actor:    auth.AuditActor(c.Context()),
 		Action:   action,
 		Resource: "policy_rule:" + p.ID.String(),
 		Status:   storage.AuditStatusSuccess,

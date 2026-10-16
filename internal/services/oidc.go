@@ -27,6 +27,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -34,6 +35,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/google/uuid"
@@ -179,6 +182,62 @@ func NewOIDCService(
 // the handler can build the end_session URL without re-reading config.
 func (s *OIDCService) PostLogoutURL() string { return s.cfg.PostLogoutURL }
 
+// StateTTL is how long an in-flight /start -> /callback round trip
+// may take. The handler uses it as the state cookie's Max-Age.
+func (s *OIDCService) StateTTL() time.Duration { return s.cfg.StateTTL }
+
+// StateCookiePath scopes the browser-binding state cookie to the
+// public callback path from SB_OIDC_REDIRECT_URL (the only request
+// that needs it). Falls back to "/" when the path is unusable as a
+// cookie path.
+func (s *OIDCService) StateCookiePath() string { return oidcStateCookiePath(s.cfg.RedirectURL) }
+
+func oidcStateCookiePath(redirectURL string) string {
+	u, err := url.Parse(redirectURL)
+	if err != nil {
+		return "/"
+	}
+	p := u.EscapedPath()
+	if p == "" || p[0] != '/' || strings.ContainsAny(p, "; ") {
+		return "/"
+	}
+	return p
+}
+
+// maxReturnToLen caps the post-login path we persist in Redis and
+// echo into a Location header.
+const maxReturnToLen = 2048
+
+// SafeReturnTo returns raw when it is a same-origin relative path and
+// "/" otherwise (API-S-12 / API-N-08). Accepted: a single leading "/"
+// followed by anything except a second "/" or "\". Rejected: absolute
+// and scheme URLs, protocol-relative "//host", "/\host", any
+// backslash, control characters (browsers strip tab/CR/LF, which
+// would turn "/\t/host" into "//host"), invalid UTF-8 and values
+// longer than maxReturnToLen. Query strings and fragments are kept so
+// the SPA's pathname+search+hash round-trips.
+func SafeReturnTo(raw string) string {
+	if raw == "" || len(raw) > maxReturnToLen || raw[0] != '/' {
+		return "/"
+	}
+	if len(raw) > 1 && (raw[1] == '/' || raw[1] == '\\') {
+		return "/"
+	}
+	if !utf8.ValidString(raw) {
+		return "/"
+	}
+	for _, r := range raw {
+		if r == '\\' || unicode.IsControl(r) {
+			return "/"
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "" || u.Host != "" || u.User != nil || u.Opaque != "" {
+		return "/"
+	}
+	return raw
+}
+
 // --- Authorize ------------------------------------------------------
 
 // AuthorizeStart represents one /auth/oidc/start invocation: the
@@ -215,7 +274,13 @@ type StepUpOptions struct {
 // in Redis (single-use, 5-min TTL), and returns the IdP authorize URL
 // the caller should redirect the browser to. `returnTo` is the
 // post-login destination on the api's host — the callback redirects
-// there after the session cookie is set.
+// there after the session cookie is set. It is normalised with
+// SafeReturnTo before it is stored.
+//
+// The caller MUST bind AuthorizeStart.State to the browser (the
+// handler sets an HttpOnly cookie) and pass that value back to
+// HandleCallback, which refuses a callback whose browser binding is
+// missing or different (login CSRF).
 func (s *OIDCService) StartAuthorize(ctx context.Context, returnTo string) (*AuthorizeStart, error) {
 	return s.StartAuthorizeWith(ctx, returnTo, StepUpOptions{})
 }
@@ -241,7 +306,7 @@ func (s *OIDCService) StartAuthorizeWith(ctx context.Context, returnTo string, s
 	payload, err := json.Marshal(authorizeState{
 		Verifier: verifier,
 		Nonce:    nonce,
-		ReturnTo: returnTo,
+		ReturnTo: SafeReturnTo(returnTo),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: marshal state: %v", ErrOIDC, err)
@@ -285,11 +350,23 @@ type CallbackResult struct {
 // verifies the ID token (including nonce), JIT-creates the local_users
 // row if needed, and issues a server-side session via SessionService.
 //
-// `state` and `code` come from the IdP's redirect query params. `ip`
-// + `userAgent` are stamped on the session row for the audit shape.
-func (s *OIDCService) HandleCallback(ctx context.Context, state, code, ip, userAgent string) (*CallbackResult, error) {
+// `state` and `code` come from the IdP's redirect query params.
+// `boundState` is the state value the browser carried in the
+// HttpOnly cookie set by /start; it must equal `state`, otherwise the
+// callback was not started by this browser (login CSRF) and is
+// refused before the stored state is consumed. `ip` + `userAgent` are
+// stamped on the session row for the audit shape.
+func (s *OIDCService) HandleCallback(ctx context.Context, state, boundState, code, ip, userAgent string) (*CallbackResult, error) {
 	if state == "" || code == "" {
 		return nil, fmt.Errorf("%w: state + code required", ErrOIDC)
+	}
+	if boundState == "" {
+		s.auditFailure(ctx, "state_cookie_missing", nil)
+		return nil, fmt.Errorf("%w: state not bound to this browser", ErrOIDC)
+	}
+	if subtle.ConstantTimeCompare([]byte(boundState), []byte(state)) != 1 {
+		s.auditFailure(ctx, "state_cookie_mismatch", nil)
+		return nil, fmt.Errorf("%w: state not bound to this browser", ErrOIDC)
 	}
 	raw, err := s.consumeState(ctx, state)
 	if err != nil {
@@ -327,13 +404,14 @@ func (s *OIDCService) HandleCallback(ctx context.Context, state, code, ip, userA
 	// re-decode that single key out of the raw map below — `oidc.Claims`
 	// always returns the whole token so this stays one round-trip.
 	var claims struct {
-		Sub      string   `json:"sub"`
-		Email    string   `json:"email"`
-		Name     string   `json:"name"`
-		AMR      []string `json:"amr"`
-		ACR      string   `json:"acr"`
-		Iss      string   `json:"iss"`
-		Groups   []string `json:"groups"`
+		Sub           string   `json:"sub"`
+		Email         string   `json:"email"`
+		EmailVerified any      `json:"email_verified"`
+		Name          string   `json:"name"`
+		AMR           []string `json:"amr"`
+		ACR           string   `json:"acr"`
+		Iss           string   `json:"iss"`
+		Groups        []string `json:"groups"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
 		s.auditFailure(ctx, "claims_decode", err)
@@ -344,9 +422,40 @@ func (s *OIDCService) HandleCallback(ctx context.Context, state, code, ip, userA
 		return nil, fmt.Errorf("%w: id_token missing sub claim", ErrOIDC)
 	}
 
+	// M2 (api#191): local_users rows are matched (and JIT-created) by
+	// email, so the email must be one the IdP verified. Without this a
+	// different `sub` with an unverified email equal to an existing
+	// user's address signs in AS that user. Fail closed when the
+	// claim is missing, false, or there is no email at all (the old
+	// sub-as-email fallback could collide with a real address the
+	// same way). Proper (iss, sub) linking needs a schema change.
+	if strings.TrimSpace(claims.Email) == "" || !emailVerifiedClaim(claims.EmailVerified) {
+		kind := "email_unverified"
+		if strings.TrimSpace(claims.Email) == "" {
+			kind = "email_missing"
+		}
+		s.auditCallbackDenied(ctx, kind, "", map[string]any{
+			"sub":   claims.Sub,
+			"iss":   claims.Iss,
+			"email": claims.Email,
+		})
+		return nil, fmt.Errorf("%w: email not verified by the identity provider", ErrOIDC)
+	}
+
 	user, err := s.upsertLocalUser(ctx, claims.Sub, claims.Email, claims.Name)
 	if err != nil {
 		return nil, fmt.Errorf("%w: jit provision: %v", ErrOIDC, err)
+	}
+
+	// API-S-05: a disabled account must not get a session through SSO
+	// either (the password path already refuses it). Checked before the
+	// group reconciler so a disabled user's grants are not touched.
+	if user.Disabled {
+		s.auditCallbackDenied(ctx, "user_disabled", "user:"+user.ID.String(), map[string]any{
+			"sub": claims.Sub,
+			"iss": claims.Iss,
+		})
+		return nil, fmt.Errorf("%w: user disabled", ErrOIDC)
 	}
 
 	// Slice E — reconcile OIDC-provisioned role grants against the
@@ -417,7 +526,24 @@ func (s *OIDCService) HandleCallback(ctx context.Context, state, code, ip, userA
 		},
 	})
 
-	return &CallbackResult{Issued: issued, ReturnTo: stored.ReturnTo, User: user}, nil
+	// Re-check on the way out: a state written before return_to was
+	// validated at /start may still be live in Redis.
+	return &CallbackResult{Issued: issued, ReturnTo: SafeReturnTo(stored.ReturnTo), User: user}, nil
+}
+
+// emailVerifiedClaim reports whether the ID token's `email_verified`
+// claim is true. Accepts a JSON boolean, or the string "true" that
+// some IdPs emit; anything else (absent, false, other strings) is
+// not verified.
+func emailVerifiedClaim(v any) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		return strings.EqualFold(strings.TrimSpace(x), "true")
+	default:
+		return false
+	}
 }
 
 // --- Logout ---------------------------------------------------------
@@ -535,7 +661,7 @@ func NewRoleReconcilerForTest(
 // IdP group names often differ in case from the deployer's expectation
 // (`SB-Admins` from one IdP, `sb-admins` in the SB_OIDC_GROUP_MAP);
 // silent name mismatch is the most common cause of zero-grant SSO
-// users seen in the field (qi UAT 2026-06-01). Values are preserved
+// users seen in the field (a staging deployment, 2026-06-01). Values are preserved
 // verbatim because they map to internal role names (admin / approver /
 // developer) that the api creates and so are always lowercase by
 // convention. If two configured keys collapse to the same lower-cased
@@ -734,7 +860,10 @@ func (s *OIDCService) upsertLocalUser(ctx context.Context, sub, email, displayNa
 	if err != nil {
 		return nil, err
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(randomPW), 10)
+	// Same cost as the local-admin hashes and the dummy hash: a
+	// cheaper hash here would let /auth/login timing tell SSO-created
+	// accounts apart from unknown emails.
+	hash, err := bcrypt.GenerateFromPassword([]byte(randomPW), passwordBcryptCost)
 	if err != nil {
 		return nil, err
 	}
@@ -796,6 +925,25 @@ func (s *OIDCService) auditFailure(ctx context.Context, kind string, err error) 
 		Actor:    "anonymous",
 		Action:   "auth.oidc.callback",
 		Resource: "auth:oidc",
+		Status:   storage.AuditStatusDenied,
+		Metadata: meta,
+	})
+}
+
+// auditCallbackDenied records a refused callback that got past token
+// verification, with identifying claims (never tokens) for triage.
+func (s *OIDCService) auditCallbackDenied(ctx context.Context, kind, resource string, extra map[string]any) {
+	if resource == "" {
+		resource = "auth:oidc"
+	}
+	meta := map[string]any{"error_kind": kind}
+	for k, v := range extra {
+		meta[k] = v
+	}
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "anonymous",
+		Action:   "auth.oidc.callback",
+		Resource: resource,
 		Status:   storage.AuditStatusDenied,
 		Metadata: meta,
 	})

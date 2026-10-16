@@ -68,12 +68,32 @@ var jsonBlobPattern = regexp.MustCompile(`\{[\s\S]{200,}\}`)
 // Empty input returns empty — callers should never persist the
 // result without checking; an empty string means "no error".
 func DiscoverError(raw string) string {
+	return scrub(raw, DiscoverMaxErrorLen)
+}
+
+// LogMaxErrorLen caps an internal error string written to the server
+// log. Roomier than DiscoverMaxErrorLen because a log line is read by
+// an operator during triage, not stored in a status column.
+const LogMaxErrorLen = 1024
+
+// LogError runs the same three passes as DiscoverError over an internal
+// error (storage, KMS, Redis, provider, network) before it is written
+// to the server log. Handlers return a stable message to the client and
+// log this instead, so the triage detail survives but a credential that
+// rode along in a wrapped error does not.
+func LogError(raw string) string {
+	return scrub(raw, LogMaxErrorLen)
+}
+
+// scrub is the shared pipeline: redact credentials, strip JSON blobs,
+// truncate to max. The order is load-bearing (see DiscoverError).
+func scrub(raw string, max int) string {
 	out := redact(raw)
 
 	// Step 3: truncate. Trailing ellipsis makes the cap visible to
 	// operators reading the row in a dashboard.
-	if len(out) > DiscoverMaxErrorLen {
-		out = out[:DiscoverMaxErrorLen-3] + "..."
+	if len(out) > max {
+		out = out[:max-3] + "..."
 	}
 
 	return strings.TrimSpace(out)

@@ -7,6 +7,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/secrets-bridge/api/internal/middleware"
+	"github.com/secrets-bridge/api/pkg/sanitize"
 )
 
 // jsonErrorHandler renders every error as a JSON body so typed clients
@@ -18,7 +19,9 @@ import (
 // wrapped Go/pgx text (database structure, provider config, internal
 // paths), so the real error is logged server-side with the request's
 // correlation ID and the client receives only a generic message plus that
-// ID for support correlation. 4xx errors carry intentional, safe,
+// ID for support correlation. The logged text goes through
+// sanitize.LogError so a credential wrapped inside a driver or KMS error
+// does not reach the log either. 4xx errors carry intentional, safe,
 // human-facing messages (for example the step-up modal reason) that the
 // SPA relies on, so those pass through unchanged.
 func jsonErrorHandler(logger *slog.Logger) func(fiber.Ctx, error) error {
@@ -36,7 +39,7 @@ func jsonErrorHandler(logger *slog.Logger) func(fiber.Ctx, error) error {
 		if code >= fiber.StatusInternalServerError {
 			rid, _ := c.Locals(string(middleware.CtxKeyRequestID)).(string)
 			logger.Error("request failed",
-				"err", err.Error(),
+				"err", sanitize.LogError(err.Error()),
 				"status", code,
 				"method", c.Method(),
 				"path", c.Path(),

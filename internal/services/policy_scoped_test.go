@@ -179,7 +179,7 @@ func TestCreateForScopedAuthor_Gate1_OutOfScope_EmitsDeniedAudit_NoRuleID(t *tes
 	var hasRuleID bool
 	if err := e.pool.QueryRow(e.ctx,
 		`SELECT metadata ? 'policy_rule_id' FROM audit_events
-		 WHERE action='policy.denied_out_of_scope' AND actor='mallory'
+		 WHERE action='policy.denied_out_of_scope' AND actor='user:mallory'
 		 ORDER BY occurred_at DESC LIMIT 1`,
 	).Scan(&hasRuleID); err != nil {
 		t.Fatal(err)

@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/keymgmt"
 	"github.com/secrets-bridge/api/pkg/storage"
@@ -52,6 +53,24 @@ type crossTeamHarness struct {
 	secretsR      *storage.Secrets
 	bindingsR     *storage.ProjectSecrets
 	jobsR         *storage.SyncJobs
+	destBindings  *storage.ProjectProviderConnections
+}
+
+// grantCrossTeamPerm gives userID one permission at the given scope via a
+// throwaway role.
+func grantCrossTeamPerm(t *testing.T, pool *storage.Pool, userID string, perm auth.Permission, scopeJSON string) {
+	t.Helper()
+	roleID := uuid.New()
+	if _, err := pool.Exec(t.Context(),
+		`INSERT INTO roles (id, name, permissions, is_system) VALUES ($1, $2, jsonb_build_array($3::text), false)`,
+		roleID, "ct-"+roleID.String()[:8], string(perm)); err != nil {
+		t.Fatalf("seed role: %v", err)
+	}
+	if _, err := pool.Exec(t.Context(),
+		`INSERT INTO user_roles (user_id, role_id, scope) VALUES ($1, $2, $3::jsonb)`,
+		userID, roleID, scopeJSON); err != nil {
+		t.Fatalf("seed grant: %v", err)
+	}
 }
 
 func buildCrossTeamHarness(t *testing.T) *crossTeamHarness {
@@ -81,13 +100,25 @@ func buildCrossTeamHarness(t *testing.T) *crossTeamHarness {
 	secretsRepo := storage.NewSecrets(pool)
 	bindingsRepo := storage.NewProjectSecrets(pool)
 
+	destBindingsRepo := storage.NewProjectProviderConnections(pool)
+
+	// Verify lanes are permission-gated (API-N-01), so wire the real
+	// repo-backed resolvers exactly like cmd/api/main.go does.
 	reqSvc := services.NewRequestService(requestRepo, approvalRepo, wrapSvc, workflows, engine, auditRepo, jobSvc).
 		WithEnvironments(envRepo).
-		WithCrossTeamRepos(teamRepo, projRepo, envRepo, provConnRepo).
-		WithProjectBindings(bindingsRepo, secretsRepo)
+		WithCrossTeamRepos(teamRepo, projRepo, envRepo, provConnRepo, destBindingsRepo).
+		WithProjectBindings(bindingsRepo, secretsRepo).
+		WithApproverScope(
+			auth.NewRepoResolver(storage.NewUserRoles(pool), storage.NewRoles(pool)),
+			auth.NewRepoTeamScopeResolver(teamRepo, projRepo),
+		)
 	jobSvc.OnCompleted(reqSvc.OnJobCompleted)
 
+	// The security approver used across these tests.
+	grantCrossTeamPerm(t, pool, "diana-security@example.com", auth.PermSecretSecurityApprove, "{}")
+
 	return &crossTeamHarness{
+		destBindings: destBindingsRepo,
 		reqSvc:       reqSvc,
 		pool:         pool,
 		envRepo:      envRepo,
@@ -151,6 +182,16 @@ func seedCrossTeamScope(t *testing.T, h *crossTeamHarness, slug string) services
 		RETURNING id`, slug+"-dest-vault").Scan(&provConnID); err != nil {
 		t.Fatalf("provider_connection: %v", err)
 	}
+	// The destination belongs to the source project's uat env (API-N-03).
+	if _, err := h.destBindings.Bind(ctx, storage.ProjectProviderConnectionBindingInput{
+		ProjectID: srcProject.ID, EnvironmentID: &srcEnv.ID, ProviderConnectionID: provConnID,
+	}); err != nil {
+		t.Fatalf("bind destination: %v", err)
+	}
+	// carol is the source approver: secret.approve scoped to the source
+	// project, the way a section head is granted it.
+	grantCrossTeamPerm(t, h.pool, "carol@example.com", auth.PermSecretApprove,
+		`{"project_id":"`+srcProject.ID.String()+`"}`)
 
 	return services.CrossTeamSubmitInput{
 		RequesterID:                     "alice@example.com",

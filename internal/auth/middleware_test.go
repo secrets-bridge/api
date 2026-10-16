@@ -309,3 +309,50 @@ func TestRequire_PanicsOnNilResolver(t *testing.T) {
 	}()
 	auth.Require(auth.PermRoleEdit, nil)
 }
+
+// RequireAnyOf is the coarse route gate on POST /requests/:id/verify
+// (API-N-01): the caller must hold at least one of the listed
+// permissions, at any scope, so a project-scoped approver still reaches
+// the handler (which then checks the exact lane and project) while a
+// caller with neither permission is refused before step-up.
+func TestRequireAnyOf(t *testing.T) {
+	resolver := &stubResolver{byUser: map[string][]auth.Grant{
+		"scoped-approver": {{Permission: "secret.approve", Scope: map[string]string{"project_id": "p1"}}},
+		"security":        {{Permission: "secret.security.approve"}},
+		"requester-only":  {{Permission: "secret.request"}},
+	}}
+	cases := []struct {
+		user string
+		want int
+	}{
+		{"scoped-approver", 204},
+		{"security", 204},
+		{"requester-only", 403},
+		{"no-grants", 403},
+		{"", 401},
+	}
+	for _, tc := range cases {
+		app := fiber.New()
+		app.Use(fakeAuth(tc.user))
+		app.Post("/verify", auth.RequireAnyOf(resolver, auth.PermSecretApprove, auth.PermSecretSecurityApprove), okHandler)
+		resp, err := app.Test(httptest.NewRequest("POST", "/verify", nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != tc.want {
+			t.Errorf("user %q: got %d, want %d", tc.user, resp.StatusCode, tc.want)
+		}
+	}
+
+	failing := &stubResolver{err: errors.New("db down")}
+	app := fiber.New()
+	app.Use(fakeAuth("scoped-approver"))
+	app.Post("/verify", auth.RequireAnyOf(failing, auth.PermSecretApprove), okHandler)
+	resp, err := app.Test(httptest.NewRequest("POST", "/verify", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 500 {
+		t.Errorf("resolver error: got %d, want 500 (fail closed)", resp.StatusCode)
+	}
+}

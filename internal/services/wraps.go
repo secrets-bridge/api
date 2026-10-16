@@ -133,10 +133,11 @@ func (s *WrapService) wrapWith(ctx context.Context, req WrapRequest, store func(
 	zero(req.Plaintext)
 
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    nonEmpty(req.Actor, "user"),
-		Action:   "wrap.create",
-		Resource: "wrap:" + w.ID.String(),
-		Status:   storage.AuditStatusSuccess,
+		Actor:         nonEmpty(req.Actor, "user"),
+		Action:        "wrap.create",
+		Resource:      "wrap:" + w.ID.String(),
+		Status:        storage.AuditStatusSuccess,
+		CorrelationID: wrapCorrelation(req.RequestID),
 		Metadata: map[string]any{
 			"byte_length":  byteLen,
 			"content_hash": fmt.Sprintf("%x", contentHash[:]),
@@ -175,7 +176,7 @@ func (s *WrapService) retrieveAsAgent(ctx context.Context, id, agentID uuid.UUID
 		return nil, nil, err
 	}
 	if err := consume(s.now().UTC()); err != nil {
-		s.auditRetrieveOutcome(ctx, agentID, id, err)
+		s.auditRetrieveOutcome(ctx, agentID, id, wrapCorrelation(w.RequestID), err)
 		return nil, nil, err
 	}
 
@@ -191,10 +192,11 @@ func (s *WrapService) retrieveAsAgent(ctx context.Context, id, agentID uuid.UUID
 	}
 
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "agent:" + agentID.String(),
-		Action:   "wrap.retrieve",
-		Resource: "wrap:" + id.String(),
-		Status:   storage.AuditStatusSuccess,
+		Actor:         "agent:" + agentID.String(),
+		Action:        "wrap.retrieve",
+		Resource:      "wrap:" + id.String(),
+		Status:        storage.AuditStatusSuccess,
+		CorrelationID: wrapCorrelation(w.RequestID),
 	})
 	return plaintext, w, nil
 }
@@ -210,7 +212,7 @@ func (s *WrapService) RetrieveByUser(ctx context.Context, id uuid.UUID, userID s
 		return nil, nil, err
 	}
 	if err := s.wraps.MarkConsumedByUser(ctx, id, userID, s.now().UTC()); err != nil {
-		s.auditRetrieveOutcomeUser(ctx, userID, id, err)
+		s.auditRetrieveOutcomeUser(ctx, userID, id, wrapCorrelation(w.RequestID), err)
 		return nil, nil, err
 	}
 
@@ -225,15 +227,16 @@ func (s *WrapService) RetrieveByUser(ctx context.Context, id uuid.UUID, userID s
 		return nil, nil, fmt.Errorf("wraps: decrypt value: %w", err)
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "user:" + userID,
-		Action:   "wrap.retrieve",
-		Resource: "wrap:" + id.String(),
-		Status:   storage.AuditStatusSuccess,
+		Actor:         "user:" + userID,
+		Action:        "wrap.retrieve",
+		Resource:      "wrap:" + id.String(),
+		Status:        storage.AuditStatusSuccess,
+		CorrelationID: wrapCorrelation(w.RequestID),
 	})
 	return plaintext, w, nil
 }
 
-func (s *WrapService) auditRetrieveOutcomeUser(ctx context.Context, userID string, wrapID uuid.UUID, err error) {
+func (s *WrapService) auditRetrieveOutcomeUser(ctx context.Context, userID string, wrapID, corr uuid.UUID, err error) {
 	status := storage.AuditStatusDenied
 	kind := "other"
 	switch {
@@ -247,11 +250,12 @@ func (s *WrapService) auditRetrieveOutcomeUser(ctx context.Context, userID strin
 		status = storage.AuditStatusFailure
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "user:" + userID,
-		Action:   "wrap.retrieve",
-		Resource: "wrap:" + wrapID.String(),
-		Status:   status,
-		Metadata: map[string]any{"error_kind": kind},
+		Actor:         "user:" + userID,
+		Action:        "wrap.retrieve",
+		Resource:      "wrap:" + wrapID.String(),
+		Status:        status,
+		CorrelationID: corr,
+		Metadata:      map[string]any{"error_kind": kind},
 	})
 }
 
@@ -310,7 +314,7 @@ func (s *WrapService) WrapByAgent(ctx context.Context, agentID uuid.UUID, req Wr
 	return s.Wrap(ctx, req)
 }
 
-func (s *WrapService) auditRetrieveOutcome(ctx context.Context, agentID, wrapID uuid.UUID, err error) {
+func (s *WrapService) auditRetrieveOutcome(ctx context.Context, agentID, wrapID, corr uuid.UUID, err error) {
 	status := storage.AuditStatusDenied
 	kind := "other"
 	switch {
@@ -327,12 +331,23 @@ func (s *WrapService) auditRetrieveOutcome(ctx context.Context, agentID, wrapID 
 		status = storage.AuditStatusFailure
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "agent:" + agentID.String(),
-		Action:   "wrap.retrieve",
-		Resource: "wrap:" + wrapID.String(),
-		Status:   status,
-		Metadata: map[string]any{"error_kind": kind},
+		Actor:         "agent:" + agentID.String(),
+		Action:        "wrap.retrieve",
+		Resource:      "wrap:" + wrapID.String(),
+		Status:        status,
+		CorrelationID: corr,
+		Metadata:      map[string]any{"error_kind": kind},
 	})
+}
+
+// wrapCorrelation ties a wrap's audit rows to its access request, whose
+// id is the request's correlation id (request.submit / approve / job.*).
+// A wrap with no request gets uuid.Nil, and storage assigns a fresh one.
+func wrapCorrelation(requestID *uuid.UUID) uuid.UUID {
+	if requestID == nil {
+		return uuid.Nil
+	}
+	return *requestID
 }
 
 // aeadEncrypt does AES-256-GCM with a fresh nonce. Returns the

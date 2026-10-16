@@ -19,11 +19,18 @@ type UserRole struct {
 	Scope     map[string]any // empty = global; e.g. {"project_id":"...","environment":"prod"}
 	GrantedBy string
 	GrantedAt time.Time
+
+	// ScopeMalformed is set on read when the stored scope is not a JSON
+	// object (for example a hand-written jsonb null). Scope is nil then,
+	// and the RBAC resolver must treat the grant as covering nothing,
+	// never as an empty (global) scope.
+	ScopeMalformed bool
 }
 
 // UserRoleRepository is the read/write surface for the user_roles table.
 type UserRoleRepository interface {
 	Grant(ctx context.Context, ur *UserRole) error
+	Get(ctx context.Context, id uuid.UUID) (*UserRole, error)
 	Revoke(ctx context.Context, id uuid.UUID) error
 	List(ctx context.Context) ([]*UserRole, error)
 	ListByUser(ctx context.Context, userID string) ([]*UserRole, error)
@@ -57,6 +64,14 @@ func (r *UserRoles) Grant(ctx context.Context, ur *UserRole) error {
 		VALUES ($1, $2, $3, NULLIF($4, ''))
 		RETURNING id, granted_at`
 	return r.pool.QueryRow(ctx, q, ur.UserID, ur.RoleID, scope, ur.GrantedBy).Scan(&ur.ID, &ur.GrantedAt)
+}
+
+// Get returns one assignment by id, or ErrNotFound.
+func (r *UserRoles) Get(ctx context.Context, id uuid.UUID) (*UserRole, error) {
+	const q = `
+		SELECT id, user_id, role_id, scope, COALESCE(granted_by, ''), granted_at
+		FROM user_roles WHERE id = $1`
+	return scanUserRole(r.pool.QueryRow(ctx, q, id))
 }
 
 func (r *UserRoles) Revoke(ctx context.Context, id uuid.UUID) error {
@@ -152,8 +167,17 @@ func scanUserRole(row interface {
 		return nil, fmt.Errorf("storage: scan user_role: %w", err)
 	}
 	if len(scopeRaw) > 0 {
-		if err := json.Unmarshal(scopeRaw, &ur.Scope); err != nil {
+		var raw any
+		if err := json.Unmarshal(scopeRaw, &raw); err != nil {
 			return nil, fmt.Errorf("storage: unmarshal user_role scope: %w", err)
+		}
+		obj, ok := raw.(map[string]any)
+		if !ok {
+			// null, array or scalar. Decoding null straight into the map
+			// used to yield an empty (global) scope.
+			ur.ScopeMalformed = true
+		} else {
+			ur.Scope = obj
 		}
 	}
 	return &ur, nil

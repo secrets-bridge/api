@@ -38,7 +38,7 @@ export TEST_REDIS_URL=redis://localhost:6379/1
 go test -race -count=1 -p 1 ./...
 ```
 
-`docker compose up -d` in this repo starts Postgres and Redis for local runs.
+`docker compose up -d postgres redis` in this repo starts Postgres and Redis on 127.0.0.1 for local runs. The compose file holds no keys: the api container reads `SB_WRAP_MASTER_KEY` and `SB_JWT_SECRET` from your shell and refuses to boot without them.
 
 ## Key configuration
 

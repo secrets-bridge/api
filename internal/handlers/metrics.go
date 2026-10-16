@@ -16,8 +16,9 @@ import (
 func Metrics(c fiber.Ctx) error {
 	families, err := prometheus.DefaultGatherer.Gather()
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).
-			SendString("metrics gather failed: " + err.Error())
+		// Through the app error handler: generic body, detail logged
+		// (API-16). The endpoint is unauthenticated.
+		return fiber.NewError(fiber.StatusInternalServerError, "metrics gather failed: "+err.Error())
 	}
 
 	format := expfmt.NewFormat(expfmt.TypeTextPlain)

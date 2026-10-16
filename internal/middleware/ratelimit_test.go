@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"net/http/httptest"
 	"os"
 	"testing"
@@ -217,5 +218,80 @@ func TestRateLimit_ZeroLimitIsPassThrough(t *testing.T) {
 	}
 	if resp.StatusCode != 200 {
 		t.Fatalf("status %d, want 200 (zero-limit should pass through)", resp.StatusCode)
+	}
+}
+
+// M4: a FailClosed bucket refuses with 503 when no Redis client is
+// wired or Redis errors, instead of letting the request through. The
+// default (per-IP edge buckets, M5) still fails open.
+func TestRateLimit_FailClosed_RefusesOnRedisOutage(t *testing.T) {
+	broken := openRedisForRateLimit(t)
+	if err := broken.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	for _, tc := range []struct {
+		name       string
+		rdb        *runtime.Client
+		failClosed bool
+		want       int
+	}{
+		{"nil client, fail closed", nil, true, 503},
+		{"redis error, fail closed", broken, true, 503},
+		{"redis error, default fails open", broken, false, 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := fiber.New()
+			app.Post("/auth/mfa/verify",
+				RateLimit(tc.rdb, nil, RateLimitConfig{
+					Name:       "test:fail-closed",
+					Bucket:     func(c fiber.Ctx) (string, bool) { return "alice", true },
+					Limit:      5,
+					Window:     60 * time.Second,
+					FailClosed: tc.failClosed,
+				}),
+				func(c fiber.Ctx) error { return c.SendStatus(200) },
+			)
+			resp, err := app.Test(httptest.NewRequest("POST", "/auth/mfa/verify", nil))
+			if err != nil {
+				t.Fatalf("Test: %v", err)
+			}
+			if resp.StatusCode != tc.want {
+				t.Fatalf("status %d, want %d", resp.StatusCode, tc.want)
+			}
+		})
+	}
+}
+
+// ByIdentity buckets on the authenticated actor only; anonymous
+// requests are not bucketed (the auth gate rejects them).
+func TestByIdentity(t *testing.T) {
+	app := fiber.New()
+	var got string
+	var ok bool
+	app.Get("/x",
+		func(c fiber.Ctx) error {
+			if a := c.Get("X-Test-Actor"); a != "" {
+				c.SetContext(context.WithValue(c.Context(), CtxKeyActor, a))
+			}
+			return c.Next()
+		},
+		func(c fiber.Ctx) error {
+			got, ok = ByIdentity()(c)
+			return c.SendStatus(200)
+		},
+	)
+	req := httptest.NewRequest("GET", "/x", nil)
+	req.Header.Set("X-Test-Actor", "11111111-1111-4111-8111-111111111111")
+	if _, err := app.Test(req); err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got != "user:11111111-1111-4111-8111-111111111111" {
+		t.Fatalf("authenticated: got (%q, %v)", got, ok)
+	}
+	if _, err := app.Test(httptest.NewRequest("GET", "/x", nil)); err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatalf("anonymous request must not be bucketed, got %q", got)
 	}
 }

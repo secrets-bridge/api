@@ -346,7 +346,14 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		gitopsMappingRepo := storage.NewGitOpsAppMappings(pool)
 		gitopsObservationRepo := storage.NewGitOpsObservations(pool)
 		gitopsSvc := services.NewGitOpsService(argoEndpointRepo, gitopsMappingRepo, gitopsObservationRepo, requestRepo, auditRepo, services.GitOpsConfig{})
-		argoEndpointSvc := services.NewArgoCDEndpointService(argoEndpointRepo, km, auditRepo)
+		// API-S-22: http:// ArgoCD base URLs carry the bearer token in
+		// clear text. Accepted with SB_ENV=dev; in production only with
+		// the explicit SB_ALLOW_INSECURE_ARGOCD_ADDR override.
+		argoEndpointSvc := services.NewArgoCDEndpointService(argoEndpointRepo, km, auditRepo).
+			WithAllowInsecureAddr(cfg.Env == ModeDev || cfg.AllowInsecureArgoCDAddr)
+		if cfg.AllowInsecureArgoCDAddr {
+			logger.Warn("SB_ALLOW_INSECURE_ARGOCD_ADDR=true — http:// ArgoCD base_url values will be accepted and the ArgoCD token sent in clear text")
+		}
 		requestSvc = requestSvc.WithGitOps(gitopsSvc)
 		gitopsH = handlers.NewGitOps(argoEndpointSvc, gitopsMappingRepo, gitopsSvc, requestRepo, newArgoCDDiscoveryFactory())
 		logger.Info("gitops visibility integration enabled (BRD §26)")
@@ -388,7 +395,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// CrossTeam*Lookup interfaces defined in services.
 	provConnRepo := storage.NewProviderConnections(pool)
 	bindingRepo := storage.NewProjectProviderConnections(pool)
-	requestSvc.WithCrossTeamRepos(teamRepo, projectRepo, environmentRepo, provConnRepo)
+	requestSvc.WithCrossTeamRepos(teamRepo, projectRepo, environmentRepo, provConnRepo, bindingRepo)
 
 	// Agent Onboarding MVP (api#178): wire enrollment-token generation +
 	// self-enrollment onto the existing agent service. Mutates the same
@@ -532,6 +539,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	tenancyH = tenancyH.WithScope(rbacResolver, teamScopeResolver)
 	projectSecretsH = projectSecretsH.WithScope(rbacResolver, teamScopeResolver)
 
+	// API-N-05: project, environment and project-secret binding writes
+	// emit an audit event with the session actor. (Role, user-role and
+	// workflow writes audit through adminH.WithAudit above.)
+	tenancyH = tenancyH.WithAudit(auditRepo)
+	projectSecretsH = projectSecretsH.WithAudit(auditRepo)
+
 	// "What are my projects?" projection (api#43 Slice D) — drives the
 	// UI project switcher.
 	meH := handlers.NewMe(projectRepo, rbacResolver).
@@ -545,7 +558,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	devSecretsH := handlers.NewDevSecrets(
 		projectRepo, environmentRepo, projectSecretsRepo, secretsRepo,
 		requestSvc,
-	)
+	).WithReadScope(rbacResolver, teamScopeResolver) // API-N-04: env secret list is project-scoped
 
 	// Session service (Slice A2). Owns the HttpOnly cookie auth path
 	// that replaces JWT-in-sessionStorage. Postgres is the source of
@@ -572,6 +585,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		services.MFAVerifyConfig{},
 	)
 	authMFAH := handlers.NewAuthMFA(mfaVerifySvc)
+	// H3: factor deletes go through the audited service path.
+	mfaH = mfaH.WithFactorDeleter(mfaVerifySvc)
 	// Slice H5: /users/me carries `mfa_enrolled` so the SPA can route
 	// brand-new users to /me/mfa instead of leaving them stuck on a
 	// step-up modal with nothing to verify with. Single source of
@@ -604,6 +619,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	}
 
 	v1Middlewares := []any{
+		// API-S-20: nothing under /api/v1 may be cached by a browser or a
+		// proxy. Wraps, reveal values, tokens, agent credentials, DEKs and
+		// the TOTP seed all ride this group. First in the chain so even a
+		// 401 from the gates below carries the header.
+		middleware.NoStore(),
 		middleware.AuthWith(authSvc, sessionSvc),
 		// Default-deny: everything under /api/v1 requires authentication
 		// unless its path is in publicV1Paths. This is the group-level
@@ -637,7 +657,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// Rate limit per architect Q7 + NAT-aware tuning (Slice A1):
 	// 30 attempts / 60s per source IP. The architect's original
 	// 5/60s assumed each user has their own public IP; many ISPs
-	// (notably Iraqi CGNAT deployments) put dozens of legitimate
+	// (notably carrier-grade NAT deployments) put dozens of legitimate
 	// users behind one egress. The per-IP layer is an anti-scan
 	// measure; per-account brute force is defended durably in
 	// Postgres by `LockoutPolicy` (5 wrong → 15 min lock) which is
@@ -899,24 +919,17 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		requireMFA,
 		devSecretsH.DirectReveal)
 
-	// Slice H2 (api#64): user-self MFA enrollment + management. No
-	// RBAC gate — every authenticated user manages their OWN factors.
-	// Handler derives the user id from the session, never from the
-	// body, so cross-user paths are structurally impossible.
-	v1.Get("/users/me/mfa/factors", mfaH.List)
-	v1.Delete("/users/me/mfa/factors/:id", mfaH.Delete)
-	v1.Post("/users/me/mfa/totp/enroll", mfaH.EnrollTOTP)
-	v1.Post("/users/me/mfa/totp/confirm", mfaH.ConfirmTOTP)
-	v1.Post("/users/me/mfa/webauthn/register/start", mfaH.EnrollWebAuthnStart)
-	v1.Post("/users/me/mfa/webauthn/register/finish", mfaH.EnrollWebAuthnFinish)
-
-	// Slice H4: step-up verification — the SOLE path post-H4 that
-	// stamps `last_mfa_at` on a session. /auth/mfa/challenge mints
-	// the per-kind nonce (TOTP ticket OR WebAuthn assertion options),
-	// /auth/mfa/verify consumes the user's response and stamps on
-	// success. Same cookie auth chain as /users/me/mfa/*.
-	v1.Post("/auth/mfa/challenge", authMFAH.Challenge)
-	v1.Post("/auth/mfa/verify", authMFAH.Verify)
+	// MFA self-service (/users/me/mfa/*) and step-up (/auth/mfa/*).
+	// The chains live in mfa_routes.go so the route tests drive the
+	// exact wiring main uses.
+	registerMFARoutes(v1, mfaRouteDeps{
+		factors:    mfaH,
+		verify:     authMFAH,
+		stepUp:     sessionSvc,
+		enrollment: mfaVerifySvc,
+		rdb:        rdb,
+		logger:     logger,
+	})
 
 	v1.Post("/environments", auth.Require(auth.PermTeamEdit, rbacResolver), tenancyH.CreateEnvironment)
 	v1.Get("/environments", tenancyH.ListEnvironments)
@@ -987,7 +1000,16 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 			requireMFA,
 			crossTeamH.Refuse,
 		),
-		verify: hs(requireMFA, crossTeamH.Verify),
+		// API-N-01: verify needs a lane permission. The route gate
+		// refuses callers holding neither secret.approve nor
+		// secret.security.approve (before step-up, like approve/reject);
+		// VerifyCrossTeam then checks the exact lane the body names
+		// against the caller's grants on the request's source project.
+		verify: hs(
+			auth.RequireAnyOf(rbacResolver, auth.PermSecretApprove, auth.PermSecretSecurityApprove),
+			requireMFA,
+			crossTeamH.Verify,
+		),
 	}.register(v1)
 
 	// bySessionBucket keys a rate-limit bucket on the authenticated
@@ -1130,7 +1152,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// The existing admin routes above stay on integration.edit;
 	// these are integration.bind scoped to (project, env) (handler
 	// runs the locked 7-gate / 3-gate chains inline).
-	pcbH := handlers.NewProjectProviderConnectionBindings(pcSvc)
+	pcbH := handlers.NewProjectProviderConnectionBindings(pcSvc).
+		WithReadScope(rbacResolver, teamScopeResolver) // API-N-04
 	v1.Post("/projects/:projectID/provider-connection-bindings", pcbH.Create)
 	v1.Get("/projects/:projectID/provider-connection-bindings", pcbH.List)
 	v1.Delete("/projects/:projectID/provider-connection-bindings/:bindingID", pcbH.Delete)
@@ -1159,7 +1182,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		auth.Require(auth.PermPolicyEdit, rbacResolver), adminH.PolicyHistory)
 
 	pprH := handlers.NewProjectPolicyRules(policyEng, policyRepo, settingsSvc).
-		WithHistory(policyHistorySvc, auditRepo)
+		WithHistory(policyHistorySvc, auditRepo).
+		WithReadScope(rbacResolver, teamScopeResolver) // API-N-04
 	v1.Post("/projects/:projectID/policy-rules", pprH.Create)
 	v1.Get("/projects/:projectID/policy-rules", pprH.List)
 	v1.Get("/projects/:projectID/policy-rules/:ruleID", pprH.Get)

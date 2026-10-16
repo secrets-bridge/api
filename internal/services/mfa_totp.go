@@ -37,10 +37,11 @@
 //     (CLAUDE rule). The audit row carries `factor_id` + `kind` only.
 //   * Storage layer is dumb byte handling — this service owns the
 //     envelope encryption (same posture as wraps.go).
-//   * Wrong codes deplete the per-challenge / per-factor budget so an
-//     attacker can't brute-force the 6-digit space; rate limit is the
-//     existing `/auth/oidc/start`-shaped per-IP bucket plus a per-actor
-//     bucket the handler layer applies.
+//   * Brute force (api#191 M4): every verify takes an attempt from a
+//     per-factor budget (5 wrong codes lock the factor for 15 min, see
+//     mfa_guard.go), each time step is accepted once per factor, and
+//     the challenge / verify / confirm routes carry a per-user limiter.
+//     The guard fails closed when Redis is unavailable.
 
 package services
 
@@ -138,6 +139,14 @@ type TOTPConfig struct {
 	// Clock is the time source. Optional — defaults to time.Now.UTC.
 	// Tests inject a frozen clock so the 30s window is deterministic.
 	Clock func() time.Time
+
+	// LockoutThreshold is how many consecutive wrong codes lock a
+	// factor (M4). Zero means DefaultTOTPLockoutThreshold.
+	LockoutThreshold int
+
+	// LockoutDuration is how long a locked factor refuses every code.
+	// Zero means DefaultTOTPLockoutDuration.
+	LockoutDuration time.Duration
 }
 
 // TOTPService is the public API.
@@ -148,6 +157,7 @@ type TOTPService struct {
 	rdb     *runtime.Client
 	issuer  string
 	clock   func() time.Time
+	guard   *totpGuard
 }
 
 // NewTOTPService wires the dependencies.
@@ -173,6 +183,7 @@ func NewTOTPService(
 		rdb:     rdb,
 		issuer:  issuer,
 		clock:   clock,
+		guard:   newTOTPGuard(rdb, cfg.LockoutThreshold, cfg.LockoutDuration),
 	}
 }
 
@@ -272,7 +283,8 @@ func (s *TOTPService) ConfirmEnroll(ctx context.Context, userID uuid.UUID, chall
 	}
 	defer zero(plaintext)
 
-	if !verifyTOTP(plaintext, code, s.clock(), totpSkewSteps) {
+	step, ok := matchTOTPStep(plaintext, code, s.clock(), totpSkewSteps)
+	if !ok {
 		s.auditConfirmFailure(ctx, userID, "code_invalid")
 		return nil, ErrTOTPInvalidCode
 	}
@@ -291,6 +303,18 @@ func (s *TOTPService) ConfirmEnroll(ctx context.Context, userID uuid.UUID, chall
 		// "this name is already used".
 		s.auditConfirmFailure(ctx, userID, "persist_failed")
 		return nil, err
+	}
+	// The code typed to confirm enrollment is spent: it must not also
+	// pass a step-up verify inside its skew window. Best effort, the
+	// factor row already exists; a failure is audited.
+	if _, err := s.guard.claimStep(ctx, factor.ID, step); err != nil {
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:    "user:" + userID.String(),
+			Action:   "mfa.totp.claim_step_failed",
+			Resource: "user_mfa_factor:" + factor.ID.String(),
+			Status:   storage.AuditStatusFailure,
+			Metadata: map[string]any{"error_kind": "guard_unavailable"},
+		})
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
 		Actor:    "user:" + userID.String(),
@@ -320,22 +344,53 @@ func (s *TOTPService) Verify(ctx context.Context, factorID uuid.UUID, code strin
 	if factor.Kind != storage.MFAFactorKindTOTP {
 		return ErrTOTPFactorWrongKind
 	}
+	now := s.clock()
+
+	// M4: take one attempt out of the factor's budget before checking
+	// the code. A locked factor refuses every code, the correct one
+	// too. Redis errors fail closed.
+	lastAttempt, err := s.guard.reserveAttempt(ctx, factorID, now)
+	if errors.Is(err, ErrTOTPLocked) {
+		s.auditVerifyFailure(ctx, factor, "factor_locked", nil)
+		return err
+	}
+	if err != nil {
+		s.auditVerifyFailure(ctx, factor, "guard_unavailable", nil)
+		return err
+	}
+
 	plaintext, err := s.decryptSecret(ctx, factor.SecretCiphertext, factor.SecretNonce, factor.DataKeyCiphertext, factor.KMSKeyID)
 	if err != nil {
 		return err
 	}
 	defer zero(plaintext)
-	if !verifyTOTP(plaintext, code, s.clock(), totpSkewSteps) {
+	step, ok := matchTOTPStep(plaintext, code, now, totpSkewSteps)
+	if !ok {
+		return s.verifyFailed(ctx, factor, "code_invalid", ErrTOTPInvalidCode, lastAttempt)
+	}
+	// M4: each time step is accepted once per factor. Atomic, so two
+	// concurrent requests carrying the same code cannot both pass.
+	fresh, err := s.guard.claimStep(ctx, factorID, step)
+	if err != nil {
+		s.auditVerifyFailure(ctx, factor, "guard_unavailable", nil)
+		return err
+	}
+	if !fresh {
+		return s.verifyFailed(ctx, factor, "code_reused", ErrTOTPCodeReused, lastAttempt)
+	}
+	if err := s.guard.clearFailures(ctx, factorID); err != nil {
+		// The code verified and its step is claimed, so the user is
+		// through. A stale attempt count only makes the next lockout
+		// come sooner. Audit it.
 		_ = s.audit.Append(ctx, &storage.AuditEvent{
 			Actor:    "user:" + factor.UserID.String(),
-			Action:   "mfa.totp.verify",
+			Action:   "mfa.totp.guard_reset_failed",
 			Resource: "user_mfa_factor:" + factorID.String(),
 			Status:   storage.AuditStatusFailure,
-			Metadata: map[string]any{"error_kind": "code_invalid"},
+			Metadata: map[string]any{"error_kind": "guard_unavailable"},
 		})
-		return ErrTOTPInvalidCode
 	}
-	if err := s.factors.TouchLastUsed(ctx, factorID, s.clock()); err != nil {
+	if err := s.factors.TouchLastUsed(ctx, factorID, now); err != nil {
 		// Verification succeeded; failing to update last_used_at
 		// shouldn't block the user. Audit it as a soft warning.
 		_ = s.audit.Append(ctx, &storage.AuditEvent{
@@ -356,6 +411,32 @@ func (s *TOTPService) Verify(ctx context.Context, factorID uuid.UUID, code strin
 }
 
 // --- helpers ---------------------------------------------------------
+
+// verifyFailed audits a failed attempt and returns `ret`. The attempt
+// was already taken from the budget by reserveAttempt; `lastAttempt`
+// means this failure locked the factor.
+func (s *TOTPService) verifyFailed(ctx context.Context, factor *storage.UserMFAFactor, kind string, ret error, lastAttempt bool) error {
+	var meta map[string]any
+	if lastAttempt {
+		meta = map[string]any{"locked": true}
+	}
+	s.auditVerifyFailure(ctx, factor, kind, meta)
+	return ret
+}
+
+func (s *TOTPService) auditVerifyFailure(ctx context.Context, factor *storage.UserMFAFactor, kind string, extra map[string]any) {
+	meta := map[string]any{"error_kind": kind}
+	for k, v := range extra {
+		meta[k] = v
+	}
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "user:" + factor.UserID.String(),
+		Action:   "mfa.totp.verify",
+		Resource: "user_mfa_factor:" + factor.ID.String(),
+		Status:   storage.AuditStatusFailure,
+		Metadata: meta,
+	})
+}
 
 func (s *TOTPService) decryptSecret(ctx context.Context, ciphertext, nonce, dataKeyCt []byte, keyID string) ([]byte, error) {
 	dataKey, err := s.km.DecryptDataKey(ctx, dataKeyCt, keyID)
@@ -444,21 +525,21 @@ func generateTOTP(secret []byte, counter uint64) string {
 	return fmt.Sprintf("%0*d", totpDigits, truncated%mod)
 }
 
-// verifyTOTP returns true iff `code` matches the expected code for the
-// current step or any step within ±skewSteps. Constant-time string
+// matchTOTPStep returns the time step `code` matches, checking the
+// current step and every step within ±skewSteps. Constant-time string
 // comparison so an attacker doesn't get a timing oracle on partial
-// matches.
+// matches. The step feeds the reuse check (M4).
 //
 // `code` is trimmed + length-checked first — a non-6-digit input can't
 // possibly match, so we short-circuit without running HMAC.
-func verifyTOTP(secret []byte, code string, now time.Time, skewSteps int) bool {
+func matchTOTPStep(secret []byte, code string, now time.Time, skewSteps int) (uint64, bool) {
 	code = strings.TrimSpace(code)
 	if len(code) != totpDigits {
-		return false
+		return 0, false
 	}
 	for _, r := range code {
 		if r < '0' || r > '9' {
-			return false
+			return 0, false
 		}
 	}
 	currentStep := uint64(now.Unix()) / totpStepSecs
@@ -476,8 +557,8 @@ func verifyTOTP(secret []byte, code string, now time.Time, skewSteps int) bool {
 		}
 		expected := generateTOTP(secret, step)
 		if subtle.ConstantTimeCompare(codeBytes, []byte(expected)) == 1 {
-			return true
+			return step, true
 		}
 	}
-	return false
+	return 0, false
 }

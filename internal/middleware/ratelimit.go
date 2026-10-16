@@ -5,8 +5,8 @@
 // for the wrap retrieval path.
 //
 // Limits per architect's Q7 decision (see project_secrets_bridge_resume_state.md),
-// adjusted for shared-NAT environments (Iraqi ISPs put many users
-// behind one CGNAT public IP — a strict per-IP cap would lock out
+// adjusted for shared-NAT environments (some ISPs put many users
+// behind one carrier-grade NAT public IP — a strict per-IP cap would lock out
 // every legitimate user behind the same egress):
 //
 //   - login        30 /  60s per-IP    (anti-scan; per-account lockout
@@ -55,6 +55,13 @@ type RateLimitConfig struct {
 	Limit int
 	// Window is the sliding-window duration.
 	Window time.Duration
+	// FailClosed refuses the request with 503 when Redis errors (or no
+	// client is wired) instead of letting it through. Off by default:
+	// the per-IP edge limiters keep failing open (M5 decision). Turn it
+	// on for per-user auth controls such as the MFA challenge, verify
+	// and confirm budgets (M4), where waving traffic through during an
+	// outage would hand out unlimited guesses.
+	FailClosed bool
 }
 
 // RateLimit returns a Fiber middleware that admits or rejects requests
@@ -73,6 +80,9 @@ func RateLimit(rdb *runtime.Client, logger *slog.Logger, cfg RateLimitConfig) fi
 	}
 	return func(c fiber.Ctx) error {
 		if rdb == nil {
+			if cfg.FailClosed {
+				return fiber.NewError(fiber.StatusServiceUnavailable, "rate limiter unavailable")
+			}
 			return c.Next()
 		}
 		key, ok := cfg.Bucket(c)
@@ -82,6 +92,13 @@ func RateLimit(rdb *runtime.Client, logger *slog.Logger, cfg RateLimitConfig) fi
 		fullBucket := cfg.Name + ":" + key
 		rl, err := rdb.AllowN(c.Context(), fullBucket, cfg.Limit, cfg.Window)
 		if err != nil {
+			if cfg.FailClosed {
+				if logger != nil {
+					logger.Warn("rate-limit redis error, failing closed",
+						"bucket", cfg.Name, "error", err)
+				}
+				return fiber.NewError(fiber.StatusServiceUnavailable, "rate limiter unavailable")
+			}
 			// Fail open. Log so operators see the degradation; never
 			// translate a Redis blip into 5xx for legit traffic.
 			if logger != nil {
@@ -114,6 +131,21 @@ func ByIP() BucketFunc {
 			return "", false
 		}
 		return ip, true
+	}
+}
+
+// ByIdentity keys the bucket on the authenticated identity the auth
+// middleware resolved (session or bearer). Unauthenticated requests are
+// not bucketed; the default-deny gate in front 401s them anyway. The
+// identity never comes from the request body or query, so it cannot be
+// rotated to dodge the budget (same reasoning as API-02).
+func ByIdentity() BucketFunc {
+	return func(c fiber.Ctx) (string, bool) {
+		a := actor(c)
+		if a == "" || a == "anonymous" {
+			return "", false
+		}
+		return "user:" + a, true
 	}
 }
 
