@@ -66,8 +66,8 @@ func TestProbes_Readyz_FailingCheckProduces503(t *testing.T) {
 	app.Get("/readyz", p.Readyz)
 
 	// Register a check that always fails — Readyz must report 503
-	// and surface the check name in the body so kubectl describe
-	// shows which dependency is unhealthy.
+	// and name the failing check in the body so an operator can see
+	// which dependency is unhealthy.
 	p.AddReadinessCheck("postgres", func(context.Context) error {
 		return errors.New("connection refused")
 	})
@@ -83,8 +83,13 @@ func TestProbes_Readyz_FailingCheckProduces503(t *testing.T) {
 	if !strings.Contains(string(body), "postgres") {
 		t.Fatalf("body did not name the failing check: %q", body)
 	}
-	if !strings.Contains(string(body), "connection refused") {
-		t.Fatalf("body did not surface the check's error: %q", body)
+	// The driver error stays in the server log; the public body only
+	// says which check is unavailable (API-16).
+	if strings.Contains(string(body), "connection refused") {
+		t.Fatalf("body echoes the check's error: %q", body)
+	}
+	if !strings.Contains(string(body), `"postgres":"unavailable"`) {
+		t.Fatalf("body did not mark the failing check unavailable: %q", body)
 	}
 }
 

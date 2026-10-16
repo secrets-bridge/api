@@ -19,6 +19,8 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,11 +34,55 @@ type ArgoCDEndpointService struct {
 	repo  storage.ArgoCDEndpointRepository
 	km    keymgmt.KeyManager
 	audit storage.AuditEventRepository
+
+	// allowInsecureAddr permits http:// base URLs. The ArgoCD bearer
+	// token rides every call to that URL, so it is off unless the
+	// deployment opts in (SB_ENV=dev, or SB_ALLOW_INSECURE_ARGOCD_ADDR
+	// in production). Deployment-level only, never per row.
+	allowInsecureAddr bool
 }
 
-// NewArgoCDEndpointService binds the service.
+// NewArgoCDEndpointService binds the service. http:// base URLs are
+// refused until WithAllowInsecureAddr(true) is called.
 func NewArgoCDEndpointService(repo storage.ArgoCDEndpointRepository, km keymgmt.KeyManager, audit storage.AuditEventRepository) *ArgoCDEndpointService {
 	return &ArgoCDEndpointService{repo: repo, km: km, audit: audit}
+}
+
+// WithAllowInsecureAddr permits http:// ArgoCD base URLs (API-S-22).
+// main wires it from SB_ENV=dev or SB_ALLOW_INSECURE_ARGOCD_ADDR=true.
+func (s *ArgoCDEndpointService) WithAllowInsecureAddr(v bool) *ArgoCDEndpointService {
+	s.allowInsecureAddr = v
+	return s
+}
+
+// ErrInvalidArgoCDURL is returned when a base URL is not an absolute
+// http(s) URL with a host.
+var ErrInvalidArgoCDURL = errors.New("services: argocd base_url must be an absolute http(s) URL with a host")
+
+// ErrInsecureArgoCDURL is returned when a base URL uses http:// and the
+// deployment has not opted in to clear-text ArgoCD traffic. Returned on
+// create, and on use for rows registered before the check existed.
+var ErrInsecureArgoCDURL = errors.New("services: argocd base_url must use https")
+
+// checkBaseURL validates the scheme and host of an ArgoCD base URL.
+// Private and in-cluster hosts (argocd-server.argocd.svc) are fine;
+// only the transport matters here.
+func (s *ArgoCDEndpointService) checkBaseURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return ErrInvalidArgoCDURL
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		if s.allowInsecureAddr {
+			return nil
+		}
+		return ErrInsecureArgoCDURL
+	default:
+		return ErrInvalidArgoCDURL
+	}
 }
 
 // CreateInput is the data the admin handler POSTs.
@@ -63,6 +109,10 @@ func (s *ArgoCDEndpointService) Create(ctx context.Context, in CreateArgoCDEndpo
 	}
 	if len(in.Token) == 0 {
 		return nil, errors.New("services: argocd endpoint token required")
+	}
+	if err := s.checkBaseURL(in.BaseURL); err != nil {
+		zero(in.Token)
+		return nil, err
 	}
 	if s.km == nil {
 		return nil, errors.New("services: KeyManager not configured")
@@ -191,6 +241,12 @@ func (s *ArgoCDEndpointService) Discover(
 	}
 	if !ep.Enabled {
 		return nil, errors.New("services: endpoint is disabled")
+	}
+	// A row registered before the scheme check may still carry an
+	// http:// base URL. Refuse BEFORE the token is unwrapped so it never
+	// goes out in clear text.
+	if err := s.checkBaseURL(ep.BaseURL); err != nil {
+		return nil, err
 	}
 	tok, err := s.ResolveToken(ctx, ep)
 	if err != nil {

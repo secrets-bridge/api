@@ -346,7 +346,14 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		gitopsMappingRepo := storage.NewGitOpsAppMappings(pool)
 		gitopsObservationRepo := storage.NewGitOpsObservations(pool)
 		gitopsSvc := services.NewGitOpsService(argoEndpointRepo, gitopsMappingRepo, gitopsObservationRepo, requestRepo, auditRepo, services.GitOpsConfig{})
-		argoEndpointSvc := services.NewArgoCDEndpointService(argoEndpointRepo, km, auditRepo)
+		// API-S-22: http:// ArgoCD base URLs carry the bearer token in
+		// clear text. Accepted with SB_ENV=dev; in production only with
+		// the explicit SB_ALLOW_INSECURE_ARGOCD_ADDR override.
+		argoEndpointSvc := services.NewArgoCDEndpointService(argoEndpointRepo, km, auditRepo).
+			WithAllowInsecureAddr(cfg.Env == ModeDev || cfg.AllowInsecureArgoCDAddr)
+		if cfg.AllowInsecureArgoCDAddr {
+			logger.Warn("SB_ALLOW_INSECURE_ARGOCD_ADDR=true — http:// ArgoCD base_url values will be accepted and the ArgoCD token sent in clear text")
+		}
 		requestSvc = requestSvc.WithGitOps(gitopsSvc)
 		gitopsH = handlers.NewGitOps(argoEndpointSvc, gitopsMappingRepo, gitopsSvc, requestRepo, newArgoCDDiscoveryFactory())
 		logger.Info("gitops visibility integration enabled (BRD §26)")
@@ -601,6 +608,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	}
 
 	v1Middlewares := []any{
+		// API-S-20: nothing under /api/v1 may be cached by a browser or a
+		// proxy. Wraps, reveal values, tokens, agent credentials, DEKs and
+		// the TOTP seed all ride this group. First in the chain so even a
+		// 401 from the gates below carries the header.
+		middleware.NoStore(),
 		middleware.AuthWith(authSvc, sessionSvc),
 		// Default-deny: everything under /api/v1 requires authentication
 		// unless its path is in publicV1Paths. This is the group-level

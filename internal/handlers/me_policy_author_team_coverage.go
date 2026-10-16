@@ -53,6 +53,7 @@ func (h *PolicyAuthorTeamCoverage) Get(c fiber.Ctx) error {
 	access, err := auth.EffectiveTeamAccess(c.Context(), actor, auth.PermPolicyAuthor,
 		h.resolver, h.teamScope)
 	if err != nil {
+		logInternalError(c, "resolve team access failed", err)
 		return stableErr(c, fiber.StatusInternalServerError, "internal_error",
 			"could not resolve team access", nil)
 	}

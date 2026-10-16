@@ -207,6 +207,11 @@ type Config struct {
 	// on provider_connections — the deployment-level override for
 	// dev clusters. Audited at boot if true.
 	AllowInsecureVaultAddr bool
+	// AllowInsecureArgoCDAddr=true permits http:// ArgoCD base_url
+	// values when SB_ENV=production (API-S-22). SB_ENV=dev always
+	// allows them. Off by default because the ArgoCD bearer token
+	// travels on every call to that URL. Logged as a WARN at boot.
+	AllowInsecureArgoCDAddr bool
 	// ProviderConnRejectSecretValues=true (default) enforces the
 	// AKIA / hvs. / JWT / OAuth regex check on scope values. The
 	// deployment-level override (false) disables that pass; the
@@ -229,6 +234,7 @@ func loadConfig() Config {
 		Env:                            envOr("SB_ENV", ModeProduction),
 		GitOpsEnabled:                  envBool("SB_GITOPS_ENABLED", false),
 		AllowInsecureVaultAddr:         envBool("SB_ALLOW_INSECURE_VAULT_ADDR", false),
+		AllowInsecureArgoCDAddr:        envBool("SB_ALLOW_INSECURE_ARGOCD_ADDR", false),
 		ProviderConnRejectSecretValues: envBool("SB_PROVIDER_CONN_REJECT_SECRETS", true),
 		BootstrapAdminUserID:           envOr("SB_BOOTSTRAP_ADMIN_USER_ID", ""),
 		JWTSecret:                      loadJWTSecret(),

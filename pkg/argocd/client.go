@@ -50,6 +50,12 @@ var ErrForbidden = errors.New("argocd: forbidden")
 // ErrNotFound maps ArgoCD 404.
 var ErrNotFound = errors.New("argocd: not found")
 
+// ErrRedirectRefused is returned when ArgoCD (or anything in front of
+// it) answers with a 3xx. The client never follows redirects: following
+// one would re-send the bearer token to wherever the Location points,
+// including an http:// downgrade or another host.
+var ErrRedirectRefused = errors.New("argocd: redirect refused")
+
 // New builds a Client. Returns an error only for malformed BaseURL or
 // invalid TLS material.
 func New(cfg Config) (*Client, error) {
@@ -80,6 +86,11 @@ func New(cfg Config) (*Client, error) {
 	}
 	hc := &http.Client{
 		Timeout: timeout,
+		// Never follow a redirect: hand the 3xx back to do(), which
+		// reports ErrRedirectRefused. The token stays with BaseURL.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 		Transport: &readOnlyTransport{
 			next: &http.Transport{
 				TLSClientConfig: tlsCfg,
@@ -360,6 +371,9 @@ func (c *Client) do(ctx context.Context, path string, out any) error {
 		return ErrForbidden
 	case http.StatusNotFound:
 		return ErrNotFound
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return fmt.Errorf("%w: %s: HTTP %d", ErrRedirectRefused, path, resp.StatusCode)
 	default:
 		return fmt.Errorf("argocd: %s: HTTP %d", path, resp.StatusCode)
 	}
