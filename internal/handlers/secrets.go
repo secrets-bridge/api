@@ -73,6 +73,8 @@ func secretsErr(err error) error {
 		return fiber.NewError(fiber.StatusForbidden, "discovery batch does not match this agent's cluster or provider")
 	case errors.Is(err, services.ErrDiscoveryIdentityUnknown):
 		return fiber.NewError(fiber.StatusForbidden, "agent has no cluster or provider identity for discovery")
+	case errors.Is(err, services.ErrDiscoveryConnectionDisabled):
+		return fiber.NewError(fiber.StatusForbidden, "provider connection is disabled")
 	default:
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}

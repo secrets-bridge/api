@@ -998,3 +998,70 @@ func TestAgentSurface_DiscoveryUploadLegacyMintedAgent(t *testing.T) {
 		t.Fatalf("%d rows written outside the legacy agents' own clusters", n)
 	}
 }
+
+// B-2 follow-up: deleting a connection sets the agent's
+// provider_connection_id to NULL. The orphaned agent must not fall back
+// to the cluster it declared at enroll, and a disabled connection's agent
+// may not publish discovery at all.
+func TestAgentSurface_DiscoveryRefusedForOrphanedOrDisabledConnection(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	orphan := fx.enrollAgent(t, "agent-orphan", "tenant-b-prod", "tenant-a-uat", "vault")
+	if _, err := fx.pool.Exec(t.Context(), `DELETE FROM provider_connections WHERE name = 'conn-agent-orphan'`); err != nil {
+		t.Fatalf("delete connection: %v", err)
+	}
+	if code, body := fx.postDiscovery(t, orphan, "tenant-b-prod", "vault", "team-beta/prod/db"); code != http.StatusForbidden {
+		t.Fatalf("orphaned agent naming its declared cluster = %d (%s); want 403", code, body)
+	}
+	if code, body := fx.postDiscovery(t, orphan, "", "vault", "team-beta/prod/db"); code != http.StatusForbidden {
+		t.Fatalf("orphaned agent without cluster_name = %d (%s); want 403", code, body)
+	}
+
+	disabled := fx.enrollAgent(t, "agent-disabled", "tenant-a-uat", "tenant-a-uat", "vault")
+	if _, err := fx.pool.Exec(t.Context(), `UPDATE provider_connections SET status = 'disabled' WHERE name = 'conn-agent-disabled'`); err != nil {
+		t.Fatalf("disable connection: %v", err)
+	}
+	if code, body := fx.postDiscovery(t, disabled, "tenant-a-uat", "vault", "team-alpha/uat/db"); code != http.StatusForbidden {
+		t.Fatalf("agent on a disabled connection = %d (%s); want 403", code, body)
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM secrets`); n != 0 {
+		t.Fatalf("refused uploads wrote %d catalog rows", n)
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM audit_events WHERE action = 'discovery.upsert' AND metadata->>'reason' = 'connection_disabled'`); n != 1 {
+		t.Fatalf("connection_disabled audit rows = %d; want 1", n)
+	}
+}
+
+// Once a claim's lease has expired ClaimNext can hand the job to another
+// agent, so the old holder can no longer post or fetch wraps for it.
+func TestAgentSurface_ExpiredLeaseCannotPostOrFetch(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	a := fx.mint(t, "agent-a", false)
+
+	read := fx.approvedRead(t, []string{"DB_PASSWORD"})
+	rj := fx.claim(t, a)
+	if _, err := fx.pool.Exec(t.Context(), `UPDATE sync_jobs SET claim_expires_at = now() - interval '1 second' WHERE id = $1`, rj.ID); err != nil {
+		t.Fatalf("expire read lease: %v", err)
+	}
+	if code, body := fx.postWrap(t, a, read.ID, "DB_PASSWORD", fx.envelope(t, a, []byte("late"), nil)); code != http.StatusForbidden {
+		t.Fatalf("post after lease expiry = %d (%s); want 403", code, body)
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM secret_wraps WHERE request_id = $1`, read.ID); n != 0 {
+		t.Fatalf("expired-lease post created %d wraps", n)
+	}
+	if _, err := fx.pool.Exec(t.Context(), `UPDATE sync_jobs SET status = 'succeeded' WHERE id = $1`, rj.ID); err != nil {
+		t.Fatalf("retire read job: %v", err)
+	}
+
+	fx.approvedPatch(t, map[string][]byte{"DB_PASSWORD": []byte("canary-lease")})
+	pj := fx.claim(t, a)
+	wid := wrapIDsFromPayload(t, pj)[0]
+	if _, err := fx.pool.Exec(t.Context(), `UPDATE sync_jobs SET claim_expires_at = now() - interval '1 second' WHERE id = $1`, pj.ID); err != nil {
+		t.Fatalf("expire patch lease: %v", err)
+	}
+	if code, body := fx.getWrap(t, a, wid); code != http.StatusForbidden {
+		t.Fatalf("fetch after lease expiry = %d (%s); want 403", code, body)
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM secret_wraps WHERE id = $1 AND consumed_at IS NULL`, wid); n != 1 {
+		t.Fatal("expired-lease fetch burned the wrap")
+	}
+}

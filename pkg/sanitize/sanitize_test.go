@@ -169,3 +169,18 @@ func TestLogError_RoomierCapThanDiscover(t *testing.T) {
 		t.Fatalf("LogError len = %d; want <= %d", len(got), sanitize.LogMaxErrorLen)
 	}
 }
+
+// A credential split by a control character must still be redacted: the
+// strip runs before redaction, so the two halves can't be glued back
+// together after the redaction pass has already missed them.
+func TestJobError_CredentialSplitByControlChar(t *testing.T) {
+	for _, in := range []string{
+		"vault: denied for AKIAABCDEFGH\x00IJKLMNOP",
+		"vault: denied for AKIAABCDEFGH\x07IJKLMNOP",
+	} {
+		got := sanitize.JobError(in)
+		if strings.Contains(got, "AKIAABCDEFGHIJKLMNOP") || !strings.Contains(got, "[REDACTED]") {
+			t.Fatalf("split credential survived: %q", got)
+		}
+	}
+}

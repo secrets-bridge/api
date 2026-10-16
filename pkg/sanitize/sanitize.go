@@ -132,8 +132,10 @@ const jobErrorScanLen = 16 * 1024
 // Postgres text/jsonb write) are dropped, and the result is capped at
 // JobMaxErrorLen bytes on a UTF-8 boundary.
 func JobError(raw string) string {
-	out := redact(truncateUTF8(raw, jobErrorScanLen, ""))
-	out = strings.Map(func(r rune) rune {
+	// Strip control characters BEFORE redacting: a credential split by a
+	// NUL or an ANSI escape would slip past the redaction patterns and
+	// then be glued back together by the strip.
+	out := strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\t' {
 			return r
 		}
@@ -141,7 +143,8 @@ func JobError(raw string) string {
 			return -1
 		}
 		return r
-	}, out)
+	}, truncateUTF8(raw, jobErrorScanLen, ""))
+	out = redact(out)
 	return strings.TrimSpace(truncateUTF8(out, JobMaxErrorLen, "..."))
 }
 

@@ -161,7 +161,8 @@ func (r *SecretWraps) Create(ctx context.Context, w *SecretWrap) error {
 // CreateForClaimedJob is the agent-side create (H4). One transaction:
 //
 //  1. Lock the job row FOR UPDATE, requiring it to be the request's job,
-//     of jobType, claimed by agentID. The lock serialises concurrent
+//     of jobType, claimed by agentID with an unexpired lease (ClaimNext
+//     hands an expired claim to another agent). The lock serialises concurrent
 //     posts for the same job and holds off Complete / a re-claim until
 //     the insert commits, so a wrap can never land on a job the agent
 //     no longer owns.
@@ -185,6 +186,7 @@ func (r *SecretWraps) CreateForClaimedJob(ctx context.Context, w *SecretWrap, jo
 		SELECT id FROM sync_jobs
 		WHERE id = $1 AND request_id = $2 AND claimed_by = $3
 		  AND status = 'claimed' AND job_type = $4
+		  AND claim_expires_at > now()
 		FOR UPDATE`, jobID, *w.RequestID, agentID, jobType).Scan(&locked)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrJobNotClaimed
@@ -212,14 +214,15 @@ func (r *SecretWraps) CreateForClaimedJob(ctx context.Context, w *SecretWrap, jo
 }
 
 // JobClaimedBy reports whether jobID is requestID's job of jobType and
-// is currently claimed by agentID.
+// is currently claimed by agentID, lease not expired.
 func (r *SecretWraps) JobClaimedBy(ctx context.Context, jobID, requestID, agentID uuid.UUID, jobType JobType) (bool, error) {
 	var ok bool
 	err := r.pool.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM sync_jobs
 			WHERE id = $1 AND request_id = $2 AND claimed_by = $3
-			  AND status = 'claimed' AND job_type = $4)`,
+			  AND status = 'claimed' AND job_type = $4
+			  AND claim_expires_at > now())`,
 		jobID, requestID, agentID, jobType).Scan(&ok)
 	if err != nil {
 		return false, fmt.Errorf("storage: check job claim: %w", err)
@@ -321,7 +324,9 @@ func (r *SecretWraps) MarkConsumed(ctx context.Context, id, agentID uuid.UUID, a
 }
 
 // MarkConsumedForJob consumes the wrap only when, in the same statement,
-// jobID is the wrap's request job, of jobType, and claimed by agentID.
+// jobID is the wrap's request job, of jobType, and claimed by agentID
+// with an unexpired lease. Once the lease runs out ClaimNext may give the
+// job to another agent, so the old holder must not take the plaintext.
 func (r *SecretWraps) MarkConsumedForJob(ctx context.Context, id, agentID, jobID uuid.UUID, jobType JobType, at time.Time) error {
 	const q = `
 		UPDATE secret_wraps w
@@ -332,7 +337,8 @@ func (r *SecretWraps) MarkConsumedForJob(ctx context.Context, id, agentID, jobID
 		  AND EXISTS (
 		      SELECT 1 FROM sync_jobs j
 		      WHERE j.id = $4 AND j.request_id = w.request_id
-		        AND j.claimed_by = $2 AND j.status = 'claimed' AND j.job_type = $5)`
+		        AND j.claimed_by = $2 AND j.status = 'claimed' AND j.job_type = $5
+		        AND j.claim_expires_at > now())`
 	tag, err := r.pool.Exec(ctx, q, id, agentID, at, jobID, jobType)
 	if err != nil {
 		return fmt.Errorf("storage: mark consumed for job: %w", err)
