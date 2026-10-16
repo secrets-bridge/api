@@ -86,6 +86,12 @@ func (s *JobService) Enqueue(ctx context.Context, req EnqueueRequest) (*storage.
 
 // Claim hands the oldest queued (or claim-expired) job to agentID with
 // a fresh lease. Returns storage.ErrNoJobs when nothing is runnable.
+//
+// The returned Payload is what the agent gets: target_provider_config is
+// reduced to the keys the agent accepts (AgentJobPayload). This covers
+// every producer, including the worker's discover scheduler and jobs
+// stored before producers translated at enqueue time. The stored row is
+// not rewritten.
 func (s *JobService) Claim(ctx context.Context, agentID uuid.UUID) (*storage.SyncJob, error) {
 	job, err := s.jobs.ClaimNext(ctx, agentID, s.claimLease)
 	if err != nil {
@@ -94,6 +100,7 @@ func (s *JobService) Claim(ctx context.Context, agentID uuid.UUID) (*storage.Syn
 		}
 		return nil, fmt.Errorf("jobs: claim: %w", err)
 	}
+	job.Payload = AgentJobPayload(job.Payload)
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
 		Actor:         "agent:" + agentID.String(),
 		Action:        "job.claim",
