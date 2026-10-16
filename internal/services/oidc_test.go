@@ -14,6 +14,8 @@ import (
 	"encoding/base64"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 func TestPKCE_S256ShaMatchesRFC7636Example(t *testing.T) {
@@ -120,5 +122,91 @@ func TestOIDCStateKey_NamespacePrefix(t *testing.T) {
 	}
 	if !strings.Contains(got, "test-state") {
 		t.Fatal("expected state value in key")
+	}
+}
+
+// API-S-12 / API-N-08: only same-origin relative paths survive.
+func TestSafeReturnTo(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", "/"},
+		{"/", "/"},
+		{"/requests/123", "/requests/123"},
+		{"/requests/123?tab=audit&x=1#top", "/requests/123?tab=audit&x=1#top"},
+		{"/a/%2F%2Fevil.example", "/a/%2F%2Fevil.example"}, // encoded slashes stay path data
+		{"/admin/policies?q=a:b", "/admin/policies?q=a:b"},
+		{"https://evil.example", "/"},
+		{"http://evil.example/requests", "/"},
+		{"//evil.example", "/"},
+		{"//evil.example/requests", "/"},
+		{`/\evil.example`, "/"},
+		{`\\evil.example`, "/"},
+		{`/requests\..\x`, "/"},
+		{"/\t/evil.example", "/"},
+		{"/\n/evil.example", "/"},
+		{"/\r\nSet-Cookie: x=y", "/"},
+		{"/\x00", "/"},
+		{"/\x7f", "/"},
+		{"/\u0085", "/"}, // C1 control
+		{"/\xff\xfe", "/"}, // invalid UTF-8
+		{"javascript:alert(1)", "/"},
+		{"requests/123", "/"},
+		{" /requests/123", "/"},
+		{"/requests/100%zz", "/"}, // bad escape
+		{"/" + strings.Repeat("a", maxReturnToLen), "/"},
+	}
+	for _, tc := range cases {
+		if got := SafeReturnTo(tc.in); got != tc.want {
+			t.Errorf("SafeReturnTo(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// M2: only an explicit true counts as verified.
+func TestEmailVerifiedClaim(t *testing.T) {
+	cases := []struct {
+		in   any
+		want bool
+	}{
+		{true, true},
+		{"true", true},
+		{"TRUE", true},
+		{false, false},
+		{"false", false},
+		{"yes", false},
+		{"1", false},
+		{float64(1), false},
+		{nil, false},
+	}
+	for _, tc := range cases {
+		if got := emailVerifiedClaim(tc.in); got != tc.want {
+			t.Errorf("emailVerifiedClaim(%#v) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestOIDCStateCookiePath(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"https://sb.example.com/api/v1/auth/oidc/callback", "/api/v1/auth/oidc/callback"},
+		{"https://sb.example.com/prefix/api/v1/auth/oidc/callback?x=1", "/prefix/api/v1/auth/oidc/callback"},
+		{"https://sb.example.com", "/"},
+		{"https://sb.example.com/a;b/callback", "/"},
+		{"::not a url", "/"},
+	}
+	for _, tc := range cases {
+		if got := oidcStateCookiePath(tc.in); got != tc.want {
+			t.Errorf("oidcStateCookiePath(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// The unknown-email branch of Login compares against dummyBcryptHash;
+// it must cost the same as real hashes or timing leaks existence.
+func TestDummyHashCostMatchesUserHashCost(t *testing.T) {
+	cost, err := bcrypt.Cost(dummyBcryptHash)
+	if err != nil {
+		t.Fatalf("bcrypt.Cost: %v", err)
+	}
+	if cost != passwordBcryptCost {
+		t.Fatalf("dummy hash cost %d != passwordBcryptCost %d", cost, passwordBcryptCost)
 	}
 }
