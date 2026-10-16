@@ -67,8 +67,9 @@ type RefuseBody struct {
 	Reason string `json:"reason"`
 }
 
-// VerifyBody is the JSON for a vote. voted_as MUST match the
-// permission the caller holds.
+// VerifyBody is the JSON for a vote. voted_as names the lane; the
+// service refuses it unless the session identity holds that lane's
+// permission on the request's source project (API-N-01).
 type VerifyBody struct {
 	VotedAs  string `json:"voted_as"` // "source" | "security"
 	Decision string `json:"decision"` // "approve" | "reject"
@@ -387,6 +388,14 @@ func crossTeamErr(err error) error {
 		return fiber.NewError(fiber.StatusBadRequest, "cross_team_min_approvers_unsupported")
 	case errors.Is(err, services.ErrSeparationOfDuties):
 		return fiber.NewError(fiber.StatusForbidden, "separation_of_duties_violated")
+	case errors.Is(err, services.ErrCrossTeamLaneForbidden):
+		return fiber.NewError(fiber.StatusForbidden, "cross_team_verify_forbidden")
+	case errors.Is(err, services.ErrCrossTeamVoteOutOfTurn):
+		return fiber.NewError(fiber.StatusConflict, "cross_team_vote_out_of_turn")
+	case errors.Is(err, services.ErrCrossTeamPriorVoteInvalid):
+		return fiber.NewError(fiber.StatusConflict, "cross_team_prior_vote_invalid")
+	case errors.Is(err, services.ErrCrossTeamKeyNotDeclared):
+		return fiber.NewError(fiber.StatusBadRequest, "cross_team_key_not_declared")
 	case errors.Is(err, storage.ErrCrossTeamAlreadyFilled):
 		return fiber.NewError(fiber.StatusConflict, "cross_team_already_filled")
 	case errors.Is(err, storage.ErrFillWindowExpired):

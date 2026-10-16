@@ -147,6 +147,39 @@ func RequireAny(perm Permission, r Resolver) fiber.Handler {
 	}
 }
 
+// RequireAnyOf returns a middleware that gates the next handler on the
+// caller holding AT LEAST ONE of `perms` at any scope. It is a coarse
+// route-level gate for endpoints whose exact permission depends on the
+// request (e.g. the cross-team verify lane: secret.approve for the
+// source vote, secret.security.approve for the security vote); the
+// handler/service still enforces the precise permission and scope.
+func RequireAnyOf(r Resolver, perms ...Permission) fiber.Handler {
+	if r == nil {
+		panic("auth: RequireAnyOf called with nil Resolver")
+	}
+	if len(perms) == 0 {
+		panic("auth: RequireAnyOf called with no permissions")
+	}
+	return func(c fiber.Ctx) error {
+		userID, ok := IdentityFromContext(c.Context())
+		if !ok {
+			return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+		}
+		grants, err := r.Resolve(c.Context(), userID)
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+		}
+		for _, g := range grants {
+			for _, p := range perms {
+				if g.Permission == string(p) {
+					return c.Next()
+				}
+			}
+		}
+		return fiber.NewError(fiber.StatusForbidden, "missing permission")
+	}
+}
+
 // RequireScoped returns a middleware that gates the next handler on
 // the caller holding `perm` AT A SCOPE COVERING THE REQUEST.
 //
