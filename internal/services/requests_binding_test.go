@@ -3,11 +3,13 @@ package services_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
@@ -67,8 +69,9 @@ func tightenEnvBinding(t *testing.T, pool *storage.Pool, env *storage.Environmen
 // written BEFORE the fix still carries the requester's
 // target_provider_config on its row. When it is approved after the fix,
 // the enqueued job must carry the config derived from the bound catalog
-// row (agent-accepted keys only), never the stored body value. An unbound
-// legacy row gets an empty config (the agent's pinned defaults).
+// row (agent-accepted keys only), never the stored body value. A row no
+// binding governs gets no job at all: it fails (see
+// TestApprove_NoGoverningBindingFailsRequest).
 func TestApprove_LegacyRowProviderConfigNotForwarded(t *testing.T) {
 	reqSvc, pool, envRepo, workflows, policies := buildL3Harness(t)
 	ctx := t.Context()
@@ -106,7 +109,6 @@ func TestApprove_LegacyRowProviderConfigNotForwarded(t *testing.T) {
 	}{
 		{"bound read", storage.AccessRequestTypeRead, "team-alpha/uat/db", map[string]any{"kvMount": "kv", "kvPrefix": "team-alpha"}},
 		{"bound patch", storage.AccessRequestTypePatch, "team-alpha/uat/db", map[string]any{"kvMount": "kv", "kvPrefix": "team-alpha"}},
-		{"unbound read", storage.AccessRequestTypeRead, "team-alpha/uat/other", map[string]any{}},
 	}
 	for _, tc := range cases {
 		wfID, envID := wf.ID, env.ID
@@ -149,5 +151,170 @@ func TestApprove_LegacyRowProviderConfigNotForwarded(t *testing.T) {
 				break
 			}
 		}
+	}
+}
+
+// B-1: the provider config a job carries comes only from the binding
+// that governs the request in its own environment. When none governs at
+// approve time (the binding was removed, or only a binding scoped to
+// another environment matches the ref), no job is enqueued and the
+// request fails with a metadata-only audit row. Before the fix the
+// lookup fell back to the first candidate, so a uat request was
+// dispatched with the prod binding's kvMount / kvPrefix.
+func TestApprove_NoGoverningBindingFailsRequest(t *testing.T) {
+	reqSvc, pool, envRepo, workflows, policies := buildL3Harness(t)
+	ctx := t.Context()
+
+	projectID := makeProjectForSvc(t, pool, "b1-strict")
+	uat := newUATEnv(t, envRepo, projectID)
+	prod := &storage.Environment{
+		ProjectID: projectID, Name: "prod",
+		Type: storage.EnvironmentTypeProd, Kind: storage.EnvironmentKindProd,
+	}
+	if err := envRepo.Create(ctx, prod); err != nil {
+		t.Fatalf("prod env Create: %v", err)
+	}
+
+	wf := &storage.WorkflowDefinition{
+		Name: "b1-strict-wf", MinApprovers: 1, AllowSelfApproval: false,
+		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
+		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
+	}
+	if err := workflows.Create(ctx, wf); err != nil {
+		t.Fatalf("wf Create: %v", err)
+	}
+	if err := policies.Create(ctx, &storage.PolicyRule{
+		Name:       "b1-strict-rule",
+		Selector:   map[string]any{"project_id": projectID.String()},
+		WorkflowID: wf.ID,
+		Priority:   500,
+		Enabled:    true,
+	}); err != nil {
+		t.Fatalf("policy Create: %v", err)
+	}
+
+	// "team-alpha/shared/db" exists only as a prod-cluster catalog row
+	// bound to the prod environment, with a prod kvPrefix.
+	prodSec := &storage.Secret{
+		ClusterName: "tenant-a-prod", ProviderType: "vault", SecretRef: "team-alpha/shared/db",
+		ProviderConfig: map[string]any{"kvMount": "kv", "kvPrefix": "team-alpha-prod"},
+		Status:         storage.SecretStatusPresent,
+	}
+	if err := storage.NewSecrets(pool).Upsert(ctx, prodSec); err != nil {
+		t.Fatalf("prod secret Upsert: %v", err)
+	}
+	bindings := storage.NewProjectSecrets(pool)
+	if err := bindings.Bind(ctx, &storage.ProjectSecret{
+		ProjectID: projectID, SecretID: prodSec.ID, EnvironmentID: &prod.ID,
+		AllowedOps: []string{storage.OpRead, storage.OpPatch}, CreatedBy: "services-test",
+	}); err != nil {
+		t.Fatalf("prod Bind: %v", err)
+	}
+	t.Cleanup(func() { _ = bindings.Unbind(context.Background(), projectID, prodSec.ID) })
+
+	repo := storage.NewAccessRequests(pool)
+	cases := []struct {
+		name string
+		typ  storage.AccessRequestType
+		ref  string
+	}{
+		{"read, only another env's binding", storage.AccessRequestTypeRead, "team-alpha/shared/db"},
+		{"patch, only another env's binding", storage.AccessRequestTypePatch, "team-alpha/shared/db"},
+		{"read, no binding at all", storage.AccessRequestTypeRead, "team-alpha/uat/unbound"},
+	}
+	for _, tc := range cases {
+		wfID, envID := wf.ID, uat.ID
+		row := &storage.AccessRequest{
+			RequesterID:        "b1-requester@example.com",
+			Type:               tc.typ,
+			Justification:      "approved after the binding stopped governing",
+			Status:             storage.AccessRequestStatusPending,
+			WorkflowID:         &wfID,
+			EnvironmentID:      &envID,
+			TargetProviderType: "vault",
+			TargetSecretRef:    tc.ref,
+			TargetKeys:         []string{"DB_PASSWORD"},
+			TargetScope:        map[string]any{"project_id": projectID.String(), "environment": "uat"},
+		}
+		if err := repo.Create(ctx, row); err != nil {
+			t.Fatalf("%s: seed row: %v", tc.name, err)
+		}
+		got, err := reqSvc.Approve(ctx, row.ID, "approver-"+uuid.NewString()[:8], "ok")
+		if err != nil {
+			t.Fatalf("%s: Approve: %v", tc.name, err)
+		}
+		if got.Status != storage.AccessRequestStatusFailed {
+			t.Errorf("%s: returned status = %s; want failed", tc.name, got.Status)
+		}
+		stored, err := repo.Get(ctx, row.ID)
+		if err != nil {
+			t.Fatalf("%s: reload: %v", tc.name, err)
+		}
+		if stored.Status != storage.AccessRequestStatusFailed {
+			t.Errorf("%s: stored status = %s; want failed", tc.name, stored.Status)
+		}
+		var jobs int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE request_id = $1`, row.ID).Scan(&jobs); err != nil {
+			t.Fatalf("%s: count jobs: %v", tc.name, err)
+		}
+		if jobs != 0 {
+			var raw []byte
+			_ = pool.QueryRow(ctx, `SELECT payload->'target_provider_config' FROM sync_jobs WHERE request_id = $1`, row.ID).Scan(&raw)
+			t.Errorf("%s: %d job(s) enqueued with target_provider_config %s; want none", tc.name, jobs, raw)
+		}
+		var reason string
+		if err := pool.QueryRow(ctx,
+			`SELECT metadata->>'reason' FROM audit_events
+			  WHERE action = 'request.execute.binding_rejected' AND correlation_id = $1`, row.ID).Scan(&reason); err != nil {
+			t.Fatalf("%s: binding_rejected audit row: %v", tc.name, err)
+		}
+		if reason != "no_governing_binding" {
+			t.Errorf("%s: audit reason = %q; want no_governing_binding", tc.name, reason)
+		}
+	}
+}
+
+// B-1, submit side: POST /requests and /requests/read derive the config
+// at submit through the same strict lookup, so a submit no binding
+// governs is refused with ErrSecretNotBound before any row is written,
+// even if the handler's tenancy gate is not wired.
+func TestSubmit_NoGoverningBindingRefused(t *testing.T) {
+	reqSvc, pool, envRepo, _, _ := buildL3Harness(t)
+	ctx := t.Context()
+
+	projectID := makeProjectForSvc(t, pool, "b1-submit")
+	newUATEnv(t, envRepo, projectID)
+	prod := &storage.Environment{
+		ProjectID: projectID, Name: "prod",
+		Type: storage.EnvironmentTypeProd, Kind: storage.EnvironmentKindProd,
+	}
+	if err := envRepo.Create(ctx, prod); err != nil {
+		t.Fatalf("prod env Create: %v", err)
+	}
+	bindSecretToEnv(t, pool, prod, "team-alpha/prod-only/db", nil)
+
+	_, err := reqSvc.SubmitRead(ctx, services.ReadInput{
+		RequesterID: "b1-submitter@example.com", ProjectID: projectID.String(), Environment: "uat",
+		TargetProviderType: "vault", TargetSecretRef: "team-alpha/prod-only/db",
+		TargetKeys: []string{"DB_PASSWORD"}, Justification: "uat read of a prod-only binding",
+	})
+	if !errors.Is(err, services.ErrSecretNotBound) {
+		t.Fatalf("SubmitRead err = %v; want ErrSecretNotBound", err)
+	}
+	_, err = reqSvc.Submit(ctx, services.PatchInput{
+		RequesterID: "b1-submitter@example.com", ProjectID: projectID.String(), Environment: "uat",
+		TargetProviderType: "vault", TargetSecretRef: "team-alpha/prod-only/db",
+		KeyValues: map[string][]byte{"DB_PASSWORD": []byte("not-a-real-value")}, Justification: "uat patch of a prod-only binding",
+	})
+	if !errors.Is(err, services.ErrSecretNotBound) {
+		t.Fatalf("Submit err = %v; want ErrSecretNotBound", err)
+	}
+	var rows int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM access_requests WHERE target_secret_ref = 'team-alpha/prod-only/db'`).Scan(&rows); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("%d request row(s) written for a refused submit; want 0", rows)
 	}
 }

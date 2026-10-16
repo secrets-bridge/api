@@ -526,7 +526,7 @@ func (s *RevealSessionService) enforceWrapAllowlist(ctx context.Context, req *st
 	if err != nil {
 		return "", err
 	}
-	sel := selectBinding(cands, req.EnvironmentID, true)
+	sel := selectBinding(cands, req.EnvironmentID)
 	if sel == nil {
 		if len(cands) > 0 {
 			return bindingRefusalEnvMismatch, ErrSecretNotBound

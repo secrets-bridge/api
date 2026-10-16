@@ -70,6 +70,9 @@ func TestSubmit_WithEnvironments_PopulatesEnvID(t *testing.T) {
 	if err := envRepo.Create(ctx, env); err != nil {
 		t.Fatalf("env Create: %v", err)
 	}
+	// POST /requests only reaches Submit for a secret bound in this
+	// environment (handler tenancy gate), and Submit re-checks it.
+	bindSecretToEnv(t, pool, env, "billing/uat/db", nil)
 
 	req, err := reqSvc.Submit(ctx, services.PatchInput{
 		RequesterID:        "alice@example.com",
@@ -166,6 +169,7 @@ func TestSubmit_ProdEnv_FiresPolicyInvariant(t *testing.T) {
 	if err := policies.Create(ctx, rule); err != nil {
 		t.Fatalf("policy Create: %v", err)
 	}
+	bindSecretToEnv(t, pool, prodEnv, "billing/prod/db", nil)
 
 	if _, err := reqSvc.Submit(ctx, services.PatchInput{
 		RequesterID:        "alice@example.com",

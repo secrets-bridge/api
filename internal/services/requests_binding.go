@@ -118,10 +118,11 @@ func GoverningBinding(bindings []*storage.ProjectSecret, envID *uuid.UUID) int {
 }
 
 // selectBinding applies GoverningBinding to (binding, catalog row)
-// candidates. Non-strict callers (provider-config derivation for a row
-// that was already authorized) fall back to the first candidate when no
-// binding governs; strict callers get nil.
-func selectBinding(cands []boundSecret, envID *uuid.UUID, strict bool) *boundSecret {
+// candidates and returns the governing one, or nil when none governs.
+// There is no fallback to another candidate: a binding scoped to a
+// different environment never authorizes a request or supplies its
+// provider config.
+func selectBinding(cands []boundSecret, envID *uuid.UUID) *boundSecret {
 	bindings := make([]*storage.ProjectSecret, len(cands))
 	for i := range cands {
 		bindings[i] = cands[i].binding
@@ -129,10 +130,7 @@ func selectBinding(cands []boundSecret, envID *uuid.UUID, strict bool) *boundSec
 	if i := GoverningBinding(bindings, envID); i >= 0 {
 		return &cands[i]
 	}
-	if strict || len(cands) == 0 {
-		return nil
-	}
-	return &cands[0]
+	return nil
 }
 
 // requireReadBinding is the binding gate for the plaintext-read submit
@@ -162,7 +160,7 @@ func (s *RequestService) requireReadBinding(ctx context.Context, env *storage.En
 	if err != nil {
 		return nil, "", err
 	}
-	sel := selectBinding(cands, &env.ID, true)
+	sel := selectBinding(cands, &env.ID)
 	if sel == nil {
 		if len(cands) > 0 {
 			return nil, bindingRefusalEnvMismatch, ErrSecretNotBound
@@ -247,30 +245,66 @@ func agentProviderConfig(providerType string, src map[string]any) map[string]any
 }
 
 // boundProviderConfig derives the provider config for a read/patch
-// request from the bound catalog row (the config discovery recorded from
-// the provider connection's scope), filtered to the agent-accepted keys.
-// It never looks at the request body or the stored request row. Returns
-// an empty config when the binding repos are not wired, the project id
-// does not parse, or no binding exists — the agent then uses its pinned
-// defaults, which is exactly what the UI flows (which send no config)
-// have always produced.
+// request from the catalog row of the binding that governs it in envID
+// (the config discovery recorded from the provider connection's scope),
+// filtered to the agent-accepted keys. It never looks at the request body
+// or the stored request row.
+//
+// It fails closed with ErrSecretNotBound when the project id does not
+// parse or no binding governs the request in envID: the binding was
+// removed, or only bindings scoped to other environments remain. It used
+// to fall back to the first candidate, which enqueued the job with
+// another environment's kvMount / kvPrefix. Only when the binding repos
+// are not wired (test wiring; the handler tenancy gate is off then too)
+// does it return an empty config, so the agent uses its pinned defaults.
 func (s *RequestService) boundProviderConfig(ctx context.Context, projectIDRaw string, envID *uuid.UUID, providerType, secretRef string) (map[string]any, error) {
 	if s.bindings == nil || s.secrets == nil {
 		return map[string]any{}, nil
 	}
 	projectID, err := uuid.Parse(projectIDRaw)
 	if err != nil {
-		return map[string]any{}, nil
+		return nil, ErrSecretNotBound
 	}
 	cands, err := s.projectBindingCandidates(ctx, projectID, providerType, secretRef)
 	if err != nil {
 		return nil, err
 	}
-	sel := selectBinding(cands, envID, false)
+	sel := selectBinding(cands, envID)
 	if sel == nil {
-		return map[string]any{}, nil
+		return nil, ErrSecretNotBound
 	}
 	return agentProviderConfig(sel.secret.ProviderType, sel.secret.ProviderConfig), nil
+}
+
+// failUnboundRequest is the enqueue-time half of the binding rule: when
+// enqueueRequestJob refuses with ErrSecretNotBound, no job exists and
+// none may run, so the request goes to failed instead of sitting at
+// approved. Metadata-only audit; returns true when the status changed.
+func (s *RequestService) failUnboundRequest(ctx context.Context, req *storage.AccessRequest, actor string) bool {
+	failed := false
+	if err := s.requests.UpdateStatus(ctx, req.ID, storage.AccessRequestStatusFailed); err == nil {
+		req.Status = storage.AccessRequestStatusFailed
+		failed = true
+	}
+	envID := ""
+	if req.EnvironmentID != nil {
+		envID = req.EnvironmentID.String()
+	}
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:         actor,
+		Action:        "request.execute.binding_rejected",
+		Resource:      "request:" + req.ID.String(),
+		Status:        storage.AuditStatusFailure,
+		CorrelationID: req.ID,
+		Metadata: map[string]any{
+			"reason":               "no_governing_binding",
+			"environment_id":       envID,
+			"target_provider_type": req.TargetProviderType,
+			"target_secret_ref":    req.TargetSecretRef,
+			"key_count":            len(req.TargetKeys),
+		},
+	})
+	return failed
 }
 
 // EnvReadInput is the per-env request endpoint's input

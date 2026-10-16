@@ -582,7 +582,9 @@ func (s *RequestService) SubmitDirectReveal(ctx context.Context, in DirectReveal
 	// as the approval-flow enqueue: a 200 here with a missing job is
 	// still a real, durable request; operators retry via admin tools).
 	if s.jobs != nil {
-		if err := s.enqueueRequestJob(ctx, req); err != nil {
+		if err := s.enqueueRequestJob(ctx, req); errors.Is(err, ErrSecretNotBound) {
+			s.failUnboundRequest(ctx, req, "user:"+in.RequesterID)
+		} else if err != nil {
 			_ = s.audit.Append(ctx, &storage.AuditEvent{
 				Actor:         "user:" + in.RequesterID,
 				Action:        "request.direct_reveal.enqueue_failed",
@@ -748,8 +750,12 @@ func (s *RequestService) Approve(ctx context.Context, requestID uuid.UUID, appro
 		// Enqueue the patch job so an agent can pick it up. Same
 		// failure posture as TTL refresh: audit-on-failure but don't
 		// roll back the approval — operators can re-issue the enqueue
-		// out-of-band if the job persistence fails.
-		if err := s.enqueueRequestJob(ctx, req); err != nil {
+		// out-of-band if the job persistence fails. The exception is a
+		// request no binding governs any more: that is a policy refusal,
+		// not a transient error, so the request fails.
+		if err := s.enqueueRequestJob(ctx, req); errors.Is(err, ErrSecretNotBound) {
+			s.failUnboundRequest(ctx, req, "user:"+approverID)
+		} else if err != nil {
 			_ = s.audit.Append(ctx, &storage.AuditEvent{
 				Actor:         "user:" + approverID,
 				Action:        "request.enqueue_job_failed",
