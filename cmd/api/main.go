@@ -405,6 +405,13 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// request submits fail closed.
 	requestSvc.WithProjectBindings(projectSecretsRepo, secretsRepo)
 	revealSessionSvc.WithAllowlist(projectSecretsRepo, secretsRepo)
+	// API-S-20: GET /requests/:id/wraps/:wrap_id hands out a wrap of the
+	// reveal-session flow (direct reveal, or any wrap bundled in a
+	// session) only inside an open, unexpired session of the caller and
+	// under the same env-matching allowlist Open applies. Plain
+	// approver-approved read wraps are unchanged.
+	revealSessionSvc.WithWrapLookup(revealSessionRepo)
+	requestSvc.WithRevealSessionGate(revealSessionSvc)
 
 	// Slice P2/P3: ProviderConnectionsService for admin CRUD + the
 	// developer dropdown + the discover-finished JobService hook.

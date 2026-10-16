@@ -59,6 +59,16 @@ type RevealSessionService struct {
 	// depth against a request row that somehow carries a denied key.
 	bindings storage.ProjectSecretRepository
 	secrets  storage.SecretRepository
+
+	// Session lookup for the single-wrap retrieve gate
+	// (AuthorizeWrapRetrieve). Wire via WithWrapLookup.
+	sessionWraps revealSessionWrapLookup
+}
+
+// revealSessionWrapLookup is the slice of *storage.RevealSessions the
+// single-wrap retrieve gate needs.
+type revealSessionWrapLookup interface {
+	ListForUserWrap(ctx context.Context, userID string, wrapID uuid.UUID) ([]*storage.RevealSession, error)
 }
 
 // NewRevealSessionService wires a RevealSessionService to its deps.
@@ -96,6 +106,13 @@ func (s *RevealSessionService) WithEnvironments(envs storage.EnvironmentReposito
 func (s *RevealSessionService) WithAllowlist(bindings storage.ProjectSecretRepository, secrets storage.SecretRepository) *RevealSessionService {
 	s.bindings = bindings
 	s.secrets = secrets
+	return s
+}
+
+// WithWrapLookup wires the session lookup AuthorizeWrapRetrieve uses.
+// Returns the service for chaining.
+func (s *RevealSessionService) WithWrapLookup(l revealSessionWrapLookup) *RevealSessionService {
+	s.sessionWraps = l
 	return s
 }
 
@@ -152,7 +169,82 @@ var (
 	// ErrNotSessionOwner is returned by MarkExpired when the caller is
 	// not the user who opened the session. Maps to 403.
 	ErrNotSessionOwner = errors.New("services: caller does not own this reveal session")
+
+	// ErrRevealSessionRequired is returned by AuthorizeWrapRetrieve when a
+	// wrap of the reveal-session flow is fetched without an open,
+	// unexpired session of the caller that bundles it. Maps to 403.
+	ErrRevealSessionRequired = errors.New("services: wrap must be retrieved inside an open reveal session")
 )
+
+// AuthorizeWrapRetrieve gates the single-wrap plaintext fetch
+// (GET /requests/:id/wraps/:wrap_id) for wraps of the reveal-session
+// flow (API-S-20). The flow applies when sessionRequired is true (the
+// caller passes it for an auto-approved direct reveal) or the wrap was
+// ever bundled into one of the caller's reveal sessions. Then:
+//
+//   - an open session (expired_at NULL AND expires_at in the future) of
+//     the caller, for this request, bundling this wrap must exist, so the
+//     session TTL holds even before the worker sweeper advances the
+//     wrap's own expiry → else ErrRevealSessionRequired;
+//   - the same env-matching allowlist check Open runs must pass for the
+//     wrap's key (binding scoped to the request's environment, else a
+//     NULL-environment one; none → ErrSecretNotBound; key outside →
+//     ErrKeyNotAllowed).
+//
+// A wrap of the plain read flow (approver-approved, never bundled in a
+// session) passes untouched, as before. Every refusal is audited and
+// happens BEFORE the single-shot consume, so a refused fetch never burns
+// the wrap. Fails closed (error) when the session lookup isn't wired.
+func (s *RevealSessionService) AuthorizeWrapRetrieve(ctx context.Context, req *storage.AccessRequest, wrap *storage.SecretWrap, userID string, sessionRequired bool) error {
+	if s.sessionWraps == nil {
+		return errors.New("services: reveal session wrap lookup not wired")
+	}
+	sessions, err := s.sessionWraps.ListForUserWrap(ctx, userID, wrap.ID)
+	if err != nil {
+		return err
+	}
+	if !sessionRequired && len(sessions) == 0 {
+		return nil
+	}
+
+	now := s.now().UTC()
+	var open *storage.RevealSession
+	for _, sess := range sessions {
+		if sess.ExpiredAt == nil && now.Before(sess.ExpiresAt) &&
+			sess.AccessRequestID != nil && *sess.AccessRequestID == req.ID {
+			open = sess
+			break
+		}
+	}
+	if open == nil {
+		s.auditRetrieveRefused(ctx, userID, req, wrap, "no_open_session")
+		return ErrRevealSessionRequired
+	}
+	if reason, err := s.enforceWrapAllowlist(ctx, req, []storage.WrapSummary{{ID: wrap.ID, KeyName: wrap.KeyName}}); err != nil {
+		if reason != "" {
+			s.auditRetrieveRefused(ctx, userID, req, wrap, reason)
+		}
+		return err
+	}
+	return nil
+}
+
+// auditRetrieveRefused records a refused single-wrap fetch. Metadata
+// only: ids and the refusal reason, never a value.
+func (s *RevealSessionService) auditRetrieveRefused(ctx context.Context, userID string, req *storage.AccessRequest, wrap *storage.SecretWrap, reason string) {
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:         "user:" + userID,
+		Action:        "wrap.retrieve.refused_session",
+		Resource:      "wrap:" + wrap.ID.String(),
+		Status:        storage.AuditStatusDenied,
+		CorrelationID: req.ID,
+		Metadata: map[string]any{
+			"request_id":     req.ID.String(),
+			"wrap_id":        wrap.ID.String(),
+			"refusal_reason": reason,
+		},
+	})
+}
 
 // Open creates a new reveal session for the caller bundling every
 // unconsumed wrap of the given access_request. The wraps remain

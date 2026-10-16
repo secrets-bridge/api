@@ -584,6 +584,11 @@ func retrieveUserWrapErr(err error) error {
 		return fiber.NewError(fiber.StatusConflict, "request not retrievable in current state")
 	case errors.Is(err, services.ErrNotRequestOwner):
 		return fiber.NewError(fiber.StatusForbidden, "only the original requester may retrieve")
+	case errors.Is(err, services.ErrRevealSessionRequired):
+		return fiber.NewError(fiber.StatusForbidden, "this wrap can only be revealed inside an open reveal session")
+	case errors.Is(err, services.ErrSecretNotBound), errors.Is(err, services.ErrKeyNotAllowed):
+		// Generic on purpose; the audit row has the reason.
+		return fiber.NewError(fiber.StatusForbidden, "this wrap is not permitted by the binding for its environment")
 	default:
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}

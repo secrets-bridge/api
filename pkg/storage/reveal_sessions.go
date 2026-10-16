@@ -163,6 +163,34 @@ func (r *RevealSessions) ListActiveForUser(ctx context.Context, userID string) (
 	return out, rows.Err()
 }
 
+// ListForUserWrap returns every session of the user, active OR expired,
+// whose wrap_ids bundles wrapID, newest first. The single-wrap retrieve
+// path uses it to decide whether a wrap belongs to the reveal-session
+// flow and, if so, whether an open session still covers it. Scoped by
+// user_id (indexed); only the requester can open a session for a request.
+// Deliberately not on RevealSessionRepository so the worker's narrower
+// interfaces are unaffected.
+func (r *RevealSessions) ListForUserWrap(ctx context.Context, userID string, wrapID uuid.UUID) ([]*RevealSession, error) {
+	const q = revealSessionSelect + `
+		WHERE user_id = $1 AND $2 = ANY(wrap_ids)
+		ORDER BY opened_at DESC`
+	rows, err := r.pool.Query(ctx, q, userID, wrapID)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list reveal sessions for wrap: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*RevealSession
+	for rows.Next() {
+		s, err := scanRevealSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 // MarkExpired atomically transitions the row to expired. Returns
 // ErrRevealSessionExpired when the row was already expired (race or
 // double-tap on Hide Now).

@@ -84,6 +84,10 @@ type RequestService struct {
 	// allowlist checks are skipped, and jobs get an empty provider config.
 	bindings storage.ProjectSecretRepository
 	secrets  storage.SecretRepository
+
+	// Reveal-session gate on the single-wrap retrieve (API-S-20). nil =
+	// off (legacy tests). Wire via WithRevealSessionGate from main.
+	revealGate RevealSessionGate
 }
 
 // NewRequestService wires a RequestService to its dependencies. The
@@ -1015,7 +1019,38 @@ func (s *RequestService) RetrieveWrapForUser(ctx context.Context, requestID, wra
 		return nil, nil, ErrRequestNotApproved
 	}
 
+	// API-S-20: wraps of the reveal-session flow are only handed out
+	// inside an open session of the caller, under the session's
+	// env-matching allowlist. A direct reveal is the only path that makes
+	// a read request approved with no approve vote (Approve always appends
+	// the vote before flipping the status), so zero approve votes marks it
+	// — that also covers direct reveals submitted before this check
+	// existed. Runs before the single-shot consume.
+	if s.revealGate != nil {
+		counts, err := s.approvals.Counts(ctx, req.ID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("services: count approvals: %w", err)
+		}
+		if err := s.revealGate.AuthorizeWrapRetrieve(ctx, req, wrap, userID, counts.Approves == 0); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	return s.wraps.RetrieveByUser(ctx, wrapID, userID)
+}
+
+// RevealSessionGate is the slice of *RevealSessionService the single-wrap
+// retrieve path consults (API-S-20).
+type RevealSessionGate interface {
+	AuthorizeWrapRetrieve(ctx context.Context, req *storage.AccessRequest, wrap *storage.SecretWrap, userID string, sessionRequired bool) error
+}
+
+// WithRevealSessionGate wires the reveal-session check into
+// RetrieveWrapForUser. nil leaves it off (legacy tests); main always
+// wires it. Returns the service for chaining.
+func (s *RequestService) WithRevealSessionGate(g RevealSessionGate) *RequestService {
+	s.revealGate = g
+	return s
 }
 
 // checkApproverScope enforces that approverID holds PermSecretApprove

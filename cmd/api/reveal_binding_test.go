@@ -59,6 +59,8 @@ type revealBindingFx struct {
 	requester uuid.UUID
 	cookie    string
 
+	approverCookie string
+
 	uatWorkflow  uuid.UUID
 	prodWorkflow uuid.UUID
 }
@@ -283,23 +285,65 @@ func bootstrapRevealBinding(t *testing.T) *revealBindingFx {
 		t.Fatalf("MarkMFA: %v", err)
 	}
 	fx.cookie = issued.CookieValue
+
+	// Approver: a second local user with global secret.approve (and a
+	// fresh-MFA session) for the plain approver-approved read flow.
+	approver := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO local_users (id, email, password_hash, display_name) VALUES ($1, 'dr-approver@example.com', $2, 'dr approver')`,
+		approver, []byte{0x00}); err != nil {
+		t.Fatalf("seed approver: %v", err)
+	}
+	approverRole := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO roles (id, name, permissions, is_system) VALUES ($1, 'dr-approver-role', '["secret.approve"]'::jsonb, false)`,
+		approverRole); err != nil {
+		t.Fatalf("seed approver role: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO user_roles (id, user_id, role_id, scope) VALUES ($1, $2, $3, '{}'::jsonb)`,
+		uuid.New(), approver, approverRole); err != nil {
+		t.Fatalf("seed approver user_role: %v", err)
+	}
+	approverSess, err := sessSvc.Issue(ctx, approver, "127.0.0.1", "reveal-binding-test")
+	if err != nil {
+		t.Fatalf("approver session Issue: %v", err)
+	}
+	if err := sessSvc.MarkMFA(ctx, approverSess.Session.ID, time.Now()); err != nil {
+		t.Fatalf("approver MarkMFA: %v", err)
+	}
+	fx.approverCookie = approverSess.CookieValue
 	return fx
 }
 
-// post sends an authenticated JSON POST through the real app and returns
-// the status + decoded body (nil when the body isn't a JSON object).
+// post sends an authenticated JSON POST through the real app as the
+// requester and returns the status + decoded body (nil when the body
+// isn't a JSON object).
 func (fx *revealBindingFx) post(t *testing.T, path string, body map[string]any) (int, map[string]any) {
 	t.Helper()
-	raw, err := json.Marshal(body)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
+	return fx.do(t, http.MethodPost, path, body, fx.cookie)
+}
+
+// do sends an authenticated request through the real app with the given
+// session cookie. A nil body sends no body.
+func (fx *revealBindingFx) do(t *testing.T, method, path string, body map[string]any, cookie string) (int, map[string]any) {
+	t.Helper()
+	var reader io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		reader = bytes.NewReader(raw)
 	}
-	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: middleware.SessionCookieName, Value: fx.cookie})
+	req := httptest.NewRequest(method, path, reader)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.AddCookie(&http.Cookie{Name: middleware.SessionCookieName, Value: cookie})
 	resp, err := fx.app.Test(req, fiber.TestConfig{Timeout: 15 * time.Second})
 	if err != nil {
-		t.Fatalf("POST %s: %v", path, err)
+		t.Fatalf("%s %s: %v", method, path, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(resp.Body)
@@ -624,14 +668,16 @@ func TestDirectReveal_ProdStillRefusedAndAudited(t *testing.T) {
 
 // wrapForAgent simulates the agent posting one wrap (fake value) for a
 // request, the way POST /agents/:id/wraps would after a read job.
-func (fx *revealBindingFx) wrapForAgent(t *testing.T, requestID, key string) {
+func (fx *revealBindingFx) wrapForAgent(t *testing.T, requestID, key string) string {
 	t.Helper()
 	rid := uuid.MustParse(requestID)
-	if _, err := fx.wrapSvc.WrapByAgent(t.Context(), uuid.New(), services.WrapRequest{
+	w, err := fx.wrapSvc.WrapByAgent(t.Context(), uuid.New(), services.WrapRequest{
 		Plaintext: []byte(rbFakeValue), RequestID: &rid, KeyName: key, TTL: 10 * time.Minute,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("WrapByAgent %s: %v", key, err)
 	}
+	return w.ID.String()
 }
 
 func (fx *revealBindingFx) openRevealSession(t *testing.T, requestID string) (int, map[string]any) {
@@ -812,5 +858,170 @@ func TestRevealSession_FailsClosedWhenNoBindingGoverns(t *testing.T) {
 	}
 	if sessions != 0 {
 		t.Errorf("reveal_sessions rows = %d; want 0", sessions)
+	}
+}
+
+// retrieveWrap fetches one wrap as the requester through the real route
+// (requireMFA + rate limit + handler). Only the status and key name are
+// returned so a test can never print the (fake) value.
+func (fx *revealBindingFx) retrieveWrap(t *testing.T, requestID, wrapID string) (int, string) {
+	t.Helper()
+	st, body := fx.do(t, http.MethodGet, "/api/v1/requests/"+requestID+"/wraps/"+wrapID, nil, fx.cookie)
+	key, _ := body["key_name"].(string)
+	return st, key
+}
+
+func (fx *revealBindingFx) wrapConsumed(t *testing.T, wrapID string) bool {
+	t.Helper()
+	var consumed bool
+	if err := fx.pool.QueryRow(t.Context(),
+		`SELECT consumed_at IS NOT NULL FROM secret_wraps WHERE id = $1`, wrapID).Scan(&consumed); err != nil {
+		t.Fatalf("load wrap: %v", err)
+	}
+	return consumed
+}
+
+// API-S-20: a direct-reveal wrap is only handed out by
+// GET /requests/:id/wraps/:wrap_id inside an open reveal session of the
+// caller. Without one the fetch is refused, audited, and does NOT burn
+// the single-shot wrap; with one it works as before.
+func TestWrapRetrieve_DirectRevealNeedsOpenSession(t *testing.T) {
+	fx := bootstrapRevealBinding(t)
+
+	st, resp := fx.directReveal(t, fx.uat, revealBody("team-alpha/uat/db", "DB_PASSWORD"))
+	if st != http.StatusCreated {
+		t.Fatalf("direct reveal = %d body=%v; want 201", st, resp)
+	}
+	reqID, _ := resp["request_id"].(string)
+	wrapID := fx.wrapForAgent(t, reqID, "DB_PASSWORD")
+
+	if st, _ := fx.retrieveWrap(t, reqID, wrapID); st != http.StatusForbidden {
+		t.Fatalf("retrieve direct-reveal wrap with no reveal session = %d; want 403", st)
+	}
+	if fx.wrapConsumed(t, wrapID) {
+		t.Fatalf("refused retrieve consumed the wrap")
+	}
+	if n := fx.countAudit(t, "wrap.retrieve.refused_session", "no_open_session"); n != 1 {
+		t.Errorf("wrap.retrieve.refused_session/no_open_session audit rows = %d; want 1", n)
+	}
+
+	// Legit: open the session, then the same wrap is handed out.
+	if st, body := fx.openRevealSession(t, reqID); st != http.StatusCreated {
+		t.Fatalf("open reveal session = %d body=%v; want 201", st, body)
+	}
+	st, key := fx.retrieveWrap(t, reqID, wrapID)
+	if st != http.StatusOK || key != "DB_PASSWORD" {
+		t.Fatalf("retrieve inside an open session = %d key=%q; want 200 DB_PASSWORD", st, key)
+	}
+}
+
+// API-S-20: the session TTL holds on the single-wrap path even before
+// the worker sweeper runs. The session's expires_at has passed (expired_at
+// still NULL, sweeper not run) while the wrap's own expires_at is still in
+// the future: the fetch must be refused.
+func TestWrapRetrieve_ExpiredSessionRefusedEvenIfWrapStillValid(t *testing.T) {
+	fx := bootstrapRevealBinding(t)
+	ctx := t.Context()
+
+	st, resp := fx.directReveal(t, fx.uat, revealBody("team-alpha/uat/db", "DB_PASSWORD"))
+	if st != http.StatusCreated {
+		t.Fatalf("direct reveal = %d body=%v; want 201", st, resp)
+	}
+	reqID, _ := resp["request_id"].(string)
+	wrapID := fx.wrapForAgent(t, reqID, "DB_PASSWORD")
+	st, sess := fx.openRevealSession(t, reqID)
+	if st != http.StatusCreated {
+		t.Fatalf("open reveal session = %d body=%v; want 201", st, sess)
+	}
+	sessionID, _ := sess["session_id"].(string)
+
+	if _, err := fx.pool.Exec(ctx,
+		`UPDATE reveal_sessions SET expires_at = now() - interval '1 second' WHERE id = $1`, sessionID); err != nil {
+		t.Fatalf("age session: %v", err)
+	}
+	var wrapLive bool
+	if err := fx.pool.QueryRow(ctx,
+		`SELECT expires_at > now() FROM secret_wraps WHERE id = $1`, wrapID).Scan(&wrapLive); err != nil {
+		t.Fatalf("load wrap expiry: %v", err)
+	}
+	if !wrapLive {
+		t.Fatalf("precondition: wrap expires_at should still be in the future")
+	}
+
+	if st, _ := fx.retrieveWrap(t, reqID, wrapID); st != http.StatusForbidden {
+		t.Fatalf("retrieve after the session TTL passed = %d; want 403", st)
+	}
+	if fx.wrapConsumed(t, wrapID) {
+		t.Errorf("refused retrieve consumed the wrap")
+	}
+}
+
+// API-S-20 + API-S-03: the single-wrap path applies the same env-matching
+// allowlist Open does. The shared ref is bound to prod (every key) on one
+// cluster and to uat (DB_PASSWORD only) on another; after the session is
+// opened the uat allowlist is tightened, so the uat request's wrap is now
+// outside the binding that governs it and must be refused, even though
+// the prod binding (first in catalog order) would still allow it.
+func TestWrapRetrieve_SessionAllowlistUsesEnvMatchingBinding(t *testing.T) {
+	fx := bootstrapRevealBinding(t)
+	ctx := t.Context()
+
+	st, resp := fx.directReveal(t, fx.uat, revealBody("team-alpha/shared/db", "DB_PASSWORD"))
+	if st != http.StatusCreated {
+		t.Fatalf("direct reveal = %d body=%v; want 201", st, resp)
+	}
+	reqID, _ := resp["request_id"].(string)
+	wrapID := fx.wrapForAgent(t, reqID, "DB_PASSWORD")
+	if st, body := fx.openRevealSession(t, reqID); st != http.StatusCreated {
+		t.Fatalf("open reveal session = %d body=%v; want 201", st, body)
+	}
+
+	if _, err := fx.pool.Exec(ctx,
+		`UPDATE project_secrets SET allowed_keys = ARRAY['OTHER_KEY']
+		  WHERE project_id = $1 AND environment_id = $2
+		    AND secret_id IN (SELECT id FROM secrets WHERE secret_ref = 'team-alpha/shared/db')`,
+		fx.project, fx.uat); err != nil {
+		t.Fatalf("tighten uat allowlist: %v", err)
+	}
+
+	if st, _ := fx.retrieveWrap(t, reqID, wrapID); st != http.StatusForbidden {
+		t.Fatalf("retrieve of a wrap outside the uat allowlist = %d; want 403", st)
+	}
+	if fx.wrapConsumed(t, wrapID) {
+		t.Errorf("refused retrieve consumed the wrap")
+	}
+	if n := fx.countAudit(t, "wrap.retrieve.refused_session", "key_not_allowed"); n != 1 {
+		t.Errorf("wrap.retrieve.refused_session/key_not_allowed audit rows = %d; want 1", n)
+	}
+}
+
+// Control: the plain read flow (request → approver approves → agent
+// wraps → requester fetches the wrap, no reveal session) is unchanged.
+func TestWrapRetrieve_PlainReadFlowUnchanged(t *testing.T) {
+	fx := bootstrapRevealBinding(t)
+
+	st, resp := fx.post(t, "/api/v1/requests/read", map[string]any{
+		"requester_id":         fx.requester.String(),
+		"project_id":           fx.project.String(),
+		"environment":          "uat",
+		"target_provider_type": "vault",
+		"target_secret_ref":    "team-alpha/uat/db",
+		"target_keys":          []string{"DB_PASSWORD"},
+		"justification":        "plain read flow control",
+	})
+	if st != http.StatusCreated {
+		t.Fatalf("POST /requests/read = %d body=%v; want 201", st, resp)
+	}
+	reqID, _ := resp["id"].(string)
+
+	st, resp = fx.do(t, http.MethodPost, "/api/v1/requests/"+reqID+"/approve", map[string]any{"comment": "ok"}, fx.approverCookie)
+	if st != http.StatusOK || resp["status"] != string(storage.AccessRequestStatusApproved) {
+		t.Fatalf("approve = %d body=%v; want 200 approved", st, resp)
+	}
+
+	wrapID := fx.wrapForAgent(t, reqID, "DB_PASSWORD")
+	st, key := fx.retrieveWrap(t, reqID, wrapID)
+	if st != http.StatusOK || key != "DB_PASSWORD" {
+		t.Fatalf("plain read retrieve without a session = %d key=%q; want 200 DB_PASSWORD", st, key)
 	}
 }
