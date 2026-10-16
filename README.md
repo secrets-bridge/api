@@ -155,6 +155,8 @@ export SB_WRAP_MASTER_KEY=$(openssl rand -base64 32)
 export SB_JWT_SECRET=$(openssl rand -base64 32)
 ```
 
+The compose file publishes every port on 127.0.0.1 only and holds no keys. The api container reads `SB_WRAP_MASTER_KEY` and `SB_JWT_SECRET` from your shell (export them as above before `docker compose up --build`) and refuses to boot without them. `SB_DEV_SEED_PASSWORD` is optional; unset means a random password per dev user, logged once.
+
 For OIDC against Authentik:
 
 ```bash
