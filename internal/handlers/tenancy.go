@@ -66,6 +66,7 @@ type Tenancy struct {
 	environments storage.EnvironmentRepository
 	resolver     auth.Resolver
 	teamScope    auth.TeamScopeResolver
+	audit        storage.AuditEventRepository
 }
 
 // NewTenancy wires the handler.
@@ -82,6 +83,29 @@ func (h *Tenancy) WithScope(r auth.Resolver, tr auth.TeamScopeResolver) *Tenancy
 	h.resolver = r
 	h.teamScope = tr
 	return h
+}
+
+// WithAudit wires audit emission for every project and environment write
+// (API-N-05). A project's team or an environment's kind decides who can
+// reach what, so each change is recorded with the session actor. Returns
+// the handler for chaining.
+func (h *Tenancy) WithAudit(a storage.AuditEventRepository) *Tenancy {
+	h.audit = a
+	return h
+}
+
+// environmentAuditMeta is the ids-and-shape view of an environment for
+// audit metadata. The name is included because grant scopes and policy
+// selectors refer to environments by name.
+func environmentAuditMeta(e *storage.Environment) map[string]any {
+	return map[string]any{
+		"environment_id": e.ID.String(),
+		"project_id":     e.ProjectID.String(),
+		"name":           e.Name,
+		"type":           string(e.Type),
+		"kind":           string(e.Kind),
+		"risk_level":     e.RiskLevel,
+	}
 }
 
 // projectScope resolves the caller's readable project set. The bool is
@@ -148,6 +172,11 @@ func (h *Tenancy) CreateProject(c fiber.Ctx) error {
 	if err := h.projects.Create(c.Context(), p); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
+	auditWrite(c, h.audit, "project.create", "project:"+p.ID.String(), map[string]any{
+		"project_id": p.ID.String(),
+		"team_id":    uuidPtrMeta(p.TeamID),
+		"status":     string(p.Status),
+	})
 	return c.Status(fiber.StatusCreated).JSON(projectToBody(p))
 }
 
@@ -165,12 +194,23 @@ func (h *Tenancy) SetProjectTeam(c fiber.Ctx) error {
 	if err := c.Bind().JSON(&body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
 	}
+	// Read the current team for the audit: moving a project between
+	// teams changes which team-scoped grants reach it.
+	var before *uuid.UUID
+	if current, err := h.projects.Get(c.Context(), id); err == nil {
+		before = current.TeamID
+	}
 	if err := h.projects.SetTeam(c.Context(), id, body.TeamID); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "not found")
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
+	auditWrite(c, h.audit, "project.team.update", "project:"+id.String(), map[string]any{
+		"project_id":     id.String(),
+		"team_id_before": uuidPtrMeta(before),
+		"team_id_after":  uuidPtrMeta(body.TeamID),
+	})
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
@@ -245,6 +285,10 @@ func (h *Tenancy) UpdateProjectStatus(c fiber.Ctx) error {
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
+	auditWrite(c, h.audit, "project.status.update", "project:"+id.String(), map[string]any{
+		"project_id": id.String(),
+		"status":     body.Status,
+	})
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
@@ -350,6 +394,10 @@ func (h *Tenancy) CreateEnvironment(c fiber.Ctx) error {
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
+	// kind is the prod/non-prod safety boundary. It can only change by
+	// delete + recreate, so both events carry it and the pair shows a
+	// kind change in the audit chain (H1 sub-item).
+	auditWrite(c, h.audit, "environment.create", "environment:"+e.ID.String(), environmentAuditMeta(e))
 	return c.Status(fiber.StatusCreated).JSON(environmentToBody(e))
 }
 
@@ -454,6 +502,19 @@ func (h *Tenancy) UpdateEnvironment(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
+	meta := environmentAuditMeta(updated)
+	meta["kind_before"] = string(current.Kind)
+	meta["kind_after"] = string(updated.Kind)
+	meta["risk_level_before"] = current.RiskLevel
+	changed := []string{}
+	if current.Description != updated.Description {
+		changed = append(changed, "description")
+	}
+	if current.RiskLevel != updated.RiskLevel {
+		changed = append(changed, "risk_level")
+	}
+	meta["changed_keys"] = changed
+	auditWrite(c, h.audit, "environment.update", "environment:"+id.String(), meta)
 	return c.JSON(environmentToBody(updated))
 }
 
@@ -463,11 +524,21 @@ func (h *Tenancy) DeleteEnvironment(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid UUID")
 	}
+	// Load first so the audit keeps the project and kind of what was
+	// removed (the row is hard-deleted).
+	current, err := h.environments.Get(c.Context(), id)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "environment not found")
+		}
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
 	if err := h.environments.Delete(c.Context(), id); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "environment not found")
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
+	auditWrite(c, h.audit, "environment.delete", "environment:"+id.String(), environmentAuditMeta(current))
 	return c.SendStatus(fiber.StatusNoContent)
 }

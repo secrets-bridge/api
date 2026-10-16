@@ -164,7 +164,7 @@ func (s *AgentService) Mint(ctx context.Context, in MintInput) (*MintedAgent, er
 		meta["public_key_algorithm"] = in.PublicKeyAlgorithm
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "admin", // wired to real auth in #10
+		Actor:    auditActorFromContext(ctx),
 		Action:   "agent.mint",
 		Resource: "agent:" + agent.ID.String(),
 		Status:   storage.AuditStatusSuccess,

@@ -93,7 +93,7 @@ func (s *ArgoCDEndpointService) Create(ctx context.Context, in CreateArgoCDEndpo
 		return nil, fmt.Errorf("services: persist argocd endpoint: %w", err)
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "admin",
+		Actor:    auditActorFromContext(ctx),
 		Action:   "argocd_endpoint.create",
 		Resource: "argocd_endpoint:" + e.ID.String(),
 		Status:   storage.AuditStatusSuccess,
@@ -141,7 +141,7 @@ func (s *ArgoCDEndpointService) SetEnabled(ctx context.Context, id uuid.UUID, en
 		return err
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "admin",
+		Actor:    auditActorFromContext(ctx),
 		Action:   "argocd_endpoint.set_enabled",
 		Resource: "argocd_endpoint:" + id.String(),
 		Status:   storage.AuditStatusSuccess,
@@ -157,7 +157,7 @@ func (s *ArgoCDEndpointService) SoftDelete(ctx context.Context, id uuid.UUID) er
 		return err
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "admin",
+		Actor:    auditActorFromContext(ctx),
 		Action:   "argocd_endpoint.delete",
 		Resource: "argocd_endpoint:" + id.String(),
 		Status:   storage.AuditStatusSuccess,
@@ -211,7 +211,7 @@ func (s *ArgoCDEndpointService) Discover(
 	apps, err := client.ListApplications(ctx, project)
 	if err != nil {
 		_ = s.audit.Append(ctx, &storage.AuditEvent{
-			Actor:    "admin",
+			Actor:    auditActorFromContext(ctx),
 			Action:   "argocd_endpoint.discover",
 			Resource: "argocd_endpoint:" + id.String(),
 			Status:   storage.AuditStatusFailure,
@@ -221,7 +221,7 @@ func (s *ArgoCDEndpointService) Discover(
 	}
 
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "admin",
+		Actor:    auditActorFromContext(ctx),
 		Action:   "argocd_endpoint.discover",
 		Resource: "argocd_endpoint:" + id.String(),
 		Status:   storage.AuditStatusSuccess,

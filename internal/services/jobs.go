@@ -72,7 +72,7 @@ func (s *JobService) Enqueue(ctx context.Context, req EnqueueRequest) (*storage.
 	}
 
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:         "admin",
+		Actor:         auditActorFromContext(ctx),
 		Action:        "job.enqueue",
 		Resource:      "job:" + job.ID.String(),
 		Status:        storage.AuditStatusSuccess,

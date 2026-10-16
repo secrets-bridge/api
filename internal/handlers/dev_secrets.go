@@ -49,6 +49,7 @@ type DevSecrets struct {
 	projectSecrets  storage.ProjectSecretRepository
 	secrets         storage.SecretRepository
 	requests        *services.RequestService
+	readScope       projectReadScope
 }
 
 // NewDevSecrets binds the handler.
@@ -66,6 +67,14 @@ func NewDevSecrets(
 		secrets:        secrets,
 		requests:       requests,
 	}
+}
+
+// WithReadScope wires the read-path project gate for ListEnvSecrets
+// (API-N-04): a caller whose secret.list / secret.request grants don't
+// cover the project gets 404. Returns the handler for chaining.
+func (h *DevSecrets) WithReadScope(r auth.Resolver, tr auth.TeamScopeResolver) *DevSecrets {
+	h.readScope = newProjectReadScope(r, tr)
+	return h
 }
 
 // EnvSecretKey is the value-free shape returned by ListEnvSecrets.
@@ -91,6 +100,15 @@ func (h *DevSecrets) ListEnvSecrets(c fiber.Ctx) error {
 	projectID, envID, err := parseProjectAndEnv(c)
 	if err != nil {
 		return err
+	}
+	// Project visibility first, before the env lookup, so an out-of-scope
+	// caller learns nothing about the project or its environments.
+	covered, err := h.readScope.covers(c, projectID)
+	if err != nil {
+		return err
+	}
+	if !covered {
+		return fiber.NewError(fiber.StatusNotFound, "project not found")
 	}
 
 	// Resolve the env so 404 short-circuits before any join work.

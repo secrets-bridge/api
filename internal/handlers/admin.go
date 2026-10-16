@@ -40,6 +40,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
@@ -145,6 +146,10 @@ func (h *Admin) CreateRole(c fiber.Ctx) error {
 	if err := h.roles.Create(c.Context(), r); err != nil {
 		return adminErr(err)
 	}
+	auditWrite(c, h.audit, "role.create", "role:"+r.ID.String(), map[string]any{
+		"role_id":     r.ID.String(),
+		"permissions": nonNilStrings(r.Permissions),
+	})
 	return c.Status(fiber.StatusCreated).JSON(roleToBody(r))
 }
 
@@ -189,27 +194,51 @@ func (h *Admin) UpdateRolePermissions(c fiber.Ctx) error {
 	if err := c.Bind().JSON(&body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
 	}
+	// Read the current list so the audit records what was added and
+	// removed, which is the privilege change a reviewer cares about.
+	existing, err := h.roles.Get(c.Context(), id)
+	if err != nil {
+		return adminErr(err)
+	}
 	if err := h.roles.UpdatePermissions(c.Context(), id, body.Permissions); err != nil {
 		return adminErr(err)
 	}
+	added, removed := stringSetDiff(existing.Permissions, body.Permissions)
+	auditWrite(c, h.audit, "role.permissions.update", "role:"+id.String(), map[string]any{
+		"role_id":             id.String(),
+		"permissions_added":   added,
+		"permissions_removed": removed,
+	})
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
-// DeleteRole handles DELETE /roles/:id.
+// DeleteRole handles DELETE /roles/:id. Deleting a role also drops every
+// user_roles row that pointed at it (FK ON DELETE CASCADE).
 func (h *Admin) DeleteRole(c fiber.Ctx) error {
 	id, err := parseID(c, "id")
 	if err != nil {
 		return err
 	}
+	existing, getErr := h.roles.Get(c.Context(), id)
 	if err := h.roles.Delete(c.Context(), id); err != nil {
 		return adminErr(err)
 	}
+	meta := map[string]any{"role_id": id.String()}
+	if getErr == nil && existing != nil {
+		meta["permissions"] = nonNilStrings(existing.Permissions)
+	}
+	auditWrite(c, h.audit, "role.delete", "role:"+id.String(), meta)
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
 // ---- user_roles ------------------------------------------------------
 
 // GrantUserRoleBody is the body of POST /user-roles.
+//
+// GrantedBy is accepted for wire compatibility but IGNORED: provenance is
+// the session actor (API-N-05). Trusting it let an admin label a grant
+// "system:oidc", the marker the OIDC role reconciler uses to decide which
+// rows it owns.
 type GrantUserRoleBody struct {
 	UserID    string         `json:"user_id"`
 	RoleID    uuid.UUID      `json:"role_id"`
@@ -243,14 +272,41 @@ func (h *Admin) GrantUserRole(c fiber.Ctx) error {
 	if body.UserID == "" || body.RoleID == uuid.Nil {
 		return fiber.NewError(fiber.StatusBadRequest, "user_id and role_id are required")
 	}
+	// API-N-06: allowed keys only, non-empty string values, UUIDs where
+	// an id is expected. A malformed scope used to collapse to {} at
+	// evaluation time and act as a global grant.
+	scope, err := auth.NormalizeGrantScope(body.Scope)
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
 	ur := &storage.UserRole{
 		UserID: body.UserID, RoleID: body.RoleID,
-		Scope: body.Scope, GrantedBy: body.GrantedBy,
+		Scope: scope, GrantedBy: sessionActor(c),
 	}
 	if err := h.userRoles.Grant(c.Context(), ur); err != nil {
 		return adminErr(err)
 	}
+	auditWrite(c, h.audit, "user_role.grant", "user_role:"+ur.ID.String(), userRoleAuditMeta(ur))
 	return c.Status(fiber.StatusCreated).JSON(userRoleToBody(ur))
+}
+
+// userRoleAuditMeta is the ids-and-shape view of an assignment for audit
+// metadata: who, which role, and the scope's keys plus its id values.
+// Free-text scope values (environment, secret_ref_prefix) stay out.
+func userRoleAuditMeta(ur *storage.UserRole) map[string]any {
+	meta := map[string]any{
+		"user_role_id": ur.ID.String(),
+		"user_id":      ur.UserID,
+		"role_id":      ur.RoleID.String(),
+		"scope_keys":   sortedKeys(ur.Scope),
+		"granted_by":   ur.GrantedBy,
+	}
+	for _, k := range []string{auth.ScopeKeyProjectID, auth.ScopeKeyTeamID} {
+		if v, ok := ur.Scope[k].(string); ok {
+			meta[k] = v
+		}
+	}
+	return meta
 }
 
 // RevokeUserRole handles DELETE /user-roles/:id.
@@ -259,9 +315,15 @@ func (h *Admin) RevokeUserRole(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	// Load first so the audit names the user and role that lost access.
+	existing, err := h.userRoles.Get(c.Context(), id)
+	if err != nil {
+		return adminErr(err)
+	}
 	if err := h.userRoles.Revoke(c.Context(), id); err != nil {
 		return adminErr(err)
 	}
+	auditWrite(c, h.audit, "user_role.revoke", "user_role:"+id.String(), userRoleAuditMeta(existing))
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
@@ -388,6 +450,9 @@ func (h *Admin) CreateWorkflow(c fiber.Ctx) error {
 	if err := h.workflows.Create(c.Context(), w); err != nil {
 		return adminErr(err)
 	}
+	auditWrite(c, h.audit, "workflow.create", "workflow:"+w.ID.String(), map[string]any{
+		"workflow_id": w.ID.String(),
+	})
 	return c.Status(fiber.StatusCreated).JSON(workflowToBody(w))
 }
 
@@ -461,19 +526,65 @@ func (h *Admin) UpdateWorkflow(c fiber.Ctx) error {
 	}
 	w := bodyToWorkflow(body)
 	w.ID = id
+	// Load the current row: it backs the scoped_policy_authorable
+	// preserve below and the changed_keys audit. One extra round-trip on
+	// an admin path.
+	existing, err := h.workflows.Get(c.Context(), id)
+	if err != nil {
+		return adminErr(err)
+	}
 	if body.ScopedPolicyAuthorable == nil {
-		// Preserve via Get → merge. Cost: one extra DB round-trip
-		// per Update. Acceptable for an admin path.
-		existing, err := h.workflows.Get(c.Context(), id)
-		if err != nil {
-			return adminErr(err)
-		}
 		w.ScopedPolicyAuthorable = existing.ScopedPolicyAuthorable
 	}
 	if err := h.workflows.Update(c.Context(), w); err != nil {
 		return adminErr(err)
 	}
+	auditWrite(c, h.audit, "workflow.update", "workflow:"+id.String(), map[string]any{
+		"workflow_id":  id.String(),
+		"changed_keys": workflowChangedKeys(existing, w),
+	})
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// workflowChangedKeys names the columns workflows.Update rewrote with a
+// different value. Names only, no values, matching the
+// provider_connection.update convention. Run it after Update, which
+// normalises a zero fill_ttl_seconds and nil notification_channels in
+// place.
+func workflowChangedKeys(before, after *storage.WorkflowDefinition) []string {
+	changed := []string{}
+	add := func(key string, differs bool) {
+		if differs {
+			changed = append(changed, key)
+		}
+	}
+	add("description", before.Description != after.Description)
+	add("min_approvers", before.MinApprovers != after.MinApprovers)
+	add("approver_role_id", uuidPtrMeta(before.ApproverRoleID) != uuidPtrMeta(after.ApproverRoleID))
+	add("wrap_ttl_created_seconds", before.WrapTTLCreated != after.WrapTTLCreated)
+	add("wrap_ttl_approved_seconds", before.WrapTTLApproved != after.WrapTTLApproved)
+	add("wrap_ttl_claimed_seconds", before.WrapTTLClaimed != after.WrapTTLClaimed)
+	add("request_ttl_seconds", before.RequestTTL != after.RequestTTL)
+	add("require_justification", before.RequireJustification != after.RequireJustification)
+	add("allow_self_approval", before.AllowSelfApproval != after.AllowSelfApproval)
+	add("notification_channels", !sameStrings(before.NotificationChannels, after.NotificationChannels))
+	add("enabled", before.Enabled != after.Enabled)
+	add("fill_ttl_seconds", before.FillTTLSeconds != after.FillTTLSeconds)
+	add("requires_security_approval", before.RequiresSecurityApproval != after.RequiresSecurityApproval)
+	add("scoped_policy_authorable", before.ScopedPolicyAuthorable != after.ScopedPolicyAuthorable)
+	return changed
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // DeleteWorkflow handles DELETE /workflows/:id.
@@ -485,6 +596,9 @@ func (h *Admin) DeleteWorkflow(c fiber.Ctx) error {
 	if err := h.workflows.Delete(c.Context(), id); err != nil {
 		return adminErr(err)
 	}
+	auditWrite(c, h.audit, "workflow.delete", "workflow:"+id.String(), map[string]any{
+		"workflow_id": id.String(),
+	})
 	return c.SendStatus(fiber.StatusNoContent)
 }
 

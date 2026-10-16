@@ -59,6 +59,7 @@ type ProjectSecrets struct {
 	environments storage.EnvironmentRepository
 	resolver     auth.Resolver
 	teamScope    auth.TeamScopeResolver
+	audit        storage.AuditEventRepository
 }
 
 // NewProjectSecrets wires the handler. The environment repository is
@@ -83,6 +84,31 @@ func (h *ProjectSecrets) WithScope(r auth.Resolver, tr auth.TeamScopeResolver) *
 	h.resolver = r
 	h.teamScope = tr
 	return h
+}
+
+// WithAudit wires audit emission for Bind / Update / Unbind (API-N-05).
+// These rows are what the request tenancy gate and the reveal allowlists
+// read, so every change is recorded with the session actor. Returns the
+// handler for chaining.
+func (h *ProjectSecrets) WithAudit(a storage.AuditEventRepository) *ProjectSecrets {
+	h.audit = a
+	return h
+}
+
+// bindingAuditMeta is the ids-and-shape view of a binding for audit
+// metadata. allowed_keys are key names from the allowlist, never values.
+func bindingAuditMeta(b *storage.ProjectSecret) map[string]any {
+	meta := map[string]any{
+		"project_id":     b.ProjectID.String(),
+		"secret_id":      b.SecretID.String(),
+		"environment_id": uuidPtrMeta(b.EnvironmentID),
+		"allowed_ops":    nonNilStrings(b.AllowedOps),
+		"all_keys":       b.AllowedKeys == nil,
+	}
+	if b.AllowedKeys != nil {
+		meta["allowed_keys"] = b.AllowedKeys
+	}
+	return meta
 }
 
 // authorizeProjectRead returns 404 when the caller's grants don't cover
@@ -154,7 +180,9 @@ type bindingBody struct {
 	EnvironmentID *string   `json:"environment_id"`
 	CreatedAt     time.Time `json:"created_at,omitempty"`
 	UpdatedAt     time.Time `json:"updated_at,omitempty"`
-	CreatedBy     string    `json:"created_by,omitempty"`
+	// CreatedBy is response-only. On Bind it is set from the session and
+	// a value sent in the body is ignored.
+	CreatedBy string `json:"created_by,omitempty"`
 
 	// Joined secret detail; populated on List + Get responses.
 	Secret *secretSummary `json:"secret,omitempty"`
@@ -282,7 +310,9 @@ func (h *ProjectSecrets) Bind(c fiber.Ctx) error {
 		EnvironmentID: envID,
 		AllowedKeys:   allowedKeys,
 		AllowedOps:    ops,
-		CreatedBy:     body.CreatedBy,
+		// Provenance is the session identity; a created_by in the body
+		// is ignored (API-N-05).
+		CreatedBy: sessionIdentity(c),
 	}
 	if err := h.bindings.Bind(c.Context(), binding); err != nil {
 		switch {
@@ -296,6 +326,7 @@ func (h *ProjectSecrets) Bind(c fiber.Ctx) error {
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, "bind failed")
 	}
+	auditWrite(c, h.audit, "project_secret.bind", projectSecretResource(projectID, binding.SecretID), bindingAuditMeta(binding))
 
 	resp := bindingToBody(binding)
 	if sec, err := h.secrets.Get(c.Context(), binding.SecretID); err == nil {
@@ -390,6 +421,7 @@ func (h *ProjectSecrets) Update(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "post-update read failed")
 	}
+	auditWrite(c, h.audit, "project_secret.update", projectSecretResource(projectID, secretID), bindingAuditMeta(binding))
 	resp := bindingToBody(binding)
 	if sec, err := h.secrets.Get(c.Context(), secretID); err == nil {
 		resp.Secret = secretToSummary(sec)
@@ -410,13 +442,30 @@ func (h *ProjectSecrets) Unbind(c fiber.Ctx) error {
 	if err := h.authorizeProjectWrite(c, projectID); err != nil {
 		return err
 	}
+	// Snapshot before the delete so the audit records what access went.
+	meta := map[string]any{"project_id": projectID.String(), "secret_id": secretID.String()}
+	if existing, err := h.bindings.Get(c.Context(), projectID, secretID); err == nil {
+		meta = bindingAuditMeta(existing)
+	}
 	if err := h.bindings.Unbind(c.Context(), projectID, secretID); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "binding not found")
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, "unbind failed")
 	}
+	auditWrite(c, h.audit, "project_secret.unbind", projectSecretResource(projectID, secretID), meta)
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+func projectSecretResource(projectID, secretID uuid.UUID) string {
+	return "project_secret:" + projectID.String() + "/" + secretID.String()
+}
+
+// sessionIdentity is the raw authenticated identity ("" when none), the
+// form the sibling project_provider_connections.created_by column uses.
+func sessionIdentity(c fiber.Ctx) string {
+	id, _ := auth.IdentityFromContext(c.Context())
+	return id
 }
 
 // --- helpers --------------------------------------------------------

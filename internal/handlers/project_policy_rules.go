@@ -240,6 +240,9 @@ type ProjectPolicyRules struct {
 	// main always wires both via WithHistory.
 	history *services.PolicyHistoryService
 	audit   storage.AuditEventRepository
+	// readScope gates List / Get / History on project visibility
+	// (API-N-04). Wired via WithReadScope.
+	readScope projectReadScope
 }
 
 // NewProjectPolicyRules constructs the handler. The PolicyEngine must
@@ -258,6 +261,29 @@ func (h *ProjectPolicyRules) WithHistory(history *services.PolicyHistoryService,
 	h.history = history
 	h.audit = audit
 	return h
+}
+
+// WithReadScope wires the project gate for the read routes (List, Get,
+// History). A caller covers the project through secret.list /
+// secret.request (the developer view), policy.author (the scoped authors
+// who write these rules) or policy.edit; anyone else gets 404. Returns
+// the handler for chaining.
+func (h *ProjectPolicyRules) WithReadScope(r auth.Resolver, tr auth.TeamScopeResolver) *ProjectPolicyRules {
+	h.readScope = newProjectReadScope(r, tr, auth.PermPolicyAuthor, auth.PermPolicyEdit)
+	return h
+}
+
+// projectReadable runs the read gate. When the project isn't covered it
+// writes the 404 envelope and reports ok=false; the caller returns err.
+func (h *ProjectPolicyRules) projectReadable(c fiber.Ctx, projectID uuid.UUID, notFoundCode, notFoundMsg string) (bool, error) {
+	covered, err := h.readScope.covers(c, projectID)
+	if err != nil {
+		return false, err
+	}
+	if !covered {
+		return false, stableErr(c, fiber.StatusNotFound, notFoundCode, notFoundMsg, nil)
+	}
+	return true, nil
 }
 
 // ---- request / response shapes ------------------------------------
@@ -465,6 +491,9 @@ func (h *ProjectPolicyRules) List(c fiber.Ctx) error {
 		return stableErr(c, fiber.StatusBadRequest, "bad_request",
 			"projectID is malformed", nil)
 	}
+	if ok, err := h.projectReadable(c, projectID, "project_not_found", "project not found"); !ok {
+		return err
+	}
 	rules, err := h.policies.ListForProject(c.Context(), projectID)
 	if err != nil {
 		return mapPolicyServiceErr(c, err)
@@ -502,6 +531,11 @@ func (h *ProjectPolicyRules) Get(c fiber.Ctx) error {
 	if err != nil {
 		return stableErr(c, fiber.StatusBadRequest, "bad_request",
 			"ruleID is malformed", nil)
+	}
+	// Same envelope as a missing or wrong-anchor rule, so an out-of-scope
+	// caller can't tell the cases apart.
+	if ok, err := h.projectReadable(c, projectID, "policy_not_found", "policy rule not found"); !ok {
+		return err
 	}
 	rule, err := h.policies.Get(c.Context(), ruleID)
 	if err != nil {
@@ -671,6 +705,9 @@ func (h *ProjectPolicyRules) History(c fiber.Ctx) error {
 	if err != nil {
 		return stableErr(c, fiber.StatusBadRequest, "bad_request",
 			err.Error(), nil)
+	}
+	if ok, err := h.projectReadable(c, projectID, "policy_not_found", "policy rule not found"); !ok {
+		return err
 	}
 
 	rule, err := h.policies.Get(c.Context(), ruleID)
