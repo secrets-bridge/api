@@ -95,8 +95,11 @@ type SecretWrapRepository interface {
 	// semantics; same error mapping.
 	MarkConsumedByUser(ctx context.Context, id uuid.UUID, userID string, at time.Time) error
 
-	// SetExpiry updates expires_at. Called by the workflow engine
-	// during state transitions (request approved → shorter TTL).
+	// SetExpiry moves expires_at EARLIER, never later: the stored value
+	// becomes LEAST(expires_at, expiresAt). Called by the workflow engine
+	// on state transitions and by reveal-session expiry. Consumed wraps
+	// are left untouched (ErrAlreadyConsumed); an already-expired wrap
+	// stays expired.
 	SetExpiry(ctx context.Context, id uuid.UUID, expiresAt time.Time) error
 
 	// DeleteExpired removes rows past their expiry. Returns the
@@ -402,12 +405,15 @@ func (r *SecretWraps) MarkConsumedByUser(ctx context.Context, id uuid.UUID, user
 	return r.consumeRefusal(ctx, id, at)
 }
 
-// SetExpiry updates expires_at. Used by the workflow engine when state
-// transitions shorten the wrap's TTL.
+// SetExpiry shortens expires_at to expiresAt when that is earlier than
+// the stored value. It never extends: a later deadline is a no-op, so a
+// state transition can't revive a wrap that already expired (the row
+// may sit around until the worker's wraps-expired sweep deletes it).
+// Consumed wraps are not touched.
 func (r *SecretWraps) SetExpiry(ctx context.Context, id uuid.UUID, expiresAt time.Time) error {
 	const q = `
 		UPDATE secret_wraps
-		SET expires_at = $2
+		SET expires_at = LEAST(expires_at, $2)
 		WHERE id = $1 AND consumed_at IS NULL`
 	tag, err := r.pool.Exec(ctx, q, id, expiresAt)
 	if err != nil {
@@ -506,4 +512,14 @@ func scanSecretWrap(row interface {
 	w.ConsumedAt = consumedAt
 	w.ConsumedByAgent = consumedByAgent
 	return &w, nil
+}
+
+// insertSecretWrap validates and writes one wrap row through q, which is
+// the pool or the transaction AccessRequests.FillWithWraps holds the
+// request row lock in.
+func insertSecretWrap(ctx context.Context, q querier, w *SecretWrap) error {
+	if err := prepareWrap(w); err != nil {
+		return err
+	}
+	return insertWrap(ctx, q, w)
 }

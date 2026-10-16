@@ -91,6 +91,28 @@ func (s *WrapService) AgentHoldsJob(ctx context.Context, jobID, requestID, agent
 }
 
 func (s *WrapService) wrapWith(ctx context.Context, req WrapRequest, store func(context.Context, *storage.SecretWrap) error) (*storage.SecretWrap, error) {
+	w, err := s.Seal(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if err := store(ctx, w); err != nil {
+		return nil, fmt.Errorf("wraps: store: %w", err)
+	}
+
+	// Zero the caller's plaintext to shrink the in-memory window.
+	zero(req.Plaintext)
+
+	s.RecordCreated(ctx, w, req.Actor, req.TTL)
+	return w, nil
+}
+
+// Seal envelope-encrypts req.Plaintext into a wrap row WITHOUT storing
+// it or auditing. It is for callers that must insert the row inside
+// their own transaction (cross-team Fill writes the wraps and the
+// status change together, so a fill that loses a race leaves nothing
+// behind). Once the row is committed the caller emits RecordCreated.
+// Seal does not zero req.Plaintext; the caller does.
+func (s *WrapService) Seal(ctx context.Context, req WrapRequest) (*storage.SecretWrap, error) {
 	if len(req.Plaintext) == 0 {
 		return nil, errors.New("wraps: plaintext is empty")
 	}
@@ -111,9 +133,7 @@ func (s *WrapService) wrapWith(ctx context.Context, req WrapRequest, store func(
 	}
 
 	contentHash := sha256.Sum256(req.Plaintext)
-	byteLen := len(req.Plaintext)
-
-	w := &storage.SecretWrap{
+	return &storage.SecretWrap{
 		RequestID:         req.RequestID,
 		KeyName:           req.KeyName,
 		EncryptedValue:    encrypted,
@@ -122,30 +142,27 @@ func (s *WrapService) wrapWith(ctx context.Context, req WrapRequest, store func(
 		KMSKeyID:          dk.KeyID,
 		Algorithm:         "AES-256-GCM",
 		ContentHash:       contentHash[:],
-		ByteLength:        byteLen,
+		ByteLength:        len(req.Plaintext),
 		ExpiresAt:         s.now().Add(req.TTL).UTC(),
-	}
-	if err := store(ctx, w); err != nil {
-		return nil, fmt.Errorf("wraps: store: %w", err)
-	}
+	}, nil
+}
 
-	// Zero the caller's plaintext to shrink the in-memory window.
-	zero(req.Plaintext)
-
+// RecordCreated emits the wrap.create audit event for a stored wrap.
+// Metadata only: byte length, content hash, KMS key id, TTL.
+func (s *WrapService) RecordCreated(ctx context.Context, w *storage.SecretWrap, actor string, ttl time.Duration) {
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:         nonEmpty(req.Actor, "user"),
+		Actor:         nonEmpty(actor, "user"),
 		Action:        "wrap.create",
 		Resource:      "wrap:" + w.ID.String(),
 		Status:        storage.AuditStatusSuccess,
-		CorrelationID: wrapCorrelation(req.RequestID),
+		CorrelationID: wrapCorrelation(w.RequestID),
 		Metadata: map[string]any{
-			"byte_length":  byteLen,
-			"content_hash": fmt.Sprintf("%x", contentHash[:]),
-			"kms_key_id":   dk.KeyID,
-			"ttl_seconds":  int64(req.TTL.Seconds()),
+			"byte_length":  w.ByteLength,
+			"content_hash": fmt.Sprintf("%x", w.ContentHash),
+			"kms_key_id":   w.KMSKeyID,
+			"ttl_seconds":  int64(ttl.Seconds()),
 		},
 	})
-	return w, nil
 }
 
 // Retrieve unwraps a stored value. The plaintext is returned to the
@@ -259,8 +276,10 @@ func (s *WrapService) auditRetrieveOutcomeUser(ctx context.Context, userID strin
 	})
 }
 
-// Refresh shortens (or extends) the wrap's TTL. Called by the workflow
-// engine on state transitions.
+// Refresh caps the wrap's remaining lifetime at newTTL from now. It can
+// only shorten: storage keeps LEAST(expires_at, now+newTTL), so a
+// transition never revives an expired wrap or stretches a live one.
+// Called by the workflow engine on state transitions.
 func (s *WrapService) Refresh(ctx context.Context, id uuid.UUID, newTTL time.Duration) error {
 	if newTTL <= 0 {
 		return errors.New("wraps: newTTL must be positive")

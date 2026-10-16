@@ -28,6 +28,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/secrets-bridge/api/pkg/storage"
+	"github.com/secrets-bridge/api/pkg/workflow"
 )
 
 // ErrSecretNotBound is returned when a read-path submit names a secret
@@ -281,8 +282,9 @@ func bindingRefusal(err error) (string, bool) {
 // not apply, so a request left at approved is visible in the audit log.
 func (s *RequestService) failUnboundRequest(ctx context.Context, req *storage.AccessRequest, actor, reason string) {
 	transitioned := false
-	if err := s.requests.UpdateStatus(ctx, req.ID, storage.AccessRequestStatusFailed); err == nil {
-		req.Status = storage.AccessRequestStatusFailed
+	fail := workflow.For(workflow.ActionFail)
+	if err := s.requests.TransitionStatus(ctx, req.ID, fail.From, fail.To); err == nil {
+		req.Status = fail.To
 		transitioned = true
 	}
 	envID := ""

@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -106,6 +107,14 @@ func Open(ctx context.Context, cfg Config) (*Pool, error) {
 		return nil, fmt.Errorf("storage: ping: %w", err)
 	}
 	return &Pool{Pool: pool}, nil
+}
+
+// querier is what both *Pool and pgx.Tx offer. Row helpers that must
+// also run inside a transaction take it instead of the pool.
+type querier interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
 // Close shuts the pool down. Idempotent; safe to call in deferred
