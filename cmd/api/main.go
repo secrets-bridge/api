@@ -387,7 +387,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	projectSecretsRepo := storage.NewProjectSecrets(pool)
 	projectSecretsH := handlers.NewProjectSecrets(projectSecretsRepo, projectRepo, secretsRepo, environmentRepo)
 	teamRepo := storage.NewTeams(pool)
-	teamsH := handlers.NewTeams(teamRepo)
+	// Project and team logos: PNG/JPEG uploads re-encoded as PNG, served
+	// back as images and reported as logo_version on project and team
+	// bodies (including /users/me).
+	logoSvc := services.NewLogoService(storage.NewLogos(pool), projectRepo, teamRepo, auditRepo)
+	tenancyH = tenancyH.WithLogos(logoSvc)
+	teamsH := handlers.NewTeams(teamRepo).WithLogos(logoSvc)
 	teamScopeResolver := auth.NewRepoTeamScopeResolver(teamRepo, projectRepo)
 	// Slice N3: wire the cross-team validators onto RequestService now
 	// that teams + projects + envs repos exist in scope. The
@@ -563,7 +568,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	meH := handlers.NewMe(projectRepo, rbacResolver).
 		WithTeamScope(teamScopeResolver).
 		WithIdentity(localUsersRepoInApp, teamRepo).
-		WithEnvironments(environmentRepo)
+		WithEnvironments(environmentRepo).
+		WithLogos(logoSvc)
 
 	// Slice L4 — per-env dev endpoints. Sits next to meH; consumes the
 	// project + env model + project_secrets binding + RequestService's
@@ -895,6 +901,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Get("/projects/:id", tenancyH.GetProject)
 	v1.Put("/projects/:id/status", auth.Require(auth.PermTeamEdit, rbacResolver), tenancyH.UpdateProjectStatus)
 	v1.Put("/projects/:id/team", auth.Require(auth.PermTeamEdit, rbacResolver), tenancyH.SetProjectTeam)
+	// Logos: GET follows the project read scope (404 outside it); writes
+	// need team.edit like the other project writes.
+	v1.Get("/projects/:id/logo", tenancyH.GetProjectLogo)
+	v1.Put("/projects/:id/logo", auth.Require(auth.PermTeamEdit, rbacResolver), tenancyH.PutProjectLogo)
+	v1.Delete("/projects/:id/logo", auth.Require(auth.PermTeamEdit, rbacResolver), tenancyH.DeleteProjectLogo)
 	v1.Get("/projects/:id/environments", tenancyH.ListEnvironmentsForProject)
 
 	// Project ↔ secret bindings (multi-tenancy, api#43 Slice A). The
@@ -963,6 +974,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Put("/teams/:id", auth.Require(auth.PermTeamEdit, rbacResolver), teamsH.Update)
 	v1.Put("/teams/:id/status", auth.Require(auth.PermTeamEdit, rbacResolver), teamsH.UpdateStatus)
 	v1.Delete("/teams/:id", auth.Require(auth.PermTeamEdit, rbacResolver), teamsH.Delete)
+	v1.Get("/teams/:id/logo", teamsH.GetTeamLogo)
+	v1.Put("/teams/:id/logo", auth.Require(auth.PermTeamEdit, rbacResolver), teamsH.PutTeamLogo)
+	v1.Delete("/teams/:id/logo", auth.Require(auth.PermTeamEdit, rbacResolver), teamsH.DeleteTeamLogo)
 	v1.Post("/teams/:id/members", auth.Require(auth.PermTeamEdit, rbacResolver), teamsH.AddMember)
 	v1.Get("/teams/:id/members", teamsH.ListMembers)
 	v1.Delete("/teams/:id/members/:user_id", auth.Require(auth.PermTeamEdit, rbacResolver), teamsH.RemoveMember)
