@@ -103,8 +103,9 @@ type EnvSecretKey struct {
 
 // ListEnvSecrets handles GET /projects/:id/environments/:env_id/secrets.
 //
-// Joins `project_secrets` ON (project_id, environment_id) and
-// expands the result into one row per allowed key. When a
+// Lists the project_secrets bindings that govern a request in this
+// environment (scoped to it, or whole-project) and expands the result
+// into one row per allowed key. When a
 // project_secrets row has `allowed_keys=NULL`, the call returns one
 // row per key discovered on the secret (via secrets.labels if
 // populated, otherwise the wire shape is `key_name=""` to signal
@@ -143,12 +144,22 @@ func (h *DevSecrets) ListEnvSecrets(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 
-	out := make([]EnvSecretKey, 0, len(bindings))
+	// Keep exactly the bindings the submit gate would accept for this
+	// environment (services.GoverningBinding): one scoped to envID, or a
+	// whole-project binding (NULL environment_id), which governs a request
+	// in any environment of the project. A binding scoped to another
+	// environment never applies. The same ref discovered on two clusters
+	// can carry two bindings; only the governing one is listed, so the
+	// list never offers a secret the gate would then refuse or route
+	// through a different catalog row.
+	type candidate struct {
+		binding *storage.ProjectSecret
+		secret  *storage.Secret
+	}
+	groups := map[string][]candidate{}
+	var order []string
 	for _, b := range bindings {
-		// Slice L3 made environment_id authoritative. A binding without
-		// env_id (un-backfilled legacy row) is skipped — operators see
-		// it in the admin UI and fix.
-		if b.EnvironmentID == nil || *b.EnvironmentID != envID {
+		if b.EnvironmentID != nil && *b.EnvironmentID != envID {
 			continue
 		}
 		secret, err := h.secrets.Get(c.Context(), b.SecretID)
@@ -158,6 +169,25 @@ func (h *DevSecrets) ListEnvSecrets(c fiber.Ctx) error {
 			}
 			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 		}
+		key := secret.ProviderType + "\x00" + secret.SecretRef
+		if _, seen := groups[key]; !seen {
+			order = append(order, key)
+		}
+		groups[key] = append(groups[key], candidate{binding: b, secret: secret})
+	}
+
+	out := make([]EnvSecretKey, 0, len(order))
+	for _, key := range order {
+		cands := groups[key]
+		bs := make([]*storage.ProjectSecret, len(cands))
+		for i := range cands {
+			bs[i] = cands[i].binding
+		}
+		i := services.GoverningBinding(bs, &envID)
+		if i < 0 {
+			continue
+		}
+		b, secret := cands[i].binding, cands[i].secret
 		ops := append([]string(nil), b.AllowedOps...)
 		if len(b.AllowedKeys) == 0 {
 			// Binding allows every key — emit one row marker.

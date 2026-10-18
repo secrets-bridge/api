@@ -18,10 +18,12 @@
 //     Slice L3 onward, but no HTTP path ever set it, so the only rows
 //     that had one came from the 0025 label-bridge backfill —
 //     operators could not create an env-scoped binding through the
-//     product. Both write paths now accept it. Omitting the field
-//     preserves the previous behaviour exactly: nil on create, and
-//     untouched on update, so a keys-only edit cannot detach a
-//     binding from its environment.
+//     product. Both write paths now accept it. On create, omitted or
+//     null means a whole-project binding. On update it is tri-state
+//     (api#249): absent keeps the stored value, so a keys-only edit
+//     cannot detach a binding from its environment; a UUID moves the
+//     binding to that environment; an explicit null (or "") makes it a
+//     whole-project binding again.
 //
 //   - allowed_keys: nil means "every key the secret exposes is
 //     allowed for this project". Non-nil = explicit allowlist. The
@@ -206,12 +208,15 @@ type secretSummary struct {
 //     to be read as null, so any edit that left it out quietly widened
 //     an allowlist to every key.
 //   - allowed_ops: absent = unchanged; a present list must be non-empty.
-//   - environment_id: absent = unchanged; detaching is not offered
-//     (unbind and re-bind instead).
+//   - environment_id: absent = unchanged, a UUID = scope the binding to
+//     that environment of this project, null (or "") = whole project
+//     (api#249). A whole-project binding governs requests in every
+//     environment of the project that has no binding of its own for the
+//     same ref (services.GoverningBinding).
 type updateBindingBody struct {
 	AllowedKeys   optionalStrings `json:"allowed_keys"`
 	AllowedOps    *[]string       `json:"allowed_ops,omitempty"`
-	EnvironmentID *string         `json:"environment_id,omitempty"`
+	EnvironmentID optionalString  `json:"environment_id"`
 }
 
 func bindingToBody(b *storage.ProjectSecret) bindingBody {
@@ -418,9 +423,13 @@ func (h *ProjectSecrets) Update(c fiber.Ctx) error {
 		}
 	}
 
-	envID, err := h.resolveEnvironment(c, projectID, body.EnvironmentID)
-	if err != nil {
-		return err
+	envID := current.EnvironmentID
+	if body.EnvironmentID.Set {
+		// null and "" resolve to nil: the binding becomes whole-project.
+		envID, err = h.resolveEnvironment(c, projectID, body.EnvironmentID.Value)
+		if err != nil {
+			return err
+		}
 	}
 
 	if err := h.bindings.Update(c.Context(), projectID, secretID, allowedKeys, ops, envID); err != nil {
@@ -437,7 +446,13 @@ func (h *ProjectSecrets) Update(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "post-update read failed")
 	}
-	auditWrite(c, h.audit, "project_secret.update", projectSecretResource(projectID, secretID), bindingAuditMeta(binding))
+	meta := bindingAuditMeta(binding)
+	if !sameUUIDPtr(current.EnvironmentID, binding.EnvironmentID) {
+		// A scope change widens or narrows where the binding governs
+		// requests, so record where it came from as well.
+		meta["previous_environment_id"] = uuidPtrMeta(current.EnvironmentID)
+	}
+	auditWrite(c, h.audit, "project_secret.update", projectSecretResource(projectID, secretID), meta)
 	resp := bindingToBody(binding)
 	if sec, err := h.secrets.Get(c.Context(), secretID); err == nil {
 		resp.Secret = secretToSummary(sec)
@@ -511,10 +526,20 @@ func validateAllowedOps(ops []string) error {
 	return nil
 }
 
+// sameUUIDPtr reports whether two optional ids are equal (both nil, or
+// both set to the same id).
+func sameUUIDPtr(a, b *uuid.UUID) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
 // resolveEnvironment turns the wire-level environment_id into a
-// validated UUID scoped to projectID. Returns (nil, nil) when the
-// caller omitted the field, which both write paths read as "leave the
-// stored value alone".
+// validated UUID scoped to projectID. Returns (nil, nil) for a nil or
+// empty value: no environment, i.e. a whole-project binding. Update only
+// calls it when the key was present in the body; an absent key keeps
+// the stored value.
 //
 // The project check is the load-bearing part: environments.id carries
 // a foreign key, so a bogus UUID is caught by the database, but an
