@@ -120,6 +120,11 @@ func (s *SSOStore) GetProvider(ctx context.Context, id uuid.UUID) (*SSOProvider,
 	return scanSSOProvider(s.pool.QueryRow(ctx, `SELECT `+ssoProviderColumns+` FROM sso_providers WHERE id = $1`, id))
 }
 
+// GetProviderByType returns the provider of a type, or ErrNotFound.
+func (s *SSOStore) GetProviderByType(ctx context.Context, providerType string) (*SSOProvider, error) {
+	return scanSSOProvider(s.pool.QueryRow(ctx, `SELECT `+ssoProviderColumns+` FROM sso_providers WHERE type = $1`, providerType))
+}
+
 // ListProviders returns every provider, by type.
 func (s *SSOStore) ListProviders(ctx context.Context) ([]*SSOProvider, error) {
 	rows, err := s.pool.Query(ctx, `SELECT `+ssoProviderColumns+` FROM sso_providers ORDER BY type`)
