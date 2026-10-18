@@ -57,3 +57,27 @@ func (o *optionalStrings) UnmarshalJSON(b []byte) error {
 	o.Value = v
 	return nil
 }
+
+// optionalString is a nullable string field whose presence is tracked.
+// It is used where the handler validates the string itself (for
+// example an id that must also belong to the project in the URL), so a
+// malformed value gets that field's own 400 rather than a generic JSON
+// error.
+type optionalString struct {
+	Set   bool    // the key was in the body
+	Value *string // nil when the body sent null
+}
+
+func (o *optionalString) UnmarshalJSON(b []byte) error {
+	o.Set = true
+	if bytes.Equal(bytes.TrimSpace(b), []byte("null")) {
+		o.Value = nil
+		return nil
+	}
+	var v string
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	o.Value = &v
+	return nil
+}

@@ -58,14 +58,13 @@ type ProjectSecretRepository interface {
 	// already exists.
 	Bind(ctx context.Context, b *ProjectSecret) error
 
-	// Update overwrites AllowedKeys + AllowedOps on an existing
-	// binding. ErrNotFound when no binding exists for the pair.
+	// Update overwrites AllowedKeys, AllowedOps and EnvironmentID on an
+	// existing binding. ErrNotFound when no binding exists for the pair.
 	//
-	// environmentID is tri-state by pointer: nil leaves the existing
-	// environment_id untouched (so an allowed_keys-only edit can never
-	// silently detach a binding from its environment), non-nil sets
-	// it. Detaching is deliberately not offered — unbind and re-bind
-	// instead, which keeps the audit trail honest about the change.
+	// Every value is written as given: environmentID nil stores NULL
+	// (a whole-project binding). Partial-update semantics live in the
+	// caller, which reads the current row and passes back the stored
+	// value for any field the client left out (api#249).
 	Update(ctx context.Context, projectID, secretID uuid.UUID, allowedKeys []string, allowedOps []string, environmentID *uuid.UUID) error
 
 	// Unbind removes the binding. ErrNotFound when no binding exists.
@@ -128,10 +127,8 @@ func (r *ProjectSecrets) Bind(ctx context.Context, b *ProjectSecret) error {
 	return nil
 }
 
-// Update rewrites AllowedKeys + AllowedOps on an existing row, and
-// attaches environmentID when one is supplied. A nil environmentID
-// preserves whatever the row already carries — see the interface doc
-// for why detaching is not offered here.
+// Update rewrites AllowedKeys, AllowedOps and EnvironmentID on an
+// existing row. A nil environmentID stores NULL; see the interface doc.
 func (r *ProjectSecrets) Update(ctx context.Context, projectID, secretID uuid.UUID, allowedKeys []string, allowedOps []string, environmentID *uuid.UUID) error {
 	if allowedKeys != nil && len(allowedKeys) == 0 {
 		return ErrEmptyAllowedKeys
@@ -140,13 +137,11 @@ func (r *ProjectSecrets) Update(ctx context.Context, projectID, secretID uuid.UU
 		return ErrEmptyAllowedOps
 	}
 
-	// COALESCE keeps the stored environment when $5 arrives NULL, so
-	// callers that only touch keys/ops cannot detach the binding.
 	const q = `
 		UPDATE project_secrets
 		SET allowed_keys = $1,
 		    allowed_ops = $2,
-		    environment_id = COALESCE($5::uuid, environment_id)
+		    environment_id = $5::uuid
 		WHERE project_id = $3 AND secret_id = $4`
 	tag, err := r.pool.Exec(ctx, q, allowedKeys, allowedOps, projectID, secretID, environmentID)
 	if err != nil {

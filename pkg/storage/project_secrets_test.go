@@ -319,7 +319,11 @@ func TestUpdate_AttachesEnvironmentID(t *testing.T) {
 	}
 }
 
-func TestUpdate_NilEnvironmentIDPreservesExisting(t *testing.T) {
+// The repository writes the environment it is given; keeping the
+// stored value for an omitted field is the handler's job (it passes the
+// current environment back). A nil environmentID therefore makes the
+// binding whole-project (api#249).
+func TestUpdate_NilEnvironmentIDClearsToWholeProject(t *testing.T) {
 	repo, projects, secrets, pool := bootstrapProjectSecrets(t)
 	projectID := seedProject(t, projects, "billing")
 	secretID := seedSecret(t, secrets, "/secrets/uat/team-alpha/db")
@@ -336,18 +340,30 @@ func TestUpdate_NilEnvironmentIDPreservesExisting(t *testing.T) {
 		t.Fatalf("Bind: %v", err)
 	}
 
-	// An allowed_keys-only edit must not silently detach the env.
+	// Passing the stored environment back keeps it.
 	if err := repo.Update(t.Context(), projectID, secretID,
-		[]string{"DB_HOST"}, []string{storage.OpRead}, nil); err != nil {
+		[]string{"DB_HOST"}, []string{storage.OpRead}, &envID); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
-
 	got, err := repo.Get(t.Context(), projectID, secretID)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
 	if got.EnvironmentID == nil || *got.EnvironmentID != envID {
-		t.Fatalf("environment was detached by an unrelated update: got %v want %v",
+		t.Fatalf("environment changed by an update that passed it back: got %v want %v",
 			got.EnvironmentID, envID)
+	}
+
+	// nil stores NULL: a whole-project binding.
+	if err := repo.Update(t.Context(), projectID, secretID,
+		[]string{"DB_HOST"}, []string{storage.OpRead}, nil); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	got, err = repo.Get(t.Context(), projectID, secretID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.EnvironmentID != nil {
+		t.Fatalf("EnvironmentID: got %v want nil", got.EnvironmentID)
 	}
 }
