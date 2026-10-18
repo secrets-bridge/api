@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // WorkflowDefinition is an admin-defined approval template.
@@ -67,7 +68,23 @@ type WorkflowRepository interface {
 	// once this method ships.
 	ListScopedPolicyAuthorable(ctx context.Context) ([]*WorkflowDefinition, error)
 	Update(ctx context.Context, w *WorkflowDefinition) error
-	Delete(ctx context.Context, id uuid.UUID) error
+	// Delete removes a non-system workflow and reports what referenced
+	// it. ErrWorkflowInUse while any access request uses it, or while
+	// policy rules route to it and deletePolicyRules is false.
+	Delete(ctx context.Context, id uuid.UUID, deletePolicyRules bool) (WorkflowUsage, error)
+}
+
+// ErrWorkflowInUse is returned by Delete when access requests reference
+// the workflow (they keep it for their history), or when policy rules
+// route to it and the caller didn't ask to delete them too.
+var ErrWorkflowInUse = errors.New("storage: workflow in use")
+
+// WorkflowUsage is what referenced a workflow when Delete looked.
+// PolicyRuleIDs lists the rules, which a successful Delete with
+// deletePolicyRules removed along with the workflow.
+type WorkflowUsage struct {
+	Requests      int
+	PolicyRuleIDs []uuid.UUID
 }
 
 // Workflows is the Postgres implementation.
@@ -251,23 +268,58 @@ func (r *Workflows) Update(ctx context.Context, w *WorkflowDefinition) error {
 	return nil
 }
 
-func (r *Workflows) Delete(ctx context.Context, id uuid.UUID) error {
-	const q = `DELETE FROM workflow_definitions WHERE id = $1 AND is_system = false`
-	tag, err := r.pool.Exec(ctx, q, id)
+// Delete removes a non-system workflow. It refuses with ErrWorkflowInUse
+// while any access request references it, and while policy rules route
+// to it unless deletePolicyRules is set; then the rules go with it
+// (policy_rules.workflow_id is ON DELETE CASCADE). The counts and the
+// delete run in one transaction with the workflow row locked, which
+// blocks a new request or rule from referencing it in between.
+func (r *Workflows) Delete(ctx context.Context, id uuid.UUID, deletePolicyRules bool) (WorkflowUsage, error) {
+	var u WorkflowUsage
+	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("storage: delete workflow: %w", err)
+		return u, fmt.Errorf("storage: begin delete workflow: %w", err)
 	}
-	if tag.RowsAffected() == 1 {
-		return nil
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var isSystem bool
+	err = tx.QueryRow(ctx, `SELECT is_system FROM workflow_definitions WHERE id = $1 FOR UPDATE`, id).Scan(&isSystem)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return u, ErrNotFound
 	}
-	w, getErr := r.Get(ctx, id)
-	if getErr != nil {
-		return getErr
+	if err != nil {
+		return u, fmt.Errorf("storage: lock workflow: %w", err)
 	}
-	if w.IsSystem {
-		return ErrSystemRow
+	if isSystem {
+		return u, ErrSystemRow
 	}
-	return ErrNotFound
+
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM access_requests WHERE workflow_id = $1`, id).Scan(&u.Requests); err != nil {
+		return u, fmt.Errorf("storage: count workflow requests: %w", err)
+	}
+	rows, err := tx.Query(ctx, `SELECT id FROM policy_rules WHERE workflow_id = $1 ORDER BY id`, id)
+	if err != nil {
+		return u, fmt.Errorf("storage: list workflow policy rules: %w", err)
+	}
+	u.PolicyRuleIDs, err = pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil {
+		return u, fmt.Errorf("storage: scan workflow policy rules: %w", err)
+	}
+	if u.Requests > 0 || (len(u.PolicyRuleIDs) > 0 && !deletePolicyRules) {
+		return u, ErrWorkflowInUse
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM workflow_definitions WHERE id = $1`, id); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" { // foreign_key_violation
+			return u, ErrWorkflowInUse
+		}
+		return u, fmt.Errorf("storage: delete workflow: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return u, fmt.Errorf("storage: commit delete workflow: %w", err)
+	}
+	return u, nil
 }
 
 const workflowSelect = `
