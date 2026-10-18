@@ -25,6 +25,7 @@ import (
 
 	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/handlers"
+	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
@@ -101,6 +102,14 @@ func TestHygiene_PolicyHistory500IsStable(t *testing.T) {
 				engine := services.NewPolicyEngine(nil, nil, nil).WithAuthorScope(hygGlobalResolver{}, nil)
 				h := handlers.NewTeamPolicyRules(engine, policies, nil).WithHistory(historySvc, brokenAudit)
 				app := fiber.New()
+				// The coverage gate needs a caller to pass; hygGlobalResolver
+				// gives it a global policy.author. Without one the gate
+				// answers 403, which this test once missed because the
+				// handler carried on past the gate (skills#86).
+				app.Use(func(c fiber.Ctx) error {
+					c.SetContext(context.WithValue(c.Context(), middleware.CtxKeyActor, "hyg-author"))
+					return c.Next()
+				})
 				app.Get("/api/v1/teams/:teamID/policy-rules/:ruleID/history", h.History)
 				return app
 			},

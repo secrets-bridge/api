@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -126,12 +127,15 @@ func bootstrapTeamPolicies(t *testing.T) *teamPolicyHarness {
 	v1 := app.Group("/api/v1")
 	app.Use(testAuthMW)
 
-	tprH := handlers.NewTeamPolicyRules(engine, storage.NewPolicies(pool), nil)
+	auditRepo := storage.NewAuditEvents(pool)
+	tprH := handlers.NewTeamPolicyRules(engine, storage.NewPolicies(pool), nil).
+		WithHistory(services.NewPolicyHistoryService(auditRepo, storage.NewWorkflows(pool), nil, nil), auditRepo)
 	v1.Post("/teams/:teamID/policy-rules", tprH.Create)
 	v1.Get("/teams/:teamID/policy-rules", tprH.List)
 	v1.Get("/teams/:teamID/policy-rules/:ruleID", tprH.Get)
 	v1.Put("/teams/:teamID/policy-rules/:ruleID", tprH.Update)
 	v1.Delete("/teams/:teamID/policy-rules/:ruleID", tprH.Delete)
+	v1.Get("/teams/:teamID/policy-rules/:ruleID/history", tprH.History)
 
 	patcH := handlers.NewPolicyAuthorTeamCoverage(resolver, identityTeamScope{})
 	v1.Get("/users/me/policy-author-team-coverage", patcH.Get)
@@ -270,6 +274,96 @@ func TestTeamPolicyList_OutOfScopeReturns403(t *testing.T) {
 		"/api/v1/teams/"+h.teamID.String()+"/policy-rules", nil)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+}
+
+// requireOnlyErrorBody fails unless the response has the given status
+// and a body that is the error envelope and nothing else.
+func requireOnlyErrorBody(t *testing.T, label string, resp *http.Response, body []byte, status int, code string) {
+	t.Helper()
+	if resp.StatusCode != status {
+		t.Errorf("%s: status=%d, want %d; body=%s", label, resp.StatusCode, status, body)
+		return
+	}
+	var env map[string]any
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Errorf("%s: body is not JSON: %s", label, body)
+		return
+	}
+	if env["error_code"] != code {
+		t.Errorf("%s: error_code=%v, want %s; body=%s", label, env["error_code"], code, body)
+	}
+	for k := range env {
+		if k != "error_code" && k != "message" {
+			t.Errorf("%s: unexpected %q in the error body: %s", label, k, body)
+		}
+	}
+}
+
+// seedTeamRule creates one team rule as a covered author and returns
+// its id.
+func seedTeamRule(t *testing.T, h *teamPolicyHarness) string {
+	t.Helper()
+	grantPolicyAuthorForTeam(h.teamID.String())
+	resp, body := doTeamPolicyJSON(t, h.app, "POST",
+		"/api/v1/teams/"+h.teamID.String()+"/policy-rules",
+		map[string]any{
+			"name": "seeded", "selector": map[string]any{"environment_kind": "non_prod"},
+			"priority": 100, "workflow_id": h.workflowID.String(), "enabled": true,
+		})
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		t.Fatalf("seed rule: status=%d body=%s", resp.StatusCode, body)
+	}
+	var env struct {
+		Rule struct {
+			ID string `json:"id"`
+		} `json:"rule"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil || env.Rule.ID == "" {
+		t.Fatalf("seed rule: no id in %s", body)
+	}
+	return env.Rule.ID
+}
+
+// The coverage gate used to write the 403 and let the handler carry on,
+// so List, Get and History sent the rules under a 403 status. Every
+// route must answer with the error envelope only.
+func TestTeamPolicyRoutes_OutOfScopeGetOnlyTheError(t *testing.T) {
+	h := bootstrapTeamPolicies(t)
+	ruleID := seedTeamRule(t, h)
+	grantPolicyAuthorForTeam(h.otherTeam.String())
+
+	base := "/api/v1/teams/" + h.teamID.String() + "/policy-rules"
+	update := map[string]any{"name": "renamed", "priority": 100, "workflow_id": h.workflowID.String(), "enabled": true,
+		"selector": map[string]any{"environment_kind": "non_prod"}}
+	routes := []struct {
+		method, path string
+		body         any
+	}{
+		{"GET", base, nil},
+		{"GET", base + "/" + ruleID, nil},
+		{"GET", base + "/" + ruleID + "/history", nil},
+		{"PUT", base + "/" + ruleID, update},
+		{"DELETE", base + "/" + ruleID, nil},
+	}
+	for _, r := range routes {
+		resp, body := doTeamPolicyJSON(t, h.app, r.method, r.path, r.body)
+		requireOnlyErrorBody(t, r.method+" "+r.path, resp, body, http.StatusForbidden, "out_of_scope_team_policy")
+	}
+}
+
+// When team access can't be resolved the gate answers 500, and the
+// handler must stop there too.
+func TestTeamPolicyRoutes_AccessLookupFailureGetsOnlyTheError(t *testing.T) {
+	h := bootstrapTeamPolicies(t)
+	ruleID := seedTeamRule(t, h)
+	currentResolver.err = errors.New("grant lookup failed")
+	t.Cleanup(func() { currentResolver.err = nil })
+
+	base := "/api/v1/teams/" + h.teamID.String() + "/policy-rules"
+	for _, path := range []string{base, base + "/" + ruleID, base + "/" + ruleID + "/history"} {
+		resp, body := doTeamPolicyJSON(t, h.app, "GET", path, nil)
+		requireOnlyErrorBody(t, "GET "+path, resp, body, http.StatusInternalServerError, "internal_error")
 	}
 }
 

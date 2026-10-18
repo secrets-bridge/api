@@ -247,12 +247,14 @@ func toTeamInheritedProjection(p *storage.PolicyRule, isPlatform, isAncestor boo
 // requireTeamPolicyScope runs gate 1 (coverage) as the first line of
 // every handler. Per §3 C3 / §4 C3 — kept in the handler so the denial
 // path emits the same envelope + audit + counter as the rest of the
-// gate chain. Returns nil to proceed; non-nil to terminate.
+// gate chain.
 //
-// On denial, the audit event + counter are emitted by the service-
-// layer engine's auditPolicyDeniedOutOfTeamScope. The handler then
-// surfaces ErrOutOfScopeTeamPolicy via mapTeamPolicyServiceErr.
-func (h *TeamPolicyRules) requireTeamPolicyScope(c fiber.Ctx, teamID uuid.UUID, actor string) error {
+// It reports ok=true to proceed. On ok=false the response (403, or 500
+// when access can't be resolved) is already written and the caller
+// returns err. Callers must stop on !ok, not on err != nil: stableErr
+// returns c.JSON's result, which is nil, so an err check alone would
+// carry on past the 403 and send the data anyway.
+func (h *TeamPolicyRules) requireTeamPolicyScope(c fiber.Ctx, teamID uuid.UUID, actor string) (bool, error) {
 	// Coverage runs via a dry-run Create with synthetic body. We don't
 	// invoke the engine directly here because the gate's audit + counter
 	// emission is centralised in the service-layer's gate 1 helper.
@@ -263,15 +265,15 @@ func (h *TeamPolicyRules) requireTeamPolicyScope(c fiber.Ctx, teamID uuid.UUID, 
 		h.engine.AuthorResolver(), h.engine.AuthorTeamScope())
 	if err != nil {
 		logInternalError(c, "resolve team access failed", err)
-		return stableErr(c, fiber.StatusInternalServerError, "internal_error",
+		return false, stableErr(c, fiber.StatusInternalServerError, "internal_error",
 			"could not resolve team access", nil)
 	}
 	if access.IsGlobal {
-		return nil
+		return true, nil
 	}
 	for _, id := range access.TeamIDs {
 		if id == teamID {
-			return nil
+			return true, nil
 		}
 	}
 	// Denied — emit audit + counter via the engine's helper (keeps
@@ -279,7 +281,7 @@ func (h *TeamPolicyRules) requireTeamPolicyScope(c fiber.Ctx, teamID uuid.UUID, 
 	// auditPolicyDeniedOutOfTeamScope is defined).
 	h.engine.EmitPolicyDeniedOutOfTeamScope(c.Context(), actor, teamID, uuid.New())
 	policyRulesDeniedTotal.WithLabelValues(policyDenialOutOfTeamScope).Inc()
-	return stableErr(c, fiber.StatusForbidden,
+	return false, stableErr(c, fiber.StatusForbidden,
 		"out_of_scope_team_policy",
 		"you don't have policy.author on this team", nil)
 }
@@ -295,8 +297,8 @@ func (h *TeamPolicyRules) Create(c fiber.Ctx) error {
 	}
 	actor := identityFromCtx(c)
 
-	if termErr := h.requireTeamPolicyScope(c, teamID, actor); termErr != nil {
-		return termErr
+	if ok, err := h.requireTeamPolicyScope(c, teamID, actor); !ok {
+		return err
 	}
 
 	var body teamPolicyCreateBody
@@ -353,8 +355,8 @@ func (h *TeamPolicyRules) List(c fiber.Ctx) error {
 			"teamID is malformed", nil)
 	}
 	actor := identityFromCtx(c)
-	if termErr := h.requireTeamPolicyScope(c, teamID, actor); termErr != nil {
-		return termErr
+	if ok, err := h.requireTeamPolicyScope(c, teamID, actor); !ok {
+		return err
 	}
 
 	rules, err := h.policies.ListForTeam(c.Context(), teamID)
@@ -391,8 +393,8 @@ func (h *TeamPolicyRules) Get(c fiber.Ctx) error {
 			"ruleID is malformed", nil)
 	}
 	actor := identityFromCtx(c)
-	if termErr := h.requireTeamPolicyScope(c, teamID, actor); termErr != nil {
-		return termErr
+	if ok, err := h.requireTeamPolicyScope(c, teamID, actor); !ok {
+		return err
 	}
 	rule, err := h.policies.Get(c.Context(), ruleID)
 	if err != nil {
@@ -441,8 +443,8 @@ func (h *TeamPolicyRules) Update(c fiber.Ctx) error {
 			"ruleID is malformed", nil)
 	}
 	actor := identityFromCtx(c)
-	if termErr := h.requireTeamPolicyScope(c, teamID, actor); termErr != nil {
-		return termErr
+	if ok, err := h.requireTeamPolicyScope(c, teamID, actor); !ok {
+		return err
 	}
 
 	var body teamPolicyUpdateBody
@@ -501,8 +503,8 @@ func (h *TeamPolicyRules) Delete(c fiber.Ctx) error {
 			"ruleID is malformed", nil)
 	}
 	actor := identityFromCtx(c)
-	if termErr := h.requireTeamPolicyScope(c, teamID, actor); termErr != nil {
-		return termErr
+	if ok, err := h.requireTeamPolicyScope(c, teamID, actor); !ok {
+		return err
 	}
 
 	if err := h.engine.DeleteForTeamScopedAuthor(c.Context(), services.DeleteTeamScopedPolicyInput{
@@ -595,8 +597,8 @@ func (h *TeamPolicyRules) History(c fiber.Ctx) error {
 	}
 
 	actor := identityFromCtx(c)
-	if termErr := h.requireTeamPolicyScope(c, teamID, actor); termErr != nil {
-		return termErr
+	if ok, err := h.requireTeamPolicyScope(c, teamID, actor); !ok {
+		return err
 	}
 
 	rule, err := h.policies.Get(c.Context(), ruleID)
