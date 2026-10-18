@@ -53,10 +53,18 @@ func RequestID() fiber.Handler {
 
 // Logger emits one structured access-log line per request with status,
 // duration, and the request ID for correlation with audit events.
+//
+// The logged status is the status sent to the client. An error returned
+// down the chain (fiber.NewError, an auth.Require denial, a panic turned
+// into an error by Recover) has no status on the response yet: Fiber
+// renders it through the app ErrorHandler only after the outermost
+// handler returns. Logger therefore renders it itself before logging
+// (see renderError) and returns nil, so the error is rendered once and
+// the log line matches the response (api#248).
 func Logger(base *slog.Logger) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		start := time.Now()
-		err := c.Next()
+		err := renderError(c, c.Next())
 		base.LogAttrs(c.Context(), slog.LevelInfo, "request",
 			slog.String("request_id", requestID(c)),
 			slog.String("method", c.Method()),
@@ -67,6 +75,21 @@ func Logger(base *slog.Logger) fiber.Handler {
 		)
 		return err
 	}
+}
+
+// renderError passes a chain error to the app ErrorHandler right away,
+// so the response status is final when the caller reads it. It returns
+// nil because the error has been rendered: returning it would make
+// Fiber call the ErrorHandler again. If the ErrorHandler itself fails,
+// the response becomes a bare 500, as Fiber does in that case.
+func renderError(c fiber.Ctx, err error) error {
+	if err == nil {
+		return nil
+	}
+	if herr := c.App().ErrorHandler(c, err); herr != nil {
+		_ = c.SendStatus(fiber.StatusInternalServerError)
+	}
+	return nil
 }
 
 // Recover converts a panic into a 500 response and a structured error
@@ -254,7 +277,9 @@ func RBAC() fiber.Handler {
 // coverage is visible during development.
 func Audit(logger *slog.Logger) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		err := c.Next()
+		// Render a chain error first so the status below is the one
+		// sent, as in Logger.
+		err := renderError(c, c.Next())
 		logger.LogAttrs(c.Context(), slog.LevelDebug, "audit_stub",
 			slog.String("request_id", requestID(c)),
 			slog.String("actor", actor(c)),
