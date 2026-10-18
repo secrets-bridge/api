@@ -111,9 +111,12 @@ func hintValue(v, placeholder string) string {
 //   - helm: the agent chart in enrollment mode, pointed at that Secret;
 //   - cli: the agent binary's environment, to run it outside the chart.
 //
-// Only kubectl and cli carry the token. The control plane URL, chart
-// version and anything the connection doesn't say are <placeholders>,
-// and so is any value hintValue refuses.
+// No line carries the token (ui#151). kubectl and cli start with a
+// silent prompt (`read -rs`; paste the token, then Enter) and hand it
+// over through stdin or the environment, so it never reaches a command line, shell history or the
+// process arguments. The control plane URL, chart version and anything
+// the connection doesn't say are <placeholders>, and so is any value
+// hintValue refuses.
 func enrollmentInstallHint(res *services.GeneratedEnrollmentToken, expectedCluster string) map[string]string {
 	cluster := hintValue(firstSet(expectedCluster, res.ClusterName), "<cluster-name>")
 	scope := func(k, placeholder string) string { return hintValue(res.Scope[k], placeholder) }
@@ -159,12 +162,15 @@ func enrollmentInstallHint(res *services.GeneratedEnrollmentToken, expectedClust
 	}
 
 	return map[string]string{
-		"kubectl": fmt.Sprintf("kubectl -n %s create secret generic %s --from-literal=enrollment_token=%s",
-			agentNamespace, agentEnrollSecret, res.Token),
+		"kubectl": "read -rs SB_ENROLL_TOKEN\n" +
+			fmt.Sprintf(`printf '%%s' "$SB_ENROLL_TOKEN" | kubectl -n %s create secret generic %s --from-file=enrollment_token=/dev/stdin`,
+				agentNamespace, agentEnrollSecret) + "\n" +
+			"unset SB_ENROLL_TOKEN",
 		"helm": helm,
-		"cli": fmt.Sprintf("SB_CP_ENDPOINT=<CONTROL_PLANE_URL> SB_ENROLLMENT_ENABLED=true SB_ENROLLMENT_TOKEN=%s "+
-			"SB_IDENTITY_FILE=<identity-file> SB_CLUSTER_NAME=%s SB_PROVIDER_TYPE=%s agent",
-			res.Token, cluster, res.ProviderType),
+		"cli": "read -rs SB_ENROLLMENT_TOKEN && export SB_ENROLLMENT_TOKEN\n" +
+			fmt.Sprintf("SB_CP_ENDPOINT=<CONTROL_PLANE_URL> SB_ENROLLMENT_ENABLED=true "+
+				"SB_IDENTITY_FILE=<identity-file> SB_CLUSTER_NAME=%s SB_PROVIDER_TYPE=%s agent",
+				cluster, res.ProviderType),
 	}
 }
 
