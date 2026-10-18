@@ -19,6 +19,7 @@ The Secrets Bridge control plane API (Go, Fiber v3, Postgres, Redis). The UI and
 | `pkg/runtime` | Redis: idempotency, locks, rate limits, pub/sub |
 | `pkg/workflow` | Access request state machine |
 | `pkg/keymgmt` | KMS backends selected by `SB_KMS_BACKEND`: `local` (dev only), `vault-transit`, `aws-kms` |
+| `pkg/objectstore` | Media in S3-compatible object storage (`Store` interface, S3 backend, `objectstoretest` fakes and live-test helper) |
 | `pkg/sealing` | X25519 + HKDF + AES-GCM envelope sealing between api and agent |
 | `pkg/argocd` | Read-only ArgoCD client, opt-in with `SB_GITOPS_ENABLED` |
 | `pkg/sanitize` | Scrubbing helpers for user or provider text that might be echoed |
@@ -32,21 +33,24 @@ go build ./... && go vet ./...
 golangci-lint run
 go mod tidy   # CI fails on a diff
 
-# integration tests need Postgres 17 and Redis; they skip when these are unset
+# integration tests need Postgres 17, Redis and an S3 API (MinIO); they skip when these are unset
 export TEST_DATABASE_URL=postgres://secrets_bridge:devpass@localhost:5432/secrets_bridge_test?sslmode=disable
 export TEST_REDIS_URL=redis://localhost:6379/1
+export TEST_OBJECTSTORE_ENDPOINT=http://localhost:9000
+export TEST_OBJECTSTORE_ACCESS_KEY=secrets-bridge TEST_OBJECTSTORE_SECRET_KEY=devpass-minio
 go test -race -count=1 -p 1 ./...
 ```
 
-`docker compose up -d postgres redis` in this repo starts Postgres and Redis on 127.0.0.1 for local runs. The compose file holds no keys: the api container reads `SB_WRAP_MASTER_KEY` and `SB_JWT_SECRET` from your shell and refuses to boot without them.
+`docker compose up -d postgres redis minio minio-init` in this repo starts Postgres, Redis and MinIO on 127.0.0.1 for local runs. The compose file holds no keys: the api container reads `SB_WRAP_MASTER_KEY` and `SB_JWT_SECRET` from your shell and refuses to boot without them.
 
 ## Key configuration
 
-`DATABASE_URL`, `REDIS_URL`, `API_ADDR`, `SB_ENV` (`dev` or `production`), `SB_JWT_SECRET` (32+ bytes), `SB_KMS_BACKEND` and its `SB_KMS_*` settings, `SB_BOOTSTRAP_ADMIN_EMAIL` / `_PASSWORD`, `SB_OIDC_*`, `SB_MFA_*`. Switches such as `SB_ALLOW_INSECURE_HEADER_AUTH` and `SB_ALLOW_DIRECT_AGENT_MINT` default to off and must stay off outside local development.
+`DATABASE_URL`, `REDIS_URL`, `API_ADDR`, `SB_ENV` (`dev` or `production`), `SB_JWT_SECRET` (32+ bytes), `SB_KMS_BACKEND` and its `SB_KMS_*` settings, `SB_BOOTSTRAP_ADMIN_EMAIL` / `_PASSWORD`, `SB_OIDC_*`, `SB_MFA_*`, `SB_OBJECTSTORE_*` (media storage; see README). Switches such as `SB_ALLOW_INSECURE_HEADER_AUTH` and `SB_ALLOW_DIRECT_AGENT_MINT` default to off and must stay off outside local development.
 
 ## Rules for this repo
 
 - **No secret values** in Postgres (outside KMS-wrapped `secret_wraps`), Redis, logs, API responses, error messages or audit metadata. Tests that touch values should assert the plaintext does not appear in the database or audit rows.
+- **Media goes to object storage**, never Postgres: images and other uploads go through `pkg/objectstore`, and Postgres keeps only metadata and the object key. No secret values in object storage.
 - **Identity comes from the authenticated session only.** Never trust a user or agent ID from a request body, query string or header.
 - Every route is behind authentication by default. A public route must be an explicit, reviewed exception.
 - Every workflow-changing action emits an audit event with a correlation ID.

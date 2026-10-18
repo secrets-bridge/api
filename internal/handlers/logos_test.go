@@ -27,6 +27,8 @@ import (
 	"github.com/secrets-bridge/api/internal/handlers"
 	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/services"
+	"github.com/secrets-bridge/api/pkg/objectstore"
+	"github.com/secrets-bridge/api/pkg/objectstore/objectstoretest"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
@@ -46,9 +48,30 @@ type logoFixture struct {
 	project      uuid.UUID
 	otherProject uuid.UUID
 	team         uuid.UUID
+	svc          *services.LogoService
+	store        objectstore.Store // nil: object storage not configured
+}
+
+// testLogoStore is the object store the logo handler tests run on: the
+// live S3-compatible server when TEST_OBJECTSTORE_ENDPOINT is set (CI
+// sets it, with MinIO), the in-memory store otherwise.
+func testLogoStore(t *testing.T) (objectstore.Store, objectstore.Config) {
+	t.Helper()
+	if os.Getenv(objectstoretest.EnvTestEndpoint) != "" {
+		return objectstoretest.Live(t)
+	}
+	return objectstoretest.NewMemory(), objectstore.Config{Bucket: "example-bucket", Prefix: "test"}
 }
 
 func bootstrapLogos(t *testing.T) *logoFixture {
+	t.Helper()
+	store, keys := testLogoStore(t)
+	return bootstrapLogosWith(t, store, keys)
+}
+
+// bootstrapLogosWith wires the fixture on the given store; nil means no
+// object storage configured.
+func bootstrapLogosWith(t *testing.T, store objectstore.Store, keys objectstore.Config) *logoFixture {
 	t.Helper()
 	enableHeaderIdentityForTest(t)
 	dbDSN := os.Getenv("TEST_DATABASE_URL")
@@ -120,6 +143,10 @@ func bootstrapLogos(t *testing.T) *logoFixture {
 	resolver := auth.NewRepoResolver(storage.NewUserRoles(pool), storage.NewRoles(pool))
 	tsr := auth.NewRepoTeamScopeResolver(teamsRepo, projectRepo)
 	logoSvc := services.NewLogoService(storage.NewLogos(pool), projectRepo, teamsRepo, storage.NewAuditEvents(pool))
+	if store != nil {
+		logoSvc = logoSvc.WithStore(store, keys)
+	}
+	fx.svc, fx.store = logoSvc, store
 
 	tenancyH := handlers.NewTenancy(projectRepo, storage.NewEnvironments(pool)).WithScope(resolver, tsr).WithLogos(logoSvc)
 	teamsH := handlers.NewTeams(teamsRepo).WithLogos(logoSvc)

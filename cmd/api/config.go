@@ -8,6 +8,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/secrets-bridge/api/pkg/objectstore"
 )
 
 // buildVersion is set at link time via -ldflags '-X main.buildVersion=...'.
@@ -225,11 +227,21 @@ type Config struct {
 	// explicit, audited break-glass admin mint. Does not affect any
 	// already-minted agent's auth/heartbeat/job behavior.
 	AllowDirectAgentMint bool
+
+	// ObjectStore holds media (logos today). Nil when SB_OBJECTSTORE_*
+	// is not configured: logo writes then answer 503. Set by main after
+	// openObjectStore; ObjectStoreConfig supplies the key prefix.
+	ObjectStore       objectstore.Store
+	ObjectStoreConfig objectstore.Config
+	// LogoBackfill runs the inline-logo backfill at start when an object
+	// store is configured. SB_OBJECTSTORE_LOGO_BACKFILL, default true.
+	LogoBackfill bool
 }
 
 func loadConfig() Config {
 	return Config{
 		Addr:                           envOr("API_ADDR", ":8080"),
+		LogoBackfill:                   envBool(envLogoBackfill, true),
 		ShutdownGrace:                  envDuration("API_SHUTDOWN_GRACE", 15*time.Second),
 		Env:                            envOr("SB_ENV", ModeProduction),
 		GitOpsEnabled:                  envBool("SB_GITOPS_ENABLED", false),

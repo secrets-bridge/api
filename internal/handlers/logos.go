@@ -10,10 +10,14 @@
 // The image is served with a long private cache (the version is in the
 // URL the console builds from logo_version), nosniff and a CSP that
 // forbids everything, so a stored file can only ever render as an image.
+// The image is streamed from object storage; the routes, headers, ETag
+// and logo_version are the same as when it lived in Postgres. With no
+// object store configured, PUT and DELETE answer 503.
 package handlers
 
 import (
 	"errors"
+	"log/slog"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
@@ -44,12 +48,18 @@ func mapLogoErr(err error, owner string) error {
 		return fiber.NewError(fiber.StatusNotFound, owner+" not found")
 	case errors.Is(err, storage.ErrNotFound):
 		return fiber.NewError(fiber.StatusNotFound, "logo not found")
+	case errors.Is(err, services.ErrLogoStorageUnavailable):
+		return fiber.NewError(fiber.StatusServiceUnavailable, "logo storage is not configured")
+	case errors.Is(err, services.ErrLogoStorageFailed):
+		return fiber.NewError(fiber.StatusServiceUnavailable, "logo storage is unavailable")
 	}
-	return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	slog.Error("logo request failed", "owner", owner, "err", err)
+	return fiber.NewError(fiber.StatusInternalServerError, "internal error")
 }
 
-// sendLogo writes the stored PNG with headers that keep it an image.
-func sendLogo(c fiber.Ctx, l *storage.Logo) error {
+// sendLogo streams the stored PNG with headers that keep it an image.
+// A matching If-None-Match answers 304 without reading the object.
+func sendLogo(c fiber.Ctx, svc *services.LogoService, kind storage.LogoKind, l *storage.Logo) error {
 	etag := `"` + l.SHA256 + `"`
 	c.Set(fiber.HeaderCacheControl, "private, max-age=31536000, immutable")
 	c.Set(fiber.HeaderETag, etag)
@@ -59,8 +69,13 @@ func sendLogo(c fiber.Ctx, l *storage.Logo) error {
 	if c.Get(fiber.HeaderIfNoneMatch) == etag {
 		return c.SendStatus(fiber.StatusNotModified)
 	}
+	body, size, err := svc.Open(c.Context(), kind, l)
+	if err != nil {
+		return mapLogoErr(err, string(kind))
+	}
 	c.Set(fiber.HeaderContentType, "image/png")
-	return c.Send(l.PNG)
+	// fasthttp closes body once it has been written.
+	return c.SendStream(body, int(size))
 }
 
 // logoActor is the session identity of the caller, required for writes.
@@ -121,7 +136,7 @@ func (h *Tenancy) projectLogoVersions(c fiber.Ctx, ids []uuid.UUID) (map[uuid.UU
 	}
 	v, err := h.logos.Versions(c.Context(), storage.LogoKindProject, ids)
 	if err != nil {
-		return nil, fiber.NewError(fiber.StatusInternalServerError, err.Error())
+		return nil, mapLogoErr(err, "project")
 	}
 	return v, nil
 }
@@ -155,7 +170,7 @@ func (h *Tenancy) GetProjectLogo(c fiber.Ctx) error {
 	if err != nil {
 		return mapLogoErr(err, "project")
 	}
-	return sendLogo(c, l)
+	return sendLogo(c, h.logos, storage.LogoKindProject, l)
 }
 
 // PutProjectLogo handles PUT /projects/:id/logo.
@@ -191,7 +206,7 @@ func (h *Teams) teamLogoVersions(c fiber.Ctx, ids []uuid.UUID) (map[uuid.UUID]st
 	}
 	v, err := h.logos.Versions(c.Context(), storage.LogoKindTeam, ids)
 	if err != nil {
-		return nil, fiber.NewError(fiber.StatusInternalServerError, err.Error())
+		return nil, mapLogoErr(err, "team")
 	}
 	return v, nil
 }
@@ -229,7 +244,7 @@ func (h *Teams) GetTeamLogo(c fiber.Ctx) error {
 	if err != nil {
 		return mapLogoErr(err, "team")
 	}
-	return sendLogo(c, l)
+	return sendLogo(c, h.logos, storage.LogoKindTeam, l)
 }
 
 // PutTeamLogo handles PUT /teams/:id/logo.

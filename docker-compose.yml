@@ -8,16 +8,23 @@
 #   export SB_JWT_SECRET=$(openssl rand -base64 48)
 #   export SB_DEV_SEED_PASSWORD=...   # optional, unset = random per dev user
 #
-#   docker compose up --build              # api + postgres + redis
+#   docker compose up --build              # api + postgres + redis + minio
 #   curl localhost:8080/healthz
 #   curl localhost:8080/readyz             # green once dependencies healthy
 #   curl localhost:8080/metrics
 #
 # For integration tests:
-#   docker compose up -d postgres redis
+#   docker compose up -d postgres redis minio minio-init
 #   export TEST_DATABASE_URL=postgres://secrets_bridge:devpass@localhost:5432/secrets_bridge_test?sslmode=disable
 #   export TEST_REDIS_URL=redis://localhost:6379/1
-#   go test -count=1 ./pkg/storage/... ./pkg/runtime/...
+#   export TEST_OBJECTSTORE_ENDPOINT=http://localhost:9000
+#   export TEST_OBJECTSTORE_ACCESS_KEY=secrets-bridge TEST_OBJECTSTORE_SECRET_KEY=devpass-minio
+#   go test -race -count=1 -p 1 ./...
+#
+# Object storage for logos and other media is MinIO here (any S3 API
+# works; AWS S3 in the cloud). minio-init creates the private
+# secrets-bridge-dev bucket and exits. The MinIO console is on
+# http://localhost:9001 with the dev credentials below.
 #
 # To exercise the aws-kms backend against LocalStack:
 #   docker compose --profile awskms up -d localstack
@@ -56,6 +63,35 @@ services:
       timeout: 2s
       retries: 20
 
+  # S3-compatible object storage for media. Dev-only credentials, like
+  # the Postgres password above. The images moved off Docker Hub, so
+  # these come from Chainguard's public registry, pinned by digest.
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:709099319add48dfb44aa596a7070d3ddd8dd04d7ae881765719aec29df9e510
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: secrets-bridge
+      MINIO_ROOT_PASSWORD: devpass-minio
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      # No curl in the image: ask the readiness endpoint with bash.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /minio/health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && read -r _ code _ <&3 && [ \"$$code\" = 200 ]"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # Creates the private bucket the api writes to, then exits.
+  minio-init:
+    image: cgr.dev/chainguard/minio-client@sha256:3d0109d854f045c0158637d6ad0d44fd8a3aef9f0b62082096eb1854c2df8b31
+    environment:
+      MC_HOST_local: http://secrets-bridge:devpass-minio@minio:9000
+    command: ["mb", "--ignore-existing", "local/secrets-bridge-dev"]
+    depends_on:
+      minio:
+        condition: service_healthy
+
   # LocalStack KMS — opt-in via `--profile awskms`. Lets devs exercise
   # the aws-kms backend without an AWS account.
   localstack:
@@ -93,6 +129,14 @@ services:
       # Optional shared password for the 3 dev users. Leave unset for
       # a fresh random password per user, logged ONCE on first boot.
       SB_DEV_SEED_PASSWORD: "${SB_DEV_SEED_PASSWORD:-}"
+      # Media (logos) go to the MinIO bucket. In the cloud, point these
+      # at an S3 bucket and leave credentials to the SDK chain (IRSA).
+      SB_OBJECTSTORE_BUCKET: secrets-bridge-dev
+      SB_OBJECTSTORE_REGION: us-east-1
+      SB_OBJECTSTORE_ENDPOINT: http://minio:9000
+      SB_OBJECTSTORE_FORCE_PATH_STYLE: "true"
+      AWS_ACCESS_KEY_ID: secrets-bridge
+      AWS_SECRET_ACCESS_KEY: devpass-minio
     ports:
       # Host port can be overridden by exporting `API_HOST_PORT`. The
       # container always listens on 8080 internally.
@@ -102,3 +146,5 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully

@@ -8,8 +8,17 @@
 // and a file that is also something else (a polyglot) does not survive.
 // Only the re-encoded PNG is stored.
 //
+// The PNG goes to object storage (pkg/objectstore) under
+// <prefix>/logos/<kind>/<entity-id>/<sha256>.png; Postgres keeps the
+// metadata and the object key (secrets-bridge/api#253). A write puts the
+// object first and then points the row at it, removes the object the row
+// pointed at before only after that, and removes the new object again if
+// the row write fails. With no object store configured the service
+// refuses writes (ErrLogoStorageUnavailable) instead of falling back to
+// Postgres; logos already stored inline are still served.
+//
 // Audit metadata carries the size, digest and dimensions of the stored
-// image, never its bytes.
+// image, never its bytes or where it is stored.
 package services
 
 import (
@@ -23,12 +32,14 @@ import (
 	"image/draw"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"log/slog"
 	"math"
 	"mime"
 
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/pkg/objectstore"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
@@ -62,7 +73,15 @@ var (
 	ErrLogoDimensions = errors.New("services: logo must be between 16 and 512 pixels on each side")
 	// ErrLogoEntityNotFound: the project or team doesn't exist (404).
 	ErrLogoEntityNotFound = errors.New("services: logo owner not found")
+	// ErrLogoStorageUnavailable: no object store is configured, so logo
+	// writes are switched off (503).
+	ErrLogoStorageUnavailable = errors.New("services: logo storage is not configured")
+	// ErrLogoStorageFailed: the object store returned an error (503).
+	ErrLogoStorageFailed = errors.New("services: logo storage failed")
 )
+
+// logoPNGType is the content type of every stored logo object.
+const logoPNGType = "image/png"
 
 // LogoService stores and serves project and team logos.
 type LogoService struct {
@@ -70,6 +89,8 @@ type LogoService struct {
 	projects storage.ProjectRepository
 	teams    storage.TeamRepository
 	audit    storage.AuditEventRepository
+	store    objectstore.Store  // nil: object storage not configured
+	keys     objectstore.Config // key prefix for object keys
 }
 
 // NewLogoService wires the service. projects and teams are used to
@@ -78,9 +99,31 @@ func NewLogoService(logos storage.LogoRepository, projects storage.ProjectReposi
 	return &LogoService{logos: logos, projects: projects, teams: teams, audit: audit}
 }
 
+// WithStore sets the object store logo images are written to and read
+// from. keys supplies the key prefix. Without it, writes are refused.
+func (s *LogoService) WithStore(store objectstore.Store, keys objectstore.Config) *LogoService {
+	s.store = store
+	s.keys = keys
+	return s
+}
+
+// StorageConfigured reports whether an object store is wired.
+func (s *LogoService) StorageConfigured() bool { return s.store != nil }
+
+// ObjectKey is where the logo with digest sha256 for one entity lives:
+// <prefix>/logos/<kind>/<entity-id>/<sha256>.png. Keys are content
+// addressed, so writing the same image twice is idempotent and a key
+// never changes meaning, which keeps long-lived caching safe.
+func (s *LogoService) ObjectKey(kind storage.LogoKind, entityID uuid.UUID, sha256 string) string {
+	return s.keys.Key("logos", string(kind), entityID.String(), sha256+".png")
+}
+
 // Put validates, re-encodes and stores a logo, and returns its version.
 // actorID is the session identity of the admin uploading it.
 func (s *LogoService) Put(ctx context.Context, kind storage.LogoKind, entityID uuid.UUID, contentType string, body []byte, actorID string) (string, error) {
+	if s.store == nil {
+		return "", ErrLogoStorageUnavailable
+	}
 	mediaType, _, err := mime.ParseMediaType(contentType)
 	if err != nil || (mediaType != "image/png" && mediaType != "image/jpeg") {
 		return "", ErrLogoUnsupportedType
@@ -121,39 +164,115 @@ func (s *LogoService) Put(ctx context.Context, kind storage.LogoKind, entityID u
 	}
 
 	digest := sha256.Sum256(stored)
+	sum := hex.EncodeToString(digest[:])
 	logo := &storage.Logo{
 		EntityID:   entityID,
-		PNG:        stored,
+		ObjectKey:  s.ObjectKey(kind, entityID, sum),
 		ByteLength: len(stored),
-		SHA256:     hex.EncodeToString(digest[:]),
+		SHA256:     sum,
 		Width:      bounds.Dx(),
 		Height:     bounds.Dy(),
 		UpdatedBy:  actorID,
 	}
-	if err := s.logos.Upsert(ctx, kind, logo); err != nil {
+
+	// Object first. The key is content addressed, so an object already
+	// there holds these exact bytes: skip the write and, below, never
+	// remove it, since the current row may point at it. When Head can't
+	// tell, assume it exists; an orphan is better than a broken row.
+	existed := true
+	if _, err := s.store.Head(ctx, logo.ObjectKey); errors.Is(err, objectstore.ErrNotFound) {
+		existed = false
+	} else if err != nil {
+		slog.WarnContext(ctx, "logo object head failed", "kind", kind, "entity_id", entityID, "err", err)
+	}
+	if !existed {
+		if err := s.store.Put(ctx, logo.ObjectKey, bytes.NewReader(stored), int64(len(stored)), logoPNGType); err != nil {
+			slog.ErrorContext(ctx, "logo object write failed", "kind", kind, "entity_id", entityID, "err", err)
+			return "", ErrLogoStorageFailed
+		}
+	}
+
+	// Then the row. If it fails, the object just written is not
+	// referenced by anything: remove it.
+	previous, err := s.logos.Upsert(ctx, kind, logo)
+	if err != nil {
+		if !existed {
+			s.removeObject(ctx, kind, entityID, logo.ObjectKey, "cleanup after failed row write")
+		}
 		// The owner was deleted between the check above and the write.
 		if errors.Is(err, storage.ErrNotFound) {
 			return "", ErrLogoEntityNotFound
 		}
 		return "", err
 	}
+
+	// The row points at the new object now; the old one can go.
+	if previous != "" && previous != logo.ObjectKey {
+		s.removeObject(ctx, kind, entityID, previous, "replaced")
+	}
 	s.emit(ctx, kind, entityID, "updated", actorID, logo)
 	return logo.Version(), nil
 }
 
 // Delete removes a logo. storage.ErrNotFound when there is none.
+// The row goes first; the object is removed after, and a failure there
+// leaves an unreferenced object behind (logged) rather than a row that
+// points at nothing. Refused like Put when no object store is wired.
 func (s *LogoService) Delete(ctx context.Context, kind storage.LogoKind, entityID uuid.UUID, actorID string) error {
+	if s.store == nil {
+		return ErrLogoStorageUnavailable
+	}
 	removed, err := s.logos.Delete(ctx, kind, entityID)
 	if err != nil {
 		return err
+	}
+	if removed.ObjectKey != "" {
+		s.removeObject(ctx, kind, entityID, removed.ObjectKey, "logo removed")
 	}
 	s.emit(ctx, kind, entityID, "removed", actorID, removed)
 	return nil
 }
 
-// Get returns a stored logo. storage.ErrNotFound when there is none.
+// Get returns a stored logo's metadata. storage.ErrNotFound when there
+// is none. Open reads the image.
 func (s *LogoService) Get(ctx context.Context, kind storage.LogoKind, entityID uuid.UUID) (*storage.Logo, error) {
 	return s.logos.Get(ctx, kind, entityID)
+}
+
+// Open returns the image for a logo from Get and its size. The caller
+// closes the reader. A logo still stored inline (before the backfill)
+// is served from its png bytes. A row whose object is missing is
+// storage.ErrNotFound, logged, since that means the bucket and the
+// database disagree.
+func (s *LogoService) Open(ctx context.Context, kind storage.LogoKind, l *storage.Logo) (io.ReadCloser, int64, error) {
+	if l.PNG != nil {
+		return io.NopCloser(bytes.NewReader(l.PNG)), int64(len(l.PNG)), nil
+	}
+	if l.ObjectKey == "" {
+		return nil, 0, storage.ErrNotFound
+	}
+	if s.store == nil {
+		slog.ErrorContext(ctx, "logo is in object storage but no object store is configured", "kind", kind, "entity_id", l.EntityID)
+		return nil, 0, ErrLogoStorageUnavailable
+	}
+	obj, err := s.store.Get(ctx, l.ObjectKey)
+	if errors.Is(err, objectstore.ErrNotFound) {
+		slog.ErrorContext(ctx, "logo object missing", "kind", kind, "entity_id", l.EntityID, "object_key", l.ObjectKey)
+		return nil, 0, storage.ErrNotFound
+	}
+	if err != nil {
+		slog.ErrorContext(ctx, "logo object read failed", "kind", kind, "entity_id", l.EntityID, "err", err)
+		return nil, 0, ErrLogoStorageFailed
+	}
+	return obj.Body, obj.Size, nil
+}
+
+// removeObject deletes an object nothing points at any more. A failure
+// leaves an orphan, which is harmless (no row can reach it) and logged.
+func (s *LogoService) removeObject(ctx context.Context, kind storage.LogoKind, entityID uuid.UUID, key, why string) {
+	if err := s.store.Delete(ctx, key); err != nil {
+		slog.WarnContext(ctx, "logo object delete failed; object left behind", "kind", kind, "entity_id", entityID, "object_key", key, "reason", why, "err", err)
+	}
 }
 
 // Versions returns entity id → logo version for the ids that have one.
