@@ -24,8 +24,10 @@ type GenerateEnrollmentTokenRequest struct {
 	ExpectedProviderType string `json:"expected_provider_type,omitempty"`
 }
 
-// EnrollmentTokenResponse returns the one-time token EXACTLY ONCE.
+// EnrollmentTokenResponse returns the one-time token EXACTLY ONCE. ID
+// is the token row, for POST /agent-enrollment-tokens/:id/revoke.
 type EnrollmentTokenResponse struct {
+	ID                   string            `json:"id"`
 	EnrollmentToken      string            `json:"enrollment_token"`
 	ExpiresAt            string            `json:"expires_at"`
 	ProviderConnectionID string            `json:"provider_connection_id"`
@@ -70,23 +72,89 @@ func (h *Agents) GenerateEnrollmentToken(c fiber.Ctx) error {
 		}
 	}
 
-	// install_hint embeds the token (this is its one-time return); the
-	// control-plane URL is a placeholder the operator/UI substitutes.
-	hint := map[string]string{
-		"helm": fmt.Sprintf(
-			"helm upgrade --install secrets-bridge-agent secrets-bridge/agent "+
-				"--set controlPlane.url=<CONTROL_PLANE_URL> --set enrollment.token=%s",
-			res.Token),
-		"cli": fmt.Sprintf(
-			"secrets-bridge agent enroll --control-plane-url <CONTROL_PLANE_URL> "+
-				"--enrollment-token %s", res.Token),
-	}
 	return c.Status(fiber.StatusCreated).JSON(EnrollmentTokenResponse{
+		ID:                   res.ID.String(),
 		EnrollmentToken:      res.Token,
 		ExpiresAt:            res.ExpiresAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
 		ProviderConnectionID: res.ProviderConnectionID.String(),
-		InstallHint:          hint,
+		InstallHint:          enrollmentInstallHint(res, req.ExpectedClusterName),
 	})
+}
+
+// Install hint names. The agent chart reads the token from a Secret and
+// never from a chart value, which would be stored in the Helm release.
+const (
+	agentChartRef     = "oci://ghcr.io/secrets-bridge/charts/secrets-bridge-agent"
+	agentNamespace    = "secrets-bridge"
+	agentEnrollSecret = "secrets-bridge-agent-enroll"
+)
+
+// enrollmentInstallHint returns copy-paste commands for a new token:
+//
+//   - kubectl: the Secret the agent chart reads the token from;
+//   - helm: the agent chart in enrollment mode, pointed at that Secret;
+//   - cli: the agent binary's environment, to run it outside the chart.
+//
+// Only kubectl and cli carry the token. The control plane URL, chart
+// version and anything the connection doesn't say are <placeholders>.
+func enrollmentInstallHint(res *services.GeneratedEnrollmentToken, expectedCluster string) map[string]string {
+	cluster := firstSet(expectedCluster, res.ClusterName, "<cluster-name>")
+	scope := func(k, placeholder string) string { return firstSet(res.Scope[k], placeholder) }
+
+	sets := []string{
+		"cp.endpoint=<CONTROL_PLANE_URL>",
+		"clusterName=" + cluster,
+		"agent.providerType=" + res.ProviderType,
+		"enrollment.enabled=true",
+		"enrollment.tokenSecretName=" + agentEnrollSecret,
+		"identity.mode=file",
+		"identity.persistence.enabled=true",
+	}
+	switch res.ProviderType {
+	case "vault":
+		sets = append(sets,
+			"providers.vault.enabled=true",
+			"providers.vault.addr="+scope("address", "<vault-address>"),
+			"providers.vault.kvMount="+scope("mount", "kv"),
+			"providers.vault.kubernetesRole=<vault-role>")
+		if ns := res.Scope["namespace"]; ns != "" {
+			sets = append(sets, "providers.vault.namespace="+ns)
+		}
+		if p := res.Scope["kvPrefix"]; p != "" {
+			sets = append(sets, "providers.vault.kvPrefix="+p)
+		}
+	case "aws-sm":
+		sets = append(sets,
+			"providers.awsSecretsManager.enabled=true",
+			"providers.awsSecretsManager.region="+scope("region", "<aws-region>"))
+		if ep := res.Scope["endpoint"]; ep != "" {
+			sets = append(sets, "providers.awsSecretsManager.endpoint="+ep)
+		}
+	}
+	helm := "helm upgrade --install secrets-bridge-agent " + agentChartRef +
+		" --version <chart-version> --namespace " + agentNamespace
+	for _, s := range sets {
+		helm += " --set " + s
+	}
+
+	return map[string]string{
+		"kubectl": fmt.Sprintf("kubectl -n %s create secret generic %s --from-literal=enrollment_token=%s",
+			agentNamespace, agentEnrollSecret, res.Token),
+		"helm": helm,
+		"cli": fmt.Sprintf("SB_CP_ENDPOINT=<CONTROL_PLANE_URL> SB_ENROLLMENT_ENABLED=true SB_ENROLLMENT_TOKEN=%s "+
+			"SB_IDENTITY_FILE=<identity-file> SB_CLUSTER_NAME=%s SB_PROVIDER_TYPE=%s agent",
+			res.Token, cluster, res.ProviderType),
+	}
+}
+
+// firstSet returns the first non-empty value.
+func firstSet(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // EnrollRequest is the agent body for POST /agents/enroll.

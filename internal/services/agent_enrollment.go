@@ -53,9 +53,18 @@ type GenerateEnrollmentTokenInput struct {
 // GeneratedEnrollmentToken is returned by GenerateEnrollmentToken. Token is
 // the plaintext, returned exactly ONCE — only its hash is persisted.
 type GeneratedEnrollmentToken struct {
+	// ID is the token row's id, which POST
+	// /agent-enrollment-tokens/:id/revoke takes.
+	ID                   uuid.UUID
 	Token                string
 	ProviderConnectionID uuid.UUID
 	ExpiresAt            time.Time
+	// The bound connection's type, cluster name and scope, so the
+	// handler can fill the install hint. Scope holds no credentials
+	// (provider connections refuse credential-shaped keys).
+	ProviderType string
+	ClusterName  string
+	Scope        map[string]string
 }
 
 // GenerateEnrollmentToken validates the connection, mints a one-time token,
@@ -129,9 +138,13 @@ func (s *AgentService) GenerateEnrollmentToken(ctx context.Context, in GenerateE
 	})
 
 	return &GeneratedEnrollmentToken{
+		ID:                   row.ID,
 		Token:                token,
 		ProviderConnectionID: in.ProviderConnectionID,
 		ExpiresAt:            expiresAt,
+		ProviderType:         string(conn.Type),
+		ClusterName:          conn.ClusterName,
+		Scope:                conn.Scope,
 	}, nil
 }
 
