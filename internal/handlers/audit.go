@@ -8,6 +8,13 @@
 // Authorization: gated by `auth.Require(auth.PermAuditRead, …)` at
 // route registration time. Permission keys: see
 // `internal/auth/permissions.go`.
+//
+// What a reader sees: holders of role.edit, user_role.edit
+// or team.edit at global scope see every event. Everyone else sees the
+// events they caused, plus the whole trail of a request they can read
+// (correlation_id=<request id>), approvers' votes included. The seeded
+// developer role holds audit.read, so without this a global developer
+// read every team's trail.
 
 package handlers
 
@@ -21,6 +28,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/services/actordisplay"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
@@ -29,7 +37,23 @@ import (
 type Audit struct {
 	repo     storage.AuditEventRepository
 	resolver *actordisplay.Resolver
+
+	// Who sees what; see the package comment. Unset in tests that
+	// don't wire it, and then every reader sees every event.
+	grants   auth.Resolver
+	requests requestReader
 }
+
+// requestReader answers "may the caller read this request", by the
+// rule GET /requests/:id applies. Implemented by Requests.
+type requestReader interface {
+	CanRead(c fiber.Ctx, id uuid.UUID) (bool, error)
+}
+
+// auditSeeAll are the permissions that, held at global scope, show
+// every actor's events. They match the console's Audit page, which
+// lets these holders widen the actor filter.
+var auditSeeAll = []auth.Permission{auth.PermRoleEdit, auth.PermUserRoleEdit, auth.PermTeamEdit}
 
 // NewAudit binds the handler to the given repositories. `users` and
 // `agents` are used to enrich audit rows with human-readable actor
@@ -42,6 +66,15 @@ func NewAudit(
 	agents storage.AgentRepository,
 ) *Audit {
 	return &Audit{repo: repo, resolver: actordisplay.New(users, agents)}
+}
+
+// WithReaderScope limits what each reader sees (see the package
+// comment): grants decides who sees everything, requests whose trails
+// a reader may open.
+func (h *Audit) WithReaderScope(grants auth.Resolver, requests requestReader) *Audit {
+	h.grants = grants
+	h.requests = requests
+	return h
 }
 
 // AuditEventBody is the JSON wire shape for one audit_events row.
@@ -80,7 +113,9 @@ type AuditEventBody struct {
 //	limit=<int>              // capped at 1000; default 100
 //
 // All filters are optional. The repository defaults the limit when
-// zero is passed.
+// zero is passed. A reader who may not see everything gets their own
+// events only (an actor filter naming someone else returns nothing),
+// unless correlation_id names a request they can read.
 func (h *Audit) List(c fiber.Ctx) error {
 	q := storage.AuditQuery{}
 
@@ -119,6 +154,17 @@ func (h *Audit) List(c fiber.Ctx) error {
 		q.Limit = n
 	}
 
+	own, err := h.ownEventsOnly(c, q.CorrelationID)
+	if err != nil {
+		return err
+	}
+	if own != "" {
+		if q.Actor != "" && q.Actor != own {
+			return c.JSON([]AuditEventBody{})
+		}
+		q.Actor = own
+	}
+
 	rows, err := h.repo.Query(c.Context(), q)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
@@ -144,6 +190,37 @@ func (h *Audit) List(c fiber.Ctx) error {
 		})
 	}
 	return c.JSON(out)
+}
+
+// ownEventsOnly returns the caller's audit actor ("user:<id>") when the
+// results must be limited to their own events, or "" when they may see
+// every actor: they hold an auditSeeAll permission globally, or
+// correlation is a request they can read.
+func (h *Audit) ownEventsOnly(c fiber.Ctx, correlation uuid.UUID) (string, error) {
+	if h.grants == nil {
+		return "", nil
+	}
+	userID, ok := auth.IdentityFromContext(c.Context())
+	if !ok {
+		return "", fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+	}
+	all, err := auth.HoldsAnyGlobal(c.Context(), h.grants, userID, auditSeeAll...)
+	if err != nil {
+		return "", fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	if all {
+		return "", nil
+	}
+	if correlation != uuid.Nil && h.requests != nil {
+		readable, err := h.requests.CanRead(c, correlation)
+		if err != nil {
+			return "", err
+		}
+		if readable {
+			return "", nil
+		}
+	}
+	return auth.AuditActor(c.Context()), nil
 }
 
 // Actor enrichment (resolveActorDisplay / lookupActorDisplay /

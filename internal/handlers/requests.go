@@ -419,6 +419,28 @@ func (h *Requests) authorizeRequestRead(c fiber.Ctx, req *storage.AccessRequest)
 	return fiber.NewError(fiber.StatusNotFound, "request not found")
 }
 
+// CanRead reports whether the caller may read request id, by the same
+// rule as GET /requests/:id. A missing request is false, like one out
+// of scope. The audit log uses it to open a request's whole trail to
+// whoever can read the request.
+func (h *Requests) CanRead(c fiber.Ctx, id uuid.UUID) (bool, error) {
+	req, err := h.svc.Get(c.Context(), id)
+	if errors.Is(err, storage.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := h.authorizeRequestRead(c, req); err != nil {
+		var fe *fiber.Error
+		if errors.As(err, &fe) && fe.Code == fiber.StatusNotFound {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // requestProjectID extracts the request's project, preferring the
 // first-class cross-team column and falling back to the target_scope
 // jsonb the read/patch/direct-reveal flows populate.
