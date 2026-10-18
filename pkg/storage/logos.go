@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // LogoKind names the entity a logo belongs to. Each kind has its own
@@ -55,7 +56,8 @@ type LogoRepository interface {
 	// Get returns the logo for one entity, or ErrNotFound.
 	Get(ctx context.Context, kind LogoKind, entityID uuid.UUID) (*Logo, error)
 	// Upsert inserts or replaces the logo for l.EntityID and sets
-	// l.UpdatedAt from the database.
+	// l.UpdatedAt from the database. ErrNotFound when the owner doesn't
+	// exist (the foreign key refuses the row).
 	Upsert(ctx context.Context, kind LogoKind, l *Logo) error
 	// Delete removes the logo and returns what was removed (without the
 	// image bytes), or ErrNotFound when there was none.
@@ -127,6 +129,10 @@ func (r *Logos) Upsert(ctx context.Context, kind LogoKind, l *Logo) error {
 			updated_at = now()
 		RETURNING updated_at`, table, column)
 	if err := r.pool.QueryRow(ctx, q, l.EntityID, l.PNG, l.SHA256, l.Width, l.Height, l.UpdatedBy).Scan(&l.UpdatedAt); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" { // foreign_key_violation
+			return ErrNotFound
+		}
 		return fmt.Errorf("storage: upsert %s logo: %w", kind, err)
 	}
 	return nil

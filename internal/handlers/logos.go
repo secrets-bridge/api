@@ -55,6 +55,7 @@ func sendLogo(c fiber.Ctx, l *storage.Logo) error {
 	c.Set(fiber.HeaderETag, etag)
 	c.Set(fiber.HeaderXContentTypeOptions, "nosniff")
 	c.Set(fiber.HeaderContentSecurityPolicy, "default-src 'none'; sandbox")
+	c.Set(fiber.HeaderContentDisposition, `inline; filename="logo.png"`)
 	if c.Get(fiber.HeaderIfNoneMatch) == etag {
 		return c.SendStatus(fiber.StatusNotModified)
 	}
