@@ -151,24 +151,24 @@ var Catalog = []Descriptor{
 	{PermTeamEdit, "Tenancy", "Create, update, archive teams and manage team memberships. Role grants scoped to a team_id implicitly cover that team's entire subtree."},
 
 	{PermWorkflowEdit, "Workflows", "Create, update, delete approval workflow definitions."},
-	{PermPolicyEdit, "Workflows", "Create, update, delete policy rules that map request scope to a workflow. Global scope — affects every project's rules. Does NOT auto-cover policy.author server-side (EPIC R, api#108)."},
-	{PermPolicyAuthor, "Workflows", "Author project-scoped policy rules for non-prod environments (EPIC R, api#108). Scoped via the existing team-aware resolver. Refuses prod env selectors, priority >= 9000, and edits to platform global rules. Granted via the policy_author system seed role."},
+	{PermPolicyEdit, "Workflows", "Create, update and delete policy rules that map a request's scope to a workflow, and edit platform settings such as the reserved priority. Global: it affects every project's rules. Holding it does not grant policy.author."},
+	{PermPolicyAuthor, "Workflows", "Author policy rules for the projects and teams the grant covers, for non-prod environments only. Can't target prod, use the reserved priority range (9000 and up by default) or edit platform-wide rules. Granted by the policy_author seed role."},
 
-	{PermAgentMint, "Agents", "Mint a new agent identity and return its credentials."},
-	{PermAgentRevoke, "Agents", "Revoke an agent — heartbeats stop being accepted."},
+	{PermAgentMint, "Agents", "Create and revoke one-time agent enrollment tokens. With SB_ALLOW_DIRECT_AGENT_MINT (local development only), also mint an agent directly."},
+	{PermAgentRevoke, "Agents", "Revoke an agent. Its heartbeats are refused from then on."},
 	{PermAgentList, "Agents", "List all registered agents and their status."},
 	{PermJobEnqueue, "Agents", "Manually enqueue a sync job via POST /jobs. Not carried by any seed role — grant explicitly. Normal request/discover flows enqueue jobs internally without this permission."},
 
 	{PermSecretRequest, "Secrets", "Submit a patch or read request against a provider secret."},
 	{PermSecretApprove, "Secrets", "Approve or reject pending secret requests."},
-	{PermSecretRevealDirect, "Secrets", "Skip the approval workflow on a Tier-2 reveal; gated by policy direct_reveal_allowed + env.kind != prod. PROD direct-reveal is impossible by construction."},
+	{PermSecretRevealDirect, "Secrets", "Reveal a secret without an approval, where a policy rule allows direct reveal. Never on prod environments: the api refuses that in code."},
 	{PermSecretValueProvide, "Secrets", "Fill or refuse an open cross-team integration request scoped to a team's inbox. Typically granted with a team_id scope."},
 	{PermSecretSecurityApprove, "Secrets", "Cast the security-approval vote required for cross-team requests in PROD environments. Strict separation — does NOT include normal approve. Same actor cannot also cast the source vote on the same request."},
 
 	{PermSecretList, "Observability", "List discovered secrets (metadata only, never values)."},
 	{PermAuditRead, "Observability", "Read the immutable audit event log."},
 
-	{PermIntegrationEdit, "Integrations", "Manage ArgoCD endpoints and gitops application mappings (when SB_GITOPS_ENABLED). Also gates provider connection lifecycle (create/update/delete/discover-now/bindings) per EPIC P."},
+	{PermIntegrationEdit, "Integrations", "Manage ArgoCD endpoints and GitOps application mappings (when SB_GITOPS_ENABLED is set), and the provider connection lifecycle: create, update, delete, discover now and bindings."},
 	{PermIntegrationBind, "Integrations", "Bind or unbind self-service-bindable provider connections on projects and environments you cover. NOT auto-covered by integration.edit server-side; grant explicitly (e.g. via the provider_connection_binder seed role)."},
 }
 
