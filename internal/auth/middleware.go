@@ -231,6 +231,22 @@ func HoldsAnyGlobal(ctx context.Context, r Resolver, userID string, perms ...Per
 	return false, nil
 }
 
+// RequireWhen applies guard only to requests for which when is true,
+// and lets the rest through. For a route where one option needs a
+// further permission, such as DELETE /workflows/:id deleting the
+// policy rules with it.
+func RequireWhen(when func(fiber.Ctx) bool, guard fiber.Handler) fiber.Handler {
+	if when == nil || guard == nil {
+		panic("auth: RequireWhen called with a nil condition or guard")
+	}
+	return func(c fiber.Ctx) error {
+		if when(c) {
+			return guard(c)
+		}
+		return c.Next()
+	}
+}
+
 // RequireScoped returns a middleware that gates the next handler on
 // the caller holding `perm` AT A SCOPE COVERING THE REQUEST.
 //

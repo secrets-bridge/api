@@ -2,6 +2,7 @@ package handlers_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -426,6 +427,91 @@ func TestWorkflows_DeleteInUse(t *testing.T) {
 	}
 	if msg := conflict("/api/v1/workflows/"+used.String()+"?delete_policy_rules=true", 1, 0); !strings.Contains(msg, "disable it instead") {
 		t.Errorf("message %q doesn't point at disabling", msg)
+	}
+}
+
+// racingWorkflows points one rule at another workflow just before the
+// delete runs, as an edit landing between a read of the rules and the
+// delete transaction would.
+type racingWorkflows struct {
+	*storage.Workflows
+	pool              *storage.Pool
+	ruleID, elsewhere uuid.UUID
+}
+
+func (r racingWorkflows) Delete(ctx context.Context, id uuid.UUID, deletePolicyRules bool) (storage.WorkflowUsage, error) {
+	if _, err := r.pool.Exec(ctx, `UPDATE policy_rules SET workflow_id = $1 WHERE id = $2`, r.elsewhere, r.ruleID); err != nil {
+		return storage.WorkflowUsage{}, err
+	}
+	return r.Workflows.Delete(ctx, id, deletePolicyRules)
+}
+
+// Deleting a workflow with its rules audits the rules the delete
+// removed, not a list read before it: a rule pointed elsewhere in
+// between survives and gets no policy.delete.
+func TestWorkflows_DeleteWithRules_AuditsWhatWasDeleted(t *testing.T) {
+	app, pool, _ := bootstrapAdmin(t)
+	ctx := t.Context()
+
+	create := func(name string) uuid.UUID {
+		resp, body := doJSON(t, app, "POST", "/api/v1/workflows", sampleWorkflowBody(name))
+		if resp.StatusCode != fiber.StatusCreated {
+			t.Fatalf("create %s: %d %s", name, resp.StatusCode, body)
+		}
+		var w handlers.WorkflowBody
+		_ = json.Unmarshal(body, &w)
+		return w.ID
+	}
+	rule := func(name string, wf uuid.UUID) uuid.UUID {
+		resp, body := doJSON(t, app, "POST", "/api/v1/policies", handlers.PolicyBody{
+			Name: name, Selector: map[string]any{"environment": "uat"}, WorkflowID: wf, Priority: 400, Enabled: true,
+		})
+		if resp.StatusCode != fiber.StatusCreated {
+			t.Fatalf("create policy %s: %d %s", name, resp.StatusCode, body)
+		}
+		var p handlers.PolicyBody
+		_ = json.Unmarshal(body, &p)
+		return p.ID
+	}
+	going, staying := create("wf-going"), create("wf-staying")
+	deletedRule, movedRule := rule("goes-with-it", going), rule("moved-away", going)
+
+	h := handlers.NewAdmin(
+		storage.NewRoles(pool),
+		storage.NewUserRoles(pool),
+		racingWorkflows{Workflows: storage.NewWorkflows(pool), pool: pool, ruleID: movedRule, elsewhere: staying},
+		storage.NewPolicies(pool),
+	).WithAudit(storage.NewAuditEvents(pool))
+	racing := mountAdmin(h)
+
+	if resp, body := doJSON(t, racing, "DELETE", "/api/v1/workflows/"+going.String()+"?delete_policy_rules=true", nil); resp.StatusCode != fiber.StatusNoContent {
+		t.Fatalf("DELETE with delete_policy_rules: %d %s", resp.StatusCode, body)
+	}
+	if resp, _ := doJSON(t, app, "GET", "/api/v1/policies/"+movedRule.String(), nil); resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("the rule pointed elsewhere was deleted: %d", resp.StatusCode)
+	}
+
+	audited := map[string]int{}
+	rows, err := pool.Query(ctx, `SELECT metadata->>'policy_rule_id' FROM audit_events WHERE action = 'policy.delete'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		audited[id]++
+	}
+	rows.Close()
+	if audited[deletedRule.String()] != 1 || audited[movedRule.String()] != 0 || len(audited) != 1 {
+		t.Fatalf("policy.delete events by rule = %v; want one for %s and none for the moved %s", audited, deletedRule, movedRule)
+	}
+	var recorded string
+	if err := pool.QueryRow(ctx,
+		`SELECT metadata->>'deleted_policy_rule_ids' FROM audit_events WHERE action = 'workflow.delete'`).Scan(&recorded); err != nil ||
+		!strings.Contains(recorded, deletedRule.String()) || strings.Contains(recorded, movedRule.String()) {
+		t.Fatalf("workflow.delete deleted_policy_rule_ids = %q, %v; want only %s", recorded, err, deletedRule)
 	}
 }
 

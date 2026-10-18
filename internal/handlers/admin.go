@@ -20,7 +20,8 @@
 //     GET    /workflows                   list
 //     GET    /workflows/:id               get
 //     PUT    /workflows/:id               update (except is_default flag)
-//     DELETE /workflows/:id               delete (404; 409 for system or in use)
+//     DELETE /workflows/:id               delete (404; 409 for system or in use;
+//                                         ?delete_policy_rules=true also needs policy.edit)
 //
 //   Policy rules
 //     POST   /policies                    create
@@ -704,44 +705,32 @@ func (h *Admin) DeleteWorkflow(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	deleteRules := c.Query("delete_policy_rules") == "true"
-
-	// Snapshot the rules first: once the workflow is deleted they are
-	// gone, and policy history reads their policy.delete events.
-	var rules []*storage.PolicyRule
-	if deleteRules && h.policies != nil {
-		all, err := h.policies.List(c.Context())
-		if err != nil {
-			return adminErr(err)
-		}
-		for _, p := range all {
-			if p.WorkflowID == id {
-				rules = append(rules, p)
-			}
-		}
-	}
+	// With delete_policy_rules=true the rules routing here go too; the
+	// route then also requires policy.edit (see main.go).
+	deleteRules := DeletesPolicyRules(c)
 
 	usage, err := h.workflows.Delete(c.Context(), id, deleteRules)
 	if errors.Is(err, storage.ErrWorkflowInUse) {
 		msg := fmt.Sprintf("%d policy rules route to this workflow; repoint or delete them first, or repeat with delete_policy_rules=true",
-			len(usage.PolicyRuleIDs))
+			len(usage.PolicyRules))
 		if usage.Requests > 0 {
 			msg = fmt.Sprintf("%d requests used this workflow, so it can't be deleted; disable it instead", usage.Requests)
 		}
 		return stableErr(c, fiber.StatusConflict, "workflow_in_use", msg, map[string]any{
 			"requests_count":     usage.Requests,
-			"policy_rules_count": len(usage.PolicyRuleIDs),
+			"policy_rules_count": len(usage.PolicyRules),
 		})
 	}
 	if err != nil {
 		return adminErr(err)
 	}
 
-	deleted := make([]string, 0, len(usage.PolicyRuleIDs))
-	for _, rid := range usage.PolicyRuleIDs {
-		deleted = append(deleted, rid.String())
-	}
-	for _, p := range rules {
+	// Audit the rules the delete removed, as it returned them: a list
+	// read before the transaction can differ if a rule was pointed to or
+	// away from this workflow in between.
+	deleted := make([]string, 0, len(usage.PolicyRules))
+	for _, p := range usage.PolicyRules {
+		deleted = append(deleted, p.ID.String())
 		scope := adminPolicyScope(p)
 		policyRulesDeletedTotal.WithLabelValues("policy.edit", scope).Inc()
 		h.auditAdminPolicy(c, "policy.delete", p, scope, nil)
@@ -752,6 +741,10 @@ func (h *Admin) DeleteWorkflow(c fiber.Ctx) error {
 	})
 	return c.SendStatus(fiber.StatusNoContent)
 }
+
+// DeletesPolicyRules reports whether a DELETE /workflows/:id asks to
+// delete the policy rules that route to the workflow as well.
+func DeletesPolicyRules(c fiber.Ctx) bool { return c.Query("delete_policy_rules") == "true" }
 
 // ---- policy_rules ---------------------------------------------------
 
