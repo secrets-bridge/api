@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	awsv2 "github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
@@ -20,8 +21,37 @@ import (
 // Objects are private: no ACL is ever set, and the api serves them
 // itself so the existing authorization stays in front of every read.
 type S3 struct {
-	client s3Client
-	cfg    Config
+	client  s3Client
+	cfg     Config
+	timeout time.Duration
+}
+
+// callTimeout bounds every call to the store, a Get until its body is
+// closed. The SDK switches its own S3 read timeout off and a request's
+// context may never be cancelled, so a store that accepts the
+// connection and then stalls would otherwise hold the goroutine and the
+// connection for good. Logos are at most 64 KiB, so this is generous.
+const callTimeout = 10 * time.Second
+
+// call returns ctx bounded by the store's call timeout.
+func (s *S3) call(ctx context.Context) (context.Context, context.CancelFunc) {
+	t := s.timeout
+	if t <= 0 {
+		t = callTimeout
+	}
+	return context.WithTimeout(ctx, t)
+}
+
+// cancelOnClose ends a Get's context when its body is closed.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
 }
 
 // s3Client is the slice of the SDK S3 client S3 uses. The interface
@@ -42,7 +72,7 @@ func NewS3(ctx context.Context, cfg Config) (*S3, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &S3{client: client, cfg: cfg}, nil
+	return &S3{client: client, cfg: cfg, timeout: callTimeout}, nil
 }
 
 // NewS3Client returns the SDK client NewS3 uses. Exported for tests and
@@ -70,7 +100,9 @@ func NewS3Client(ctx context.Context, cfg Config) (*s3.Client, error) {
 }
 
 // newS3WithClient wires a fake client in unit tests.
-func newS3WithClient(c s3Client, cfg Config) *S3 { return &S3{client: c, cfg: cfg} }
+func newS3WithClient(c s3Client, cfg Config) *S3 {
+	return &S3{client: c, cfg: cfg, timeout: callTimeout}
+}
 
 // Config returns the store's configuration.
 func (s *S3) Config() Config { return s.cfg }
@@ -79,6 +111,8 @@ func (s *S3) Config() Config { return s.cfg }
 // (HeadBucket, which needs s3:ListBucket). The api calls it at boot so
 // a wrong bucket, region, endpoint or role fails there.
 func (s *S3) Check(ctx context.Context) error {
+	ctx, cancel := s.call(ctx)
+	defer cancel()
 	if _, err := s.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: awsv2.String(s.cfg.Bucket)}); err != nil {
 		return fmt.Errorf("objectstore: bucket %q is not reachable: %w", s.cfg.Bucket, err)
 	}
@@ -103,6 +137,8 @@ func (s *S3) Put(ctx context.Context, key string, body io.ReadSeeker, size int64
 			in.SSEKMSKeyId = awsv2.String(s.cfg.KMSKeyID)
 		}
 	}
+	ctx, cancel := s.call(ctx)
+	defer cancel()
 	if _, err := s.client.PutObject(ctx, in); err != nil {
 		return fmt.Errorf("objectstore: put: %w", err)
 	}
@@ -111,18 +147,20 @@ func (s *S3) Put(ctx context.Context, key string, body io.ReadSeeker, size int64
 
 // Get opens one object.
 func (s *S3) Get(ctx context.Context, key string) (*Object, error) {
+	ctx, cancel := s.call(ctx)
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: awsv2.String(s.cfg.Bucket),
 		Key:    awsv2.String(key),
 	})
 	if err != nil {
+		cancel()
 		if isNotFound(err) {
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("objectstore: get: %w", err)
 	}
 	return &Object{
-		Body:        out.Body,
+		Body:        cancelOnClose{ReadCloser: out.Body, cancel: cancel},
 		Size:        awsv2.ToInt64(out.ContentLength),
 		ContentType: awsv2.ToString(out.ContentType),
 	}, nil
@@ -130,6 +168,8 @@ func (s *S3) Get(ctx context.Context, key string) (*Object, error) {
 
 // Head reads one object's metadata.
 func (s *S3) Head(ctx context.Context, key string) (*Info, error) {
+	ctx, cancel := s.call(ctx)
+	defer cancel()
 	out, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: awsv2.String(s.cfg.Bucket),
 		Key:    awsv2.String(key),
@@ -146,6 +186,8 @@ func (s *S3) Head(ctx context.Context, key string) (*Info, error) {
 // Delete removes one object. S3 answers 204 for a missing key, so this
 // is idempotent; a 404 from a stricter server is treated the same way.
 func (s *S3) Delete(ctx context.Context, key string) error {
+	ctx, cancel := s.call(ctx)
+	defer cancel()
 	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: awsv2.String(s.cfg.Bucket),
 		Key:    awsv2.String(key),
