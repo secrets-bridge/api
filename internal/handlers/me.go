@@ -188,6 +188,10 @@ type MeResponse struct {
 	// When the boot path hasn't wired the MFA service, the field
 	// is reported as false (safe default — pushes user to enroll).
 	MFAEnrolled bool `json:"mfa_enrolled"`
+	// PendingApproval is true while the account waits for an admin's
+	// approval. Such an account can only read this and sign out; the
+	// console shows a "waiting for approval" page.
+	PendingApproval bool `json:"pending_approval"`
 }
 
 // GetMe handles GET /api/v1/users/me. Returns the bundle the UI needs
@@ -284,6 +288,8 @@ func (h *Me) GetMe(c fiber.Ctx) error {
 		Teams:       teamsOut,
 		Projects:    projects,
 		MFAEnrolled: mfaEnrolled,
+
+		PendingApproval: user.PendingApproval,
 	})
 }
 

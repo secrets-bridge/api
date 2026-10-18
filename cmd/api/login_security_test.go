@@ -190,7 +190,7 @@ type loginHarness struct {
 	client *http.Client
 }
 
-func newLoginHarness(t *testing.T) *loginHarness {
+func newLoginHarness(t *testing.T, opts ...func(*Config)) *loginHarness {
 	t.Helper()
 	dbDSN := os.Getenv("TEST_DATABASE_URL")
 	redisURL := os.Getenv("TEST_REDIS_URL")
@@ -257,6 +257,9 @@ func newLoginHarness(t *testing.T) *loginHarness {
 		OIDCClientSecret: "test-client-secret",
 		OIDCRedirectURL:  apiURL + "/api/v1/auth/oidc/callback",
 		OIDCScopes:       "openid profile email",
+	}
+	for _, o := range opts {
+		o(&cfg)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	app := newApp(cfg, logger, pool, rdb, km, authSvc)

@@ -466,7 +466,20 @@ func (s *OIDCService) HandleCallback(ctx context.Context, state, boundState, cod
 	if s.cfg.GroupClaim != "" && s.cfg.GroupClaim != "groups" {
 		groups = extractGroups(idToken, s.cfg.GroupClaim)
 	}
-	if s.reconciler != nil {
+	if user.PendingApproval {
+		// api#266: an account waiting for approval gets a session that
+		// can only read /users/me and sign out
+		// (middleware.RequireApprovedExcept), and no grants from the
+		// IdP's groups: the role it gets is the approving admin's
+		// choice. Its existing grants are left alone.
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:    "system:oidc",
+			Action:   "auth.oidc.reconcile_skipped",
+			Resource: "user:" + user.ID.String(),
+			Status:   storage.AuditStatusSuccess,
+			Metadata: map[string]any{"reason": "pending_approval"},
+		})
+	} else if s.reconciler != nil {
 		if err := s.reconciler.Reconcile(ctx, user.ID.String(), groups); err != nil {
 			// Don't fail the login — the user authenticated; we just
 			// couldn't sync grants. Audit and continue.

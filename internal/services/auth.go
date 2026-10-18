@@ -550,6 +550,8 @@ func mustGenerateDummyHash() []byte {
 // be an existing, enabled local user, checked with one primary-key
 // lookup per bearer request, so disabling a user stops their tokens
 // right away instead of at expiry. Any lookup failure fails closed.
+// An account still waiting for approval is refused too: it may only
+// read /users/me and sign out, which needs a session, not a token.
 func (s *AuthService) SubjectFromToken(ctx context.Context, token string) (string, error) {
 	if s.signer == nil {
 		return "", auth.ErrInvalidToken
@@ -566,7 +568,7 @@ func (s *AuthService) SubjectFromToken(ctx context.Context, token string) (strin
 		return "", auth.ErrInvalidToken
 	}
 	user, err := s.users.Get(ctx, id)
-	if err != nil || user.Disabled {
+	if err != nil || user.Disabled || user.PendingApproval {
 		return "", auth.ErrInvalidToken
 	}
 	return claims.Subject, nil
