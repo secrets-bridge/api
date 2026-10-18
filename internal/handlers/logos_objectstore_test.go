@@ -79,6 +79,19 @@ func TestLogoObjects_PutStoresBytesOutsidePostgres(t *testing.T) {
 	}
 }
 
+// noCachedError fails when an error response carries the image's
+// year-long cache headers: the logo URL is versioned, so a cached 404
+// or 503 would stick long after the store is back.
+func noCachedError(t *testing.T, r logoResp) {
+	t.Helper()
+	if cc := r.header.Get("Cache-Control"); strings.Contains(cc, "immutable") || strings.Contains(cc, "max-age") {
+		t.Errorf("error %d is cacheable: Cache-Control %q", r.status, cc)
+	}
+	if et := r.header.Get("ETag"); et != "" {
+		t.Errorf("error %d carries ETag %s", r.status, et)
+	}
+}
+
 func TestLogoObjects_MissingObjectIs404(t *testing.T) {
 	fx := bootstrapLogos(t)
 	path := "/api/v1/projects/" + fx.project.String() + "/logo"
@@ -93,6 +106,7 @@ func TestLogoObjects_MissingObjectIs404(t *testing.T) {
 	if r.status != http.StatusNotFound || bytes.Contains(r.body, []byte(key)) {
 		t.Fatalf("GET with the object gone: %d %s, want 404 without the key", r.status, r.body)
 	}
+	noCachedError(t, r)
 	// A conditional request still answers from the row alone.
 	r = fx.do(t, http.MethodGet, path, fx.admin, "", nil, map[string]string{"If-None-Match": `"` + sha + `"`})
 	if r.status != http.StatusNotModified {
@@ -211,6 +225,7 @@ func TestLogoObjects_StoreFailureAnswers503WithoutDetail(t *testing.T) {
 	if r.status != http.StatusServiceUnavailable || strings.Contains(string(r.body), objectstoretest.ErrInjected.Error()) {
 		t.Fatalf("GET with a failing store: %d %s", r.status, r.body)
 	}
+	noCachedError(t, r)
 }
 
 // When the row write fails after the object went in, the new object is

@@ -328,6 +328,41 @@ func TestLogoStore_OldObjectDeleteFailureIsNotFatal(t *testing.T) {
 	}
 }
 
+// A Head that fails for any reason but "not found" (throttling, a
+// timeout, a role without s3:ListBucket) can't say whether the object
+// is there. The write must still happen: the row then points at a key
+// that holds the image, and the old logo goes only after that.
+func TestLogoStore_HeadFailureStillWritesObject(t *testing.T) {
+	h := newLogoHarness(t)
+	id := uuid.New()
+	if _, err := h.svc.Put(t.Context(), storage.LogoKindProject, id, "image/png", pngUpload(t, 32, 32), "u"); err != nil {
+		t.Fatal(err)
+	}
+	h.store.Set(func(m *objectstoretest.Memory) { m.FailHead = true })
+	if _, err := h.svc.Put(t.Context(), storage.LogoKindProject, id, "image/png", pngUpload(t, 64, 64), "u"); err != nil {
+		t.Fatalf("Put with a failing Head = %v", err)
+	}
+	row, _ := h.repo.row(storage.LogoKindProject, id)
+	if h.store.Bytes(row.ObjectKey) == nil {
+		t.Fatalf("row points at %s, which was never written (keys %v)", row.ObjectKey, h.store.Keys())
+	}
+	rc, _, err := h.svc.Open(t.Context(), storage.LogoKindProject, &row)
+	if err != nil {
+		t.Fatalf("Open after the upload: %v", err)
+	}
+	_ = readAllClose(t, rc)
+
+	// Same with a failing row write: the object may be the one the
+	// current row uses, so it stays.
+	h.repo.failUpsert = true
+	if _, err := h.svc.Put(t.Context(), storage.LogoKindProject, id, "image/png", pngUpload(t, 64, 64), "u"); err == nil {
+		t.Fatal("want the row error")
+	}
+	if h.store.Bytes(row.ObjectKey) == nil {
+		t.Fatal("cleanup removed the object the current row points at")
+	}
+}
+
 func TestLogoStore_DeleteRemovesRowThenObject(t *testing.T) {
 	h := newLogoHarness(t)
 	id := uuid.New()

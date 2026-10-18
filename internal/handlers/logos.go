@@ -71,6 +71,10 @@ func sendLogo(c fiber.Ctx, svc *services.LogoService, kind storage.LogoKind, l *
 	}
 	body, size, err := svc.Open(c.Context(), kind, l)
 	if err != nil {
+		// The year-long cache is for the image. A 404 or 503 kept under
+		// the versioned URL would outlive the outage it reports.
+		c.Set(fiber.HeaderCacheControl, "no-store")
+		c.Response().Header.Del(fiber.HeaderETag)
 		return mapLogoErr(err, string(kind))
 	}
 	c.Set(fiber.HeaderContentType, "image/png")
