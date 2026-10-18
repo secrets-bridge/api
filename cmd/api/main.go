@@ -392,7 +392,10 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// down where policyHistorySvc is constructed alongside the scoped
 	// handlers (search for "policyHistorySvc := ").
 	requestsH := handlers.NewRequests(requestSvc)
-	wrapsH := handlers.NewWraps(requestSvc, wrapSvc, agentRepo, km)
+	wrapsH := handlers.NewWraps(requestSvc, wrapSvc, agentRepo, km).WithAllowUnsealed(cfg.AllowUnsealedWraps)
+	if cfg.AllowUnsealedWraps {
+		logger.Warn("SB_ALLOW_UNSEALED_WRAPS=true: wraps can reach agents without an X25519 key as plaintext over TLS, and agents can post plaintext values")
+	}
 	revealSessionSvc := services.NewRevealSessionService(
 		revealSessionRepo, requestRepo, wrapSvc, policyEng, auditRepo,
 	).WithEnvironments(environmentRepo)

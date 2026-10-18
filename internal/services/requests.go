@@ -1118,6 +1118,13 @@ func (s *RequestService) CreateAgentWrap(ctx context.Context, agentID, requestID
 // auditAgentWrapRefused records a metadata-only denial for an agent wrap
 // call refused by an H4 gate: ids and a reason code, never a value, key
 // material or the agent-supplied key name.
+// AuditUnsealedWrapRefused records that an agent wrap call was refused
+// because it would have carried a plaintext value (api#264): a retrieve
+// by an agent with no usable X25519 key, or a create with `value`.
+func (s *RequestService) AuditUnsealedWrapRefused(ctx context.Context, action string, agentID, wrapID uuid.UUID, reason string) {
+	s.auditAgentWrapRefused(ctx, action, agentID, uuid.Nil, wrapID, reason)
+}
+
 func (s *RequestService) auditAgentWrapRefused(ctx context.Context, action string, agentID, requestID, wrapID uuid.UUID, reason string) {
 	resource := "request:" + requestID.String()
 	meta := map[string]any{"reason": reason, "agent_id": agentID.String()}

@@ -44,6 +44,9 @@ type Wraps struct {
 	wraps    *services.WrapService
 	agents   AgentLookup
 	kms      keymgmt.KeyManager
+	// allowUnsealed brings back the legacy plaintext-over-TLS shapes
+	// (SB_ALLOW_UNSEALED_WRAPS). Off by default.
+	allowUnsealed bool
 }
 
 // AgentLookup is the slice of AgentRepository the Wraps handler needs:
@@ -57,13 +60,28 @@ func NewWraps(requests *services.RequestService, wraps *services.WrapService, ag
 	return &Wraps{requests: requests, wraps: wraps, agents: agents, kms: km}
 }
 
+// WithAllowUnsealed turns the legacy plaintext-over-TLS wrap shapes back
+// on (SB_ALLOW_UNSEALED_WRAPS, api#264). Without it a wrap reaches an
+// agent only sealed to its X25519 key, and agents post envelopes only.
+func (h *Wraps) WithAllowUnsealed(allow bool) *Wraps {
+	h.allowUnsealed = allow
+	return h
+}
+
+// sealable reports whether an agent has a public key a wrap can be
+// sealed to.
+func sealable(a *storage.Agent) bool {
+	return a.PublicKeyAlgorithm == "x25519" && len(a.PublicKey) == 32
+}
+
 // WrapPayload is the JSON returned to the agent. EXACTLY ONE of Value
 // (plaintext-over-TLS) or Sealed (wire-envelope) is populated:
 //
-//   - If the agent registered a public_key at mint time, the CP
-//     SEALS the response to that key; only the Sealed field is set.
-//   - If no public_key is registered (backwards-compat agents), the
-//     CP falls back to Value with plaintext base64.
+//   - The CP SEALS the response to the agent's registered X25519
+//     public key; only the Sealed field is set.
+//   - An agent with no usable key is refused with 409 before the wrap
+//     is consumed. Value (plaintext base64) is returned only with the
+//     SB_ALLOW_UNSEALED_WRAPS break-glass (api#264).
 //
 // The agent inspects which field is populated and decodes accordingly.
 type WrapPayload struct {
@@ -128,6 +146,21 @@ func (h *Wraps) Retrieve(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusInternalServerError, "agent identity missing in context")
 	}
 
+	// Decide how the value can travel BEFORE the single-shot consume, so
+	// a refusal never burns the wrap. An agent with no usable X25519 key
+	// gets the same answer for every wrap id, so the refusal says
+	// nothing about whether the wrap exists (api#264).
+	agent, err := h.agents.Get(c.Context(), agentID)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "load agent: "+err.Error())
+	}
+	seal := sealable(agent)
+	if !seal && !h.allowUnsealed {
+		h.requests.AuditUnsealedWrapRefused(c.Context(), "wrap.retrieve", agentID, wrapID, "agent_public_key_missing")
+		return fiber.NewError(fiber.StatusConflict,
+			"agent_public_key_required: register the agent's X25519 public key; wraps are only delivered sealed")
+	}
+
 	plaintext, wrap, err := h.requests.RetrieveWrap(c.Context(), wrapID, agentID)
 	if err != nil {
 		return wrapErr(err)
@@ -145,14 +178,9 @@ func (h *Wraps) Retrieve(c fiber.Ctx) error {
 		body.RequestID = wrap.RequestID.String()
 	}
 
-	// SEAL when the requesting agent has a public key on file.
-	// Otherwise fall back to plaintext-over-TLS (backwards compat for
-	// agents that registered before wire-envelope was wired).
-	agent, err := h.agents.Get(c.Context(), agentID)
-	if err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "load agent: "+err.Error())
-	}
-	if len(agent.PublicKey) > 0 && agent.PublicKeyAlgorithm == "x25519" {
+	// SEAL to the agent's key. Plaintext-over-TLS only with the
+	// SB_ALLOW_UNSEALED_WRAPS break-glass, checked above.
+	if seal {
 		env, err := sealing.Seal(plaintext, agent.PublicKey)
 		if err != nil {
 			return fiber.NewError(fiber.StatusInternalServerError, "seal: "+err.Error())
@@ -207,7 +235,8 @@ func (h *Wraps) IssueDEK(c fiber.Ctx) error {
 // (wire-envelope, Piece 8b) is populated:
 //
 //   - Value: base64 plaintext. Legacy shape; TLS is the only thing
-//     protecting it in flight.
+//     protecting it in flight. Refused with 400 unless
+//     SB_ALLOW_UNSEALED_WRAPS is on (api#264).
 //   - Envelope: agent first called /agents/:id/dek to get a fresh
 //     KMS DEK, AES-256-GCM-encrypted the plaintext locally, and
 //     POSTs the ciphertext + nonce + dek_ciphertext here. The CP
@@ -267,6 +296,10 @@ func (h *Wraps) Create(c fiber.Ctx) error {
 	}
 	if (body.Value == "") == (body.Envelope == nil) {
 		return fiber.NewError(fiber.StatusBadRequest, "exactly one of value or envelope is required")
+	}
+	if body.Value != "" && !h.allowUnsealed {
+		h.requests.AuditUnsealedWrapRefused(c.Context(), "wrap.create", agentID, uuid.Nil, "plaintext_value_refused")
+		return fiber.NewError(fiber.StatusBadRequest, "envelope_required: post the value as a wire envelope (POST /dek first); plaintext value is refused")
 	}
 	reqID, err := uuid.Parse(body.RequestID)
 	if err != nil {

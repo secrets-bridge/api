@@ -67,6 +67,13 @@ func bootstrapAgentSurface(t *testing.T) *agentSurface {
 // AgentService reads through (the revocation race test gates Get).
 func bootstrapAgentSurfaceWith(t *testing.T, wrap func(*storage.Agents) storage.AgentRepository) *agentSurface {
 	t.Helper()
+	return bootstrapAgentSurfaceOpts(t, wrap, false)
+}
+
+// bootstrapAgentSurfaceOpts also sets the SB_ALLOW_UNSEALED_WRAPS
+// break-glass on the wraps handler.
+func bootstrapAgentSurfaceOpts(t *testing.T, wrap func(*storage.Agents) storage.AgentRepository, allowUnsealed bool) *agentSurface {
+	t.Helper()
 	dbDSN := os.Getenv("TEST_DATABASE_URL")
 	redisURL := os.Getenv("TEST_REDIS_URL")
 	if dbDSN == "" || redisURL == "" {
@@ -147,7 +154,7 @@ func bootstrapAgentSurfaceWith(t *testing.T, wrap func(*storage.Agents) storage.
 	v1 := app.Group("/api/v1")
 	agentsH := handlers.NewAgents(agentSvc)
 	jobsH := handlers.NewJobs(jobSvc)
-	wrapsH := handlers.NewWraps(reqSvc, wrapSvc, agentsR, km)
+	wrapsH := handlers.NewWraps(reqSvc, wrapSvc, agentsR, km).WithAllowUnsealed(allowUnsealed)
 	v1.Post("/agents/enroll", agentsH.Enroll)
 	agentRoutes := v1.Group("/agents/:id", middleware.AgentAuth(agentSvc))
 	agentRoutes.Post("/jobs/claim", jobsH.Claim)
@@ -488,8 +495,8 @@ func TestAgentSurface_OtherAgentCannotPostWrap(t *testing.T) {
 // A claimed.
 func TestAgentSurface_OtherAgentCannotFetchWrap(t *testing.T) {
 	fx := bootstrapAgentSurface(t)
-	a := fx.mint(t, "agent-a", false)
-	b := fx.mint(t, "agent-b", false)
+	a := fx.mint(t, "agent-a", true)
+	b := fx.mint(t, "agent-b", true)
 	req := fx.approvedPatch(t, map[string][]byte{"DB_PASSWORD": []byte("canary-patch-b")})
 
 	// Unclaimed job: refused, wrap untouched.
@@ -575,8 +582,8 @@ func TestAgentSurface_ConcurrentDuplicateKeyOneWins(t *testing.T) {
 // the one that produced them, may fetch (and burn) them.
 func TestAgentSurface_AgentCannotFetchUserDestinedWrap(t *testing.T) {
 	fx := bootstrapAgentSurface(t)
-	a := fx.mint(t, "agent-a", false)
-	b := fx.mint(t, "agent-b", false)
+	a := fx.mint(t, "agent-a", true)
+	b := fx.mint(t, "agent-b", true)
 	req := fx.approvedRead(t, []string{"DB_PASSWORD"})
 	fx.claim(t, a)
 	code, body := fx.postWrap(t, a, req.ID, "DB_PASSWORD", fx.envelope(t, a, []byte("canary-user-only"), nil))
@@ -1035,7 +1042,7 @@ func TestAgentSurface_DiscoveryRefusedForOrphanedOrDisabledConnection(t *testing
 // agent, so the old holder can no longer post or fetch wraps for it.
 func TestAgentSurface_ExpiredLeaseCannotPostOrFetch(t *testing.T) {
 	fx := bootstrapAgentSurface(t)
-	a := fx.mint(t, "agent-a", false)
+	a := fx.mint(t, "agent-a", true)
 
 	read := fx.approvedRead(t, []string{"DB_PASSWORD"})
 	rj := fx.claim(t, a)
@@ -1063,5 +1070,89 @@ func TestAgentSurface_ExpiredLeaseCannotPostOrFetch(t *testing.T) {
 	}
 	if n := fx.countRows(t, `SELECT count(*) FROM secret_wraps WHERE id = $1 AND consumed_at IS NULL`, wid); n != 1 {
 		t.Fatal("expired-lease fetch burned the wrap")
+	}
+}
+
+// ---- api#264: sealed wraps only -------------------------------------
+
+// An agent with no X25519 key on file gets a 409 for its own claimed
+// patch wrap. The wrap is not consumed, no plaintext comes back, and the
+// refusal is audited. The same agent with a key gets it sealed.
+func TestAgentSurface_KeylessAgentFetchRefusedWithoutBurning(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	a := fx.mint(t, "agent-keyless", false)
+	fx.approvedPatch(t, map[string][]byte{"DB_PASSWORD": []byte("canary-sealed-only")})
+	job := fx.claim(t, a)
+	wid := wrapIDsFromPayload(t, job)[0]
+
+	code, body := fx.getWrap(t, a, wid)
+	if code != http.StatusConflict {
+		t.Fatalf("keyless fetch = %d (%s); want 409", code, body)
+	}
+	if bytes.Contains(body, []byte("canary-sealed-only")) || bytes.Contains(body, []byte(base64.StdEncoding.EncodeToString([]byte("canary-sealed-only")))) ||
+		bytes.Contains(body, []byte(`"value"`)) {
+		t.Fatalf("refusal carries the value: %s", body)
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM secret_wraps WHERE id = $1 AND consumed_at IS NULL`, wid); n != 1 {
+		t.Fatal("refused fetch burned the wrap")
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM audit_events WHERE action = 'wrap.retrieve' AND status = 'denied'
+		AND metadata->>'reason' = 'agent_public_key_missing' AND metadata->>'wrap_id' = $1`, wid); n != 1 {
+		t.Fatalf("refusal audit rows = %d; want 1", n)
+	}
+}
+
+// Posting a plaintext `value` is refused with 400 and stores nothing;
+// the envelope path still works for the same key.
+func TestAgentSurface_PlaintextValueCreateRefused(t *testing.T) {
+	fx := bootstrapAgentSurface(t)
+	a := fx.mint(t, "agent-a", true)
+	req := fx.approvedRead(t, []string{"DB_PASSWORD"})
+	fx.claim(t, a)
+
+	code, body := fx.call(t, http.MethodPost, "/api/v1/agents/"+a.id.String()+"/wraps", a.secret, map[string]any{
+		"request_id": req.ID.String(), "key_name": "DB_PASSWORD",
+		"value": base64.StdEncoding.EncodeToString([]byte("canary-plain-post")),
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("plaintext value post = %d (%s); want 400", code, body)
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM secret_wraps WHERE request_id = $1`, req.ID); n != 0 {
+		t.Fatalf("plaintext post stored %d wraps", n)
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM audit_events WHERE action = 'wrap.create' AND status = 'denied'
+		AND metadata->>'reason' = 'plaintext_value_refused'`); n != 1 {
+		t.Fatalf("refusal audit rows = %d; want 1", n)
+	}
+	if code, body := fx.postWrap(t, a, req.ID, "DB_PASSWORD", fx.envelope(t, a, []byte("canary-sealed-post"), nil)); code != http.StatusCreated {
+		t.Fatalf("envelope post after the refusal = %d (%s); want 201", code, body)
+	}
+}
+
+// With SB_ALLOW_UNSEALED_WRAPS the legacy shapes still work, for an agent
+// that predates wire-envelope.
+func TestAgentSurface_UnsealedBreakGlassKeepsLegacyShapes(t *testing.T) {
+	fx := bootstrapAgentSurfaceOpts(t, nil, true)
+	a := fx.mint(t, "agent-legacy", false)
+	fx.approvedPatch(t, map[string][]byte{"DB_PASSWORD": []byte("canary-legacy")})
+	job := fx.claim(t, a)
+	wid := wrapIDsFromPayload(t, job)[0]
+	code, body := fx.getWrap(t, a, wid)
+	if code != http.StatusOK {
+		t.Fatalf("legacy keyless fetch with the switch = %d (%s); want 200", code, body)
+	}
+	var p handlers.WrapPayload
+	if err := json.Unmarshal(body, &p); err != nil || p.Sealed != nil || p.Value != base64.StdEncoding.EncodeToString([]byte("canary-legacy")) {
+		t.Fatalf("legacy fetch did not return the plaintext shape (err=%v)", err)
+	}
+
+	b := fx.mint(t, "agent-legacy-read", false)
+	req := fx.approvedRead(t, []string{"DB_PASSWORD"})
+	fx.claim(t, b)
+	if code, body := fx.call(t, http.MethodPost, "/api/v1/agents/"+b.id.String()+"/wraps", b.secret, map[string]any{
+		"request_id": req.ID.String(), "key_name": "DB_PASSWORD",
+		"value": base64.StdEncoding.EncodeToString([]byte("canary-legacy-post")),
+	}); code != http.StatusCreated {
+		t.Fatalf("legacy value post with the switch = %d (%s); want 201", code, body)
 	}
 }
