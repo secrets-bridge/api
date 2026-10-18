@@ -47,6 +47,32 @@ type Me struct {
 	users        storage.LocalUserRepository
 	teams        storage.TeamRepository
 	mfa          MFAEnrollmentLookup
+	logos        LogoVersionLookup
+}
+
+// LogoVersionLookup is the slice of the logo service /users/me needs:
+// logo_version for many projects or teams in one query.
+type LogoVersionLookup interface {
+	Versions(ctx context.Context, kind storage.LogoKind, entityIDs []uuid.UUID) (map[uuid.UUID]string, error)
+}
+
+// WithLogos adds logo_version to the project and team summaries.
+// Returns the handler for chaining.
+func (h *Me) WithLogos(l LogoVersionLookup) *Me {
+	h.logos = l
+	return h
+}
+
+// logoVersions looks up logo versions, or none when logos aren't wired.
+func (h *Me) logoVersions(c fiber.Ctx, kind storage.LogoKind, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	if h.logos == nil {
+		return map[uuid.UUID]string{}, nil
+	}
+	v, err := h.logos.Versions(c.Context(), kind, ids)
+	if err != nil {
+		return nil, fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	return v, nil
 }
 
 // WithEnvironments wires the EnvironmentRepository so the projection
@@ -105,6 +131,9 @@ type ProjectSummary struct {
 	Name         string               `json:"name"`
 	Status       string               `json:"status"`
 	Environments []EnvironmentSummary `json:"environments,omitempty"`
+	// LogoVersion is set when the project has a logo (GET
+	// /projects/:id/logo?v=<logo_version>); null otherwise.
+	LogoVersion *string `json:"logo_version"`
 }
 
 // EnvironmentSummary is the per-env shape returned alongside a
@@ -125,6 +154,8 @@ type TeamSummary struct {
 	Name         string  `json:"name"`
 	ParentTeamID *string `json:"parent_team_id"`
 	Status       string  `json:"status"`
+	// LogoVersion is set when the team has a logo; null otherwise.
+	LogoVersion *string `json:"logo_version"`
 }
 
 // MeResponse is the JSON shape returned by GET /users/me. Single
@@ -206,6 +237,14 @@ func (h *Me) GetMe(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
+	teamIDs := make([]uuid.UUID, 0, len(teams))
+	for _, t := range teams {
+		teamIDs = append(teamIDs, t.ID)
+	}
+	teamLogos, err := h.logoVersions(c, storage.LogoKindTeam, teamIDs)
+	if err != nil {
+		return err
+	}
 	teamsOut := make([]TeamSummary, 0, len(teams))
 	for _, t := range teams {
 		var parent *string
@@ -218,6 +257,7 @@ func (h *Me) GetMe(c fiber.Ctx) error {
 			Name:         t.Name,
 			ParentTeamID: parent,
 			Status:       string(t.Status),
+			LogoVersion:  logoVersionPtr(teamLogos, t.ID),
 		})
 	}
 
@@ -258,15 +298,26 @@ func (h *Me) projectsForUser(c fiber.Ctx, userID string) ([]ProjectSummary, erro
 	if err != nil {
 		return nil, fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
+	ids := make([]uuid.UUID, 0, len(all))
+	for _, p := range all {
+		if access.Covers(p.ID) {
+			ids = append(ids, p.ID)
+		}
+	}
+	logos, err := h.logoVersions(c, storage.LogoKindProject, ids)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]ProjectSummary, 0, len(all))
 	for _, p := range all {
 		if !access.Covers(p.ID) {
 			continue
 		}
 		summary := ProjectSummary{
-			ID:     p.ID.String(),
-			Name:   p.Name,
-			Status: string(p.Status),
+			ID:          p.ID.String(),
+			Name:        p.Name,
+			Status:      string(p.Status),
+			LogoVersion: logoVersionPtr(logos, p.ID),
 		}
 		if h.environments != nil {
 			envs, err := h.environments.ListByProject(c.Context(), p.ID)

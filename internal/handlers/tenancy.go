@@ -49,6 +49,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/secrets-bridge/api/internal/auth"
+	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
@@ -68,6 +69,7 @@ type Tenancy struct {
 	resolver     auth.Resolver
 	teamScope    auth.TeamScopeResolver
 	audit        storage.AuditEventRepository
+	logos        *services.LogoService
 }
 
 // NewTenancy wires the handler.
@@ -137,6 +139,9 @@ type projectBody struct {
 	Status      string     `json:"status,omitempty"`
 	CreatedAt   time.Time  `json:"created_at,omitempty"`
 	UpdatedAt   time.Time  `json:"updated_at,omitempty"`
+	// LogoVersion is set when the project has a logo; the console loads
+	// it from /projects/:id/logo?v=<logo_version>. Ignored on input.
+	LogoVersion *string `json:"logo_version"`
 }
 
 func projectToBody(p *storage.Project) projectBody {
@@ -232,12 +237,24 @@ func (h *Tenancy) ListProjects(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
-	out := make([]projectBody, 0, len(rows))
+	visible := make([]*storage.Project, 0, len(rows))
+	ids := make([]uuid.UUID, 0, len(rows))
 	for _, p := range rows {
 		if scoped && !access.Covers(p.ID) {
 			continue
 		}
-		out = append(out, projectToBody(p))
+		visible = append(visible, p)
+		ids = append(ids, p.ID)
+	}
+	versions, err := h.projectLogoVersions(c, ids)
+	if err != nil {
+		return err
+	}
+	out := make([]projectBody, 0, len(visible))
+	for _, p := range visible {
+		b := projectToBody(p)
+		b.LogoVersion = logoVersionPtr(versions, p.ID)
+		out = append(out, b)
 	}
 	return c.JSON(out)
 }
@@ -263,7 +280,13 @@ func (h *Tenancy) GetProject(c fiber.Ctx) error {
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
-	return c.JSON(projectToBody(p))
+	versions, err := h.projectLogoVersions(c, []uuid.UUID{p.ID})
+	if err != nil {
+		return err
+	}
+	b := projectToBody(p)
+	b.LogoVersion = logoVersionPtr(versions, p.ID)
+	return c.JSON(b)
 }
 
 type projectStatusBody struct {

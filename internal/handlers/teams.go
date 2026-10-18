@@ -41,6 +41,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/secrets-bridge/api/internal/auth"
+	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
@@ -53,6 +54,7 @@ type Teams struct {
 	// non-transactional Update; production main always wires both.
 	teamsConcrete *storage.Teams
 	audit         *storage.AuditEvents
+	logos         *services.LogoService
 }
 
 // NewTeams wires the handler.
@@ -86,6 +88,9 @@ type teamBody struct {
 	Description  string     `json:"description,omitempty"`
 	CreatedAt    time.Time  `json:"created_at,omitempty"`
 	UpdatedAt    time.Time  `json:"updated_at,omitempty"`
+	// LogoVersion is set when the team has a logo; the console loads it
+	// from /teams/:id/logo?v=<logo_version>. Ignored on input.
+	LogoVersion *string `json:"logo_version"`
 }
 
 func teamToBody(t *storage.Team) teamBody {
@@ -161,9 +166,18 @@ func (h *Teams) List(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
+	ids := make([]uuid.UUID, len(all))
+	for i, t := range all {
+		ids[i] = t.ID
+	}
+	versions, err := h.teamLogoVersions(c, ids)
+	if err != nil {
+		return err
+	}
 	out := make([]teamBody, len(all))
 	for i, t := range all {
 		out[i] = teamToBody(t)
+		out[i].LogoVersion = logoVersionPtr(versions, t.ID)
 	}
 	return c.JSON(out)
 }
@@ -178,7 +192,11 @@ func (h *Teams) Get(c fiber.Ctx) error {
 	if err != nil {
 		return mapTeamErr(err)
 	}
-	return c.JSON(teamToBody(t))
+	b, err := h.teamBodyWithLogo(c, t)
+	if err != nil {
+		return err
+	}
+	return c.JSON(b)
 }
 
 // teamUpdateBody is the PUT /teams/:id input. name is required.
@@ -256,7 +274,11 @@ func (h *Teams) Update(c fiber.Ctx) error {
 		"parent_team_id_before": uuidPtrMeta(current.ParentTeamID),
 		"parent_team_id_after":  uuidPtrMeta(t.ParentTeamID),
 	})
-	return c.JSON(teamToBody(t))
+	b, err := h.teamBodyWithLogo(c, t)
+	if err != nil {
+		return err
+	}
+	return c.JSON(b)
 }
 
 // UpdateStatus handles PUT /teams/:id/status.
