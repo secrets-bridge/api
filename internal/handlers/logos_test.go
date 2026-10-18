@@ -12,6 +12,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -33,7 +34,9 @@ import (
 // the image, logo_version on bodies and value-free audit metadata.
 //
 // The route-level team.edit gate on PUT/DELETE is registered in main
-// like the other project writes; these tests exercise the handlers.
+// like the other project writes and covered by
+// TestTenancyWrites_RequireTeamEdit in cmd/api; these tests exercise
+// the handlers.
 
 type logoFixture struct {
 	app          *fiber.App
@@ -199,6 +202,25 @@ func jpegBytes(t *testing.T, w, h int) []byte {
 	return buf.Bytes()
 }
 
+// photoJPEG is a w×h JPEG of a noisy gradient, like a photo: small as a
+// JPEG, much larger as a PNG of the same size.
+func photoJPEG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	rng := rand.New(rand.NewPCG(1, 2))
+	noisy := func(v int) uint8 { return uint8(max(0, min(255, v+rng.IntN(17)-8))) }
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Set(x, y, color.RGBA{R: noisy(x * 255 / w), G: noisy(y * 255 / h), B: noisy(120 + (x+y)%40), A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 75}); err != nil {
+		t.Fatalf("encode jpeg: %v", err)
+	}
+	return buf.Bytes()
+}
+
 // withTextChunk inserts a tEXt chunk after IHDR, the way image tools
 // store comments and other metadata.
 func withTextChunk(t *testing.T, p []byte, text string) []byte {
@@ -257,6 +279,7 @@ func TestLogo_RoundTripReencodesAndServesAsImage(t *testing.T) {
 		"Etag":                    `"` + digest + `"`,
 		"X-Content-Type-Options":  "nosniff",
 		"Content-Security-Policy": "default-src 'none'; sandbox",
+		"Content-Disposition":     `inline; filename="logo.png"`,
 	}
 	for k, v := range want {
 		if got := get.header.Get(k); got != v {
@@ -287,6 +310,38 @@ func TestLogo_JPEGIsStoredAsPNG(t *testing.T) {
 	get := fx.do(t, http.MethodGet, path, fx.outsider, "", nil, nil)
 	if get.status != http.StatusOK || !bytes.HasPrefix(get.body, []byte("\x89PNG\r\n\x1a\n")) {
 		t.Fatalf("team logo: %d, PNG signature %v", get.status, bytes.HasPrefix(get.body, []byte("\x89PNG")))
+	}
+}
+
+// A photo-like JPEG used to be refused as over 64 KiB: re-encoded as a
+// 16-bit PNG at full size it was hundreds of KiB. It is now stored as an
+// 8-bit PNG at most 128 px on the longer side.
+func TestLogo_PhotoJPEGIsScaledToFit(t *testing.T) {
+	fx := bootstrapLogos(t)
+	path := "/api/v1/projects/" + fx.project.String() + "/logo"
+	upload := photoJPEG(t, 512, 384)
+	if len(upload) > services.LogoMaxBytes {
+		t.Fatalf("fixture is %d bytes, over the upload cap", len(upload))
+	}
+	if put := fx.do(t, http.MethodPut, path, fx.admin, "image/jpeg", upload, nil); put.status != http.StatusOK {
+		t.Fatalf("PUT: %d %s", put.status, put.body)
+	}
+	get := fx.do(t, http.MethodGet, path, fx.admin, "", nil, nil)
+	if get.status != http.StatusOK {
+		t.Fatalf("GET: %d %s", get.status, get.body)
+	}
+	cfg, err := png.DecodeConfig(bytes.NewReader(get.body))
+	if err != nil {
+		t.Fatalf("stored logo is not a PNG: %v", err)
+	}
+	if cfg.Width != 128 || cfg.Height != 96 {
+		t.Errorf("stored %dx%d, want 128x96 (longer side 128, aspect kept)", cfg.Width, cfg.Height)
+	}
+	if cfg.ColorModel != color.RGBAModel {
+		t.Errorf("stored color model %T, want 8-bit RGB", cfg.ColorModel)
+	}
+	if len(get.body) > services.LogoMaxBytes {
+		t.Errorf("stored %d bytes, over the cap", len(get.body))
 	}
 }
 
@@ -326,6 +381,12 @@ func TestLogo_RefusesWhatItCannotStore(t *testing.T) {
 	missing := fx.do(t, http.MethodPut, "/api/v1/projects/"+uuid.New().String()+"/logo", fx.admin, "image/png", pngBytes(t, 32, 32), nil)
 	if missing.status != http.StatusNotFound || !strings.Contains(string(missing.body), "project not found") {
 		t.Fatalf("PUT for a missing project: %d %s", missing.status, missing.body)
+	}
+	// The owner is checked before the body is decoded: bytes that are not
+	// an image still get 404 for a project that doesn't exist.
+	unread := fx.do(t, http.MethodPut, "/api/v1/projects/"+uuid.New().String()+"/logo", fx.admin, "image/png", []byte("not a png"), nil)
+	if unread.status != http.StatusNotFound {
+		t.Fatalf("PUT garbage for a missing project: %d %s, want 404", unread.status, unread.body)
 	}
 }
 

@@ -101,3 +101,17 @@ func TestLogos_TeamKindUsesTeamTable(t *testing.T) {
 		t.Fatal("logo for a missing team was stored")
 	}
 }
+
+// The foreign key refuses a logo for an owner that doesn't exist, for
+// example one deleted after the service checked it. Upsert reports that
+// as ErrNotFound rather than a raw constraint error.
+func TestLogos_UpsertForMissingOwnerIsNotFound(t *testing.T) {
+	pool := freshDB(t)
+	repo := storage.NewLogos(pool)
+	for _, kind := range []storage.LogoKind{storage.LogoKindProject, storage.LogoKindTeam} {
+		logo := &storage.Logo{EntityID: uuid.New(), PNG: []byte("png-bytes"), SHA256: strings.Repeat("ab", 32), Width: 16, Height: 16, UpdatedBy: "tester"}
+		if err := repo.Upsert(t.Context(), kind, logo); !errors.Is(err, storage.ErrNotFound) {
+			t.Errorf("%s: Upsert for a missing owner = %v, want ErrNotFound", kind, err)
+		}
+	}
+}

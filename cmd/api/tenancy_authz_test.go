@@ -47,12 +47,17 @@ func newTenancyWriteAuthzApp(res auth.Resolver) *fiber.App {
 	v1.Post("/environments", auth.Require(auth.PermTeamEdit, res), leak)
 	v1.Put("/environments/:id", auth.Require(auth.PermTeamEdit, res), leak)
 	v1.Delete("/environments/:id", auth.Require(auth.PermTeamEdit, res), leak)
+	v1.Put("/projects/:id/logo", auth.Require(auth.PermTeamEdit, res), leak)
+	v1.Delete("/projects/:id/logo", auth.Require(auth.PermTeamEdit, res), leak)
+	v1.Put("/teams/:id/logo", auth.Require(auth.PermTeamEdit, res), leak)
+	v1.Delete("/teams/:id/logo", auth.Require(auth.PermTeamEdit, res), leak)
 	// A representative read stays open (no gate) so we don't over-claim.
 	v1.Get("/projects", leak)
 	return app
 }
 
-// API-04: project + environment mutation routes must require team.edit.
+// API-04: project + environment mutation routes, and the project and
+// team logo writes, must require team.edit.
 // Prove-by-revert: dropping auth.Require(PermTeamEdit) turns the no-perm
 // cases from 403 into "reachable".
 func TestTenancyWrites_RequireTeamEdit(t *testing.T) {
@@ -71,6 +76,10 @@ func TestTenancyWrites_RequireTeamEdit(t *testing.T) {
 		{http.MethodPost, "/api/v1/environments"},
 		{http.MethodPut, "/api/v1/environments/" + envID},
 		{http.MethodDelete, "/api/v1/environments/" + envID},
+		{http.MethodPut, "/api/v1/projects/" + envID + "/logo"},
+		{http.MethodDelete, "/api/v1/projects/" + envID + "/logo"},
+		{http.MethodPut, "/api/v1/teams/" + envID + "/logo"},
+		{http.MethodDelete, "/api/v1/teams/" + envID + "/logo"},
 	}
 	for _, w := range writes {
 		if got := statusOf(t, app, w.method, w.path, nil); got != http.StatusUnauthorized {
