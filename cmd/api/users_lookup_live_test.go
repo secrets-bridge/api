@@ -59,6 +59,19 @@ func TestLive_UserLookup(t *testing.T) {
 	if code, _, body := lookup(other, "q=alice"); code != http.StatusForbidden {
 		t.Errorf("without user_role.edit or team.edit = %d %s; want 403", code, body)
 	}
+	// A team- or project-scoped grant of either permission must not open
+	// the directory: the users aren't tenancy-scoped, so only a global
+	// grant counts. The 403 body must carry no user data.
+	scopedTeam := l.grantUser(t, []string{"team.edit"}, `{"team_id":"`+uuid.NewString()+`"}`)
+	scopedGrant := l.grantUser(t, []string{"user_role.edit"}, `{"project_id":"`+uuid.NewString()+`"}`)
+	for name, u := range map[string]string{"scoped team.edit": scopedTeam, "scoped user_role.edit": scopedGrant} {
+		for _, q := range []string{"q=alice", "ids=" + alice} {
+			code, users, body := lookup(u, q)
+			if code != http.StatusForbidden || len(users) != 0 || strings.Contains(body, "@example.com") {
+				t.Errorf("%s ?%s = %d %s; want 403 with no user data", name, q[:min(len(q), 8)], code, body)
+			}
+		}
+	}
 
 	// ids: unknown and non-UUID ids are skipped; only four fields.
 	ids := url.QueryEscape(alice + "," + uuid.NewString() + ",alice-legacy-id")

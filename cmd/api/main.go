@@ -843,7 +843,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// Admin user lookup (api#240): names and emails for the user ids in
 	// team members and role assignments, and a search for the grant and
 	// member forms. Gated on the permissions that manage those lists.
-	v1.Get("/users", auth.RequireAnyOf(rbacResolver, auth.PermUserRoleEdit, auth.PermTeamEdit),
+	v1.Get("/users", auth.RequireAnyOfGlobal(rbacResolver, auth.PermUserRoleEdit, auth.PermTeamEdit),
 		handlers.NewUsers(localUsersRepoInApp).Lookup)
 
 	v1.Post("/workflows", auth.Require(auth.PermWorkflowEdit, rbacResolver), adminH.CreateWorkflow)
