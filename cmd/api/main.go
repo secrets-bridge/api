@@ -669,6 +669,13 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		logger.Warn("INSECURE: X-User-Id header identity is ENABLED (SB_ALLOW_INSECURE_HEADER_AUTH=true) — never set this on a routable deployment")
 	}
 
+	// What an account waiting for approval may still do.
+	pendingAllowed := map[string]bool{
+		"GET /api/v1/users/me":          true,
+		"POST /api/v1/auth/logout":      true,
+		"POST /api/v1/auth/oidc/logout": true,
+	}
+
 	v1Middlewares := []any{
 		// API-S-20: nothing under /api/v1 may be cached by a browser or a
 		// proxy. Wraps, reveal values, tokens, agent credentials, DEKs and
@@ -691,6 +698,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		// Every route under that prefix carries its own auth (AgentAuth,
 		// or auth.Require on /agents/:id/revoke), so the exemption is safe.
 		middleware.RequireAuthedExcept(publicV1Paths, "/api/v1/agents/"),
+		// An account waiting for an admin's approval (api#266) may only
+		// read /users/me and sign out; everything else is 403
+		// account_pending_approval. Group-level for the same reason as
+		// the gate above: a new route can't forget about it.
+		middleware.RequireApprovedExcept(publicV1Paths, pendingAllowed),
 		middleware.RBAC(),
 		middleware.Audit(logger),
 	}
@@ -874,6 +886,13 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// member forms. Gated on the permissions that manage those lists.
 	v1.Get("/users", auth.RequireAnyOfGlobal(rbacResolver, auth.PermUserRoleEdit, auth.PermTeamEdit),
 		handlers.NewUsers(localUsersRepoInApp).Lookup)
+
+	// Accounts waiting for an admin's approval (api#266). Approving
+	// grants a role, so all three need a global user_role.edit.
+	approvalsH := handlers.NewUserApprovals(localUsersRepoInApp, auditRepo)
+	v1.Get("/users/pending", auth.Require(auth.PermUserRoleEdit, rbacResolver), approvalsH.ListPending)
+	v1.Post("/users/:id/approve", auth.Require(auth.PermUserRoleEdit, rbacResolver), approvalsH.Approve)
+	v1.Post("/users/:id/decline", auth.Require(auth.PermUserRoleEdit, rbacResolver), approvalsH.Decline)
 
 	v1.Post("/workflows", auth.Require(auth.PermWorkflowEdit, rbacResolver), adminH.CreateWorkflow)
 	v1.Get("/workflows", adminH.ListWorkflows)

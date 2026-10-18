@@ -144,6 +144,11 @@ const SessionCookieName = "sb_session"
 // paths.
 const CtxKeySessionID ctxKey = "session_id"
 
+// CtxKeyPendingApproval is true when the request's session belongs to
+// an account still waiting for an admin's approval. AuthWith sets it;
+// RequireApprovedExcept enforces it.
+const CtxKeyPendingApproval ctxKey = "pending_approval"
+
 // Auth resolves the request actor identity.
 //
 // Resolution order (Slice A2 adds the cookie branch at the front):
@@ -206,6 +211,9 @@ func AuthWith(verifier TokenVerifier, sessions SessionLooker) fiber.Handler {
 		if session != nil {
 			ctx = context.WithValue(ctx, CtxKeySessionID, session.ID.String())
 			ctx = context.WithValue(ctx, CtxKeySession, session)
+			if session.UserPending {
+				ctx = context.WithValue(ctx, CtxKeyPendingApproval, true)
+			}
 		}
 		c.SetContext(ctx)
 		return c.Next()
@@ -261,6 +269,25 @@ func RequireAuthedExcept(public map[string]bool, publicPrefixes ...string) fiber
 			return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
 		}
 		return c.Next()
+	}
+}
+
+// RequireApprovedExcept stops an account that is waiting for an admin's
+// approval at the group level: it may use the public paths and the
+// "METHOD /path" entries in allowed (reading /users/me and signing out),
+// and every other request gets 403 account_pending_approval. Like
+// RequireAuthedExcept, a route that forgets about waiting accounts is
+// covered here rather than left open to them. Bearer tokens of waiting
+// accounts are refused earlier, in AuthService.SubjectFromToken.
+func RequireApprovedExcept(public map[string]bool, allowed map[string]bool) fiber.Handler {
+	return func(c fiber.Ctx) error {
+		if pending, _ := c.Context().Value(CtxKeyPendingApproval).(bool); !pending {
+			return c.Next()
+		}
+		if public[c.Path()] || allowed[c.Method()+" "+c.Path()] {
+			return c.Next()
+		}
+		return fiber.NewError(fiber.StatusForbidden, "account_pending_approval")
 	}
 }
 

@@ -40,6 +40,11 @@ type Session struct {
 	// time. Only GetByTokenHash fills it (same round trip, PK join);
 	// SessionService.Validate refuses the session when it is true.
 	UserDisabled bool
+	// UserPending is the owning local_users.pending_approval flag,
+	// filled the same way. The session stays valid, but the auth
+	// middleware marks the request so RequireApprovedExcept limits it
+	// to /users/me and sign-out.
+	UserPending bool
 }
 
 // SessionRepository is the public surface.
@@ -102,7 +107,7 @@ func (r *Sessions) GetByTokenHash(ctx context.Context, tokenHash []byte) (*Sessi
 	const q = `
 		SELECT s.id, s.user_id, s.token_hash, s.created_at, s.expires_at, s.idle_expires_at,
 		       s.last_mfa_at, s.revoked_at, COALESCE(s.ip, ''), COALESCE(s.user_agent, ''),
-		       u.disabled
+		       u.disabled, u.pending_approval
 		FROM sessions s
 		JOIN local_users u ON u.id = s.user_id
 		WHERE s.token_hash = $1`
@@ -110,7 +115,7 @@ func (r *Sessions) GetByTokenHash(ctx context.Context, tokenHash []byte) (*Sessi
 	if err := r.pool.QueryRow(ctx, q, tokenHash).Scan(
 		&s.ID, &s.UserID, &s.TokenHash, &s.CreatedAt, &s.ExpiresAt, &s.IdleExpiresAt,
 		&s.LastMFAAt, &s.RevokedAt, &s.IP, &s.UserAgent,
-		&s.UserDisabled,
+		&s.UserDisabled, &s.UserPending,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound

@@ -487,3 +487,26 @@ func TestSubjectFromToken_RefusesDisabledAndUnknownUsers(t *testing.T) {
 		t.Fatal("SubjectFromToken accepted a deleted user's token")
 	}
 }
+
+// api#266: an account waiting for approval may only read /users/me and
+// sign out with a session; its bearer tokens are refused.
+func TestSubjectFromToken_RefusesPendingUsers(t *testing.T) {
+	svc, pool := bootstrapAuth(t)
+	ctx := t.Context()
+	repo := storage.NewLocalUsers(pool)
+	mustCreateUser(t, repo, "pat@example.com", "pw-p")
+
+	res, err := svc.Login(ctx, "pat@example.com", []byte("pw-p"))
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if _, err := svc.SubjectFromToken(ctx, res.Token); err != nil {
+		t.Fatalf("SubjectFromToken before: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE local_users SET pending_approval = TRUE WHERE id = $1`, res.User.ID); err != nil {
+		t.Fatalf("mark pending: %v", err)
+	}
+	if _, err := svc.SubjectFromToken(ctx, res.Token); err == nil {
+		t.Fatal("SubjectFromToken accepted a waiting account's token")
+	}
+}

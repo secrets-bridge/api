@@ -16,6 +16,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -41,8 +42,12 @@ type LocalUser struct {
 	Disabled         bool
 	FailedLoginCount int
 	LockedUntil      *time.Time
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	// PendingApproval is set while the account waits for an admin's
+	// approval (migration 0041). Such an account may only read
+	// /users/me and sign out.
+	PendingApproval bool
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 // ErrLocalUserExists signals an email collision (unique-violation
@@ -113,12 +118,12 @@ func (r *LocalUsers) Create(ctx context.Context, u *LocalUser) error {
 	u.Email = strings.ToLower(strings.TrimSpace(u.Email))
 
 	const q = `
-		INSERT INTO local_users (id, email, password_hash, display_name, disabled)
+		INSERT INTO local_users (id, email, password_hash, display_name, disabled, pending_approval)
 		VALUES (COALESCE(NULLIF($1, '00000000-0000-0000-0000-000000000000'::uuid), gen_random_uuid()),
-		        $2, $3, $4, $5)
+		        $2, $3, $4, $5, $6)
 		RETURNING id, created_at, updated_at`
 	if err := r.pool.QueryRow(ctx, q,
-		u.ID, u.Email, u.PasswordHash, u.DisplayName, u.Disabled,
+		u.ID, u.Email, u.PasswordHash, u.DisplayName, u.Disabled, u.PendingApproval,
 	).Scan(&u.ID, &u.CreatedAt, &u.UpdatedAt); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -131,7 +136,7 @@ func (r *LocalUsers) Create(ctx context.Context, u *LocalUser) error {
 
 func (r *LocalUsers) Get(ctx context.Context, id uuid.UUID) (*LocalUser, error) {
 	const q = `SELECT id, email, password_hash, display_name, disabled,
-	                  failed_login_count, locked_until, created_at, updated_at
+	                  failed_login_count, locked_until, pending_approval, created_at, updated_at
 	           FROM local_users WHERE id = $1`
 	return r.scan(ctx, q, id)
 }
@@ -139,7 +144,7 @@ func (r *LocalUsers) Get(ctx context.Context, id uuid.UUID) (*LocalUser, error) 
 func (r *LocalUsers) GetByEmail(ctx context.Context, email string) (*LocalUser, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	const q = `SELECT id, email, password_hash, display_name, disabled,
-	                  failed_login_count, locked_until, created_at, updated_at
+	                  failed_login_count, locked_until, pending_approval, created_at, updated_at
 	           FROM local_users WHERE email = $1`
 	return r.scan(ctx, q, email)
 }
@@ -148,7 +153,7 @@ func (r *LocalUsers) scan(ctx context.Context, q string, arg any) (*LocalUser, e
 	var u LocalUser
 	if err := r.pool.QueryRow(ctx, q, arg).Scan(
 		&u.ID, &u.Email, &u.PasswordHash, &u.DisplayName, &u.Disabled,
-		&u.FailedLoginCount, &u.LockedUntil,
+		&u.FailedLoginCount, &u.LockedUntil, &u.PendingApproval,
 		&u.CreatedAt, &u.UpdatedAt,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -161,7 +166,7 @@ func (r *LocalUsers) scan(ctx context.Context, q string, arg any) (*LocalUser, e
 
 func (r *LocalUsers) List(ctx context.Context) ([]*LocalUser, error) {
 	const q = `SELECT id, email, password_hash, display_name, disabled,
-	                  failed_login_count, locked_until, created_at, updated_at
+	                  failed_login_count, locked_until, pending_approval, created_at, updated_at
 	           FROM local_users
 	           ORDER BY email ASC`
 	rows, err := r.pool.Query(ctx, q)
@@ -174,7 +179,7 @@ func (r *LocalUsers) List(ctx context.Context) ([]*LocalUser, error) {
 		var u LocalUser
 		if err := rows.Scan(
 			&u.ID, &u.Email, &u.PasswordHash, &u.DisplayName, &u.Disabled,
-			&u.FailedLoginCount, &u.LockedUntil,
+			&u.FailedLoginCount, &u.LockedUntil, &u.PendingApproval,
 			&u.CreatedAt, &u.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("storage: scan local user: %w", err)
@@ -375,4 +380,127 @@ func (r *LocalUsers) lookup(ctx context.Context, q string, arg any, limit int) (
 		out = append(out, u)
 	}
 	return out, rows.Err()
+}
+
+// ErrNotPending is returned by ApprovePending and DeclinePending when the
+// account is not waiting for approval (never was, already approved or
+// declined, or disabled).
+var ErrNotPending = errors.New("storage: local user is not waiting for approval")
+
+// LocalUserPendingMax caps how many waiting accounts ListPending returns.
+const LocalUserPendingMax = 100
+
+// ListPending returns the accounts waiting for approval, oldest first
+// (at most limit, capped at LocalUserPendingMax), and how many are
+// waiting in all. Disabled accounts are left out: a declined account
+// stays pending_approval but is disabled. Only id, email, display name
+// and created_at are read.
+func (r *LocalUsers) ListPending(ctx context.Context, limit int) ([]*LocalUser, int, error) {
+	if limit <= 0 || limit > LocalUserPendingMax {
+		limit = LocalUserPendingMax
+	}
+	var total int
+	if err := r.pool.QueryRow(ctx,
+		`SELECT count(*) FROM local_users WHERE pending_approval AND NOT disabled`).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("storage: count pending local users: %w", err)
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, email, display_name, created_at
+		FROM local_users
+		WHERE pending_approval AND NOT disabled
+		ORDER BY created_at ASC, id ASC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, 0, fmt.Errorf("storage: list pending local users: %w", err)
+	}
+	defer rows.Close()
+	out := []*LocalUser{}
+	for rows.Next() {
+		u := &LocalUser{PendingApproval: true}
+		if err := rows.Scan(&u.ID, &u.Email, &u.DisplayName, &u.CreatedAt); err != nil {
+			return nil, 0, fmt.Errorf("storage: scan pending local user: %w", err)
+		}
+		out = append(out, u)
+	}
+	return out, total, rows.Err()
+}
+
+// ApprovePending clears an account's pending_approval and grants it ur
+// (ur.UserID is set from id) in one transaction, so an approved account
+// never exists without the role it was approved with, and a failed
+// grant leaves it waiting. ErrNotPending when the account isn't
+// waiting, ErrNotFound when it or the role doesn't exist.
+func (r *LocalUsers) ApprovePending(ctx context.Context, id uuid.UUID, ur *UserRole) error {
+	if ur == nil || ur.RoleID == uuid.Nil {
+		return errors.New("storage: a role is required to approve an account")
+	}
+	if ur.Scope == nil {
+		ur.Scope = map[string]any{}
+	}
+	scope, err := json.Marshal(ur.Scope)
+	if err != nil {
+		return fmt.Errorf("storage: marshal user_role scope: %w", err)
+	}
+	ur.UserID = id.String()
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("storage: begin approve: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE local_users SET pending_approval = FALSE
+		WHERE id = $1 AND pending_approval AND NOT disabled`, id)
+	if err != nil {
+		return fmt.Errorf("storage: approve local user: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM local_users WHERE id = $1)`, id).Scan(&exists); err != nil {
+			return fmt.Errorf("storage: approve local user: %w", err)
+		}
+		if !exists {
+			return ErrNotFound
+		}
+		return ErrNotPending
+	}
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO user_roles (user_id, role_id, scope, granted_by)
+		VALUES ($1, $2, $3, NULLIF($4, ''))
+		RETURNING id, granted_at`, ur.UserID, ur.RoleID, scope, ur.GrantedBy).Scan(&ur.ID, &ur.GrantedAt); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" { // foreign_key_violation: no such role
+			return ErrNotFound
+		}
+		return fmt.Errorf("storage: grant on approve: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("storage: commit approve: %w", err)
+	}
+	return nil
+}
+
+// DeclinePending disables an account that is waiting for approval. It
+// leaves pending_approval set, so re-enabling the account later still
+// needs an approval. It never touches an account that isn't waiting:
+// ErrNotPending then, ErrNotFound when the account doesn't exist.
+func (r *LocalUsers) DeclinePending(ctx context.Context, id uuid.UUID) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE local_users SET disabled = TRUE
+		WHERE id = $1 AND pending_approval AND NOT disabled`, id)
+	if err != nil {
+		return fmt.Errorf("storage: decline local user: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	var exists bool
+	if err := r.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM local_users WHERE id = $1)`, id).Scan(&exists); err != nil {
+		return fmt.Errorf("storage: decline local user: %w", err)
+	}
+	if !exists {
+		return ErrNotFound
+	}
+	return ErrNotPending
 }
