@@ -65,3 +65,5 @@ go test -race -count=1 -p 1 ./...
 Feature branch off `main`, conventional commits, small PRs, CI green, then open a PR for maintainer review. Never push to `main`.
 
 This repo is public. Keep account IDs, hostnames, cluster names, real secret paths and company names out of code, tests, commits, PRs and issues. Use placeholders such as `123456789012`, `vault.example.com` and `tenant-a-uat`.
+
+**No AI attribution.** Commits and PRs describe the change, nothing else. Don't add `Co-Authored-By` trailers for AI assistants, "Generated with ..." lines or links to AI sessions to commit messages, PR titles or PR bodies. A squash merge copies the PR body into the commit on `main`, where it can't be edited later. If you use a coding assistant, turn off its commit and PR attribution in its settings.
