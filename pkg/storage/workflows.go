@@ -80,11 +80,21 @@ type WorkflowRepository interface {
 var ErrWorkflowInUse = errors.New("storage: workflow in use")
 
 // WorkflowUsage is what referenced a workflow when Delete looked.
-// PolicyRuleIDs lists the rules, which a successful Delete with
-// deletePolicyRules removed along with the workflow.
+// PolicyRules are the rules routing to it, read with their rows locked,
+// so a successful Delete with deletePolicyRules removed exactly these
+// along with the workflow.
 type WorkflowUsage struct {
-	Requests      int
-	PolicyRuleIDs []uuid.UUID
+	Requests    int
+	PolicyRules []*PolicyRule
+}
+
+// PolicyRuleIDs returns the ids of PolicyRules.
+func (u WorkflowUsage) PolicyRuleIDs() []uuid.UUID {
+	ids := make([]uuid.UUID, 0, len(u.PolicyRules))
+	for _, p := range u.PolicyRules {
+		ids = append(ids, p.ID)
+	}
+	return ids
 }
 
 // Workflows is the Postgres implementation.
@@ -273,7 +283,9 @@ func (r *Workflows) Update(ctx context.Context, w *WorkflowDefinition) error {
 // to it unless deletePolicyRules is set; then the rules go with it
 // (policy_rules.workflow_id is ON DELETE CASCADE). The counts and the
 // delete run in one transaction with the workflow row locked, which
-// blocks a new request or rule from referencing it in between.
+// blocks a new request or rule from referencing it in between, and the
+// rule rows locked, which blocks one from being pointed elsewhere, so
+// the returned rules are the ones deleted.
 func (r *Workflows) Delete(ctx context.Context, id uuid.UUID, deletePolicyRules bool) (WorkflowUsage, error) {
 	var u WorkflowUsage
 	tx, err := r.pool.Begin(ctx)
@@ -297,15 +309,23 @@ func (r *Workflows) Delete(ctx context.Context, id uuid.UUID, deletePolicyRules 
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM access_requests WHERE workflow_id = $1`, id).Scan(&u.Requests); err != nil {
 		return u, fmt.Errorf("storage: count workflow requests: %w", err)
 	}
-	rows, err := tx.Query(ctx, `SELECT id FROM policy_rules WHERE workflow_id = $1 ORDER BY id`, id)
+	rows, err := tx.Query(ctx, policySelect+` WHERE workflow_id = $1 ORDER BY id FOR UPDATE`, id)
 	if err != nil {
 		return u, fmt.Errorf("storage: list workflow policy rules: %w", err)
 	}
-	u.PolicyRuleIDs, err = pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
-	if err != nil {
-		return u, fmt.Errorf("storage: scan workflow policy rules: %w", err)
+	for rows.Next() {
+		p, err := scanPolicy(rows)
+		if err != nil {
+			rows.Close()
+			return u, fmt.Errorf("storage: scan workflow policy rules: %w", err)
+		}
+		u.PolicyRules = append(u.PolicyRules, p)
 	}
-	if u.Requests > 0 || (len(u.PolicyRuleIDs) > 0 && !deletePolicyRules) {
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return u, fmt.Errorf("storage: list workflow policy rules: %w", err)
+	}
+	if u.Requests > 0 || (len(u.PolicyRules) > 0 && !deletePolicyRules) {
 		return u, ErrWorkflowInUse
 	}
 

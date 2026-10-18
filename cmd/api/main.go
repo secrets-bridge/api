@@ -885,7 +885,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		adminH.ListScopedAuthorableWorkflows)
 	v1.Get("/workflows/:id", adminH.GetWorkflow)
 	v1.Put("/workflows/:id", auth.Require(auth.PermWorkflowEdit, rbacResolver), adminH.UpdateWorkflow)
-	v1.Delete("/workflows/:id", auth.Require(auth.PermWorkflowEdit, rbacResolver), adminH.DeleteWorkflow)
+	// ?delete_policy_rules=true deletes the rules routing to it as well,
+	// so it also needs policy.edit, like every other rule delete.
+	v1.Delete("/workflows/:id", auth.Require(auth.PermWorkflowEdit, rbacResolver),
+		auth.RequireWhen(handlers.DeletesPolicyRules, auth.Require(auth.PermPolicyEdit, rbacResolver)),
+		adminH.DeleteWorkflow)
 
 	v1.Post("/policies", auth.Require(auth.PermPolicyEdit, rbacResolver), adminH.CreatePolicy)
 	v1.Get("/policies", adminH.ListPolicies)

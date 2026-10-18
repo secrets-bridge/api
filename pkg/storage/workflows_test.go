@@ -152,7 +152,7 @@ func TestWorkflows_Delete_RefusesWhileInUse(t *testing.T) {
 
 	// Unused: deleted, nothing reported.
 	free := makeWorkflowForAuthorableTest(t, repo, "wf-free"+sfx, true, false)
-	if u, err := repo.Delete(ctx, free.ID, false); err != nil || u.Requests != 0 || len(u.PolicyRuleIDs) != 0 {
+	if u, err := repo.Delete(ctx, free.ID, false); err != nil || u.Requests != 0 || len(u.PolicyRules) != 0 {
 		t.Fatalf("Delete unused = %+v, %v; want deleted with no usage", u, err)
 	}
 
@@ -165,13 +165,13 @@ func TestWorkflows_Delete_RefusesWhileInUse(t *testing.T) {
 		t.Fatalf("seed rule: %v", err)
 	}
 	u, err := repo.Delete(ctx, ruled.ID, false)
-	if !errors.Is(err, storage.ErrWorkflowInUse) || len(u.PolicyRuleIDs) != 1 || u.PolicyRuleIDs[0] != ruleID {
+	if !errors.Is(err, storage.ErrWorkflowInUse) || len(u.PolicyRules) != 1 || u.PolicyRules[0].ID != ruleID {
 		t.Fatalf("Delete with a rule = %+v, %v; want ErrWorkflowInUse naming the rule", u, err)
 	}
 	if _, err := repo.Get(ctx, ruled.ID); err != nil {
 		t.Fatalf("refused delete removed the workflow: %v", err)
 	}
-	if u, err := repo.Delete(ctx, ruled.ID, true); err != nil || len(u.PolicyRuleIDs) != 1 {
+	if u, err := repo.Delete(ctx, ruled.ID, true); err != nil || len(u.PolicyRules) != 1 {
 		t.Fatalf("Delete with deletePolicyRules = %+v, %v; want deleted", u, err)
 	}
 	var left int
