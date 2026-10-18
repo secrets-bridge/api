@@ -28,6 +28,39 @@ on `main`.
 - `pkg/keymgmt.FromEnv(ctx)` now takes a second `env` argument so the
   resolver can reject `BackendLocal` outside dev. Sole caller
   (`cmd/api/main.go`) updated.
+- Security batch, October 2026. Behaviour callers and operators see:
+  - OIDC login needs an `email` claim with `email_verified: true`, or
+    it answers 401. Disabled users are refused on every path (#197).
+  - Cross-team submit needs the source `project_id` and environment,
+    and a `requester_id` in a submit body is ignored. Verify votes go
+    source first, then security (409 `cross_team_vote_out_of_turn`), and
+    fill rejects undeclared keys (#198).
+  - Adding or removing an MFA factor needs a fresh step-up once a factor
+    exists. MFA endpoints answer 429 when locked or rate limited and 503
+    when Redis is down (#199).
+  - Internal errors return fixed messages (`POST /jobs` and TOTP enroll
+    failures are 500, not 400), `/readyz` no longer echoes driver
+    errors, every `/api/v1` response is `Cache-Control: no-store`, and
+    `http://` ArgoCD endpoints are refused outside `SB_ENV=dev` unless
+    `SB_ALLOW_INSECURE_ARGOCD_ADDR=true` (#203).
+  - Admin PUTs are partial updates: a missing key keeps the stored
+    value, send `""` or `null` to clear. A grant with a malformed scope
+    grants nothing. Project-scoped reads answer 404 without coverage
+    (#206).
+  - A request's `target_provider_config` body field is ignored. The job
+    gets its provider config from the bound catalog row. Direct reveal,
+    read and patch need a binding that governs the environment, and
+    approve fails a request whose binding no longer governs it, with no
+    job (#201).
+  - Agent wraps and discovery are scoped to the agent that claimed the
+    job and to its bound connection. Discovery on a disabled connection
+    is refused (#202).
+  - Request status changes are conditional, so the loser of a race
+    gets 409. Wraps are never extended, and a request past its
+    `request_ttl` answers 410 `request_expired` on approve, verify or
+    fill (#205).
+  - `docker-compose.yml` binds every port to 127.0.0.1 and the api reads
+    `SB_WRAP_MASTER_KEY` and `SB_JWT_SECRET` from the shell (#204).
 
 ---
 
