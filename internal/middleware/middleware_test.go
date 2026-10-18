@@ -1,7 +1,10 @@
 package middleware
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"log/slog"
 	"net/http/httptest"
 	"testing"
 
@@ -103,5 +106,32 @@ func TestContextKey_AccessibleViaStdContext(t *testing.T) {
 	got, _ := parent.Value(marker{}).(string)
 	if got != "ok" {
 		t.Fatalf("baseline context lookup broke: %q", got)
+	}
+}
+
+// The audit stub reads the response status after c.Next() like Logger
+// does, so it must see the status of a returned error too (api#248).
+func TestAudit_LogsStatusOfReturnedError(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	app := fiber.New()
+	app.Use(Audit(logger))
+	app.Get("/x", func(c fiber.Ctx) error { return fiber.NewError(fiber.StatusForbidden, "denied") })
+
+	resp, err := app.Test(httptest.NewRequest("GET", "/x", nil))
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusForbidden {
+		t.Fatalf("response status = %d, want 403", resp.StatusCode)
+	}
+	var line struct {
+		Status int `json:"status"`
+	}
+	if err := json.Unmarshal(logs.Bytes(), &line); err != nil {
+		t.Fatalf("decode audit_stub line %q: %v", logs.String(), err)
+	}
+	if line.Status != fiber.StatusForbidden {
+		t.Fatalf("audit_stub status = %d, want 403", line.Status)
 	}
 }
