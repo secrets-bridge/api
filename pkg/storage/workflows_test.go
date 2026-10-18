@@ -5,6 +5,7 @@
 package storage_test
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -137,5 +138,68 @@ func TestWorkflows_ListScopedPolicyAuthorable_FiltersToEnabledAndAuthorable(t *t
 		if !w.ScopedPolicyAuthorable {
 			t.Fatalf("not-authorable workflow leaked: %s", w.Name)
 		}
+	}
+}
+
+// api#239: Delete refuses a workflow that requests or policy rules still
+// reference, and deletes the rules with it only when asked.
+func TestWorkflows_Delete_RefusesWhileInUse(t *testing.T) {
+	pool := freshDB(t)
+	ctx := t.Context()
+	repo := storage.NewWorkflows(pool)
+	// freshDB doesn't clear workflows, so names carry a per-run suffix.
+	sfx := "-" + uuid.NewString()[:8]
+
+	// Unused: deleted, nothing reported.
+	free := makeWorkflowForAuthorableTest(t, repo, "wf-free"+sfx, true, false)
+	if u, err := repo.Delete(ctx, free.ID, false); err != nil || u.Requests != 0 || len(u.PolicyRuleIDs) != 0 {
+		t.Fatalf("Delete unused = %+v, %v; want deleted with no usage", u, err)
+	}
+
+	// A policy rule routes to it: refused unless deletePolicyRules.
+	ruled := makeWorkflowForAuthorableTest(t, repo, "wf-ruled"+sfx, true, false)
+	var ruleID uuid.UUID
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO policy_rules (name, selector, workflow_id, priority) VALUES ('r', '{}'::jsonb, $1, 10) RETURNING id`,
+		ruled.ID).Scan(&ruleID); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	u, err := repo.Delete(ctx, ruled.ID, false)
+	if !errors.Is(err, storage.ErrWorkflowInUse) || len(u.PolicyRuleIDs) != 1 || u.PolicyRuleIDs[0] != ruleID {
+		t.Fatalf("Delete with a rule = %+v, %v; want ErrWorkflowInUse naming the rule", u, err)
+	}
+	if _, err := repo.Get(ctx, ruled.ID); err != nil {
+		t.Fatalf("refused delete removed the workflow: %v", err)
+	}
+	if u, err := repo.Delete(ctx, ruled.ID, true); err != nil || len(u.PolicyRuleIDs) != 1 {
+		t.Fatalf("Delete with deletePolicyRules = %+v, %v; want deleted", u, err)
+	}
+	var left int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM policy_rules WHERE id = $1`, ruleID).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("rule left after cascade delete: %d, %v", left, err)
+	}
+
+	// A request used it: refused even with deletePolicyRules.
+	used := makeWorkflowForAuthorableTest(t, repo, "wf-used"+sfx, true, false)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO access_requests (requester_id, type, status, justification, workflow_id, target_provider_type, target_secret_ref, target_keys)
+		 VALUES ('alice', 'patch', 'executed', 'test', $1, 'vault', 'secret/data/x', '["K"]')`, used.ID); err != nil {
+		t.Fatalf("seed request: %v", err)
+	}
+	u, err = repo.Delete(ctx, used.ID, true)
+	if !errors.Is(err, storage.ErrWorkflowInUse) || u.Requests != 1 {
+		t.Fatalf("Delete used by a request = %+v, %v; want ErrWorkflowInUse with 1 request", u, err)
+	}
+
+	// System and missing rows keep their errors.
+	var sysID uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT id FROM workflow_definitions WHERE is_system = true LIMIT 1`).Scan(&sysID); err != nil {
+		t.Fatalf("system workflow: %v", err)
+	}
+	if _, err := repo.Delete(ctx, sysID, true); !errors.Is(err, storage.ErrSystemRow) {
+		t.Fatalf("Delete system = %v; want ErrSystemRow", err)
+	}
+	if _, err := repo.Delete(ctx, uuid.New(), false); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("Delete missing = %v; want ErrNotFound", err)
 	}
 }

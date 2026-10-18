@@ -177,7 +177,9 @@ func (fakeWorkflowsForHandler) ListScopedPolicyAuthorable(
 func (fakeWorkflowsForHandler) Update(context.Context, *storage.WorkflowDefinition) error {
 	panic("unused")
 }
-func (fakeWorkflowsForHandler) Delete(context.Context, uuid.UUID) error { panic("unused") }
+func (fakeWorkflowsForHandler) Delete(context.Context, uuid.UUID, bool) (storage.WorkflowUsage, error) {
+	panic("unused")
+}
 
 // ---- project history tests ---------------------------------------
 

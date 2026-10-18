@@ -90,7 +90,9 @@ func (f *fakeWorkflowRepo) ListScopedPolicyAuthorable(context.Context) ([]*stora
 func (f *fakeWorkflowRepo) Update(context.Context, *storage.WorkflowDefinition) error {
 	panic("unused")
 }
-func (f *fakeWorkflowRepo) Delete(context.Context, uuid.UUID) error { panic("unused") }
+func (f *fakeWorkflowRepo) Delete(context.Context, uuid.UUID, bool) (storage.WorkflowUsage, error) {
+	panic("unused")
+}
 
 // ---- helpers -----------------------------------------------------
 

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -351,6 +352,80 @@ func TestWorkflows_DeleteSystemReturns409(t *testing.T) {
 	resp, _ := doJSON(t, app, "DELETE", "/api/v1/workflows/"+sysID.String(), nil)
 	if resp.StatusCode != fiber.StatusConflict {
 		t.Fatalf("expected 409 for system workflow delete, got %d", resp.StatusCode)
+	}
+}
+
+// api#239: a workflow that requests or policy rules reference answers
+// 409 workflow_in_use with counts; delete_policy_rules=true deletes the
+// rules with it and records a policy.delete for each.
+func TestWorkflows_DeleteInUse(t *testing.T) {
+	app, pool, h := bootstrapAdmin(t)
+	h.WithAudit(storage.NewAuditEvents(pool))
+	ctx := t.Context()
+
+	create := func(name string) uuid.UUID {
+		resp, body := doJSON(t, app, "POST", "/api/v1/workflows", sampleWorkflowBody(name))
+		if resp.StatusCode != fiber.StatusCreated {
+			t.Fatalf("create %s: %d %s", name, resp.StatusCode, body)
+		}
+		var w handlers.WorkflowBody
+		_ = json.Unmarshal(body, &w)
+		return w.ID
+	}
+	conflict := func(path string, wantRequests, wantRules float64) string {
+		t.Helper()
+		resp, body := doJSON(t, app, "DELETE", path, nil)
+		var env map[string]any
+		_ = json.Unmarshal(body, &env)
+		if resp.StatusCode != fiber.StatusConflict || env["error_code"] != "workflow_in_use" ||
+			env["requests_count"] != wantRequests || env["policy_rules_count"] != wantRules {
+			t.Fatalf("DELETE %s = %d %s; want 409 workflow_in_use with %v requests and %v rules",
+				path, resp.StatusCode, body, wantRequests, wantRules)
+		}
+		return env["message"].(string)
+	}
+
+	// Rules route to it: refused, then deleted with them on request.
+	ruled := create("wf-ruled")
+	resp, body := doJSON(t, app, "POST", "/api/v1/policies", handlers.PolicyBody{
+		Name: "uses-wf-ruled", Selector: map[string]any{"environment": "uat"}, WorkflowID: ruled, Priority: 400, Enabled: true,
+	})
+	if resp.StatusCode != fiber.StatusCreated {
+		t.Fatalf("create policy: %d %s", resp.StatusCode, body)
+	}
+	var rule handlers.PolicyBody
+	_ = json.Unmarshal(body, &rule)
+	if msg := conflict("/api/v1/workflows/"+ruled.String(), 0, 1); !strings.Contains(msg, "delete_policy_rules=true") {
+		t.Errorf("message %q doesn't say how to proceed", msg)
+	}
+	if resp, body := doJSON(t, app, "DELETE", "/api/v1/workflows/"+ruled.String()+"?delete_policy_rules=true", nil); resp.StatusCode != fiber.StatusNoContent {
+		t.Fatalf("DELETE with delete_policy_rules: %d %s", resp.StatusCode, body)
+	}
+	if resp, _ := doJSON(t, app, "GET", "/api/v1/policies/"+rule.ID.String(), nil); resp.StatusCode != fiber.StatusNotFound {
+		t.Fatalf("policy survived its workflow: %d", resp.StatusCode)
+	}
+	var policyDeletes int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_events WHERE action = 'policy.delete' AND metadata->>'policy_rule_id' = $1`,
+		rule.ID.String()).Scan(&policyDeletes); err != nil || policyDeletes != 1 {
+		t.Fatalf("policy.delete events for the cascaded rule = %d, %v; want 1", policyDeletes, err)
+	}
+	var recorded string
+	if err := pool.QueryRow(ctx,
+		`SELECT metadata->>'deleted_policy_rule_ids' FROM audit_events WHERE action = 'workflow.delete'`).Scan(&recorded); err != nil ||
+		!strings.Contains(recorded, rule.ID.String()) {
+		t.Fatalf("workflow.delete metadata = %q, %v; want the deleted rule id", recorded, err)
+	}
+
+	// A request used it: refused even with delete_policy_rules.
+	used := create("wf-used")
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO access_requests (requester_id, type, status, justification, workflow_id, target_provider_type, target_secret_ref, target_keys)
+		 VALUES ('alice', 'patch', 'executed', 'test', $1, 'vault', 'secret/data/x', '["K"]')`, used); err != nil {
+		t.Fatalf("seed request: %v", err)
+	}
+	if msg := conflict("/api/v1/workflows/"+used.String()+"?delete_policy_rules=true", 1, 0); !strings.Contains(msg, "disable it instead") {
+		t.Errorf("message %q doesn't point at disabling", msg)
 	}
 }
 
