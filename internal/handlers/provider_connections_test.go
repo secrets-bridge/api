@@ -120,10 +120,11 @@ func testAuthMW(c fiber.Ctx) error {
 // userID. Tests reset `grants` before each call.
 type stubResolver struct {
 	grants []auth.Grant
+	err    error // when set, Resolve fails with it
 }
 
 func (s *stubResolver) Resolve(_ context.Context, _ string) ([]auth.Grant, error) {
-	return s.grants, nil
+	return s.grants, s.err
 }
 
 // Module-level pointer so the per-test bootstrap can re-aim the
