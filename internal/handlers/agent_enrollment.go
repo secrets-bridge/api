@@ -6,6 +6,7 @@ package handlers
 import (
 	"errors"
 	"fmt"
+	"regexp"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
@@ -89,6 +90,21 @@ const (
 	agentEnrollSecret = "secrets-bridge-agent-enroll"
 )
 
+// hintValueRe is what a connection or request value may hold to go into
+// the hint as typed. The hint is pasted into a shell, and helm splits a
+// --set on commas, so a scope value like "kv,cp.endpoint=https://..."
+// would add settings of its own. Scope values are free text (address
+// and endpoint only pass url.Parse, which takes "$(...)" in a path).
+var hintValueRe = regexp.MustCompile(`^[A-Za-z0-9._:/@%+-]+$`)
+
+// hintValue returns v when it is safe to paste, else the placeholder.
+func hintValue(v, placeholder string) string {
+	if !hintValueRe.MatchString(v) {
+		return placeholder
+	}
+	return v
+}
+
 // enrollmentInstallHint returns copy-paste commands for a new token:
 //
 //   - kubectl: the Secret the agent chart reads the token from;
@@ -96,10 +112,11 @@ const (
 //   - cli: the agent binary's environment, to run it outside the chart.
 //
 // Only kubectl and cli carry the token. The control plane URL, chart
-// version and anything the connection doesn't say are <placeholders>.
+// version and anything the connection doesn't say are <placeholders>,
+// and so is any value hintValue refuses.
 func enrollmentInstallHint(res *services.GeneratedEnrollmentToken, expectedCluster string) map[string]string {
-	cluster := firstSet(expectedCluster, res.ClusterName, "<cluster-name>")
-	scope := func(k, placeholder string) string { return firstSet(res.Scope[k], placeholder) }
+	cluster := hintValue(firstSet(expectedCluster, res.ClusterName), "<cluster-name>")
+	scope := func(k, placeholder string) string { return hintValue(res.Scope[k], placeholder) }
 
 	sets := []string{
 		"cp.endpoint=<CONTROL_PLANE_URL>",
@@ -112,23 +129,27 @@ func enrollmentInstallHint(res *services.GeneratedEnrollmentToken, expectedClust
 	}
 	switch res.ProviderType {
 	case "vault":
+		mount := "kv"
+		if res.Scope["mount"] != "" {
+			mount = scope("mount", "<kv-mount>")
+		}
 		sets = append(sets,
 			"providers.vault.enabled=true",
 			"providers.vault.addr="+scope("address", "<vault-address>"),
-			"providers.vault.kvMount="+scope("mount", "kv"),
+			"providers.vault.kvMount="+mount,
 			"providers.vault.kubernetesRole=<vault-role>")
-		if ns := res.Scope["namespace"]; ns != "" {
-			sets = append(sets, "providers.vault.namespace="+ns)
+		if res.Scope["namespace"] != "" {
+			sets = append(sets, "providers.vault.namespace="+scope("namespace", "<vault-namespace>"))
 		}
-		if p := res.Scope["kvPrefix"]; p != "" {
-			sets = append(sets, "providers.vault.kvPrefix="+p)
+		if res.Scope["kvPrefix"] != "" {
+			sets = append(sets, "providers.vault.kvPrefix="+scope("kvPrefix", "<kv-prefix>"))
 		}
 	case "aws-sm":
 		sets = append(sets,
 			"providers.awsSecretsManager.enabled=true",
 			"providers.awsSecretsManager.region="+scope("region", "<aws-region>"))
-		if ep := res.Scope["endpoint"]; ep != "" {
-			sets = append(sets, "providers.awsSecretsManager.endpoint="+ep)
+		if res.Scope["endpoint"] != "" {
+			sets = append(sets, "providers.awsSecretsManager.endpoint="+scope("endpoint", "<aws-endpoint>"))
 		}
 	}
 	helm := "helm upgrade --install secrets-bridge-agent " + agentChartRef +
