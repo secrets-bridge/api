@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -286,6 +287,20 @@ func (s *RequestService) failUnboundRequest(ctx context.Context, req *storage.Ac
 	if err := s.requests.TransitionStatus(ctx, req.ID, fail.From, fail.To); err == nil {
 		req.Status = fail.To
 		transitioned = true
+	}
+	// Approve set the patch wraps to WrapTTLApproved just before the
+	// enqueue. A refused request has no use for them, so cap them the way
+	// Reject and Cancel do. Refresh only shortens, and a request without
+	// wraps (direct reveal, read) lists none.
+	if err := s.refreshWrapsForRequest(ctx, req.ID, 5*time.Minute); err != nil {
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:         actor,
+			Action:        "request.refresh_ttl_failed",
+			Resource:      "request:" + req.ID.String(),
+			Status:        storage.AuditStatusFailure,
+			CorrelationID: req.ID,
+			Metadata:      map[string]any{"error": err.Error(), "phase": "failed"},
+		})
 	}
 	envID := ""
 	if req.EnvironmentID != nil {
