@@ -324,3 +324,55 @@ func (r *LocalUsers) ClearLockout(ctx context.Context, id uuid.UUID) error {
 	}
 	return nil
 }
+
+// LocalUserLookupMax caps how many users ListByIDs and Search return.
+const LocalUserLookupMax = 100
+
+// ListByIDs returns the users with the given ids, ordered by email.
+// Unknown ids are skipped. Only id, email, display name and the
+// disabled flag are read; the password hash and lockout state are
+// left empty. Used by the admin user lookup (api#240).
+func (r *LocalUsers) ListByIDs(ctx context.Context, ids []uuid.UUID) ([]*LocalUser, error) {
+	if len(ids) == 0 {
+		return []*LocalUser{}, nil
+	}
+	const q = `SELECT id, email, display_name, disabled
+	           FROM local_users
+	           WHERE id = ANY($1)
+	           ORDER BY email ASC
+	           LIMIT $2`
+	return r.lookup(ctx, q, ids, LocalUserLookupMax)
+}
+
+// Search returns up to limit users (at most LocalUserLookupMax) whose
+// email or display name contains text, ignoring case, ordered by email.
+// `%`, `_` and `\` in text match literally. Same columns as ListByIDs.
+func (r *LocalUsers) Search(ctx context.Context, text string, limit int) ([]*LocalUser, error) {
+	if limit <= 0 || limit > LocalUserLookupMax {
+		limit = LocalUserLookupMax
+	}
+	pattern := "%" + strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(text) + "%"
+	const q = `SELECT id, email, display_name, disabled
+	           FROM local_users
+	           WHERE email ILIKE $1 ESCAPE '\' OR display_name ILIKE $1 ESCAPE '\'
+	           ORDER BY email ASC
+	           LIMIT $2`
+	return r.lookup(ctx, q, pattern, limit)
+}
+
+func (r *LocalUsers) lookup(ctx context.Context, q string, arg any, limit int) ([]*LocalUser, error) {
+	rows, err := r.pool.Query(ctx, q, arg, limit)
+	if err != nil {
+		return nil, fmt.Errorf("storage: look up local users: %w", err)
+	}
+	defer rows.Close()
+	out := []*LocalUser{}
+	for rows.Next() {
+		u := &LocalUser{}
+		if err := rows.Scan(&u.ID, &u.Email, &u.DisplayName, &u.Disabled); err != nil {
+			return nil, fmt.Errorf("storage: scan local user: %w", err)
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}

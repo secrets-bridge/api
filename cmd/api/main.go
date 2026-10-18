@@ -840,6 +840,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Get("/user-roles", adminH.ListAllUserRoles)
 	v1.Delete("/user-roles/:id", auth.Require(auth.PermUserRoleEdit, rbacResolver), adminH.RevokeUserRole)
 	v1.Get("/users/:userID/roles", adminH.ListUserRoles)
+	// Admin user lookup (api#240): names and emails for the user ids in
+	// team members and role assignments, and a search for the grant and
+	// member forms. Gated on the permissions that manage those lists.
+	v1.Get("/users", auth.RequireAnyOfGlobal(rbacResolver, auth.PermUserRoleEdit, auth.PermTeamEdit),
+		handlers.NewUsers(localUsersRepoInApp).Lookup)
 
 	v1.Post("/workflows", auth.Require(auth.PermWorkflowEdit, rbacResolver), adminH.CreateWorkflow)
 	v1.Get("/workflows", adminH.ListWorkflows)

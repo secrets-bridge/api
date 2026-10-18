@@ -180,6 +180,42 @@ func RequireAnyOf(r Resolver, perms ...Permission) fiber.Handler {
 	}
 }
 
+// RequireAnyOfGlobal returns a middleware that gates the next handler
+// on the caller holding AT LEAST ONE of `perms` at GLOBAL scope (an
+// empty scope), the same scope rule as Require. Use it for routes that
+// accept more than one admin permission but expose data that isn't
+// tenancy-scoped, such as the user directory: a team- or project-scoped
+// grant of the same permission must not unlock it.
+func RequireAnyOfGlobal(r Resolver, perms ...Permission) fiber.Handler {
+	if r == nil {
+		panic("auth: RequireAnyOfGlobal called with nil Resolver")
+	}
+	if len(perms) == 0 {
+		panic("auth: RequireAnyOfGlobal called with no permissions")
+	}
+	return func(c fiber.Ctx) error {
+		userID, ok := IdentityFromContext(c.Context())
+		if !ok {
+			return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+		}
+		grants, err := r.Resolve(c.Context(), userID)
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+		}
+		for _, g := range grants {
+			if len(g.Scope) != 0 {
+				continue
+			}
+			for _, p := range perms {
+				if g.Permission == string(p) {
+					return c.Next()
+				}
+			}
+		}
+		return fiber.NewError(fiber.StatusForbidden, "missing permission (global scope)")
+	}
+}
+
 // RequireScoped returns a middleware that gates the next handler on
 // the caller holding `perm` AT A SCOPE COVERING THE REQUEST.
 //
