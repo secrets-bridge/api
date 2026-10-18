@@ -12,6 +12,16 @@ on `main`.
 ## [Unreleased]
 
 ### Added
+- Object storage for media (`pkg/objectstore`, #253): an S3 backend on
+  AWS SDK v2 for AWS S3 and S3-compatible servers such as MinIO,
+  configured with `SB_OBJECTSTORE_*`. Project and team logos are now
+  stored in the bucket at `<prefix>/logos/<kind>/<entity-id>/<sha256>.png`
+  and streamed by the api with the same routes, headers, ETag and
+  `logo_version` as before. Migration 0040 adds `object_key` and
+  `byte_length` and makes `png` nullable; a backfill at start (under a
+  Redis lock, `SB_OBJECTSTORE_LOGO_BACKFILL`) moves existing logos out
+  of Postgres. Without object storage configured, logo uploads and
+  deletes answer 503. docker-compose gains MinIO and a bucket bootstrap.
 - `SB_ENV` deployment-mode env var. `production` (default) refuses the
   LocalKMS backend at boot; `dev` allows it and triggers the dev
   seeder.

@@ -59,6 +59,14 @@ jobs:
     env:
       TEST_DATABASE_URL: postgres://secrets_bridge:devpass@localhost:5432/secrets_bridge_test?sslmode=disable
       TEST_REDIS_URL: redis://localhost:6379/1
+      # Live object storage tests run against MinIO (started below).
+      # Throwaway CI-only credentials for that container.
+      TEST_OBJECTSTORE_ENDPOINT: http://localhost:9000
+      TEST_OBJECTSTORE_BUCKET: sb-test
+      TEST_OBJECTSTORE_ACCESS_KEY: sb-ci
+      TEST_OBJECTSTORE_SECRET_KEY: sb-ci-minio-pass
+      # MinIO left Docker Hub; Chainguard's public build, pinned by digest.
+      MINIO_IMAGE: cgr.dev/chainguard/minio@sha256:709099319add48dfb44aa596a7070d3ddd8dd04d7ae881765719aec29df9e510
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -67,12 +75,36 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+      # MinIO can't be a `services:` container: the image needs
+      # `server /data` as its command and services take no command.
+      - name: start minio
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER="$TEST_OBJECTSTORE_ACCESS_KEY" \
+            -e MINIO_ROOT_PASSWORD="$TEST_OBJECTSTORE_SECRET_KEY" \
+            "$MINIO_IMAGE" server /data
+          for _ in $(seq 1 60); do
+            if curl -fsS http://localhost:9000/minio/health/ready >/dev/null; then exit 0; fi
+            sleep 1
+          done
+          docker logs minio
+          exit 1
       # -p 1 forces serial PACKAGE execution. Multiple integration
       # test packages share one Postgres + Redis pair and TRUNCATE
       # between tests; running packages concurrently would race the
       # truncates against each other. Tests within a package still
       # run serially by default.
       - run: go test -race -count=1 -p 1 ./...
+      # The object storage tests skip without TEST_OBJECTSTORE_ENDPOINT;
+      # make sure they really ran here.
+      - name: object storage tests did not skip
+        run: |
+          go test -count=1 -p 1 -v -run 'TestS3Live|TestOpenObjectStore_Live|TestLogoObjects' \
+            ./pkg/objectstore/ ./cmd/api/ ./internal/handlers/ | tee objectstore-tests.log
+          if grep -q -- '--- SKIP' objectstore-tests.log; then
+            echo "::error::object storage tests were skipped"
+            exit 1
+          fi
 
   lint:
     name: lint

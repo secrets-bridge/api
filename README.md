@@ -51,6 +51,7 @@ internal/
 pkg/
   argocd/               read-only ArgoCD client (BRD §26 GitOps integration)
   keymgmt/              KeyManager interface + local / vault-transit / aws-kms
+  objectstore/          media in S3-compatible object storage (AWS S3, MinIO)
   runtime/              Redis primitives: locks, idempotency, rate limit, pub/sub
   sealing/              X25519 + HKDF-SHA256 + AES-256-GCM wire-envelope crypto
   storage/              Postgres repositories + migrations (golang-migrate)
@@ -117,6 +118,23 @@ Tier 2 ops (approve / reject / reveal wrap) additionally require `last_mfa_at` w
 | `SB_KMS_VAULT_ADDR` / `_TOKEN` / `_KEY` / `_MOUNT` | (required for `vault-transit`) | Vault Transit-backed KeyManager. |
 | `SB_KMS_AWS_REGION` / `_KEY_ID` / `_ENDPOINT` | (required for `aws-kms`) | AWS KMS-backed KeyManager. Credentials via standard AWS SDK chain (IRSA / instance role / env). |
 
+### Object storage for media
+
+Logos (and later other uploads) are stored in a private S3-compatible bucket. Postgres keeps only their metadata. Credentials come from the standard AWS SDK chain: IRSA, the instance role, or `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. Secret values never go to object storage.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SB_OBJECTSTORE_BUCKET` | (unset) | Bucket name. Unset, with no other `SB_OBJECTSTORE_*` set, means object storage is off: the api boots, logo uploads and deletes answer 503, and logos still stored in Postgres keep being served. |
+| `SB_OBJECTSTORE_REGION` | (required with a bucket) | Bucket region. Use `us-east-1` for MinIO unless it is configured otherwise. |
+| `SB_OBJECTSTORE_ENDPOINT` | (unset) | Endpoint override (`http://` or `https://`) for MinIO and other S3 APIs, or a VPC endpoint. |
+| `SB_OBJECTSTORE_FORCE_PATH_STYLE` | `false` | `true` for path-style addressing, which MinIO needs. |
+| `SB_OBJECTSTORE_PREFIX` | (unset) | Key prefix, for sharing a bucket. Logos live at `<prefix>/logos/<kind>/<entity-id>/<sha256>.png`. |
+| `SB_OBJECTSTORE_SSE` | (unset) | Unset sends no SSE header (the bucket default applies). `AES256` for SSE-S3, `aws:kms` for SSE-KMS. Case-sensitive. |
+| `SB_OBJECTSTORE_KMS_KEY_ID` | (required with `aws:kms`) | KMS key ARN, id or alias. Refused with any other SSE mode. |
+| `SB_OBJECTSTORE_LOGO_BACKFILL` | `true` | At start, copy logos still stored in Postgres to the bucket and clear their bytes (one replica at a time, under a Redis lock). `false` for the first step of a rolling upgrade. |
+
+A setting without a bucket, an invalid value or a bucket the api can't reach (`HeadBucket`) fails the boot. The api needs `s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on its prefix, plus `kms:GenerateDataKey` and `kms:Decrypt` on the key for SSE-KMS.
+
 ### GitOps integration (BRD §26, opt-in)
 
 | Env var | Default | Notes |
@@ -137,9 +155,11 @@ Enforced in code review + (where possible) by CI. Violations block merge.
 ## Local development
 
 ```bash
-docker compose up -d postgres redis
+docker compose up -d postgres redis minio minio-init
 export TEST_DATABASE_URL="postgres://secrets_bridge:devpass@localhost:5432/secrets_bridge_test?sslmode=disable"
 export TEST_REDIS_URL="redis://localhost:6379/1"
+export TEST_OBJECTSTORE_ENDPOINT="http://localhost:9000"
+export TEST_OBJECTSTORE_ACCESS_KEY=secrets-bridge TEST_OBJECTSTORE_SECRET_KEY=devpass-minio
 
 go build ./...
 go vet ./...
@@ -155,7 +175,7 @@ export SB_WRAP_MASTER_KEY=$(openssl rand -base64 32)
 export SB_JWT_SECRET=$(openssl rand -base64 32)
 ```
 
-The compose file publishes every port on 127.0.0.1 only and holds no keys. The api container reads `SB_WRAP_MASTER_KEY` and `SB_JWT_SECRET` from your shell (export them as above before `docker compose up --build`) and refuses to boot without them. `SB_DEV_SEED_PASSWORD` is optional; unset means a random password per dev user, logged once.
+The compose file publishes every port on 127.0.0.1 only and holds no api keys; its only credentials are the throwaway dev passwords for Postgres and MinIO. `minio-init` creates the `secrets-bridge-dev` bucket the api container writes logos to. The api container reads `SB_WRAP_MASTER_KEY` and `SB_JWT_SECRET` from your shell (export them as above before `docker compose up --build`) and refuses to boot without them. `SB_DEV_SEED_PASSWORD` is optional; unset means a random password per dev user, logged once.
 
 For OIDC against Authentik:
 

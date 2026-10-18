@@ -120,6 +120,22 @@ func main() {
 	}
 	logger.Info("keymgmt backend ready", "key_id", km.CurrentKeyID())
 
+	// Object storage for media. Not configured is allowed (logo writes
+	// answer 503); misconfigured or unreachable refuses to boot. See
+	// objectstore.go.
+	objStore, objCfg, err := openObjectStore(context.Background())
+	if err != nil {
+		logger.Error("object storage", "error", err)
+		os.Exit(1)
+	}
+	cfg.ObjectStore, cfg.ObjectStoreConfig = objStore, objCfg
+	if objStore != nil {
+		logger.Info("object storage ready", "bucket", objCfg.Bucket, "region", objCfg.Region,
+			"endpoint_override", objCfg.Endpoint != "", "path_style", objCfg.PathStyle, "sse", objCfg.SSE)
+	} else {
+		logger.Warn("object storage not configured (SB_OBJECTSTORE_BUCKET unset): logo uploads are disabled")
+	}
+
 	// Bootstrap admin assignment. Idempotent: if any user already
 	// holds an admin grant, this is a no-op. v1 escape hatch so the
 	// platform is usable before OIDC + a real login flow ship.
@@ -390,7 +406,20 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// Project and team logos: PNG/JPEG uploads re-encoded as PNG, served
 	// back as images and reported as logo_version on project and team
 	// bodies (including /users/me).
-	logoSvc := services.NewLogoService(storage.NewLogos(pool), projectRepo, teamRepo, auditRepo)
+	logoRepo := storage.NewLogos(pool)
+	logoSvc := services.NewLogoService(logoRepo, projectRepo, teamRepo, auditRepo)
+	if cfg.ObjectStore != nil {
+		logoSvc = logoSvc.WithStore(cfg.ObjectStore, cfg.ObjectStoreConfig)
+		if cfg.LogoBackfill {
+			startLogoBackfill(logger, rdb, logoSvc)
+		} else {
+			logger.Info("logo backfill switched off (" + envLogoBackfill + "=false)")
+		}
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		warnInlineLogos(ctx, logger, logoRepo)
+		cancel()
+	}
 	tenancyH = tenancyH.WithLogos(logoSvc)
 	teamsH := handlers.NewTeams(teamRepo).WithLogos(logoSvc)
 	teamScopeResolver := auth.NewRepoTeamScopeResolver(teamRepo, projectRepo)
