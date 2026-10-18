@@ -69,12 +69,26 @@ func TestLive_EnrollmentTokenResponse_IDAndInstallHint(t *testing.T) {
 			t.Errorf("helm hint contains %q", bad)
 		}
 	}
-	if want := "--from-literal=enrollment_token=" + res.EnrollmentToken; !strings.Contains(res.InstallHint["kubectl"], want) {
-		t.Errorf("kubectl hint lacks the Secret literal:\n%s", res.InstallHint["kubectl"])
+	// ui#151: the token is on no line of the hint. Pasted into a shell,
+	// a command line ends up in history and in the process arguments;
+	// kubectl and cli read it at a silent prompt instead.
+	for k, line := range res.InstallHint {
+		if strings.Contains(line, res.EnrollmentToken) {
+			t.Errorf("%s hint carries the enrollment token", k)
+		}
+	}
+	kubectl := res.InstallHint["kubectl"]
+	for _, want := range []string{"read -rs SB_ENROLL_TOKEN", "--from-file=enrollment_token=/dev/stdin", "unset SB_ENROLL_TOKEN"} {
+		if !strings.Contains(kubectl, want) {
+			t.Errorf("kubectl hint lacks %q:\n%s", want, kubectl)
+		}
+	}
+	if strings.Contains(kubectl, "--from-literal") {
+		t.Errorf("kubectl hint still passes the token as an argument:\n%s", kubectl)
 	}
 	cli := res.InstallHint["cli"]
-	if !strings.Contains(cli, "SB_ENROLLMENT_TOKEN="+res.EnrollmentToken) || !strings.Contains(cli, "SB_ENROLLMENT_ENABLED=true") ||
-		strings.Contains(cli, "agent enroll") {
+	if !strings.Contains(cli, "read -rs SB_ENROLLMENT_TOKEN") || !strings.Contains(cli, "SB_ENROLLMENT_ENABLED=true") ||
+		strings.Contains(cli, "SB_ENROLLMENT_TOKEN=") || strings.Contains(cli, "agent enroll") {
 		t.Errorf("cli hint does not match the agent binary:\n%s", cli)
 	}
 
