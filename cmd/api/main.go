@@ -996,6 +996,28 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// request-lifecycle routes further down share one instance.
 	requireMFA := middleware.RequireFreshMFA(sessionSvc, mfaVerifySvc)
 
+	// Sign-in providers and the install's public address, set from the
+	// console (api#267). A global auth.sso.edit for every route, and a
+	// fresh second factor for every write: whoever holds it decides who
+	// can sign in.
+	ssoSvc, err := services.NewSSOService(storage.NewSSOStore(pool), roleRepo, km, cfg.PublicURL, cfg.OIDCIssuer)
+	if err != nil {
+		logger.Error("sign-in settings", "error", err)
+		os.Exit(1)
+	}
+	ssoH := handlers.NewSSO(ssoSvc, auditRepo)
+	ssoEdit := auth.Require(auth.PermAuthSSOEdit, rbacResolver)
+	v1.Get("/sso/providers", ssoEdit, ssoH.ListProviders)
+	v1.Post("/sso/providers", ssoEdit, requireMFA, ssoH.CreateProvider)
+	v1.Get("/sso/providers/:id", ssoEdit, ssoH.GetProvider)
+	v1.Put("/sso/providers/:id", ssoEdit, requireMFA, ssoH.UpdateProvider)
+	v1.Put("/sso/providers/:id/secret", ssoEdit, requireMFA, ssoH.SetSecret)
+	v1.Post("/sso/providers/:id/enable", ssoEdit, requireMFA, ssoH.Enable)
+	v1.Post("/sso/providers/:id/disable", ssoEdit, requireMFA, ssoH.Disable)
+	v1.Delete("/sso/providers/:id", ssoEdit, requireMFA, ssoH.DeleteProvider)
+	v1.Get("/sso/settings", ssoEdit, ssoH.GetSettings)
+	v1.Put("/sso/settings", ssoEdit, requireMFA, ssoH.UpdateSettings)
+
 	// Pre-launch triage (item 2): direct-reveal auto-approves and enqueues
 	// a read of a live value, so the SUBMIT is itself a Tier-2 action and
 	// now requires fresh MFA, not just the value pickup downstream.

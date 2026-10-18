@@ -91,6 +91,9 @@ func TestSeedMigrationStringsAreInCatalog(t *testing.T) {
 
 		// security_approver (0029_cross_team_roles.up.sql) — Slice N2.
 		"secret.security.approve",
+
+		// admin, 0043_seed_admin_auth_sso_edit.up.sql (api#267).
+		"auth.sso.edit",
 	}
 	for _, p := range seedPermissions {
 		if !IsKnown(p) {

@@ -1,0 +1,6 @@
+BEGIN;
+
+DROP TABLE IF EXISTS sso_settings;
+DROP TABLE IF EXISTS sso_providers;
+
+COMMIT;

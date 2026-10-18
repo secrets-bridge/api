@@ -38,7 +38,7 @@ type liveApp struct {
 	pool *storage.Pool
 }
 
-func newLiveApp(t *testing.T) *liveApp {
+func newLiveApp(t *testing.T, opts ...func(*Config)) *liveApp {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	redisURL := os.Getenv("TEST_REDIS_URL")
@@ -71,6 +71,8 @@ func newLiveApp(t *testing.T) *liveApp {
 		DELETE FROM agent_enrollment_tokens;
 		DELETE FROM agents;
 		DELETE FROM provider_connections;
+		DELETE FROM sso_providers;
+		UPDATE sso_settings SET public_url = NULL, pending_cap = 50;
 		DELETE FROM policy_rules WHERE is_system = false;
 		DELETE FROM team_members;
 		DELETE FROM teams;
@@ -115,6 +117,9 @@ func newLiveApp(t *testing.T) *liveApp {
 		AllowInsecureHeaderAuth: true,
 		AllowDirectAgentMint:    true,
 		AllowInsecureVaultAddr:  true,
+	}
+	for _, o := range opts {
+		o(&appCfg)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return &liveApp{app: newApp(appCfg, logger, pool, rdb, km, authSvc), pool: pool}

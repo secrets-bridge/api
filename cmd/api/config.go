@@ -101,6 +101,13 @@ type Config struct {
 	BootstrapAdminEmail    string
 	BootstrapAdminPassword string
 
+	// PublicURL is the install's public address, for example
+	// https://secrets.example.com (SB_PUBLIC_URL). Sign-in redirect URIs
+	// are built from it, never from request headers. When unset, an
+	// admin saves it from the console (api#267); when set, it wins and
+	// the console shows it read-only.
+	PublicURL string
+
 	// OIDC client config (Slice B). When OIDCIssuer is empty the OIDC
 	// routes are NOT mounted and the local-admin login path stays the
 	// only sign-in surface (compatible with A1 + A2 deployments).
@@ -252,6 +259,7 @@ func loadConfig() Config {
 		JWTSecret:                      loadJWTSecret(),
 		JWTTokenTTL:                    envDuration("SB_JWT_TOKEN_TTL", 8*time.Hour),
 		BootstrapAdminEmail:            envOr("SB_BOOTSTRAP_ADMIN_EMAIL", ""),
+		PublicURL:                      envOr("SB_PUBLIC_URL", ""),
 		BootstrapAdminPassword:         envOr("SB_BOOTSTRAP_ADMIN_PASSWORD", ""),
 		DevSeedPassword:                envOr("SB_DEV_SEED_PASSWORD", ""),
 		OIDCIssuer:                     envOr("SB_OIDC_ISSUER", ""),
