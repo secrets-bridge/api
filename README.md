@@ -126,7 +126,7 @@ Logos (and later other uploads) are stored in a private S3-compatible bucket. Po
 |---|---|---|
 | `SB_OBJECTSTORE_BUCKET` | (unset) | Bucket name. Unset, with no other `SB_OBJECTSTORE_*` set, means object storage is off: the api boots, logo uploads and deletes answer 503, and logos still stored in Postgres keep being served. |
 | `SB_OBJECTSTORE_REGION` | (required with a bucket) | Bucket region. Use `us-east-1` for MinIO unless it is configured otherwise. |
-| `SB_OBJECTSTORE_ENDPOINT` | (unset) | Endpoint override (`http://` or `https://`) for MinIO and other S3 APIs, or a VPC endpoint. |
+| `SB_OBJECTSTORE_ENDPOINT` | (unset) | Endpoint override for MinIO and other S3 APIs, or a VPC endpoint. `https://`; plain `http://` only with `SB_ENV=dev`, otherwise the api refuses to boot. |
 | `SB_OBJECTSTORE_FORCE_PATH_STYLE` | `false` | `true` for path-style addressing, which MinIO needs. |
 | `SB_OBJECTSTORE_PREFIX` | (unset) | Key prefix, for sharing a bucket. Logos live at `<prefix>/logos/<kind>/<entity-id>/<sha256>.png`. |
 | `SB_OBJECTSTORE_SSE` | (unset) | Unset sends no SSE header (the bucket default applies). `AES256` for SSE-S3, `aws:kms` for SSE-KMS. Case-sensitive. |

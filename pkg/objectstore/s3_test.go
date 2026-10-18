@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	awsv2 "github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
@@ -159,5 +160,83 @@ func TestS3_GetRoundTrip(t *testing.T) {
 	}
 	if s.Config().Bucket != "example-bucket" {
 		t.Fatal("Config")
+	}
+}
+
+// stallS3 takes every call and never answers, like a store that accepts
+// the connection and then stalls. A call returns only when its context
+// ends; a Get answers at once with a body that stalls the same way.
+type stallS3 struct{}
+
+func (stallS3) PutObject(ctx context.Context, _ *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (stallS3) GetObject(ctx context.Context, _ *s3.GetObjectInput, _ ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
+	return &s3.GetObjectOutput{Body: stallBody{ctx}, ContentLength: awsv2.Int64(1)}, nil
+}
+
+func (stallS3) HeadObject(ctx context.Context, _ *s3.HeadObjectInput, _ ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (stallS3) DeleteObject(ctx context.Context, _ *s3.DeleteObjectInput, _ ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (stallS3) HeadBucket(ctx context.Context, _ *s3.HeadBucketInput, _ ...func(*s3.Options)) (*s3.HeadBucketOutput, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+type stallBody struct{ ctx context.Context }
+
+func (b stallBody) Read([]byte) (int, error) {
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+
+func (stallBody) Close() error { return nil }
+
+// Every call ends with an error once the call timeout passes, even with
+// a context that is never cancelled (what a Fiber handler passes in).
+func TestS3_StalledStoreCallsEnd(t *testing.T) {
+	s := newS3WithClient(stallS3{}, Config{Bucket: "example-bucket"})
+	s.timeout = 50 * time.Millisecond
+	ctx := context.Background()
+	calls := map[string]func() error{
+		"put":    func() error { return s.Put(ctx, "k", bytes.NewReader([]byte("x")), 1, "image/png") },
+		"head":   func() error { _, err := s.Head(ctx, "k"); return err },
+		"delete": func() error { return s.Delete(ctx, "k") },
+		"check":  func() error { return s.Check(ctx) },
+		"get": func() error {
+			o, err := s.Get(ctx, "k")
+			if err != nil {
+				return err
+			}
+			defer func() { _ = o.Body.Close() }()
+			_, err = io.ReadAll(o.Body)
+			return err
+		},
+	}
+	done := make(chan string, len(calls))
+	for name, call := range calls {
+		go func() {
+			if err := call(); err == nil {
+				t.Errorf("%s: no error from a stalled store", name)
+			}
+			done <- name
+		}()
+	}
+	deadline := time.After(5 * time.Second)
+	for range calls {
+		select {
+		case <-done:
+		case <-deadline:
+			t.Fatalf("calls still waiting on a stalled store after 5s")
+		}
 	}
 }

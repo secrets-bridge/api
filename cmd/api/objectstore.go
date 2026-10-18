@@ -20,7 +20,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/secrets-bridge/api/internal/services"
@@ -41,10 +43,19 @@ const (
 // openObjectStore loads the object-storage config and, when enabled,
 // builds the S3 store and checks the bucket is reachable. A nil store
 // with a nil error means object storage is not configured.
-func openObjectStore(ctx context.Context) (objectstore.Store, objectstore.Config, error) {
+//
+// Outside SB_ENV=dev a plain http:// endpoint refuses to boot, as the
+// chart already does: the request signatures and the media would cross
+// the network in clear text. The chart's check doesn't run when the
+// SB_OBJECTSTORE_* variables come from secrets.existingSecret or from
+// an install without the chart, so the api checks too.
+func openObjectStore(ctx context.Context, env string) (objectstore.Store, objectstore.Config, error) {
 	cfg, err := objectstore.LoadConfig()
 	if err != nil || !cfg.Enabled() {
 		return nil, cfg, err
+	}
+	if env != ModeDev && strings.HasPrefix(cfg.Endpoint, "http://") {
+		return nil, cfg, fmt.Errorf("objectstore: %s is plain http://, which is refused with SB_ENV=%s; use an https:// endpoint", objectstore.EnvEndpoint, env)
 	}
 	store, err := objectstore.NewS3(ctx, cfg)
 	if err != nil {

@@ -123,7 +123,7 @@ func main() {
 	// Object storage for media. Not configured is allowed (logo writes
 	// answer 503); misconfigured or unreachable refuses to boot. See
 	// objectstore.go.
-	objStore, objCfg, err := openObjectStore(context.Background())
+	objStore, objCfg, err := openObjectStore(context.Background(), cfg.Env)
 	if err != nil {
 		logger.Error("object storage", "error", err)
 		os.Exit(1)
