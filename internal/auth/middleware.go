@@ -198,22 +198,37 @@ func RequireAnyOfGlobal(r Resolver, perms ...Permission) fiber.Handler {
 		if !ok {
 			return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
 		}
-		grants, err := r.Resolve(c.Context(), userID)
+		held, err := HoldsAnyGlobal(c.Context(), r, userID, perms...)
 		if err != nil {
 			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 		}
-		for _, g := range grants {
-			if len(g.Scope) != 0 {
-				continue
-			}
-			for _, p := range perms {
-				if g.Permission == string(p) {
-					return c.Next()
-				}
+		if !held {
+			return fiber.NewError(fiber.StatusForbidden, "missing permission (global scope)")
+		}
+		return c.Next()
+	}
+}
+
+// HoldsAnyGlobal reports whether userID holds at least one of perms at
+// GLOBAL scope (an empty scope), the rule RequireAnyOfGlobal enforces.
+// For handlers that change what they return, rather than refuse, by
+// the caller's permissions.
+func HoldsAnyGlobal(ctx context.Context, r Resolver, userID string, perms ...Permission) (bool, error) {
+	grants, err := r.Resolve(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	for _, g := range grants {
+		if len(g.Scope) != 0 {
+			continue
+		}
+		for _, p := range perms {
+			if g.Permission == string(p) {
+				return true, nil
 			}
 		}
-		return fiber.NewError(fiber.StatusForbidden, "missing permission (global scope)")
 	}
+	return false, nil
 }
 
 // RequireScoped returns a middleware that gates the next handler on

@@ -915,11 +915,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Get("/permissions", permissionsH.List)
 
 	// Audit log — read-only over the append-only audit_events table
-	// (NFR-07). Gated by `audit.read` so platform operators with no
-	// direct DB access can still see the chain of who-did-what to
-	// every resource. Filters: actor / action / resource /
-	// correlation_id / since / until / limit.
-	auditH := handlers.NewAudit(auditRepo, localUsersRepoInApp, agentRepo)
+	// (NFR-07). Gated by `audit.read`. Global role.edit, user_role.edit
+	// or team.edit holders see every event; other readers see their own
+	// events and the whole trail of a request they can read.
+	// Filters: actor / action / resource / correlation_id / since /
+	// until / limit.
+	auditH := handlers.NewAudit(auditRepo, localUsersRepoInApp, agentRepo).WithReaderScope(rbacResolver, requestsH)
 	v1.Get("/audit-events", auth.Require(auth.PermAuditRead, rbacResolver), auditH.List)
 
 	// Tenancy admin — projects + environments. Pre-existed in the
