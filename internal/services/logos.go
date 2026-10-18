@@ -178,14 +178,18 @@ func (s *LogoService) Put(ctx context.Context, kind storage.LogoKind, entityID u
 	// Object first. The key is content addressed, so an object already
 	// there holds these exact bytes: skip the write and, below, never
 	// remove it, since the current row may point at it. When Head can't
-	// tell, assume it exists; an orphan is better than a broken row.
-	existed := true
+	// tell, write anyway (same key, same bytes) but keep treating the
+	// object as possibly in use, so a failed row write leaves it: an
+	// orphan is better than a broken row. Skipping the write here would
+	// point the row at a key that may not exist and drop the old logo.
+	existed, write := true, false
 	if _, err := s.store.Head(ctx, logo.ObjectKey); errors.Is(err, objectstore.ErrNotFound) {
-		existed = false
+		existed, write = false, true
 	} else if err != nil {
-		slog.WarnContext(ctx, "logo object head failed", "kind", kind, "entity_id", entityID, "err", err)
+		slog.WarnContext(ctx, "logo object head failed; writing it anyway", "kind", kind, "entity_id", entityID, "err", err)
+		write = true
 	}
-	if !existed {
+	if write {
 		if err := s.store.Put(ctx, logo.ObjectKey, bytes.NewReader(stored), int64(len(stored)), logoPNGType); err != nil {
 			slog.ErrorContext(ctx, "logo object write failed", "kind", kind, "entity_id", entityID, "err", err)
 			return "", ErrLogoStorageFailed
