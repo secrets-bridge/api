@@ -14,7 +14,7 @@ import (
 // Wires the REAL group middleware chain (AuthWith → RequireAuthedExcept
 // with the REAL publicV1Paths) in front of stand-in handlers, then
 // asserts the unauthenticated-access matrix. No DB: AuthWith(nil,nil)
-// with no cookie/bearer resolves to anonymous, and the stand-ins only
+// with no session cookie resolves to anonymous, and the stand-ins only
 // run if the gate lets them through — so a 200 here means the endpoint
 // was reachable unauthenticated, which is the P0 we are closing.
 func newEnforcementTestApp() *fiber.App {

@@ -378,7 +378,7 @@ func ScopeFromJSONBody(keys ...string) ScopeFn {
 // AuditActor names who caused an action, for the audit log's actor
 // column, from the request context (API-15):
 //
-//	"user:<id>"          an authenticated session or bearer caller
+//	"user:<id>"          an authenticated user (session cookie, or the dev-only X-User-Id header)
 //	"agent:<id>"         an agent authenticated by AgentAuth
 //	"anonymous"          an HTTP request with no identity
 //	"system:background"  no request identity at all (boot, background work)

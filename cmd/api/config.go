@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -76,13 +75,10 @@ type Config struct {
 	// matching the future OIDC `sub` claim; it is NOT a credential.
 	BootstrapAdminUserID string
 
-	// JWTSecret is read only to log that SB_JWT_SECRET is no longer used:
-	// login issues no bearer token since M1 (api#191).
-	JWTSecret []byte
-
-	// JWTTokenTTL (SB_JWT_TOKEN_TTL) is no longer used: login issues no
-	// bearer token since M1 (api#191).
-	JWTTokenTTL time.Duration
+	// RetiredEnvSet names the retired settings (retiredEnv) that are
+	// still set, so main can say they can be removed. Only the names are
+	// kept, never the values.
+	RetiredEnvSet []string
 
 	// BootstrapAdminEmail / Password seed a local admin user on
 	// first boot when local_users is empty. Idempotent: once any
@@ -259,8 +255,7 @@ func loadConfig() Config {
 		AllowUnsealedWraps:             envBool("SB_ALLOW_UNSEALED_WRAPS", false),
 		ProviderConnRejectSecretValues: envBool("SB_PROVIDER_CONN_REJECT_SECRETS", true),
 		BootstrapAdminUserID:           envOr("SB_BOOTSTRAP_ADMIN_USER_ID", ""),
-		JWTSecret:                      loadJWTSecret(),
-		JWTTokenTTL:                    envDuration("SB_JWT_TOKEN_TTL", 8*time.Hour),
+		RetiredEnvSet:                  retiredEnvSet(),
 		BootstrapAdminEmail:            envOr("SB_BOOTSTRAP_ADMIN_EMAIL", ""),
 		PublicURL:                      envOr("SB_PUBLIC_URL", ""),
 		BootstrapAdminPassword:         envOr("SB_BOOTSTRAP_ADMIN_PASSWORD", ""),
@@ -371,24 +366,21 @@ func (c Config) ValidateEnv() error {
 	}
 }
 
-// loadJWTSecret reads SB_JWT_SECRET as base64 (preferred) or raw
-// bytes. Returns nil when the env var is unset. Nothing signs with it
-// any more (M1, api#191): main only logs that a set value is unused,
-// and an unset one is fine.
-func loadJWTSecret() []byte {
-	raw, ok := os.LookupEnv("SB_JWT_SECRET")
-	if !ok || raw == "" {
-		return nil
+// retiredEnv are settings the api no longer reads. SB_JWT_SECRET and
+// SB_JWT_TOKEN_TTL signed and timed the login bearer token, which login
+// stopped issuing in M1 (api#191).
+var retiredEnv = []string{"SB_JWT_SECRET", "SB_JWT_TOKEN_TTL"}
+
+// retiredEnvSet returns the names of the retiredEnv entries that are
+// set to a non-empty value. It never returns or reads out the values.
+func retiredEnvSet() []string {
+	var set []string
+	for _, k := range retiredEnv {
+		if v, ok := os.LookupEnv(k); ok && v != "" {
+			set = append(set, k)
+		}
 	}
-	// Try base64 first.
-	if decoded, err := base64.StdEncoding.DecodeString(raw); err == nil && len(decoded) >= 32 {
-		return decoded
-	}
-	if decoded, err := base64.RawStdEncoding.DecodeString(raw); err == nil && len(decoded) >= 32 {
-		return decoded
-	}
-	// Fall back to raw bytes.
-	return []byte(raw)
+	return set
 }
 
 func envBool(key string, fallback bool) bool {

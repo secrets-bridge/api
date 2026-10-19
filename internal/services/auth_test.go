@@ -5,7 +5,6 @@ package services_test
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"os"
 	"strings"
@@ -50,10 +49,6 @@ func bootstrapAuth(t *testing.T) (*services.AuthService, *storage.Pool) {
 		t.Fatalf("truncate: %v", err)
 	}
 
-	jwtKey := make([]byte, 32)
-	if _, err := rand.Read(jwtKey); err != nil {
-		t.Fatalf("rand: %v", err)
-	}
 	svc := services.NewAuthService(
 		storage.NewLocalUsers(pool),
 		storage.NewRoles(pool),

@@ -9,7 +9,7 @@
 //   - Gate canAuthorTeamPolicy(teamID) helper without walking the
 //     team tree client-side
 //
-// Permission: bearer-only. The endpoint exposes ONLY the caller's own
+// Permission: any authenticated session, no extra permission. The endpoint exposes ONLY the caller's own
 // coverage — not enumerable across other users. EffectiveTeamAccess
 // is the source of truth; server-side computation means the SPA
 // doesn't need separate /teams + role-grants requests to compute
