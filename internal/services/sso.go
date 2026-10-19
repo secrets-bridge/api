@@ -85,10 +85,10 @@ type SSOProviderInput struct {
 }
 
 type ssoStore interface {
-	CreateProvider(ctx context.Context, p *storage.SSOProvider) error
+	CreateProvider(ctx context.Context, p *storage.SSOProvider, allowedDefaultPerms []string) error
 	GetProvider(ctx context.Context, id uuid.UUID) (*storage.SSOProvider, error)
 	ListProviders(ctx context.Context) ([]*storage.SSOProvider, error)
-	UpdateProvider(ctx context.Context, p *storage.SSOProvider) (*storage.SSOProvider, error)
+	UpdateProvider(ctx context.Context, p *storage.SSOProvider, allowedDefaultPerms []string) (*storage.SSOProvider, error)
 	SetProviderSecret(ctx context.Context, id uuid.UUID, secret storage.SSOSecret, by string) error
 	SetProviderEnabled(ctx context.Context, id uuid.UUID, enabled bool, by string) error
 	DeleteProvider(ctx context.Context, id uuid.UUID) (*storage.SSOProvider, error)
@@ -157,8 +157,10 @@ func (s *SSOService) CreateProvider(ctx context.Context, in SSOProviderInput, by
 		return nil, err
 	}
 	p.Secret = sealed
-	if err := s.store.CreateProvider(ctx, p); err != nil {
-		return nil, err
+	// apply checked the default role for a clear error; the store checks
+	// it again under a lock on the role, against a concurrent role edit.
+	if err := s.store.CreateProvider(ctx, p, NonPrivilegedPermissions); err != nil {
+		return nil, mapDefaultRoleErr(err)
 	}
 	return p, nil
 }
@@ -179,9 +181,9 @@ func (s *SSOService) UpdateProvider(ctx context.Context, id uuid.UUID, in SSOPro
 	if err := s.apply(ctx, p, in); err != nil {
 		return nil, nil, err
 	}
-	before, err = s.store.UpdateProvider(ctx, p)
+	before, err = s.store.UpdateProvider(ctx, p, NonPrivilegedPermissions)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, mapDefaultRoleErr(err)
 	}
 	after, err = s.store.GetProvider(ctx, id)
 	return before, after, err
@@ -367,6 +369,19 @@ func HoldsPrivileged(perms []string) bool {
 		}
 	}
 	return false
+}
+
+// mapDefaultRoleErr turns the store's default-role refusals into the
+// service's errors. A role that's gone by the time of the write is a
+// missing role on default_role_id.
+func mapDefaultRoleErr(err error) error {
+	switch {
+	case errors.Is(err, storage.ErrDefaultRolePrivileged):
+		return ErrSSOPrivilegedDefaultRole
+	case errors.Is(err, storage.ErrDefaultRoleMissing):
+		return &SSOInputError{"default_role_id", "no such role"}
+	}
+	return err
 }
 
 // defaultRoleUsable reports whether a provider's default role may be

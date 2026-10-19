@@ -56,7 +56,7 @@ type fakeSSOStore struct {
 	created *storage.SSOProvider
 }
 
-func (f *fakeSSOStore) CreateProvider(_ context.Context, p *storage.SSOProvider) error {
+func (f *fakeSSOStore) CreateProvider(_ context.Context, p *storage.SSOProvider, _ []string) error {
 	p.ID = uuid.New()
 	f.created = p
 	return nil

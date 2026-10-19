@@ -475,6 +475,7 @@ func (s *SSOSignIn) signIn(ctx context.Context, p *storage.SSOProvider, c *googl
 	// for approval like any other.
 	pending := p.RequireApproval
 	var role *uuid.UUID
+	roleRefused := false
 	if !pending && p.DefaultRoleID != nil {
 		usable, err := s.cfg.defaultRoleUsable(ctx, *p.DefaultRoleID)
 		if err != nil {
@@ -483,10 +484,7 @@ func (s *SSOSignIn) signIn(ctx context.Context, p *storage.SSOProvider, c *googl
 		if usable {
 			role = p.DefaultRoleID
 		} else {
-			pending = true
-			s.appendAudit(ctx, "system:sso", "sso_provider.default_role_refused", "sso_provider:"+p.ID.String(),
-				storage.AuditStatusDenied, map[string]any{"provider_type": p.Type, "default_role_id": p.DefaultRoleID.String(),
-					"reason": "default_role_privileged"})
+			pending, roleRefused = true, true
 		}
 	}
 	pendingCap := 0
@@ -524,6 +522,13 @@ func (s *SSOSignIn) signIn(ctx context.Context, p *storage.SSOProvider, c *googl
 			return nil, refuse("identity_taken")
 		}
 		return nil, err
+	}
+	// Audited only now that the account exists: a sign-in refused at the
+	// waiting cap made no account, so no role was refused for it.
+	if roleRefused {
+		s.appendAudit(ctx, "system:sso", "sso_provider.default_role_refused", "sso_provider:"+p.ID.String(),
+			storage.AuditStatusDenied, map[string]any{"provider_type": p.Type, "default_role_id": p.DefaultRoleID.String(),
+				"reason": "default_role_privileged", "user_id": u.ID.String()})
 	}
 	action := "user.pending"
 	if !pending {
