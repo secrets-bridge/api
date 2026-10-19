@@ -39,7 +39,7 @@ func newSSOHarness(t *testing.T, mutate func(*loginHarness, *services.SSOProvide
 	services.GoogleIssuer = h.idp.url
 	t.Cleanup(func() { services.GoogleIssuer = prev })
 
-	svc, err := services.NewSSOService(storage.NewSSOStore(h.pool), storage.NewRoles(h.pool), h.km, "", "")
+	svc, err := services.NewSSOService(storage.NewSSOStore(h.pool), storage.NewRoles(h.pool), h.km, "", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -512,11 +512,12 @@ func TestSSO_WidenedDefaultRoleIsNotGranted(t *testing.T) {
 		in.RequireApproval = false
 		in.DefaultRoleID = &role
 	})
-	admin, adminSession := h.freshSession("ada@example.com")
-	h.grantAdmin(admin.ID)
-	if code, body, _ := h.authed(http.MethodPut, "/api/v1/roles/"+role.String()+"/permissions", adminSession,
-		map[string]any{"permissions": []string{"secret.request", "secret.reveal.direct", "user_role.edit"}}); code != http.StatusNoContent {
-		t.Fatalf("widen the role = %d %s", code, body)
+	// The api now refuses this edit (TestSSO_DefaultRoleCantBeWidenedOrDeleted),
+	// so widen it in the database, as an older api, a migration or psql
+	// could have: sign-in must still not grant it.
+	if _, err := h.pool.Exec(t.Context(),
+		`UPDATE roles SET permissions = '["secret.request", "secret.reveal.direct", "user_role.edit"]' WHERE id = $1`, role); err != nil {
+		t.Fatal(err)
 	}
 
 	r := h.signIn(googleClaims("wide-1", "wes@example.com", "example.com"))
@@ -724,5 +725,122 @@ func TestSSO_ConnectWithTheProviderGoneComesBackToTheProfile(t *testing.T) {
 	}
 	if code, body := h.finish(session, strings.TrimPrefix(loc, "/me#sso_ticket=")); code != http.StatusConflict || !strings.Contains(string(body), `"reason":"no_provider"`) {
 		t.Fatalf("finish = %d %s; want 409 with reason no_provider", code, body)
+	}
+}
+
+// hatmast2r's pass: a role that a provider gives to new accounts can't be
+// widened through the API, and can't be deleted while it's the default
+// (409, not 500).
+func TestSSO_DefaultRoleCantBeWidenedOrDeleted(t *testing.T) {
+	role, other := uuid.New(), uuid.New()
+	h := newSSOHarness(t, func(lh *loginHarness, in *services.SSOProviderInput) {
+		for _, id := range []uuid.UUID{role, other} {
+			if _, err := lh.pool.Exec(t.Context(), `INSERT INTO roles (id, name, permissions) VALUES ($1, $2, '["secret.request"]')`,
+				id, "sso-guard-"+id.String()[:8]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		in.RequireApproval = false
+		in.DefaultRoleID = &role
+	})
+	admin, session := h.freshSession("ada@example.com")
+	h.grantAdmin(admin.ID)
+	put := func(id uuid.UUID, perms ...string) (int, []byte) {
+		code, body, _ := h.authed(http.MethodPut, "/api/v1/roles/"+id.String()+"/permissions", session, map[string]any{"permissions": perms})
+		return code, body
+	}
+	if code, body := put(role, "secret.request", "secret.reveal.direct"); code != http.StatusConflict || !strings.Contains(string(body), "role_is_sso_default") {
+		t.Fatalf("widening the default role = %d %s; want 409 role_is_sso_default", code, body)
+	}
+	if n := h.count(`SELECT count(*) FROM roles WHERE id = $1 AND permissions ? 'secret.reveal.direct'`, role); n != 0 {
+		t.Fatal("the refused edit changed the role")
+	}
+	if code, body := put(role, "secret.request", "secret.list", "audit.read"); code != http.StatusNoContent {
+		t.Fatalf("a non-privileged edit of the default role = %d %s; want 204", code, body)
+	}
+	if code, body := put(other, "secret.request", "secret.reveal.direct"); code != http.StatusNoContent {
+		t.Fatalf("widening a role no provider uses = %d %s; want 204", code, body)
+	}
+	code, body, _ := h.authed(http.MethodDelete, "/api/v1/roles/"+role.String(), session, nil)
+	if code != http.StatusConflict {
+		t.Fatalf("deleting the default role = %d %s; want 409", code, body)
+	}
+	if n := h.count(`SELECT count(*) FROM roles WHERE id = $1`, role); n != 1 {
+		t.Fatal("the default role was deleted")
+	}
+}
+
+// hatmast2r's pass: with no public address (cleared in the console, or
+// SB_PUBLIC_URL removed later) sign-in fails closed. Google isn't
+// offered, start refuses, and a forged Host never becomes the redirect.
+func TestSSO_NoPublicAddressFailsClosed(t *testing.T) {
+	h := newSSOHarness(t, nil)
+	if _, err := h.pool.Exec(h.t.Context(), `UPDATE sso_settings SET public_url = NULL`); err != nil {
+		t.Fatal(err)
+	}
+	if _, body, _ := h.authed(http.MethodGet, "/api/v1/auth/providers", nil, nil); strings.Contains(string(body), `"google"`) {
+		t.Fatalf("Google is offered without a public address: %s", body)
+	}
+	for _, host := range []string{"", "evil.example"} {
+		req, _ := http.NewRequest(http.MethodGet, h.apiURL+"/api/v1/auth/sso/google/start", nil)
+		if host != "" {
+			req.Host = host
+			req.Header.Set("X-Forwarded-Host", host)
+			req.Header.Set("X-Forwarded-Proto", "https")
+		}
+		r := h.do(req)
+		if loc := r.Header.Get("Location"); r.StatusCode != http.StatusFound || loc != "/login?error=sso" {
+			t.Fatalf("start without a public address (host %q) = %d %q; want the refusal page", host, r.StatusCode, loc)
+		}
+	}
+	if n := h.auditReasons("no_public_url"); n != 2 {
+		t.Fatalf("no_public_url refusals = %d, want 2", n)
+	}
+}
+
+// hatmast2r's pass: the hd and domain checks run on every sign-in, not
+// only when the identity is first bound. An identity whose domain is
+// later removed (or a provider deleted and added again with other
+// domains) is refused.
+func TestSSO_DomainsAreCheckedOnEverySignIn(t *testing.T) {
+	h := newSSOHarness(t, func(_ *loginHarness, in *services.SSOProviderInput) { in.RequireApproval = false })
+	pat := googleClaims("dom-1", "pat@example.com", "example.com")
+	if findCookie(h.signIn(pat), loginTestSessionKey) == nil {
+		t.Fatal("first sign-in refused")
+	}
+	if _, err := h.pool.Exec(h.t.Context(), `UPDATE sso_providers SET allowed_domains = '{other.org}'`); err != nil {
+		t.Fatal(err)
+	}
+	if findCookie(h.signIn(pat), loginTestSessionKey) != nil {
+		t.Fatal("an identity outside the allowed domains signed in again")
+	}
+	if n := h.auditReasons("hd_not_allowed"); n != 1 {
+		t.Fatalf("hd_not_allowed refusals = %d, want 1", n)
+	}
+}
+
+// hatmast2r's pass: a client secret sent with a normal edit is refused,
+// not silently ignored. It changes only through PUT .../secret, which
+// audits the rotation.
+func TestSSO_EditDoesNotTakeASecret(t *testing.T) {
+	h := newSSOHarness(t, nil)
+	admin, session := h.freshSession("ada@example.com")
+	h.grantAdmin(admin.ID)
+	var before []byte
+	if err := h.pool.QueryRow(h.t.Context(), `SELECT client_secret_ciphertext FROM sso_providers`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	code, body, _ := h.authed(http.MethodPut, "/api/v1/sso/providers/"+h.provider.ID.String(), session, map[string]any{
+		"client_id": loginTestClientID, "client_secret": "GOCSPX-sent-with-an-edit", "allowed_domains": []string{"example.com"}, "require_approval": true,
+	})
+	if code != http.StatusBadRequest || !strings.Contains(string(body), "client_secret") {
+		t.Fatalf("an edit with a client secret = %d %s; want 400 naming client_secret", code, body)
+	}
+	var after []byte
+	if err := h.pool.QueryRow(h.t.Context(), `SELECT client_secret_ciphertext FROM sso_providers`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("the refused edit changed the stored secret")
 	}
 }

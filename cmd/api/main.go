@@ -387,7 +387,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	agentsH := handlers.NewAgents(agentSvc).WithDirectMint(cfg.AllowDirectAgentMint)
 	jobsH := handlers.NewJobs(jobSvc)
 	adminH := handlers.NewAdmin(roleRepo, userRoleRepo, workflowRepo, policyRepo).
-		WithAudit(auditRepo)
+		WithAudit(auditRepo).
+		WithSSODefaultRoles(storage.NewSSOStore(pool))
 	// R-follow-up #5 slice 1c — adminH.WithHistory is called further
 	// down where policyHistorySvc is constructed alongside the scoped
 	// handlers (search for "policyHistorySvc := ").
@@ -1003,7 +1004,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// console (api#267). A global auth.sso.edit for every route, and a
 	// fresh second factor for every write: whoever holds it decides who
 	// can sign in.
-	ssoSvc, err := services.NewSSOService(storage.NewSSOStore(pool), roleRepo, km, cfg.PublicURL, cfg.OIDCIssuer)
+	ssoSvc, err := services.NewSSOService(storage.NewSSOStore(pool), roleRepo, km, cfg.PublicURL, cfg.OIDCIssuer, cfg.Env == ModeDev)
 	if err != nil {
 		logger.Error("sign-in settings", "error", err)
 		os.Exit(1)

@@ -18,18 +18,34 @@ func TestNormalizePublicURL(t *testing.T) {
 		"https://secrets.example.com/":      "https://secrets.example.com",
 		" https://secrets.example.com/sb/ ": "https://secrets.example.com/sb",
 		"https://secrets.example.com:8443":  "https://secrets.example.com:8443",
-		"http://localhost:18080":            "http://localhost:18080",
-		"http://127.0.0.1:18080/":           "http://127.0.0.1:18080",
 	}
 	for in, want := range good {
-		if got, err := NormalizePublicURL(in); err != nil || got != want {
-			t.Errorf("NormalizePublicURL(%q) = %q, %v; want %q", in, got, err, want)
+		for _, dev := range []bool{false, true} {
+			if got, err := NormalizePublicURL(in, dev); err != nil || got != want {
+				t.Errorf("NormalizePublicURL(%q, dev=%v) = %q, %v; want %q", in, dev, got, err, want)
+			}
 		}
 	}
 	for _, in := range []string{"", "secrets.example.com", "http://secrets.example.com", "ftp://x.example.com",
 		"https://u:p@x.example.com", "https://x.example.com/?a=b", "https://x.example.com/#f"} {
-		if got, err := NormalizePublicURL(in); err == nil {
-			t.Errorf("NormalizePublicURL(%q) = %q; want an error", in, got)
+		for _, dev := range []bool{false, true} {
+			if got, err := NormalizePublicURL(in, dev); err == nil {
+				t.Errorf("NormalizePublicURL(%q, dev=%v) = %q; want an error", in, dev, got)
+			}
+		}
+	}
+	// Plain http for localhost and loopback only with SB_ENV=dev.
+	loopback := map[string]string{
+		"http://localhost:18080":  "http://localhost:18080",
+		"http://127.0.0.1:18080/": "http://127.0.0.1:18080",
+		"http://[::1]:18080":      "http://[::1]:18080",
+	}
+	for in, want := range loopback {
+		if got, err := NormalizePublicURL(in, true); err != nil || got != want {
+			t.Errorf("NormalizePublicURL(%q, dev) = %q, %v; want %q", in, got, err, want)
+		}
+		if got, err := NormalizePublicURL(in, false); err == nil {
+			t.Errorf("NormalizePublicURL(%q) outside dev = %q; want an error", in, got)
 		}
 	}
 }
@@ -69,7 +85,7 @@ func newTestSSO(t *testing.T, envIssuer string, roles fakeRoles) (*SSOService, *
 		t.Fatal(err)
 	}
 	store := &fakeSSOStore{}
-	s, err := NewSSOService(store, roles, km, "", envIssuer)
+	s, err := NewSSOService(store, roles, km, "", envIssuer, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +123,7 @@ func TestSSO_EnvGoogleBlocksEnableAndListing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	google, err := NewSSOService(store, nil, km, "", "https://accounts.google.com")
+	google, err := NewSSOService(store, nil, km, "", "https://accounts.google.com", false)
 	if err != nil {
 		t.Fatal(err)
 	}
