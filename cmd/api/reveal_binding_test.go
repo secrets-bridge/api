@@ -17,7 +17,6 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
-	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/keymgmt"
@@ -128,7 +127,7 @@ func bootstrapRevealBinding(t *testing.T) *revealBindingFx {
 	}
 	authSvc := services.NewAuthService(
 		storage.NewLocalUsers(pool), storage.NewRoles(pool), storage.NewUserRoles(pool),
-		storage.NewAuditEvents(pool), auth.NewSigner(jwtSecret), time.Hour,
+		storage.NewAuditEvents(pool),
 	)
 
 	// newApp writes the package-level header-identity switch from cfg;

@@ -163,7 +163,7 @@ func newHygFixture(t *testing.T, cfg Config, km *hygFlakyKMS) *hygFixture {
 	auditRepo := storage.NewAuditEvents(pool)
 	authSvc := services.NewAuthService(
 		storage.NewLocalUsers(pool), storage.NewRoles(pool), storage.NewUserRoles(pool),
-		auditRepo, auth.NewSigner(hygRandomBytes(t, 32)), time.Hour,
+		auditRepo,
 	)
 	if cfg.Env == "" {
 		cfg.Env = ModeDev

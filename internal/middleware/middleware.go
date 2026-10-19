@@ -109,14 +109,6 @@ func Recover(logger *slog.Logger) fiber.Handler {
 	}
 }
 
-// TokenVerifier is the slice of `services.AuthService` the middleware
-// needs to verify Bearer JWTs. Kept as an interface so the middleware
-// stays test-friendly + so consumers without a JWT signer can pass
-// nil (header-only mode, useful for the offline test path).
-type TokenVerifier interface {
-	SubjectFromToken(ctx context.Context, token string) (string, error)
-}
-
 // SessionLooker is the slice of `services.SessionService` the auth
 // middleware needs to resolve a cookie value to the authenticated
 // user. Returns the user UUID string on success; opaque error on
@@ -140,8 +132,7 @@ const SessionCookieName = "sb_session"
 // CtxKeySessionID is the typed context key carrying the authenticated
 // session UUID for downstream handlers (audit shape expansion,
 // admin "show my active sessions" queries). Empty string when the
-// request is unauthenticated or used the legacy Bearer / X-User-Id
-// paths.
+// request is unauthenticated or used the legacy X-User-Id path.
 const CtxKeySessionID ctxKey = "session_id"
 
 // CtxKeyPendingApproval is true when the request's session belongs to
@@ -151,39 +142,33 @@ const CtxKeyPendingApproval ctxKey = "pending_approval"
 
 // Auth resolves the request actor identity.
 //
-// Resolution order (Slice A2 adds the cookie branch at the front):
+// Resolution order:
 //  1. `sb_session` cookie — validated via SessionLooker; the
 //     authenticated user's UUID becomes the actor. The slide-the-idle-
 //     TTL side effect runs inside the looker.
-//  2. `Authorization: Bearer <jwt>` — validated via TokenVerifier;
-//     the `sub` claim becomes the actor.
-//  3. `X-User-Id: <id>` — legacy header used by curl / pre-JWT UI
-//     flows. NOT a security boundary; kept so existing tests and
-//     development scripts keep working.
-//  4. Fallback: "anonymous".
+//  2. `X-User-Id: <id>` — legacy header, honoured only with
+//     SB_ALLOW_INSECURE_HEADER_AUTH (local dev). NOT a security boundary.
+//  3. Fallback: "anonymous".
 //
-// A Bearer token or cookie that FAILS verification falls through to
-// the next layer rather than returning 401 — the actual authorization
-// gate is `internal/auth.Require`, which is permission-driven.
-// Generic-401 surfaces from there once it's enabled.
-//
-// When OIDC lands (Slice B), the Bearer branch is retired; the cookie
-// branch becomes the only authenticated path. Every consumer reads
-// from `CtxKeyActor` either way.
-func Auth(verifier TokenVerifier) fiber.Handler {
-	return AuthWith(verifier, nil)
+// `Authorization: Bearer` is not read (M1, api#191): the session cookie
+// is the only user credential, so logout, revocation and expiry apply
+// to every way in. A cookie that FAILS verification falls through to
+// anonymous rather than returning 401; the default-deny gate
+// (RequireAuthedExcept) and `internal/auth.Require` answer 401.
+func Auth() fiber.Handler {
+	return AuthWith(nil)
 }
 
 // AuthWith is the same as Auth but accepts a cookie-based session
 // looker as the first resolution layer. cmd/api uses this once the
 // SessionService is constructed; tests that don't care about cookies
-// keep using Auth(verifier).
+// keep using Auth().
 //
 // When the cookie path resolves a session, the full Session pointer
 // is written to `CtxKeySession` so downstream middleware (Slice D's
 // `RequireFreshMFA`) can read `last_mfa_at` without a second DB
 // round-trip.
-func AuthWith(verifier TokenVerifier, sessions SessionLooker) fiber.Handler {
+func AuthWith(sessions SessionLooker) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		actor := "anonymous"
 		var session *storage.Session
@@ -192,13 +177,6 @@ func AuthWith(verifier TokenVerifier, sessions SessionLooker) fiber.Handler {
 				if s, err := sessions.SessionFromCookie(c.Context(), cookie); err == nil && s != nil {
 					actor = s.UserID.String()
 					session = s
-				}
-			}
-		}
-		if actor == "anonymous" && verifier != nil {
-			if h := c.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-				if sub, err := verifier.SubjectFromToken(c.Context(), strings.TrimPrefix(h, "Bearer ")); err == nil {
-					actor = sub
 				}
 			}
 		}
@@ -277,8 +255,7 @@ func RequireAuthedExcept(public map[string]bool, publicPrefixes ...string) fiber
 // "METHOD /path" entries in allowed (reading /users/me and signing out),
 // and every other request gets 403 account_pending_approval. Like
 // RequireAuthedExcept, a route that forgets about waiting accounts is
-// covered here rather than left open to them. Bearer tokens of waiting
-// accounts are refused earlier, in AuthService.SubjectFromToken.
+// covered here rather than left open to them.
 func RequireApprovedExcept(public map[string]bool, allowed map[string]bool) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		if pending, _ := c.Context().Value(CtxKeyPendingApproval).(bool); !pending {

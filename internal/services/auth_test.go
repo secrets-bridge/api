@@ -12,7 +12,6 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
@@ -57,8 +56,6 @@ func bootstrapAuth(t *testing.T) (*services.AuthService, *storage.Pool) {
 		storage.NewRoles(pool),
 		storage.NewUserRoles(pool),
 		storage.NewAuditEvents(pool),
-		auth.NewSigner(jwtKey),
-		8*time.Hour,
 	)
 	return svc, pool
 }
@@ -300,8 +297,8 @@ func TestLogin_SuccessClearsCounter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Login success: %v", err)
 	}
-	if res.Token == "" {
-		t.Fatal("empty token on successful login")
+	if res.User.ID != user.ID {
+		t.Fatalf("login user = %s, want %s", res.User.ID, user.ID)
 	}
 
 	got, err := repo.Get(ctx, user.ID)
@@ -453,60 +450,5 @@ func TestLogin_ExpiredLockoutAllowsOneGuessThenRelocks(t *testing.T) {
 	}
 	if _, err := svc.Login(ctx, "frank@example.com", []byte("pw-f")); err == nil {
 		t.Fatal("correct password right after re-lock: expected ErrInvalidCredentials")
-	}
-}
-
-// API-S-05: a correctly signed bearer token stops resolving once the
-// user is disabled or deleted.
-func TestSubjectFromToken_RefusesDisabledAndUnknownUsers(t *testing.T) {
-	svc, pool := bootstrapAuth(t)
-	ctx := t.Context()
-	repo := storage.NewLocalUsers(pool)
-	mustCreateUser(t, repo, "gina@example.com", "pw-g")
-
-	res, err := svc.Login(ctx, "gina@example.com", []byte("pw-g"))
-	if err != nil {
-		t.Fatalf("Login: %v", err)
-	}
-	sub, err := svc.SubjectFromToken(ctx, res.Token)
-	if err != nil || sub != res.User.ID.String() {
-		t.Fatalf("SubjectFromToken = %q, %v; want %s", sub, err, res.User.ID)
-	}
-
-	if err := repo.SetDisabled(ctx, res.User.ID, true); err != nil {
-		t.Fatalf("SetDisabled: %v", err)
-	}
-	if _, err := svc.SubjectFromToken(ctx, res.Token); err == nil {
-		t.Fatal("SubjectFromToken accepted a disabled user's token")
-	}
-
-	if _, err := pool.Exec(ctx, `DELETE FROM local_users WHERE id = $1`, res.User.ID); err != nil {
-		t.Fatalf("delete user: %v", err)
-	}
-	if _, err := svc.SubjectFromToken(ctx, res.Token); err == nil {
-		t.Fatal("SubjectFromToken accepted a deleted user's token")
-	}
-}
-
-// api#266: an account waiting for approval may only read /users/me and
-// sign out with a session; its bearer tokens are refused.
-func TestSubjectFromToken_RefusesPendingUsers(t *testing.T) {
-	svc, pool := bootstrapAuth(t)
-	ctx := t.Context()
-	repo := storage.NewLocalUsers(pool)
-	mustCreateUser(t, repo, "pat@example.com", "pw-p")
-
-	res, err := svc.Login(ctx, "pat@example.com", []byte("pw-p"))
-	if err != nil {
-		t.Fatalf("Login: %v", err)
-	}
-	if _, err := svc.SubjectFromToken(ctx, res.Token); err != nil {
-		t.Fatalf("SubjectFromToken before: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE local_users SET pending_approval = TRUE WHERE id = $1`, res.User.ID); err != nil {
-		t.Fatalf("mark pending: %v", err)
-	}
-	if _, err := svc.SubjectFromToken(ctx, res.Token); err == nil {
-		t.Fatal("SubjectFromToken accepted a waiting account's token")
 	}
 }

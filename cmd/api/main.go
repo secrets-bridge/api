@@ -146,13 +146,11 @@ func main() {
 		}
 	}
 
-	// JWT secret is REQUIRED — the login endpoint can't function
-	// without it.
-	if err := cfg.ValidateJWTSecret(); err != nil {
-		logger.Error("jwt secret missing", "error", err)
-		os.Exit(1)
+	// Login no longer issues bearer tokens (M1, api#191), so nothing
+	// signs with SB_JWT_SECRET any more.
+	if len(cfg.JWTSecret) > 0 {
+		logger.Info("SB_JWT_SECRET is set but no longer used: sign-in is cookie-session only; it can be removed")
 	}
-	jwtSigner := auth.NewSigner(cfg.JWTSecret)
 
 	// Local-admin bootstrap. Creates the seed admin user + role
 	// assignment on first boot when local_users is empty. Idempotent
@@ -163,8 +161,6 @@ func main() {
 		storage.NewRoles(pool),
 		storage.NewUserRoles(pool),
 		storage.NewAuditEvents(pool),
-		jwtSigner,
-		cfg.JWTTokenTTL,
 	)
 	if cfg.BootstrapAdminEmail != "" && cfg.BootstrapAdminPassword != "" {
 		bootCtx2, bootCancel2 := context.WithTimeout(context.Background(), 30*time.Second)
@@ -686,7 +682,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		// the TOTP seed all ride this group. First in the chain so even a
 		// 401 from the gates below carries the header.
 		middleware.NoStore(),
-		middleware.AuthWith(authSvc, sessionSvc),
+		middleware.AuthWith(sessionSvc),
 		// Default-deny: everything under /api/v1 requires authentication
 		// unless its path is in publicV1Paths. This is the group-level
 		// backstop — per-route auth.Require still enforces specific
@@ -718,7 +714,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// Authentication — public route, no auth gating. The UI POSTs
 	// email + password here and receives a signed JWT in return. The
 	// rest of the platform reads identity from `middleware.CtxKeyActor`
-	// which the upstream `middleware.Auth(authSvc)` populated from
+	// which the upstream `middleware.Auth()` populated from
 	// either the Bearer JWT or the legacy X-User-Id header.
 	//
 	// Rate limit per architect Q7 + NAT-aware tuning (Slice A1):

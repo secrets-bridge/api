@@ -38,7 +38,7 @@ func h1TestResolver() auth.Resolver {
 func newTenancyWriteAuthzApp(res auth.Resolver) *fiber.App {
 	app := fiber.New()
 	v1 := app.Group("/api/v1",
-		middleware.AuthWith(nil, nil),
+		middleware.AuthWith(nil),
 		middleware.RequireAuthedExcept(publicV1Paths),
 	)
 	leak := func(c fiber.Ctx) error { return c.SendString("reachable") }

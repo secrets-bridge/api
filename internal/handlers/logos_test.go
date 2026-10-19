@@ -154,7 +154,7 @@ func bootstrapLogosWith(t *testing.T, store objectstore.Store, keys objectstore.
 		WithIdentity(storage.NewLocalUsers(pool), teamsRepo).WithLogos(logoSvc)
 
 	app := fiber.New()
-	app.Use(middleware.Auth(nil))
+	app.Use(middleware.Auth())
 	app.Get("/api/v1/projects", tenancyH.ListProjects)
 	app.Get("/api/v1/projects/:id", tenancyH.GetProject)
 	app.Get("/api/v1/projects/:id/logo", tenancyH.GetProjectLogo)

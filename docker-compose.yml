@@ -5,7 +5,6 @@
 # Export these before starting the api container (postgres/redis alone
 # don't need them); the api refuses to boot if a key is missing:
 #   export SB_WRAP_MASTER_KEY=$(openssl rand -base64 32)
-#   export SB_JWT_SECRET=$(openssl rand -base64 48)
 #   export SB_DEV_SEED_PASSWORD=...   # optional, unset = random per dev user
 #
 #   docker compose up --build              # api + postgres + redis + minio
@@ -122,10 +121,9 @@ services:
       # (LocalKMS rejected at boot).
       SB_ENV: dev
       # Keys come from your shell, never from this file. Left empty,
-      # the api refuses to boot ("SB_WRAP_MASTER_KEY is not set" /
-      # "SB_JWT_SECRET must be set"), so nothing runs on a shared key.
+      # the api refuses to boot ("SB_WRAP_MASTER_KEY is not set"), so
+      # nothing runs on a shared key.
       SB_WRAP_MASTER_KEY: "${SB_WRAP_MASTER_KEY:-}"
-      SB_JWT_SECRET: "${SB_JWT_SECRET:-}"
       # Optional shared password for the 3 dev users. Leave unset for
       # a fresh random password per user, logged ONCE on first boot.
       SB_DEV_SEED_PASSWORD: "${SB_DEV_SEED_PASSWORD:-}"

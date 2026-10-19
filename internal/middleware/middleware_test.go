@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http/httptest"
 	"testing"
@@ -80,7 +81,7 @@ func TestRequestID_RejectsOverlongInbound(t *testing.T) {
 
 func TestAuth_StubSetsAnonymousActor(t *testing.T) {
 	app := fiber.New()
-	app.Use(Auth(nil))
+	app.Use(Auth())
 	app.Get("/x", func(c fiber.Ctx) error {
 		if v, ok := c.Context().Value(CtxKeyActor).(string); !ok || v != "anonymous" {
 			return c.Status(500).SendString("actor not set")
@@ -94,6 +95,27 @@ func TestAuth_StubSetsAnonymousActor(t *testing.T) {
 	}
 	if resp.StatusCode != 200 {
 		t.Fatalf("status: %d", resp.StatusCode)
+	}
+}
+
+// M1 (api#191): a bearer token is not read at all, so a request that
+// carries only one stays anonymous whatever the token says.
+func TestAuth_BearerHeaderIsIgnored(t *testing.T) {
+	app := fiber.New()
+	app.Use(AuthWith(nil))
+	app.Get("/x", func(c fiber.Ctx) error {
+		v, _ := c.Context().Value(CtxKeyActor).(string)
+		return c.SendString(v)
+	})
+	req := httptest.NewRequest("GET", "/x", nil)
+	req.Header.Set("Authorization", "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbiJ9.c2ln")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "anonymous" {
+		t.Fatalf("actor = %q, want anonymous", body)
 	}
 }
 

@@ -98,7 +98,7 @@ func newGateFixture(t *testing.T) *gateFixture {
 	}
 	authSvc := services.NewAuthService(
 		storage.NewLocalUsers(pool), storage.NewRoles(pool), storage.NewUserRoles(pool),
-		storage.NewAuditEvents(pool), auth.NewSigner(randomBytes(t, 32)), time.Hour,
+		storage.NewAuditEvents(pool),
 	)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	app := newApp(Config{Env: ModeDev, ProviderConnRejectSecretValues: true}, logger, pool, rdb, km, authSvc)

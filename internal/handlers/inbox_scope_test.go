@@ -113,7 +113,7 @@ func bootstrapInboxScope(t *testing.T) *inboxScopeFixture {
 	crossTeamH := handlers.NewCrossTeam(reqSvc, resolver, tsr)
 
 	app := fiber.New()
-	app.Use(middleware.Auth(nil))
+	app.Use(middleware.Auth())
 	app.Get("/api/v1/requests/inbox", crossTeamH.Inbox)
 	app.Get("/api/v1/requests/inbox/count", crossTeamH.InboxCount)
 	fx.app = app

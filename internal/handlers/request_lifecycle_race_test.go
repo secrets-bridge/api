@@ -129,7 +129,7 @@ func bootstrapLifecycle(t *testing.T) *lifecycleFixture {
 	crossTeamH := handlers.NewCrossTeam(reqSvc, nil, nil)
 
 	app := fiber.New()
-	app.Use(middleware.Auth(nil))
+	app.Use(middleware.Auth())
 	app.Post("/api/v1/requests/:id/approve", requestsH.Approve)
 	app.Post("/api/v1/requests/:id/reject", requestsH.Reject)
 	app.Post("/api/v1/requests/:id/cancel", requestsH.Cancel)

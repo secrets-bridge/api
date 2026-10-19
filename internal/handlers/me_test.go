@@ -77,7 +77,7 @@ func bootstrapMe(t *testing.T) (*fiber.App, *storage.Pool) {
 		WithIdentity(users, teams)
 
 	app := fiber.New()
-	app.Use(middleware.Auth(nil)) // legacy X-User-Id path
+	app.Use(middleware.Auth()) // legacy X-User-Id path
 	app.Get("/api/v1/users/me", meH.GetMe)
 	return app, pool
 }
@@ -241,7 +241,7 @@ func TestGetMe_MFAEnrolled_RoundTrip(t *testing.T) {
 				WithIdentity(users, teams).
 				WithMFAEnrollment(c.lk)
 			caseApp := fiber.New()
-			caseApp.Use(middleware.Auth(nil))
+			caseApp.Use(middleware.Auth())
 			caseApp.Get("/api/v1/users/me", meH.GetMe)
 
 			req := httptest.NewRequest("GET", "/api/v1/users/me", nil)
