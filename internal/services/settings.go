@@ -326,7 +326,8 @@ func (s *SettingsService) Set(ctx context.Context, in SetInput) (*PlatformSettin
 	if v, ok := oldDecoded["value"]; ok {
 		auditMeta["old_value"] = v
 	}
-	auditJSON, err := json.Marshal(auditMeta)
+	// Same allowlist as every other audit write (api#263).
+	auditJSON, err := json.Marshal(storage.SanitizeAuditMetadata("platform_setting.update", auditMeta))
 	if err != nil {
 		return nil, fmt.Errorf("services: marshal audit metadata: %w", err)
 	}
