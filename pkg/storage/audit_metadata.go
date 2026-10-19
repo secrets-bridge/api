@@ -63,7 +63,7 @@ var auditMetaKeys = map[string]auditMetaKind{
 	// ids
 	"aaguid": metaID, "agent_id": metaID, "attempted_environment_id": metaID, "attempted_project_id": metaID,
 	"attempted_team_id": metaID, "attempted_workflow_id": metaID, "binding_id": metaID, "connection_id": metaID,
-	"default_role_id": metaID, "enrollment_token_id": metaID, "environment": metaID, "environment_id": metaID,
+	"default_role_id": metaID, "enrollment_token_id": metaID, "environment_id": metaID,
 	"filled_by": metaID, "job_id": metaID, "kms_key_id": metaID, "new_parent_team_id": metaID,
 	"observation_id": metaID, "old_parent_team_id": metaID, "parent_team_id": metaID,
 	"parent_team_id_after": metaID, "parent_team_id_before": metaID, "policy_rule_id": metaID,
@@ -80,14 +80,14 @@ var auditMetaKeys = map[string]auditMetaKind{
 	"job_type": metaToken, "kind": metaToken, "kind_after": metaToken, "kind_before": metaToken,
 	"path": metaToken, "phase": metaToken, "prior_lane": metaToken, "provider_type": metaToken,
 	"public_key_algorithm": metaToken, "purpose": metaToken, "refusal_reason": metaToken,
-	"request_type": metaToken, "risk_level_before": metaToken, "role": metaToken, "scope": metaToken,
+	"request_type": metaToken, "scope": metaToken,
 	"severity": metaToken, "state": metaToken, "status": metaToken, "sweeper": metaToken, "target": metaToken,
 	"target_provider_type": metaToken, "triggered_by": metaToken, "type": metaToken, "voted_as": metaToken,
 
 	// names
 	"acr": metaName, "agent_version": metaName, "application_name": metaName, "base_url": metaURL,
 	"client_id": metaName, "cluster_name": metaName, "destination_secret_ref": metaName,
-	"display_name": metaName, "email": metaEmail, "email_at_link": metaEmail, "environment_name": metaName,
+	"display_name": metaName, "email": metaEmail, "environment": metaName, "role": metaName, "email_at_link": metaEmail, "environment_name": metaName,
 	"expected_cluster_name": metaName, "ip": metaName, "iss": metaName, "key": metaName, "label": metaName,
 	"name": metaName, "project_filter": metaName, "public_url": metaURL, "reason": metaName, "sub": metaName, "target_secret_ref": metaName,
 	"user_agent": metaName,
@@ -102,12 +102,12 @@ var auditMetaKeys = map[string]auditMetaKind{
 	"requests_swept": metaNumber, "rollup_window_seconds": metaNumber, "sessions_swept": metaNumber,
 	"skipped_locked": metaNumber, "source_votes": metaNumber, "source_votes_needed": metaNumber,
 	"stale_after_seconds": metaNumber, "team_policy_rule_count": metaNumber, "threshold": metaNumber,
-	"ttl_seconds": metaNumber, "pending_cap": metaNumber, "undeclared_count": metaNumber, "width": metaNumber, "wrap_count": metaNumber,
+	"ttl_seconds": metaNumber, "pending_cap": metaNumber, "risk_level": metaNumber, "risk_level_before": metaNumber, "window_minutes": metaNumber, "undeclared_count": metaNumber, "width": metaNumber, "wrap_count": metaNumber,
 	"wrap_errors": metaNumber, "wraps_already_closed": metaNumber, "priority": metaNumber,
 	"wraps_expired": metaNumber, "wraps_self_healed": metaNumber,
 
 	// bools
-	"became_approved": metaBool, "client_secret_set": metaBool,
+	"became_approved": metaBool, "first_in_window": metaBool, "client_secret_set": metaBool,
 	"discover_enabled": metaBool, "enabled": metaBool, "has_comment": metaBool, "has_error": metaBool,
 	"has_reason": metaBool, "require_approval": metaBool, "requires_security_approval": metaBool,
 	"security_approval_required": metaBool, "security_vote_present": metaBool, "self_heal_failed": metaBool,
@@ -121,7 +121,7 @@ var auditMetaKeys = map[string]auditMetaKind{
 	"added": metaNameListOrScalar, "deleted": metaNameListOrScalar, "revoked": metaNameListOrScalar,
 
 	// times
-	"at": metaTime, "deadline": metaTime, "expires_at": metaTime, "idle_expires_at": metaTime,
+	"at": metaTime, "deadline": metaTime, "first": metaTime, "last": metaTime, "window_start": metaTime, "expires_at": metaTime, "idle_expires_at": metaTime,
 	"locked_until": metaTime, "timeout_at": metaTime,
 
 	// digests and fingerprints (content_hash is the value digest tracked in skills#68)
