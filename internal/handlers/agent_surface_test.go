@@ -1142,7 +1142,7 @@ func TestAgentSurface_UnsealedBreakGlassKeepsLegacyShapes(t *testing.T) {
 		t.Fatalf("legacy keyless fetch with the switch = %d (%s); want 200", code, body)
 	}
 	var p handlers.WrapPayload
-	if err := json.Unmarshal(body, &p); err != nil || p.Sealed != nil || p.Value != base64.StdEncoding.EncodeToString([]byte("canary-legacy")) {
+	if err := json.Unmarshal(body, &p); err != nil || p.Sealed != nil || p.Value == nil || *p.Value != base64.StdEncoding.EncodeToString([]byte("canary-legacy")) {
 		t.Fatalf("legacy fetch did not return the plaintext shape (err=%v)", err)
 	}
 

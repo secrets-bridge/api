@@ -85,14 +85,14 @@ func sealable(a *storage.Agent) bool {
 //
 // The agent inspects which field is populated and decodes accordingly.
 type WrapPayload struct {
-	WrapID      string            `json:"wrap_id"`
-	RequestID   string            `json:"request_id,omitempty"`
-	KeyName     string            `json:"key_name,omitempty"`
-	Value       string            `json:"value,omitempty"`  // base64 — present when not sealed
-	Sealed      *SealedEnvelope   `json:"sealed,omitempty"` // present when sealed
-	ByteLength  int               `json:"byte_length"`
-	ContentHash string            `json:"content_hash"` // hex SHA-256 of plaintext
-	Algorithm   string            `json:"algorithm"`    // the wrap's AEAD (storage layer)
+	WrapID      string          `json:"wrap_id"`
+	RequestID   string          `json:"request_id,omitempty"`
+	KeyName     string          `json:"key_name,omitempty"`
+	Value       *string         `json:"value,omitempty"`  // base64, present when not sealed ("" for an empty value)
+	Sealed      *SealedEnvelope `json:"sealed,omitempty"` // present when sealed
+	ByteLength  int             `json:"byte_length"`
+	ContentHash string          `json:"content_hash"` // hex SHA-256 of plaintext
+	Algorithm   string          `json:"algorithm"`    // the wrap's AEAD (storage layer)
 }
 
 // SealedEnvelope is the wire-envelope shape returned by the CP when the
@@ -104,12 +104,14 @@ type WrapPayload struct {
 //	aes_key = HKDF(shared, salt=ephemeral_public_key || agent_public_key, info="secrets-bridge.wrap.v1")
 //	plaintext = AES-256-GCM-Open(aes_key, ciphertext, nonce)
 type SealedEnvelope struct {
-	Algorithm          string `json:"algorithm"`             // "x25519-hkdf-aes-gcm"
-	Ciphertext         string `json:"ciphertext"`            // base64
-	Nonce              string `json:"nonce"`                 // base64
-	EphemeralPublicKey string `json:"ephemeral_public_key"`  // base64
+	Algorithm          string `json:"algorithm"`            // "x25519-hkdf-aes-gcm"
+	Ciphertext         string `json:"ciphertext"`           // base64
+	Nonce              string `json:"nonce"`                // base64
+	EphemeralPublicKey string `json:"ephemeral_public_key"` // base64
 }
 
+// wrapErr maps an agent wrap retrieve error to its status. Create has
+// its own coded mapping (createWrapErr).
 func wrapErr(err error) error {
 	switch {
 	case errors.Is(err, storage.ErrNotFound):
@@ -124,12 +126,6 @@ func wrapErr(err error) error {
 		return fiber.NewError(fiber.StatusForbidden, "request is not dispatched to this agent")
 	case errors.Is(err, services.ErrWrapNotForAgent):
 		return fiber.NewError(fiber.StatusForbidden, "wrap is not retrievable by an agent")
-	case errors.Is(err, services.ErrKeyNotRequested):
-		return fiber.NewError(fiber.StatusForbidden, "key_name is not one of the request's target keys")
-	case errors.Is(err, storage.ErrDuplicateWrapKey):
-		return fiber.NewError(fiber.StatusConflict, "a wrap for this key already exists on the request")
-	case errors.Is(err, services.ErrWrapCreateNotRead):
-		return fiber.NewError(fiber.StatusBadRequest, "wrap creation only supported for read requests")
 	default:
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
@@ -192,7 +188,8 @@ func (h *Wraps) Retrieve(c fiber.Ctx) error {
 			EphemeralPublicKey: base64.StdEncoding.EncodeToString(env.EphemeralPublicKey),
 		}
 	} else {
-		body.Value = base64.StdEncoding.EncodeToString(plaintext)
+		v := base64.StdEncoding.EncodeToString(plaintext)
+		body.Value = &v
 	}
 	return c.Status(fiber.StatusOK).JSON(body)
 }
@@ -242,21 +239,24 @@ func (h *Wraps) IssueDEK(c fiber.Ctx) error {
 //     POSTs the ciphertext + nonce + dek_ciphertext here. The CP
 //     unwraps the DEK via KMS, decrypts, then re-envelopes for
 //     storage. Plaintext never on the wire.
+//
+// A pointer, so a legacy post of an empty value (`"value": ""`) is told
+// apart from no value at all (api#286).
 type CreateWrapBody struct {
-	RequestID string                 `json:"request_id"`
-	KeyName   string                 `json:"key_name"`
-	Value     string                 `json:"value,omitempty"`    // base64; legacy path
-	Envelope  *CreateWrapEnvelope    `json:"envelope,omitempty"` // wire-envelope path
+	RequestID string              `json:"request_id"`
+	KeyName   string              `json:"key_name"`
+	Value     *string             `json:"value,omitempty"`    // base64; legacy path
+	Envelope  *CreateWrapEnvelope `json:"envelope,omitempty"` // wire-envelope path
 }
 
 // CreateWrapEnvelope is the agent-side wire-envelope shape posted to
 // the wrap-creation endpoint. All byte fields are base64.
 type CreateWrapEnvelope struct {
-	Algorithm        string `json:"algorithm"`         // "aes-256-gcm"
-	Ciphertext       string `json:"ciphertext"`        // AES-GCM(dek, plaintext)
-	Nonce            string `json:"nonce"`             // GCM nonce
-	DEKCiphertext    string `json:"dek_ciphertext"`    // KMS-wrapped DEK (round-trip from /dek)
-	DEKKMSKeyID      string `json:"dek_kms_key_id,omitempty"`
+	Algorithm     string `json:"algorithm"`      // "aes-256-gcm"
+	Ciphertext    string `json:"ciphertext"`     // AES-GCM(dek, plaintext)
+	Nonce         string `json:"nonce"`          // GCM nonce
+	DEKCiphertext string `json:"dek_ciphertext"` // KMS-wrapped DEK (round-trip from /dek)
+	DEKKMSKeyID   string `json:"dek_kms_key_id,omitempty"`
 }
 
 // CreateResponse is the JSON returned after the wrap is persisted.
@@ -276,12 +276,17 @@ type CreateResponse struct {
 // Used by the agent's ReadExecutor: after GetValue returns the bundle,
 // the agent splits it by key, base64-encodes each plaintext, and POSTs
 // one wrap per key. The CP runs WrapService.Wrap which envelope-
-// encrypts via the KMS layer and persists.
+// encrypts via the KMS layer and persists. An empty value is a valid
+// value and is sealed like any other (api#286).
 //
 // Authorization: AgentAuth confirms the caller is a valid agent; then
 // RequestService.CreateAgentWrap requires the read request's job to be
 // claimed by THIS agent, key_name to be one of the request's target
 // keys, and no earlier wrap for the same key (H4, api#191).
+//
+// Every refusal of the agent's input is a 4xx whose JSON body carries a
+// stable code in `error` and a human message in `message` (see the
+// WrapCreateCode* constants). Only a server-side failure is a 500.
 func (h *Wraps) Create(c fiber.Ctx) error {
 	agentID, ok := middleware.AgentIDFromContext(c.Context())
 	if !ok {
@@ -289,39 +294,40 @@ func (h *Wraps) Create(c fiber.Ctx) error {
 	}
 	var body CreateWrapBody
 	if err := c.Bind().JSON(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
+		return createRefusal(c, fiber.StatusBadRequest, WrapCreateCodeInvalidJSON, "invalid JSON body")
 	}
 	if body.RequestID == "" || body.KeyName == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "request_id, key_name required")
+		return createRefusal(c, fiber.StatusBadRequest, WrapCreateCodeMissingField, "request_id, key_name required")
 	}
-	if (body.Value == "") == (body.Envelope == nil) {
-		return fiber.NewError(fiber.StatusBadRequest, "exactly one of value or envelope is required")
+	if (body.Value == nil) == (body.Envelope == nil) {
+		return createRefusal(c, fiber.StatusBadRequest, WrapCreateCodeValueOrEnvelope, "exactly one of value or envelope is required")
 	}
-	if body.Value != "" && !h.allowUnsealed {
+	if body.Value != nil && !h.allowUnsealed {
 		h.requests.AuditUnsealedWrapRefused(c.Context(), "wrap.create", agentID, uuid.Nil, "plaintext_value_refused")
-		return fiber.NewError(fiber.StatusBadRequest, "envelope_required: post the value as a wire envelope (POST /dek first); plaintext value is refused")
+		return createRefusal(c, fiber.StatusBadRequest, WrapCreateCodeEnvelopeRequired,
+			"post the value as a wire envelope (POST /dek first); plaintext value is refused")
 	}
 	reqID, err := uuid.Parse(body.RequestID)
 	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid request_id UUID")
+		return createRefusal(c, fiber.StatusBadRequest, WrapCreateCodeInvalidRequestID, "invalid request_id UUID")
 	}
 
 	var plaintext []byte
-	if body.Value != "" {
-		// Legacy plaintext-over-TLS path.
-		plaintext, err = base64.StdEncoding.DecodeString(body.Value)
+	if body.Value != nil {
+		// Legacy plaintext-over-TLS path. "" decodes to an empty value.
+		plaintext, err = base64.StdEncoding.DecodeString(*body.Value)
 		if err != nil {
-			return fiber.NewError(fiber.StatusBadRequest, "value is not valid base64")
+			return createRefusal(c, fiber.StatusBadRequest, WrapCreateCodeInvalidValue, "value is not valid base64")
 		}
 	} else {
 		// Wire-envelope path: unwrap the agent-supplied DEK envelope.
-		plaintext, err = h.unsealAgentEnvelope(c.Context(), body.Envelope)
-		if err != nil {
-			var ee *envelopeError
-			if errors.As(err, &ee) {
+		var ee *envelopeError
+		plaintext, ee = h.unsealAgentEnvelope(c.Context(), body.Envelope)
+		if ee != nil {
+			if ee.cause != nil {
 				logInternalError(c, "wrap envelope rejected", ee.cause)
 			}
-			return fiber.NewError(fiber.StatusBadRequest, "envelope: "+err.Error())
+			return createRefusal(c, fiber.StatusBadRequest, ee.code, "envelope: "+ee.msg)
 		}
 	}
 	defer zero(plaintext)
@@ -331,7 +337,7 @@ func (h *Wraps) Create(c fiber.Ctx) error {
 	// lands at most once per request.
 	wrap, err := h.requests.CreateAgentWrap(c.Context(), agentID, reqID, body.KeyName, plaintext)
 	if err != nil {
-		return wrapErr(err)
+		return createWrapErr(c, err)
 	}
 
 	return c.Status(fiber.StatusCreated).JSON(CreateResponse{
@@ -344,20 +350,68 @@ func (h *Wraps) Create(c fiber.Ctx) error {
 	})
 }
 
+// Stable codes in the `error` field of a refused POST /agents/:id/wraps.
+// Agents and operators match on these; the `message` text may change.
+const (
+	WrapCreateCodeInvalidJSON        = "invalid_json"
+	WrapCreateCodeMissingField       = "missing_required_field"
+	WrapCreateCodeValueOrEnvelope    = "value_or_envelope_required"
+	WrapCreateCodeEnvelopeRequired   = "envelope_required"
+	WrapCreateCodeInvalidRequestID   = "invalid_request_id"
+	WrapCreateCodeInvalidValue       = "invalid_value_encoding"
+	WrapCreateCodeUnsupportedAlg     = "unsupported_envelope_algorithm"
+	WrapCreateCodeInvalidEnvelope    = "invalid_envelope"
+	WrapCreateCodeDataKeyUndecrypted = "envelope_data_key_undecryptable"
+	WrapCreateCodeUnauthenticated    = "envelope_unauthenticated"
+	WrapCreateCodeRequestNotFound    = "request_not_found"
+	WrapCreateCodeNotReadRequest     = "request_not_read"
+	WrapCreateCodeNotApproved        = "request_not_approved"
+	WrapCreateCodeJobNotClaimed      = "job_not_claimed"
+	WrapCreateCodeKeyNotRequested    = "key_not_requested"
+	WrapCreateCodeDuplicateKey       = "duplicate_key"
+)
+
+// createRefusal answers a refused wrap create with a stable code and a
+// client-safe message.
+func createRefusal(c fiber.Ctx, status int, code, msg string) error {
+	return c.Status(status).JSON(fiber.Map{"error": code, "message": msg})
+}
+
+// createWrapErr maps a RequestService.CreateAgentWrap error to its
+// refusal. Anything not listed is a server-side failure and goes to the
+// app error handler, which logs it and answers a generic 500.
+func createWrapErr(c fiber.Ctx, err error) error {
+	switch {
+	case errors.Is(err, storage.ErrNotFound):
+		return createRefusal(c, fiber.StatusNotFound, WrapCreateCodeRequestNotFound, "request not found")
+	case errors.Is(err, services.ErrWrapCreateNotRead):
+		return createRefusal(c, fiber.StatusBadRequest, WrapCreateCodeNotReadRequest, "wrap creation only supported for read requests")
+	case errors.Is(err, services.ErrRequestNotApproved):
+		return createRefusal(c, fiber.StatusConflict, WrapCreateCodeNotApproved, "owning request is not approved")
+	case errors.Is(err, storage.ErrJobNotClaimed):
+		return createRefusal(c, fiber.StatusForbidden, WrapCreateCodeJobNotClaimed, "request is not dispatched to this agent")
+	case errors.Is(err, services.ErrKeyNotRequested):
+		return createRefusal(c, fiber.StatusForbidden, WrapCreateCodeKeyNotRequested, "key_name is not one of the request's target keys")
+	case errors.Is(err, storage.ErrDuplicateWrapKey):
+		return createRefusal(c, fiber.StatusConflict, WrapCreateCodeDuplicateKey, "a wrap for this key already exists on the request")
+	default:
+		return err
+	}
+}
+
 // AES-256-GCM shape of an agent wire envelope (cipher.NewGCM defaults).
 const (
 	gcmStandardNonceSize = 12
 	gcmTagSize           = 16
 )
 
-// errInvalidEnvelope is the one message a malformed envelope gets.
-var errInvalidEnvelope = errors.New("invalid envelope")
-
-// envelopeError is a wrap-envelope failure whose Error() is a stable,
-// client-safe message. The cause (a KMS backend error carrying the
-// backend URL and key name, or a crypto error) is logged server side by
-// the caller and never returned to the agent (API-16).
+// envelopeError is a wrap-envelope refusal: a stable code, a client-safe
+// message and, for KMS or crypto failures, the cause. The cause (a KMS
+// backend error carrying the backend URL and key name, or a crypto
+// error) is logged server side by the caller and never returned to the
+// agent (API-16).
 type envelopeError struct {
+	code  string
 	msg   string
 	cause error
 }
@@ -365,61 +419,71 @@ type envelopeError struct {
 func (e *envelopeError) Error() string { return e.msg }
 func (e *envelopeError) Unwrap() error { return e.cause }
 
+func invalidEnvelope(msg string) *envelopeError {
+	return &envelopeError{code: WrapCreateCodeInvalidEnvelope, msg: msg}
+}
+
 // unsealAgentEnvelope reverses what the agent did with the DEK that
 // /agents/:id/dek issued: KMS-decrypt the DEK ciphertext to recover
 // the plaintext data key, then AES-GCM-open the ciphertext.
 //
+// An empty value is valid: its ciphertext is just the 16-byte GCM tag,
+// and it opens to a non-nil empty slice (api#286).
+//
 // The plaintext DEK is zeroed inside this function; only the unwrapped
 // plaintext escapes (and the caller defer-zeroes it).
-func (h *Wraps) unsealAgentEnvelope(ctx context.Context, env *CreateWrapEnvelope) ([]byte, error) {
+func (h *Wraps) unsealAgentEnvelope(ctx context.Context, env *CreateWrapEnvelope) ([]byte, *envelopeError) {
 	if env.Algorithm != "aes-256-gcm" {
-		return nil, errors.New("unsupported algorithm")
+		return nil, &envelopeError{code: WrapCreateCodeUnsupportedAlg, msg: "unsupported algorithm"}
 	}
 	if env.Ciphertext == "" || env.Nonce == "" || env.DEKCiphertext == "" {
-		return nil, errors.New("ciphertext, nonce, dek_ciphertext required")
+		return nil, invalidEnvelope("ciphertext, nonce, dek_ciphertext required")
 	}
 	ciphertext, err := base64.StdEncoding.DecodeString(env.Ciphertext)
 	if err != nil {
-		return nil, errors.New("ciphertext is not valid base64")
+		return nil, invalidEnvelope("ciphertext is not valid base64")
 	}
 	nonce, err := base64.StdEncoding.DecodeString(env.Nonce)
 	if err != nil {
-		return nil, errors.New("nonce is not valid base64")
+		return nil, invalidEnvelope("nonce is not valid base64")
 	}
 	dekCt, err := base64.StdEncoding.DecodeString(env.DEKCiphertext)
 	if err != nil {
-		return nil, errors.New("dek_ciphertext is not valid base64")
+		return nil, invalidEnvelope("dek_ciphertext is not valid base64")
 	}
 	// API-S-23: gcm.Open panics on a nonce that is not exactly the GCM
 	// nonce size. Check the shape before any KMS call and answer with
 	// one generic message.
 	if len(nonce) != gcmStandardNonceSize || len(ciphertext) < gcmTagSize {
-		return nil, errInvalidEnvelope
+		return nil, invalidEnvelope("invalid envelope")
 	}
 
 	dek, err := h.kms.DecryptDataKey(ctx, dekCt, env.DEKKMSKeyID)
 	if err != nil {
-		return nil, &envelopeError{msg: "data key could not be decrypted", cause: err}
+		return nil, &envelopeError{code: WrapCreateCodeDataKeyUndecrypted, msg: "data key could not be decrypted", cause: err}
 	}
 	defer zero(dek)
 	if len(dek) != 32 {
-		return nil, errors.New("dek is not 32 bytes")
+		return nil, invalidEnvelope("dek is not 32 bytes")
 	}
 
 	block, err := aes.NewCipher(dek)
 	if err != nil {
-		return nil, &envelopeError{msg: "ciphertext could not be authenticated", cause: err}
+		return nil, &envelopeError{code: WrapCreateCodeUnauthenticated, msg: "ciphertext could not be authenticated", cause: err}
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, &envelopeError{msg: "ciphertext could not be authenticated", cause: err}
+		return nil, &envelopeError{code: WrapCreateCodeUnauthenticated, msg: "ciphertext could not be authenticated", cause: err}
 	}
 	if len(nonce) != gcm.NonceSize() || len(ciphertext) < gcm.Overhead() {
-		return nil, errInvalidEnvelope
+		return nil, invalidEnvelope("invalid envelope")
 	}
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return nil, &envelopeError{msg: "ciphertext could not be authenticated", cause: err}
+		return nil, &envelopeError{code: WrapCreateCodeUnauthenticated, msg: "ciphertext could not be authenticated", cause: err}
+	}
+	if plaintext == nil {
+		plaintext = []byte{}
 	}
 	return plaintext, nil
 }
@@ -432,4 +496,3 @@ func zero(b []byte) {
 		b[i] = 0
 	}
 }
-
