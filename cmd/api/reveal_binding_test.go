@@ -138,7 +138,6 @@ func bootstrapRevealBinding(t *testing.T) *revealBindingFx {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	app := newApp(Config{
 		Env:                            ModeDev,
-		JWTTokenTTL:                    time.Hour,
 		MFATOTPIssuer:                  "Secrets Bridge",
 		ProviderConnRejectSecretValues: true,
 	}, logger, pool, rdb, km, authSvc)

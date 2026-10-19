@@ -320,9 +320,13 @@ func TestLogin_EmitsBreakGlassAuditEvent(t *testing.T) {
 	repo := storage.NewLocalUsers(pool)
 	mustCreateUser(t, repo, "carol@example.com", "pw-c")
 
-	if _, err := svc.Login(ctx, "carol@example.com", []byte("pw-c")); err != nil {
+	res, err := svc.Login(ctx, "carol@example.com", []byte("pw-c"))
+	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
+	// Login only verifies; the handler records the success once the
+	// session exists (api#277).
+	svc.RecordLoginSuccess(ctx, res)
 
 	var count int
 	if err := pool.QueryRow(ctx,

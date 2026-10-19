@@ -41,7 +41,6 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/keymgmt"
 	"github.com/secrets-bridge/api/pkg/runtime"
@@ -189,8 +188,9 @@ type loginHarness struct {
 	apiURL string
 	client *http.Client
 	km     keymgmt.KeyManager
-	// signer forges correctly signed JWTs, to show they are no credential.
-	signer *auth.Signer
+	// jwtKey is the key login tokens were signed with before M1; tests
+	// forge correctly signed JWTs with it to show they are no credential.
+	jwtKey []byte
 }
 
 func newLoginHarness(t *testing.T, opts ...func(*Config)) *loginHarness {
@@ -274,7 +274,7 @@ func newLoginHarness(t *testing.T, opts ...func(*Config)) *loginHarness {
 
 	return &loginHarness{
 		t: t, pool: pool, rdb: rdb, users: users, idp: idp, apiURL: apiURL, km: km,
-		signer: auth.NewSigner(jwtKey),
+		jwtKey: jwtKey,
 		client: &http.Client{
 			Timeout: 60 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -425,11 +425,7 @@ func (h *loginHarness) me(session *http.Cookie, bearer string) (int, string) {
 // sign login tokens: before M1 it was a working credential.
 func (h *loginHarness) signedToken(uid uuid.UUID) string {
 	h.t.Helper()
-	tok, _, err := h.signer.SignToken(auth.Claims{Subject: uid.String()}, time.Hour)
-	if err != nil {
-		h.t.Fatalf("SignToken: %v", err)
-	}
-	return tok
+	return forgedLoginJWT(h.t, h.jwtKey, uid.String())
 }
 
 func (h *loginHarness) count(q string, args ...any) int {
@@ -542,7 +538,7 @@ func TestLoginSecurity_OIDCJITRequiresVerifiedEmail(t *testing.T) {
 
 // --- API-S-05 / API-N-09: disabled users -----------------------------
 
-func TestLoginSecurity_DisabledUserLosesSessionsTokensAndOIDC(t *testing.T) {
+func TestLoginSecurity_DisabledUserLosesSessionsAndOIDC(t *testing.T) {
 	h := newLoginHarness(t)
 	ctx := t.Context()
 	user := h.createUser("dana@example.com", "dana-correct-pw", bcrypt.MinCost)

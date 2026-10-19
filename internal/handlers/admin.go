@@ -538,7 +538,7 @@ func (h *Admin) ListWorkflows(c fiber.Ctx) error {
 // authorable. Returns enabled AND scoped_policy_authorable=true
 // workflows for the EPIC R Slice R3 author drawer (R-follow-up #1).
 //
-// Auth: bearer + policy.author at any scope. The caller doesn't need
+// Auth: session + policy.author at any scope. The caller doesn't need
 // scoped coverage of any specific project to LIST opted-in workflows;
 // they need it to USE one (which the gate chain at POST/PUT
 // /projects/:id/policy-rules enforces).

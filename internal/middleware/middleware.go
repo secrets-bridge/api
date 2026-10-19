@@ -143,10 +143,10 @@ const CtxKeyPendingApproval ctxKey = "pending_approval"
 // Auth resolves the request actor identity.
 //
 // Resolution order:
-//  1. `sb_session` cookie — validated via SessionLooker; the
+//  1. `sb_session` cookie: validated via SessionLooker; the
 //     authenticated user's UUID becomes the actor. The slide-the-idle-
 //     TTL side effect runs inside the looker.
-//  2. `X-User-Id: <id>` — legacy header, honoured only with
+//  2. `X-User-Id: <id>`: legacy header, honoured only with
 //     SB_ALLOW_INSECURE_HEADER_AUTH (local dev). NOT a security boundary.
 //  3. Fallback: "anonymous".
 //

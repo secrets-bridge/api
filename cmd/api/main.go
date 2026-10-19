@@ -146,10 +146,10 @@ func main() {
 		}
 	}
 
-	// Login no longer issues bearer tokens (M1, api#191), so nothing
-	// signs with SB_JWT_SECRET any more.
-	if len(cfg.JWTSecret) > 0 {
-		logger.Info("SB_JWT_SECRET is set but no longer used: sign-in is cookie-session only; it can be removed")
+	// Login no longer issues bearer tokens (M1, api#191), so the JWT
+	// settings are not read any more.
+	if len(cfg.RetiredEnvSet) > 0 {
+		logger.Info("settings no longer used can be removed: sign-in is cookie-session only", "env", cfg.RetiredEnvSet)
 	}
 
 	// Local-admin bootstrap. Creates the seed admin user + role
@@ -611,8 +611,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	).WithScope(rbacResolver, teamScopeResolver).
 		WithReadScope(rbacResolver, teamScopeResolver) // API-N-04: env secret list is project-scoped
 
-	// Session service (Slice A2). Owns the HttpOnly cookie auth path
-	// that replaces JWT-in-sessionStorage. Postgres is the source of
+	// Session service (Slice A2). Owns the HttpOnly session cookie, the
+	// only user credential (M1, api#191). Postgres is the source of
 	// truth — sessions revoke immediately on logout. A Redis cache
 	// layer is a future performance follow-up only if profiling shows
 	// the per-request validation lookup is a hot spot.
@@ -646,9 +646,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
-	// (issue #10). `AuthWith` adds the cookie path at the front of
-	// the resolution chain (cookie -> Bearer JWT -> X-User-Id ->
-	// anonymous).
+	// (issue #10). `AuthWith` resolves the caller from the session
+	// cookie, then the dev-only X-User-Id header, else anonymous.
+	// Authorization: Bearer is not read (M1, api#191).
 	// Slice K — login-time MFA gate. When enabled, every authenticated
 	// route requires the session to have been MFA-verified at least
 	// once. The middleware has its own carve-out list for the routes
@@ -712,10 +712,10 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1 := app.Group("/api/v1", v1Middlewares...)
 
 	// Authentication — public route, no auth gating. The UI POSTs
-	// email + password here and receives a signed JWT in return. The
-	// rest of the platform reads identity from `middleware.CtxKeyActor`
-	// which the upstream `middleware.Auth()` populated from
-	// either the Bearer JWT or the legacy X-User-Id header.
+	// email + password here and gets the session cookie back, nothing
+	// else. The rest of the platform reads identity from
+	// `middleware.CtxKeyActor`, which `middleware.AuthWith` set from
+	// that cookie (or the dev-only X-User-Id header).
 	//
 	// Rate limit per architect Q7 + NAT-aware tuning (Slice A1):
 	// 30 attempts / 60s per source IP. The architect's original

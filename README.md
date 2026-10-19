@@ -67,13 +67,13 @@ pkg/
 | `GET /healthz` | none | Process liveness (kubelet) |
 | `GET /readyz`  | none | Dependency readiness (Postgres + Redis pings) |
 | `GET /metrics` | none | Prometheus exposition (scrape) |
-| `POST /api/v1/auth/login` | none (public) | Local-admin sign-in; sets `sb_session` cookie + returns legacy JWT (back-compat) |
+| `POST /api/v1/auth/login` | none (public) | Local-admin sign-in; sets the `sb_session` cookie, the only credential (no token in the body) |
 | `POST /api/v1/auth/logout` | cookie | Idempotent session revoke + clear cookie |
 | `GET /api/v1/auth/oidc/start` | none | PKCE + state + nonce → 302 to IdP authorize. `?step_up=mfa` forces MFA re-prompt |
 | `GET /api/v1/auth/oidc/callback` | IdP | Code exchange + JIT-provision + cookie set + redirect to `return_to` |
 | `POST /api/v1/auth/oidc/logout` | cookie | RP-initiated logout + IdP `end_session_endpoint` |
 | `POST /api/v1/auth/oidc/backchannel` | IdP signature | RFC 8417: revoke every session for the user's `sub` |
-| `/api/v1/*` (everything else) | cookie / Bearer JWT / X-User-Id stub | Versioned API surface |
+| `/api/v1/*` (everything else) | session cookie (X-User-Id only with the dev-only `SB_ALLOW_INSECURE_HEADER_AUTH`) | Versioned API surface |
 
 Tier 2 ops (approve / reject / reveal wrap) additionally require `last_mfa_at` within the step-up TTL (15 min). Stale sessions get `401 step_up_required` + `WWW-Authenticate: step-up max_age=900 acr_values=mfa`.
 

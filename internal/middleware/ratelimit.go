@@ -135,7 +135,7 @@ func ByIP() BucketFunc {
 }
 
 // ByIdentity keys the bucket on the authenticated identity the auth
-// middleware resolved (session or bearer). Unauthenticated requests are
+// middleware resolved from the session. Unauthenticated requests are
 // not bucketed; the default-deny gate in front 401s them anyway. The
 // identity never comes from the request body or query, so it cannot be
 // rotated to dodge the budget (same reasoning as API-02).

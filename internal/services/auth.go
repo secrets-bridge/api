@@ -3,7 +3,8 @@
 //
 // Two responsibilities:
 //
-//  1. **Login**: email + password -> bcrypt verify -> issue JWT
+//  1. **Login**: email + password -> bcrypt verify. The handler then
+//     starts the session (the only credential) and records the outcome.
 //  2. **Bootstrap**: on api boot, when no local users exist AND the
 //     operator has set the SB_BOOTSTRAP_ADMIN_EMAIL + _PASSWORD env
 //     vars, create the seed admin user and bind it to the seed admin
@@ -19,8 +20,8 @@
 //   - Generic "invalid credentials" error on every failure shape
 //     (unknown email, wrong password, disabled user) so a probe can't
 //     enumerate. Audit log holds the specifics with error_kind.
-//   - JWT is HS256 with a SB_JWT_SECRET-backed key. The secret must
-//     be at least 32 bytes; the config layer fails loud if not.
+//   - Login returns no token: the caller starts a session, the only
+//     credential (M1, api#191), and records the outcome after it.
 //   - Plaintext password NEVER persisted; the input string is
 //     overwritten with zeros after bcrypt.
 
@@ -58,7 +59,7 @@ func DefaultLockoutPolicy() LockoutPolicy {
 	return LockoutPolicy{Threshold: 5, Duration: 15 * time.Minute}
 }
 
-// AuthService wires the local-users repo + JWT signer + audit pipe.
+// AuthService wires the local-users repo + roles + audit pipe.
 type AuthService struct {
 	users     storage.LocalUserRepository
 	roles     storage.RoleRepository
@@ -104,6 +105,11 @@ var ErrInvalidCredentials = errors.New("services: invalid credentials")
 // api#191).
 type LoginResult struct {
 	User LoggedInUser
+
+	// user is the verified account. The success audit rows are written
+	// from it by RecordLoginSuccess once the caller has started the
+	// session, not by Login itself.
+	user *storage.LocalUser
 }
 
 // LoggedInUser is the value-free projection of LocalUser used in
@@ -114,8 +120,9 @@ type LoggedInUser struct {
 	DisplayName string
 }
 
-// Login verifies email + password and returns a signed JWT on
-// success. Failure modes (unknown email / wrong password / disabled
+// Login verifies email + password and returns the user on success.
+// It does not audit the success: RecordLoginSuccess does, once the
+// caller has started the session. Failure modes (unknown email / wrong password / disabled
 // / locked) all return `ErrInvalidCredentials` with the same generic
 // message — audit metadata carries the specific `error_kind` for
 // triage without disclosure on the wire.
@@ -205,16 +212,43 @@ func (s *AuthService) Login(ctx context.Context, email string, password []byte) 
 		})
 	}
 
-	s.auditSuccess(ctx, user)
-	s.auditBreakGlass(ctx, user)
-
 	return &LoginResult{
 		User: LoggedInUser{
 			ID:          user.ID,
 			Email:       user.Email,
 			DisplayName: user.DisplayName,
 		},
+		user: user,
 	}, nil
+}
+
+// RecordLoginSuccess writes the auth.login success row and the
+// BREAK_GLASS_LOGIN row for a login whose session now exists. Login
+// only verifies the password; the caller records the outcome once it
+// knows whether the session started, so a login that ends without a
+// session is never audited as a success.
+func (s *AuthService) RecordLoginSuccess(ctx context.Context, res *LoginResult) {
+	if res == nil || res.user == nil {
+		return
+	}
+	s.auditSuccess(ctx, res.user)
+	s.auditBreakGlass(ctx, res.user)
+}
+
+// RecordLoginWithoutSession writes a denied auth.login row for a
+// correct password that did not end in a session. kind says why
+// ("session_unavailable" or "session_failed").
+func (s *AuthService) RecordLoginWithoutSession(ctx context.Context, res *LoginResult, kind string) {
+	if res == nil || res.user == nil {
+		return
+	}
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "anonymous",
+		Action:   "auth.login",
+		Resource: "user:" + res.user.ID.String(),
+		Status:   storage.AuditStatusDenied,
+		Metadata: map[string]any{"error_kind": kind},
+	})
 }
 
 // recordFailedLogin audits a wrong password. The counter was already
