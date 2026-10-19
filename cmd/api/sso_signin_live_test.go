@@ -25,6 +25,12 @@ import (
 
 const ssoClientSecret = "GOCSPX-live-test-secret-0000"
 
+// ssoPublicURL is the public address the harness saves. The harness runs
+// in production mode, where a plain-http address isn't accepted, and the
+// redirect URI built from it is only compared, never fetched (the tests
+// call the callback on the test server directly).
+const ssoPublicURL = "https://secrets.example.com"
+
 type ssoHarness struct {
 	*loginHarness
 	svc      *services.SSOService
@@ -57,7 +63,7 @@ func newSSOHarness(t *testing.T, mutate func(*loginHarness, *services.SSOProvide
 	if err != nil {
 		t.Fatalf("create provider: %v", err)
 	}
-	if _, err := h.pool.Exec(t.Context(), `UPDATE sso_settings SET public_url = $1`, h.apiURL); err != nil {
+	if _, err := h.pool.Exec(t.Context(), `UPDATE sso_settings SET public_url = $1`, ssoPublicURL); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.SetEnabled(t.Context(), p.ID, true, "test"); err != nil {
@@ -284,7 +290,7 @@ func TestSSO_HDIsRequired(t *testing.T) {
 func TestSSO_RedirectURIComesFromThePublicAddress(t *testing.T) {
 	h := newSSOHarness(t, nil)
 	_, rt := h.startSignIn("evil.example")
-	if want := h.apiURL + "/api/v1/auth/sso/google/callback"; rt.redirectURI != want {
+	if want := ssoPublicURL + "/api/v1/auth/sso/google/callback"; rt.redirectURI != want {
 		t.Fatalf("redirect_uri = %q with forged headers; want %q", rt.redirectURI, want)
 	}
 }
@@ -880,5 +886,27 @@ func TestSSO_DefaultRoleRefusedAuditedOnlyForACreatedAccount(t *testing.T) {
 	}
 	if n := refused(); n != 1 {
 		t.Fatalf("refused events after a cap refusal = %d, want still 1", n)
+	}
+}
+
+// api#274: an http://localhost address saved before plain http needed
+// SB_ENV=dev (this harness runs in production mode) counts as unset on
+// read. Google isn't offered and start refuses, instead of sending
+// people to a loopback redirect URI.
+func TestSSO_SavedLoopbackAddressOutsideDevFailsClosed(t *testing.T) {
+	h := newSSOHarness(t, nil)
+	if _, err := h.pool.Exec(h.t.Context(), `UPDATE sso_settings SET public_url = 'http://localhost:5173'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, body, _ := h.authed(http.MethodGet, "/api/v1/auth/providers", nil, nil); strings.Contains(string(body), `"google"`) {
+		t.Fatalf("Google is offered with a refused saved address: %s", body)
+	}
+	req, _ := http.NewRequest(http.MethodGet, h.apiURL+"/api/v1/auth/sso/google/start", nil)
+	r := h.do(req)
+	if loc := r.Header.Get("Location"); r.StatusCode != http.StatusFound || loc != "/login?error=sso" {
+		t.Fatalf("start with a refused saved address = %d %q; want the refusal page", r.StatusCode, loc)
+	}
+	if n := h.auditReasons("no_public_url"); n != 1 {
+		t.Fatalf("no_public_url refusals = %d, want 1", n)
 	}
 }
