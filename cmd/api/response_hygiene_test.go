@@ -539,7 +539,7 @@ func TestHygiene_NoStore_SecretBearingResponses(t *testing.T) {
 	fx := newHygFixture(t, Config{AllowDirectAgentMint: true}, nil)
 	ctx := t.Context()
 
-	// 1. Login returns a bearer token.
+	// 1. Login sets the session cookie.
 	const pw = "hyg-test-password-not-real"
 	loginUser := fx.userWithPassword(t, "login-user", pw)
 	r := fx.do(t, http.MethodPost, "/api/v1/auth/login", nil, map[string]any{"email": loginUser.email, "password": pw})

@@ -121,10 +121,6 @@ func bootstrapRevealBinding(t *testing.T) *revealBindingFx {
 	if err != nil {
 		t.Fatalf("NewLocalKMS: %v", err)
 	}
-	jwtSecret := make([]byte, 32)
-	if _, err := rand.Read(jwtSecret); err != nil {
-		t.Fatalf("rand: %v", err)
-	}
 	authSvc := services.NewAuthService(
 		storage.NewLocalUsers(pool), storage.NewRoles(pool), storage.NewUserRoles(pool),
 		storage.NewAuditEvents(pool),
@@ -138,7 +134,6 @@ func bootstrapRevealBinding(t *testing.T) *revealBindingFx {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	app := newApp(Config{
 		Env:                            ModeDev,
-		JWTTokenTTL:                    time.Hour,
 		MFATOTPIssuer:                  "Secrets Bridge",
 		ProviderConnRejectSecretValues: true,
 	}, logger, pool, rdb, km, authSvc)

@@ -35,7 +35,6 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
-	"github.com/secrets-bridge/api/internal/auth/authtest"
 	"github.com/secrets-bridge/api/internal/handlers"
 	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/services"
@@ -76,7 +75,7 @@ type mfaStack struct {
 	factors  storage.UserMFAFactorRepository
 	audit    storage.AuditEventRepository
 	sessions *services.SessionService
-	signer   *authtest.Signer
+	jwtKey   []byte
 	clk      *frozenClock
 }
 
@@ -152,7 +151,7 @@ func newMFAStack(t *testing.T, opts mfaStackOpts) *mfaStack {
 	// The verify service stamps last_mfa_at with REAL time, the same
 	// clock HasFreshMFA compares against.
 	verifySvc := services.NewMFAVerifyService(factors, totpSvc, webauthnSvc, sessionSvc, audit, rdb, services.MFAVerifyConfig{})
-	signer := authtest.NewSigner([]byte("test-only-jwt-secret-0123456789abcdef"))
+	jwtKey := []byte("test-only-jwt-secret-0123456789abcdef")
 
 	// Same handler wiring as main.go.
 	mfaH := handlers.NewMFA(factors, users, totpSvc).WithWebAuthn(webauthnSvc)
@@ -183,7 +182,7 @@ func newMFAStack(t *testing.T, opts mfaStackOpts) *mfaStack {
 
 	return &mfaStack{
 		app: app, pool: pool, rdb: rdb, users: users, factors: factors,
-		audit: audit, sessions: sessionSvc, signer: signer, clk: clk,
+		audit: audit, sessions: sessionSvc, jwtKey: jwtKey, clk: clk,
 	}
 }
 
@@ -241,11 +240,7 @@ func (s *mfaStack) loginSession(t *testing.T, uid uuid.UUID) mfaCaller {
 
 func (s *mfaStack) bearerFor(t *testing.T, uid uuid.UUID) mfaCaller {
 	t.Helper()
-	tok, _, err := s.signer.SignToken(authtest.Claims{Subject: uid.String()}, time.Hour)
-	if err != nil {
-		t.Fatalf("SignToken: %v", err)
-	}
-	return mfaCaller{userID: uid, bearer: tok}
+	return mfaCaller{userID: uid, bearer: forgedLoginJWT(t, s.jwtKey, uid.String())}
 }
 
 type mfaResp struct {

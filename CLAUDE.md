@@ -13,7 +13,7 @@ The Secrets Bridge control plane API (Go, Fiber v3, Postgres, Redis). The UI and
 | `cmd/api` | Wiring: config, storage, Redis runtime, KMS, services and every route in `main.go` with the permission that guards it |
 | `internal/handlers` | Thin HTTP handlers: parse, call a service, map errors to status codes |
 | `internal/services` | Business logic: request lifecycle (`requests*.go`), PolicyEngine (`policy*.go`), reveal sessions, agent enrollment, MFA, OIDC, provider connections, wraps, jobs |
-| `internal/auth` | `auth.Require(perm)` guards, permission constants and grant scopes. `internal/auth/authtest` forges the pre-M1 HS256 login tokens, for tests that prove a bearer token is ignored |
+| `internal/auth` | `auth.Require(perm)` guards, permission constants and grant scopes. The pre-M1 HS256 login token forger lives only in `cmd/api/forged_jwt_test.go`, so it never ships |
 | `internal/middleware` | Request ID, logging, recover, session auth behind a default-deny route group, agent auth |
 | `pkg/storage` | pgx repositories and ordered SQL migrations in `pkg/storage/migrations` (applied on start) |
 | `pkg/runtime` | Redis: idempotency, locks, rate limits, pub/sub |

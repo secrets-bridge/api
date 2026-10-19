@@ -146,11 +146,7 @@ func main() {
 		}
 	}
 
-	// Login no longer issues bearer tokens (M1, api#191), so nothing
-	// signs with SB_JWT_SECRET any more.
-	if len(cfg.JWTSecret) > 0 {
-		logger.Info("SB_JWT_SECRET is set but no longer used: sign-in is cookie-session only; it can be removed")
-	}
+	logRetiredEnv(logger, cfg.RetiredEnvSet)
 
 	// Local-admin bootstrap. Creates the seed admin user + role
 	// assignment on first boot when local_users is empty. Idempotent
@@ -611,8 +607,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	).WithScope(rbacResolver, teamScopeResolver).
 		WithReadScope(rbacResolver, teamScopeResolver) // API-N-04: env secret list is project-scoped
 
-	// Session service (Slice A2). Owns the HttpOnly cookie auth path
-	// that replaces JWT-in-sessionStorage. Postgres is the source of
+	// Session service (Slice A2). Owns the HttpOnly session cookie, the
+	// only user credential (M1, api#191). Postgres is the source of
 	// truth — sessions revoke immediately on logout. A Redis cache
 	// layer is a future performance follow-up only if profiling shows
 	// the per-request validation lookup is a hot spot.
@@ -1492,4 +1488,14 @@ func bootstrapAdminGrant(ctx context.Context, pool *storage.Pool, userID string,
 		"role", "admin",
 		"scope", "global")
 	return nil
+}
+
+// logRetiredEnv notes the retired settings that are still set. Login no
+// longer issues bearer tokens (M1, api#191), so the JWT settings are not
+// read any more. It logs the names only, never the values.
+func logRetiredEnv(logger *slog.Logger, set []string) {
+	if len(set) == 0 {
+		return
+	}
+	logger.Info("settings no longer used can be removed: sign-in is cookie-session only", "env", set)
 }

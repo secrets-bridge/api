@@ -6,7 +6,7 @@
 //   GET    /api/v1/platform-settings/:key      single row, 404 unknown_platform_setting
 //   PUT    /api/v1/platform-settings/:key      update; transactional with audit
 //
-// Auth: bearer + policy.edit on every route per §2 Q5 lock. Until a
+// Auth: session + policy.edit on every route per §2 Q5 lock. Until a
 // dedicated platform.settings.edit permission lands (when the broader
 // settings surface lands), policy.edit gates the surface — the
 // admin who governs the policy band IS the admin who edits the cap.
