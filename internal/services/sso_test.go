@@ -53,7 +53,13 @@ func TestNormalizePublicURL(t *testing.T) {
 // fakeSSOStore keeps one provider in memory; only what these tests use.
 type fakeSSOStore struct {
 	ssoStore
-	created *storage.SSOProvider
+	created  *storage.SSOProvider
+	settings storage.SSOSettings
+}
+
+func (f *fakeSSOStore) GetSettings(context.Context) (*storage.SSOSettings, error) {
+	st := f.settings
+	return &st, nil
 }
 
 func (f *fakeSSOStore) CreateProvider(_ context.Context, p *storage.SSOProvider, _ []string) error {
@@ -106,6 +112,38 @@ func TestSSO_RefusesGoogleWhenEnvProviderIsGoogle(t *testing.T) {
 		Type: "google", ClientID: "x", ClientSecret: "y", AllowedDomains: []string{"example.com"}, RequireApproval: true,
 	}, "user:a"); err != nil {
 		t.Fatalf("create with another env provider = %v; want ok", err)
+	}
+}
+
+// api#274: a saved address is checked again when it's read. One saved
+// under an older rule (plain http for localhost before that needed
+// SB_ENV=dev) counts as unset outside dev, so sign-in fails closed.
+func TestSSO_SavedPublicURLIsCheckedOnRead(t *testing.T) {
+	km, err := keymgmt.NewLocalKMS(bytes.Repeat([]byte{7}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeSSOStore{settings: storage.SSOSettings{PublicURL: "http://localhost:5173", PendingCap: 50}}
+	for _, tc := range []struct {
+		dev         bool
+		url, source string
+	}{{false, "", ""}, {true, "http://localhost:5173", "console"}} {
+		s, err := NewSSOService(store, nil, km, "", "", tc.dev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		url, source, err := s.PublicURL(t.Context())
+		if err != nil || url != tc.url || source != tc.source {
+			t.Errorf("PublicURL with dev=%v = %q, %q, %v; want %q, %q", tc.dev, url, source, err, tc.url, tc.source)
+		}
+		if redirect, _ := s.RedirectURL(t.Context(), "google"); (redirect == "") != (tc.url == "") {
+			t.Errorf("RedirectURL with dev=%v = %q", tc.dev, redirect)
+		}
+	}
+	store.settings.PublicURL = "https://secrets.example.com"
+	s, _ := NewSSOService(store, nil, km, "", "", false)
+	if url, _, _ := s.PublicURL(t.Context()); url != "https://secrets.example.com" {
+		t.Errorf("a valid saved address = %q", url)
 	}
 }
 

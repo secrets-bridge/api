@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"regexp"
@@ -253,7 +254,11 @@ func (s *SSOService) ClientSecret(ctx context.Context, p *storage.SSOProvider) (
 }
 
 // PublicURL returns the install's public address and where it came from
-// ("env", "console", or "" when unset).
+// ("env", "console", or "" when unset). A saved address is checked again
+// against today's rule (NormalizePublicURL, with SB_ENV) every time it's
+// read: one saved under an older rule, like plain http for localhost
+// before that needed SB_ENV=dev, counts as unset, so sign-in fails closed
+// and the console asks for the address again (api#274).
 func (s *SSOService) PublicURL(ctx context.Context) (string, string, error) {
 	if s.envPublic != "" {
 		return s.envPublic, "env", nil
@@ -265,7 +270,13 @@ func (s *SSOService) PublicURL(ctx context.Context) (string, string, error) {
 	if st.PublicURL == "" {
 		return "", "", nil
 	}
-	return st.PublicURL, "console", nil
+	u, err := NormalizePublicURL(st.PublicURL, s.dev)
+	if err != nil {
+		slog.WarnContext(ctx, "sso: the saved public address no longer passes the address rule; treating it as unset",
+			"reason", err.Error())
+		return "", "", nil
+	}
+	return u, "console", nil
 }
 
 // Settings returns the stored settings with the effective public
