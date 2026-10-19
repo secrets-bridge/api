@@ -3,21 +3,21 @@
 //
 // Endpoints:
 //
-//   Admin (under /api/v1):
-//     POST   /argocd-endpoints                 register a new ArgoCD endpoint
-//     GET    /argocd-endpoints                 list configured endpoints (no token)
-//     GET    /argocd-endpoints/:id             get one endpoint (no token)
-//     PUT    /argocd-endpoints/:id/enabled     toggle enabled flag
-//     DELETE /argocd-endpoints/:id             soft-delete
+//	Admin (under /api/v1):
+//	  POST   /argocd-endpoints                 register a new ArgoCD endpoint
+//	  GET    /argocd-endpoints                 list configured endpoints (no token)
+//	  GET    /argocd-endpoints/:id             get one endpoint (no token)
+//	  PUT    /argocd-endpoints/:id/enabled     toggle enabled flag
+//	  DELETE /argocd-endpoints/:id             soft-delete
 //
-//     POST   /gitops-app-mappings              create a mapping
-//     GET    /gitops-app-mappings              list mappings
-//     DELETE /gitops-app-mappings/:id          soft-delete
+//	  POST   /gitops-app-mappings              create a mapping
+//	  GET    /gitops-app-mappings              list mappings
+//	  DELETE /gitops-app-mappings/:id          soft-delete
 //
-//   User (under /api/v1):
-//     GET    /requests/:id/gitops              list observation rows for the
-//                                              request (only the requester or
-//                                              an admin may read)
+//	User (under /api/v1):
+//	  GET    /requests/:id/gitops              list observation rows for the
+//	                                           request (only the requester or
+//	                                           an admin may read)
 package handlers
 
 import (
@@ -72,9 +72,9 @@ type createArgoCDEndpointBody struct {
 	// the request body shape stays JSON-clean. It's the plaintext
 	// ArgoCD account token; the service envelope-encrypts before
 	// persisting and never logs it.
-	TokenB64      string  `json:"token_b64"`
-	TLSCAPEM      string  `json:"tls_ca_pem,omitempty"`
-	TLSServerName string  `json:"tls_server_name,omitempty"`
+	TokenB64      string `json:"token_b64"`
+	TLSCAPEM      string `json:"tls_ca_pem,omitempty"`
+	TLSServerName string `json:"tls_server_name,omitempty"`
 }
 
 type argocdEndpointResponse struct {
@@ -124,7 +124,7 @@ func (h *GitOps) CreateArgoCDEndpoint(c fiber.Ctx) error {
 			return fiber.NewError(fiber.StatusBadRequest,
 				"base_url must use https (http:// is only accepted with SB_ENV=dev or SB_ALLOW_INSECURE_ARGOCD_ADDR=true)")
 		case errors.Is(err, services.ErrInvalidArgoCDURL):
-			return fiber.NewError(fiber.StatusBadRequest, "base_url must be an absolute https URL with a host")
+			return fiber.NewError(fiber.StatusBadRequest, "base_url must be an absolute https URL with a host and no user info, query or fragment")
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
@@ -424,7 +424,8 @@ func observationToResponse(o *storage.GitOpsObservation) observationResponse {
 // the UI needs to bulk-create gitops_app_mappings rows.
 //
 // Optional query parameter:
-//   ?project=<name>   filter to a single ArgoCD project (e.g. "team-alpha")
+//
+//	?project=<name>   filter to a single ArgoCD project (e.g. "team-alpha")
 //
 // Returns 503 when the endpoint is disabled or the ArgoCD call fails;
 // the UI then renders "discovery unavailable" without retrying.
@@ -442,10 +443,10 @@ func (h *GitOps) GetDiscoveredApps(c fiber.Ctx) error {
 			return fiber.NewError(fiber.StatusNotFound, "argocd endpoint not found")
 		}
 		if errors.Is(err, services.ErrInsecureArgoCDURL) || errors.Is(err, services.ErrInvalidArgoCDURL) {
-			// A row registered before the scheme check. Nothing was
-			// sent; the operator must re-register it over https.
+			// A row registered before the URL check. Nothing was
+			// sent; the operator must re-register it.
 			return fiber.NewError(fiber.StatusConflict,
-				"argocd endpoint base_url must use https; re-register the endpoint")
+				"argocd endpoint base_url must use https with no user info, query or fragment; re-register the endpoint")
 		}
 		// 503 instead of 500 — the upstream is the failure point, not the api.
 		return fiber.NewError(fiber.StatusServiceUnavailable, err.Error())

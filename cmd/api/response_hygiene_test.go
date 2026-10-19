@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -173,9 +174,7 @@ func newHygFixture(t *testing.T, cfg Config, km *hygFlakyKMS) *hygFixture {
 	logger := slog.New(slog.NewJSONHandler(logs, nil))
 	// main() makes the app logger the process default; handlers that
 	// answer with their own stable message log through slog.Default.
-	prev := slog.Default()
-	slog.SetDefault(logger)
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	swapDefaultLogger(t, logger)
 	return &hygFixture{
 		app:      newApp(cfg, logger, pool, rdb, km, authSvc),
 		pool:     pool,
@@ -704,6 +703,13 @@ func TestHygiene_ArgoCD_BaseURLSchemeByEnv(t *testing.T) {
 		{"prod https in-cluster accepted", prod, "https://argocd-server.argocd.svc.cluster.local", http.StatusCreated},
 		{"prod malformed refused", prod, "ftp://argocd.example.com", http.StatusBadRequest},
 		{"prod no host refused", prod, "https://", http.StatusBadRequest},
+		{"prod user info refused", prod, "https://admin:pw@argocd.example.com", http.StatusBadRequest},
+		{"prod user only refused", prod, "https://admin@argocd.example.com", http.StatusBadRequest},
+		{"prod query refused", prod, "https://argocd.example.com/?token=abc", http.StatusBadRequest},
+		{"prod empty query refused", prod, "https://argocd.example.com/?", http.StatusBadRequest},
+		{"prod fragment refused", prod, "https://argocd.example.com/#x", http.StatusBadRequest},
+		{"dev user info refused", dev, "http://admin:pw@argocd-server.argocd.svc", http.StatusBadRequest},
+		{"prod https with port and path accepted", prod, "https://argocd.example.com:8443/argocd", http.StatusCreated},
 		{"dev http accepted", dev, "http://argocd-server.argocd.svc", http.StatusCreated},
 		{"dev https accepted", dev, "https://argocd.example.com", http.StatusCreated},
 		{"prod+flag http accepted", flagged, "http://argocd-server.argocd.svc", http.StatusCreated},
@@ -767,6 +773,37 @@ func TestHygiene_ArgoCD_LegacyHTTPRowNotUsedInProduction(t *testing.T) {
 	}
 	if hits.Load() == 0 {
 		t.Fatalf("dev discovery should reach the endpoint")
+	}
+}
+
+// A row written before the user-info check (api#279) is refused on use
+// too: nothing goes out to the endpoint.
+func TestHygiene_ArgoCD_LegacyUserInfoRowNotUsed(t *testing.T) {
+	var hits atomic.Int32
+	argo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	}))
+	t.Cleanup(argo.Close)
+
+	dev := newHygFixture(t, Config{Env: ModeDev, GitOpsEnabled: true}, nil)
+	admin := dev.user(t, "argo-userinfo-admin", auth.PermIntegrationEdit)
+	r := dev.do(t, http.MethodPost, "/api/v1/argocd-endpoints", admin, hygArgoBody(argo.URL))
+	if r.status != http.StatusCreated {
+		t.Fatalf("seed endpoint: %d %s", r.status, r.body)
+	}
+	epID, _ := r.json(t)["id"].(string)
+	legacy := strings.Replace(argo.URL, "http://", "http://admin:pw@", 1) + "/?token=abc"
+	if _, err := dev.pool.Exec(t.Context(), `UPDATE argocd_endpoints SET base_url = $1 WHERE id = $2`, legacy, epID); err != nil {
+		t.Fatalf("write legacy row: %v", err)
+	}
+	r = dev.do(t, http.MethodGet, "/api/v1/argocd-endpoints/"+epID+"/discovered-apps", admin, nil)
+	if r.status != http.StatusConflict {
+		t.Fatalf("discovery with user info: status = %d; want 409 (%s)", r.status, r.body)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("sent %d request(s) to an endpoint whose URL carries user info", hits.Load())
 	}
 }
 
@@ -949,5 +986,41 @@ func TestHygiene_ScopedPolicyCreate_UnknownWorkflowIs403(t *testing.T) {
 	m := r.json(t)
 	if m["error_code"] != "workflow_not_authorable_for_scope" || m["workflow_id"] != missingWF {
 		t.Errorf("envelope = %v; want workflow_not_authorable_for_scope + workflow_id", m)
+	}
+}
+
+// swapDefaultLogger makes logger the slog default for one test.
+// slog.SetDefault also points the standard log package at the new
+// handler, and setting the default back does not undo that, so the log
+// output, flags and prefix are saved and restored too. Without it every
+// later log line in the package lands in this test's buffer (api#279).
+func swapDefaultLogger(t *testing.T, logger *slog.Logger) {
+	t.Helper()
+	prev := slog.Default()
+	prevOut, prevFlags, prevPrefix := log.Writer(), log.Flags(), log.Prefix()
+	slog.SetDefault(logger)
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+		log.SetPrefix(prevPrefix)
+	})
+}
+
+// After a test that swapped the default logger, the standard log
+// package writes where it did before, not into that test's buffer.
+func TestSwapDefaultLogger_RestoresLogOutput(t *testing.T) {
+	before := log.Writer()
+	buf := &hygLogBuffer{}
+	t.Run("swap", func(t *testing.T) {
+		swapDefaultLogger(t, slog.New(slog.NewJSONHandler(buf, nil)))
+		log.Print("inside")
+	})
+	if log.Writer() != before {
+		t.Fatal("log output still points at the swapped logger")
+	}
+	log.Print("after the swap")
+	if strings.Contains(buf.String(), "after the swap") {
+		t.Fatal("a later log line landed in the swapped logger's buffer")
 	}
 }

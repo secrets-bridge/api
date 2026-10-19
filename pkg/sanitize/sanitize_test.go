@@ -184,3 +184,64 @@ func TestJobError_CredentialSplitByControlChar(t *testing.T) {
 		}
 	}
 }
+
+// Placeholder credentials for the newer patterns (api#279). None of
+// them is a real token.
+var credentialCanaries = map[string]string{
+	"github classic":    "ghp_" + strings.Repeat("A1b2", 9),
+	"github oauth":      "gho_" + strings.Repeat("Z9y8", 9),
+	"github fine":       "github_pat_" + strings.Repeat("Ab12_", 6),
+	"gitlab":            "glpat-" + strings.Repeat("x1Y2", 5),
+	"slack bot":         "xoxb-" + "123456789012-abcdefABCDEF",
+	"slack user":        "xoxp-" + "1234-5678-abcdefghij",
+	"slack app":         "xoxa-" + "2-abcdefghijkl",
+	"slack refresh":     "xoxr-" + "abcdefghijkl",
+	"sk api key":        "sk-" + strings.Repeat("aB3d", 6),
+	"sk project key":    "sk-proj-" + strings.Repeat("Qw7e", 6),
+	"pem private key":   "-----BEGIN PRIVATE KEY----- MIIEvQIBADANBgkqhkiG9w0BAQEFAASC",
+	"pem rsa multiline": "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----",
+	"pem bare header":   "-----BEGIN",
+}
+
+func TestHasCredential_NewPatterns(t *testing.T) {
+	for name, c := range credentialCanaries {
+		for _, in := range []string{c, "prefix " + c + " suffix", "key=" + c} {
+			if !sanitize.HasCredential(in) {
+				t.Errorf("%s: HasCredential(%q) = false", name, in)
+			}
+		}
+		got := sanitize.DiscoverError("provider said " + c + " and stopped")
+		if strings.Contains(got, c) || !strings.Contains(got, "[REDACTED]") {
+			t.Errorf("%s: not redacted: %q", name, got)
+		}
+	}
+}
+
+// Values that look a little like the prefixed tokens but are ordinary
+// enums, names and ids: they must not be flagged.
+func TestHasCredential_LegitimateValues(t *testing.T) {
+	for _, in := range []string{
+		"risk-high", "sk", "sk-1", "sk-short", "risk-" + strings.Repeat("a", 30), "desk-" + strings.Repeat("b", 30),
+		"ghp_short", "github_pat", "glpat-1", "xoxb", "xoxz-" + strings.Repeat("c", 20),
+		"secret.read", "provider_connection.create", "no_governing_binding", "DB_PASSWORD",
+		"BEGIN", "----- section -----", "vault: 503 backend unavailable",
+		"550e8400-e29b-41d4-a716-446655440000", "sha256:" + strings.Repeat("ab", 32),
+	} {
+		if sanitize.HasCredential(in) {
+			t.Errorf("HasCredential(%q) = true, want false", in)
+		}
+	}
+}
+
+// A PEM block is redacted whole, header to END line, and the text
+// after it survives.
+func TestDiscoverError_RedactsPEMBlock(t *testing.T) {
+	in := "tls: bad key -----BEGIN EC PRIVATE KEY-----\nMHcCAQEEI\n-----END EC PRIVATE KEY----- then 503"
+	got := sanitize.LogError(in)
+	if strings.Contains(got, "MHcCAQEEI") || strings.Contains(got, "BEGIN") {
+		t.Fatalf("PEM body survived: %q", got)
+	}
+	if !strings.HasSuffix(got, "then 503") {
+		t.Fatalf("text after the PEM block lost: %q", got)
+	}
+}
