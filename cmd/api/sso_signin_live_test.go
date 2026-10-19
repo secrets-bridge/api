@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -38,6 +39,10 @@ func newSSOHarness(t *testing.T, mutate func(*loginHarness, *services.SSOProvide
 	prev := services.GoogleIssuer
 	services.GoogleIssuer = h.idp.url
 	t.Cleanup(func() { services.GoogleIssuer = prev })
+	// Leave no provider behind: one with a default role holds that role
+	// (ON DELETE RESTRICT), and other packages' tests wipe roles in the
+	// same database.
+	t.Cleanup(func() { _, _ = h.pool.Exec(context.Background(), `DELETE FROM sso_providers`) })
 
 	svc, err := services.NewSSOService(storage.NewSSOStore(h.pool), storage.NewRoles(h.pool), h.km, "", "", false)
 	if err != nil {
@@ -318,7 +323,7 @@ func TestSSO_ApprovalOffGrantsTheDefaultRole(t *testing.T) {
 	role := uuid.New()
 	h := newSSOHarness(t, func(lh *loginHarness, in *services.SSOProviderInput) {
 		if _, err := lh.pool.Exec(t.Context(),
-			`INSERT INTO roles (id, name, permissions) VALUES ($1, 'sso-basic', '["secret.request"]')`, role); err != nil {
+			`INSERT INTO roles (id, name, permissions) VALUES ($1, $2, '["secret.request"]')`, role, "sso-basic-"+role.String()[:8]); err != nil {
 			t.Fatal(err)
 		}
 		in.RequireApproval = false
@@ -842,5 +847,38 @@ func TestSSO_EditDoesNotTakeASecret(t *testing.T) {
 	}
 	if !bytes.Equal(before, after) {
 		t.Fatal("the refused edit changed the stored secret")
+	}
+}
+
+// Review follow-up: default_role_refused is audited only when an account
+// was created waiting because of it, not for a sign-in the waiting cap
+// turned away.
+func TestSSO_DefaultRoleRefusedAuditedOnlyForACreatedAccount(t *testing.T) {
+	role := uuid.New()
+	h := newSSOHarness(t, func(lh *loginHarness, in *services.SSOProviderInput) {
+		if _, err := lh.pool.Exec(t.Context(), `INSERT INTO roles (id, name, permissions) VALUES ($1, $2, '["secret.request"]')`,
+			role, "sso-audit-"+role.String()[:8]); err != nil {
+			t.Fatal(err)
+		}
+		in.RequireApproval = false
+		in.DefaultRoleID = &role
+	})
+	if _, err := h.pool.Exec(t.Context(), `UPDATE roles SET permissions = '["secret.request", "secret.reveal.direct"]' WHERE id = $1`, role); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(t.Context(), `UPDATE sso_settings SET pending_cap = 1`); err != nil {
+		t.Fatal(err)
+	}
+	refused := func() int {
+		return h.count(`SELECT count(*) FROM audit_events WHERE action = 'sso_provider.default_role_refused'`)
+	}
+	if findCookie(h.signIn(googleClaims("ar-1", "first@example.com", "example.com")), loginTestSessionKey) == nil || refused() != 1 {
+		t.Fatalf("first sign-in: refused events = %d, want 1", refused())
+	}
+	if findCookie(h.signIn(googleClaims("ar-2", "second@example.com", "example.com")), loginTestSessionKey) != nil {
+		t.Fatal("a sign-in over the waiting cap got a session")
+	}
+	if n := refused(); n != 1 {
+		t.Fatalf("refused events after a cap refusal = %d, want still 1", n)
 	}
 }

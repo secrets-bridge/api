@@ -66,8 +66,9 @@ type Admin struct {
 	// authoring actions.
 	audit storage.AuditEventRepository
 
-	// ssoDefaults tells whether a sign-in provider gives a role to new
-	// accounts. Optional; when nil, role edits aren't checked against it.
+	// ssoDefaults makes a widening role edit check, under a lock on the
+	// role, that no sign-in provider gives the role to new accounts.
+	// Optional; when nil, role edits aren't checked against it.
 	ssoDefaults SSODefaultRoles
 
 	// R-follow-up #5 slice 1c (api#135) — history service for the
@@ -83,7 +84,9 @@ func NewAdmin(roles storage.RoleRepository, userRoles storage.UserRoleRepository
 
 // SSODefaultRoles is the slice of the sign-in store the role routes use.
 type SSODefaultRoles interface {
-	RoleIsDefault(ctx context.Context, roleID uuid.UUID) (bool, error)
+	// UpdateRolePermissionsUnlessDefault replaces the permissions unless
+	// a provider uses the role as its default (storage.ErrRoleIsSSODefault).
+	UpdateRolePermissionsUnlessDefault(ctx context.Context, roleID uuid.UUID, perms []string) error
 }
 
 // WithSSODefaultRoles makes PUT /roles/:id/permissions refuse to widen
@@ -237,18 +240,19 @@ func (h *Admin) UpdateRolePermissions(c fiber.Ctx) error {
 	}
 	// A sign-in provider's default role goes to every new account with
 	// approval off, so it stays within the non-privileged permissions.
-	// Sign-in checks the role again too; this says so at edit time.
+	// Sign-in checks the role again too; this says so at edit time. The
+	// check and the write share a lock on the role row with provider
+	// saves, so the two can't both pass at once.
 	if h.ssoDefaults != nil && services.HoldsPrivileged(perms) {
-		used, err := h.ssoDefaults.RoleIsDefault(c.Context(), id)
-		if err != nil {
-			return fiber.NewError(fiber.StatusInternalServerError, "could not check sign-in providers")
-		}
-		if used {
-			return stableErr(c, fiber.StatusConflict, "role_is_sso_default",
-				"a sign-in provider gives this role to new accounts, so it can only hold "+strings.Join(services.NonPrivilegedPermissions, ", "), nil)
-		}
+		err = h.ssoDefaults.UpdateRolePermissionsUnlessDefault(c.Context(), id, perms)
+	} else {
+		err = h.roles.UpdatePermissions(c.Context(), id, perms)
 	}
-	if err := h.roles.UpdatePermissions(c.Context(), id, perms); err != nil {
+	if errors.Is(err, storage.ErrRoleIsSSODefault) {
+		return stableErr(c, fiber.StatusConflict, "role_is_sso_default",
+			"a sign-in provider gives this role to new accounts, so it can only hold "+strings.Join(services.NonPrivilegedPermissions, ", "), nil)
+	}
+	if err != nil {
 		return adminErr(err)
 	}
 	added, removed := stringSetDiff(existing.Permissions, perms)
