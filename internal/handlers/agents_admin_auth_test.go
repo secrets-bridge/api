@@ -90,7 +90,7 @@ func bootstrapAdminAgents(t *testing.T) *adminAgentsFixture {
 
 	app := fiber.New()
 	v1 := app.Group("/api/v1",
-		middleware.Auth(nil),
+		middleware.Auth(),
 		middleware.RequireAuthedExcept(map[string]bool{}, "/api/v1/agents/"),
 	)
 	v1.Get("/admin/agents", auth.Require(auth.PermAgentList, resolver), agentsH.AdminListAgents)

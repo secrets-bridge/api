@@ -41,11 +41,11 @@ export TEST_OBJECTSTORE_ACCESS_KEY=secrets-bridge TEST_OBJECTSTORE_SECRET_KEY=de
 go test -race -count=1 -p 1 ./...
 ```
 
-`docker compose up -d postgres redis minio minio-init` in this repo starts Postgres, Redis and MinIO on 127.0.0.1 for local runs. The compose file holds no keys: the api container reads `SB_WRAP_MASTER_KEY` and `SB_JWT_SECRET` from your shell and refuses to boot without them.
+`docker compose up -d postgres redis minio minio-init` in this repo starts Postgres, Redis and MinIO on 127.0.0.1 for local runs. The compose file holds no keys: the api container reads `SB_WRAP_MASTER_KEY` from your shell and refuses to boot without it.
 
 ## Key configuration
 
-`DATABASE_URL`, `REDIS_URL`, `API_ADDR`, `SB_ENV` (`dev` or `production`), `SB_JWT_SECRET` (32+ bytes), `SB_KMS_BACKEND` and its `SB_KMS_*` settings, `SB_BOOTSTRAP_ADMIN_EMAIL` / `_PASSWORD`, `SB_PUBLIC_URL` (the public address for sign-in redirect URIs; otherwise set from the console), `SB_OIDC_*`, `SB_MFA_*`, `SB_OBJECTSTORE_*` (media storage; see README). Switches such as `SB_ALLOW_INSECURE_HEADER_AUTH` and `SB_ALLOW_DIRECT_AGENT_MINT` default to off and must stay off outside local development.
+`DATABASE_URL`, `REDIS_URL`, `API_ADDR`, `SB_ENV` (`dev` or `production`), `SB_KMS_BACKEND` and its `SB_KMS_*` settings, `SB_BOOTSTRAP_ADMIN_EMAIL` / `_PASSWORD`, `SB_PUBLIC_URL` (the public address for sign-in redirect URIs; otherwise set from the console), `SB_OIDC_*`, `SB_MFA_*`, `SB_OBJECTSTORE_*` (media storage; see README). Switches such as `SB_ALLOW_INSECURE_HEADER_AUTH` and `SB_ALLOW_DIRECT_AGENT_MINT` default to off and must stay off outside local development.
 
 ## Rules for this repo
 

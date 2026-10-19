@@ -110,7 +110,7 @@ func TestRevealOpen_NoWrapsProduced_Returns503WrapNotReady(t *testing.T) {
 	revealH := handlers.NewRevealSessions(revealSvc)
 
 	app := fiber.New()
-	app.Use(middleware.Auth(nil))
+	app.Use(middleware.Auth())
 	app.Post("/api/v1/reveal-sessions", revealH.Open)
 
 	body := strings.NewReader(`{"access_request_id":"` + req.ID.String() + `"}`)

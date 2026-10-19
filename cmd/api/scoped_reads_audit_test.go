@@ -16,7 +16,6 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
-	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/pkg/keymgmt"
@@ -103,7 +102,7 @@ func newLiveApp(t *testing.T, opts ...func(*Config)) *liveApp {
 	}
 	authSvc := services.NewAuthService(
 		storage.NewLocalUsers(pool), storage.NewRoles(pool), storage.NewUserRoles(pool),
-		storage.NewAuditEvents(pool), auth.NewSigner(bytes.Repeat([]byte{9}, 32)), time.Hour,
+		storage.NewAuditEvents(pool),
 	)
 
 	// newApp flips the package-level header-identity switch from the

@@ -153,7 +153,6 @@ func newMFAStack(t *testing.T, opts mfaStackOpts) *mfaStack {
 	// clock HasFreshMFA compares against.
 	verifySvc := services.NewMFAVerifyService(factors, totpSvc, webauthnSvc, sessionSvc, audit, rdb, services.MFAVerifyConfig{})
 	signer := auth.NewSigner([]byte("test-only-jwt-secret-0123456789abcdef"))
-	authSvc := services.NewAuthService(users, nil, nil, audit, signer, time.Hour)
 
 	// Same handler wiring as main.go.
 	mfaH := handlers.NewMFA(factors, users, totpSvc).WithWebAuthn(webauthnSvc)
@@ -164,7 +163,7 @@ func newMFAStack(t *testing.T, opts mfaStackOpts) *mfaStack {
 	app := fiber.New(fiber.Config{ErrorHandler: jsonErrorHandler(logger)})
 	app.Use(middleware.RequestID())
 	groupMW := []any{
-		middleware.AuthWith(authSvc, sessionSvc),
+		middleware.AuthWith(sessionSvc),
 		middleware.RequireAuthedExcept(publicV1Paths, "/api/v1/agents/"),
 		middleware.RBAC(),
 		middleware.Audit(logger),
@@ -442,8 +441,10 @@ func (s *mfaStack) totpStepUp(t *testing.T, who mfaCaller, f enrolledTOTP, code 
 // --- H3: factor changes are step-up gated ----------------------------
 
 // First-factor enrollment must keep working without any MFA stamp:
-// that is how MFA gets bootstrapped. Covered for a cookie session, a
-// bearer JWT identity, and with the login-time gate switched on.
+// that is how MFA gets bootstrapped. Covered for a cookie session and
+// with the login-time gate switched on. A bearer JWT is not a
+// credential any more (M1, api#191): even one signed with the server's
+// key for a live user is unauthenticated and enrolls nothing.
 func TestMFARoutes_FirstFactorEnrollment_NoStampNeeded(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -460,6 +461,16 @@ func TestMFARoutes_FirstFactorEnrollment_NoStampNeeded(t *testing.T) {
 			who := s.loginSession(t, uid)
 			if tc.bearer {
 				who = s.bearerFor(t, uid)
+			}
+			if tc.bearer {
+				r := s.call(t, who, http.MethodPost, "/users/me/mfa/totp/enroll", map[string]string{"label": "phone"})
+				if r.status != http.StatusUnauthorized {
+					t.Fatalf("bearer totp enroll = %d %s; want 401", r.status, r.body)
+				}
+				if got := s.countFactors(t, uid); got != 0 {
+					t.Fatalf("bearer added %d factors", got)
+				}
+				return
 			}
 			if at := who.sessionID; at != uuid.Nil {
 				if s.lastMFAAt(t, at) != nil {

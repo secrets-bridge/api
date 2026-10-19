@@ -76,17 +76,12 @@ type Config struct {
 	// matching the future OIDC `sub` claim; it is NOT a credential.
 	BootstrapAdminUserID string
 
-	// JWTSecret is the HMAC key for HS256-signed login tokens. Must
-	// be ≥32 bytes. Accepted as a base64 string OR raw bytes; the
-	// loader picks whichever decode path yields ≥32 bytes.
-	//
-	// When unset, the api refuses to start (fail loud rather than
-	// silently mint useless tokens).
+	// JWTSecret is read only to log that SB_JWT_SECRET is no longer used:
+	// login issues no bearer token since M1 (api#191).
 	JWTSecret []byte
 
-	// JWTTokenTTL bounds the login session lifetime. Default 8h —
-	// matches typical admin-session expectations. Operators wanting
-	// a tighter window override via SB_JWT_TOKEN_TTL.
+	// JWTTokenTTL (SB_JWT_TOKEN_TTL) is no longer used: login issues no
+	// bearer token since M1 (api#191).
 	JWTTokenTTL time.Duration
 
 	// BootstrapAdminEmail / Password seed a local admin user on

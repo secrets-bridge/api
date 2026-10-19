@@ -39,7 +39,6 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
@@ -65,8 +64,6 @@ type AuthService struct {
 	roles     storage.RoleRepository
 	userRoles storage.UserRoleRepository
 	audit     storage.AuditEventRepository
-	signer    *auth.Signer
-	tokenTTL  time.Duration
 	lockout   LockoutPolicy
 }
 
@@ -78,16 +75,12 @@ func NewAuthService(
 	roles storage.RoleRepository,
 	userRoles storage.UserRoleRepository,
 	audit storage.AuditEventRepository,
-	signer *auth.Signer,
-	tokenTTL time.Duration,
 ) *AuthService {
 	return &AuthService{
 		users:     users,
 		roles:     roles,
 		userRoles: userRoles,
 		audit:     audit,
-		signer:    signer,
-		tokenTTL:  tokenTTL,
 		lockout:   DefaultLockoutPolicy(),
 	}
 }
@@ -107,10 +100,10 @@ func (s *AuthService) WithLockoutPolicy(p LockoutPolicy) *AuthService {
 var ErrInvalidCredentials = errors.New("services: invalid credentials")
 
 // LoginResult is what the handler returns to the UI on success.
+// The caller starts a session for User; there is no bearer token (M1,
+// api#191).
 type LoginResult struct {
-	Token     string
-	ExpiresAt time.Time
-	User      LoggedInUser
+	User LoggedInUser
 }
 
 // LoggedInUser is the value-free projection of LocalUser used in
@@ -212,22 +205,10 @@ func (s *AuthService) Login(ctx context.Context, email string, password []byte) 
 		})
 	}
 
-	claims := auth.Claims{
-		Subject: user.ID.String(),
-		Email:   user.Email,
-		Name:    user.DisplayName,
-	}
-	token, expires, err := s.signer.SignToken(claims, s.tokenTTL)
-	if err != nil {
-		return nil, fmt.Errorf("services: sign token: %w", err)
-	}
-
 	s.auditSuccess(ctx, user)
 	s.auditBreakGlass(ctx, user)
 
 	return &LoginResult{
-		Token:     token,
-		ExpiresAt: expires,
 		User: LoggedInUser{
 			ID:          user.ID,
 			Email:       user.Email,
@@ -540,38 +521,6 @@ func mustGenerateDummyHash() []byte {
 		panic(fmt.Errorf("services: dummy bcrypt: %w", err))
 	}
 	return h
-}
-
-// SubjectFromToken verifies a bearer JWT via `Signer.VerifyToken` and
-// returns its `sub` claim. Middleware uses this to extract the user
-// id without exposing the full claims struct outside this package.
-//
-// API-S-05: a valid signature is not enough. The subject must still
-// be an existing, enabled local user, checked with one primary-key
-// lookup per bearer request, so disabling a user stops their tokens
-// right away instead of at expiry. Any lookup failure fails closed.
-// An account still waiting for approval is refused too: it may only
-// read /users/me and sign out, which needs a session, not a token.
-func (s *AuthService) SubjectFromToken(ctx context.Context, token string) (string, error) {
-	if s.signer == nil {
-		return "", auth.ErrInvalidToken
-	}
-	claims, err := s.signer.VerifyToken(token)
-	if err != nil {
-		return "", err
-	}
-	id, err := uuid.Parse(claims.Subject)
-	if err != nil {
-		// Sub MUST be a UUID for local users; OIDC may relax this
-		// later but the field stays opaque to the rest of the
-		// platform either way.
-		return "", auth.ErrInvalidToken
-	}
-	user, err := s.users.Get(ctx, id)
-	if err != nil || user.Disabled || user.PendingApproval {
-		return "", auth.ErrInvalidToken
-	}
-	return claims.Subject, nil
 }
 
 // Constant-time helper used by other auth flows; exposed here to keep

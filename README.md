@@ -94,8 +94,8 @@ Tier 2 ops (approve / reject / reveal wrap) additionally require `last_mfa_at` w
 
 | Env var | Default | Notes |
 |---|---|---|
-| `SB_JWT_SECRET` | required | HMAC-SHA256 key, ≥32 bytes (base64 preferred). Used for legacy Bearer JWT path. |
-| `SB_JWT_TOKEN_TTL` | `8h` | Lifetime of the legacy JWT issued by `/auth/login`. Cookie session has its own policy. |
+| `SB_JWT_SECRET` | unused | No longer read: sign-in is cookie-session only and there is no bearer token (api#191). Remove it from your environment. |
+| `SB_JWT_TOKEN_TTL` | unused | No longer read: `/auth/login` issues no JWT (api#191). The session cookie has its own lifetime. |
 | `SB_BOOTSTRAP_ADMIN_EMAIL` + `SB_BOOTSTRAP_ADMIN_PASSWORD` | (unset) | First-boot seed of the local-admin user. Idempotent. |
 | `SB_PUBLIC_URL` | (unset) | The install's public address, e.g. `https://secrets.example.com`. Sign-in redirect URIs are built from it, never from request headers. When unset, an admin with `auth.sso.edit` saves it from the console's sign-in settings; when set, it wins and the console shows it read-only. |
 | `SB_BOOTSTRAP_ADMIN_USER_ID` | (unset) | First-boot grant of `admin` role to this user_id. Idempotent. |
@@ -173,10 +173,9 @@ For the LocalKMS backend in dev:
 ```bash
 export SB_ENV=dev
 export SB_WRAP_MASTER_KEY=$(openssl rand -base64 32)
-export SB_JWT_SECRET=$(openssl rand -base64 32)
 ```
 
-The compose file publishes every port on 127.0.0.1 only and holds no api keys; its only credentials are the throwaway dev passwords for Postgres and MinIO. `minio-init` creates the `secrets-bridge-dev` bucket the api container writes logos to. The api container reads `SB_WRAP_MASTER_KEY` and `SB_JWT_SECRET` from your shell (export them as above before `docker compose up --build`) and refuses to boot without them. `SB_DEV_SEED_PASSWORD` is optional; unset means a random password per dev user, logged once.
+The compose file publishes every port on 127.0.0.1 only and holds no api keys; its only credentials are the throwaway dev passwords for Postgres and MinIO. `minio-init` creates the `secrets-bridge-dev` bucket the api container writes logos to. The api container reads `SB_WRAP_MASTER_KEY` from your shell (export it as above before `docker compose up --build`) and refuses to boot without it. `SB_DEV_SEED_PASSWORD` is optional; unset means a random password per dev user, logged once.
 
 For OIDC against Authentik:
 
@@ -195,7 +194,6 @@ docker build -t secrets-bridge-api:dev .
 docker run --rm -p 8080:8080 \
   -e DATABASE_URL=postgres://... \
   -e REDIS_URL=redis://... \
-  -e SB_JWT_SECRET=... \
   -e SB_KMS_BACKEND=vault-transit \
   -e SB_KMS_VAULT_ADDR=... \
   -e SB_KMS_VAULT_TOKEN=... \

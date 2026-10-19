@@ -189,6 +189,8 @@ type loginHarness struct {
 	apiURL string
 	client *http.Client
 	km     keymgmt.KeyManager
+	// signer forges correctly signed JWTs, to show they are no credential.
+	signer *auth.Signer
 }
 
 func newLoginHarness(t *testing.T, opts ...func(*Config)) *loginHarness {
@@ -246,7 +248,7 @@ func newLoginHarness(t *testing.T, opts ...func(*Config)) *loginHarness {
 	users := storage.NewLocalUsers(pool)
 	authSvc := services.NewAuthService(
 		users, storage.NewRoles(pool), storage.NewUserRoles(pool),
-		storage.NewAuditEvents(pool), auth.NewSigner(jwtKey), time.Hour,
+		storage.NewAuditEvents(pool),
 	)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -272,6 +274,7 @@ func newLoginHarness(t *testing.T, opts ...func(*Config)) *loginHarness {
 
 	return &loginHarness{
 		t: t, pool: pool, rdb: rdb, users: users, idp: idp, apiURL: apiURL, km: km,
+		signer: auth.NewSigner(jwtKey),
 		client: &http.Client{
 			Timeout: 60 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -380,7 +383,8 @@ func (h *loginHarness) oidcLogin(returnTo string, claims map[string]any) *http.R
 }
 
 // passwordLogin posts to /auth/login and returns the response plus
-// the bearer token from the body (empty on failure).
+// any `token` field in the body. Since M1 (api#191) there is none, and
+// tests assert it stays empty.
 func (h *loginHarness) passwordLogin(email, password string) (*http.Response, string) {
 	h.t.Helper()
 	body, _ := json.Marshal(map[string]string{"email": email, "password": password})
@@ -415,6 +419,17 @@ func (h *loginHarness) me(session *http.Cookie, bearer string) (int, string) {
 		_ = json.NewDecoder(resp.Body).Decode(&out)
 	}
 	return resp.StatusCode, out.ID
+}
+
+// signedToken is a JWT for uid signed with the key the api used to
+// sign login tokens: before M1 it was a working credential.
+func (h *loginHarness) signedToken(uid uuid.UUID) string {
+	h.t.Helper()
+	tok, _, err := h.signer.SignToken(auth.Claims{Subject: uid.String()}, time.Hour)
+	if err != nil {
+		h.t.Fatalf("SignToken: %v", err)
+	}
+	return tok
 }
 
 func (h *loginHarness) count(q string, args ...any) int {
@@ -532,10 +547,11 @@ func TestLoginSecurity_DisabledUserLosesSessionsTokensAndOIDC(t *testing.T) {
 	ctx := t.Context()
 	user := h.createUser("dana@example.com", "dana-correct-pw", bcrypt.MinCost)
 
-	resp, bearer := h.passwordLogin("dana@example.com", "dana-correct-pw")
-	if resp.StatusCode != http.StatusOK || bearer == "" {
-		t.Fatalf("password login: status %d, token empty=%v", resp.StatusCode, bearer == "")
+	resp, token := h.passwordLogin("dana@example.com", "dana-correct-pw")
+	if resp.StatusCode != http.StatusOK || token != "" {
+		t.Fatalf("password login: status %d, token in body=%v", resp.StatusCode, token != "")
 	}
+	bearer := h.signedToken(user.ID)
 	pwSession := findCookie(resp, loginTestSessionKey)
 	resp = h.oidcLogin("/", verifiedClaims("dana-sub", "dana@example.com"))
 	if resp.StatusCode != http.StatusFound {
@@ -545,11 +561,13 @@ func TestLoginSecurity_DisabledUserLosesSessionsTokensAndOIDC(t *testing.T) {
 	for name, st := range map[string]int{
 		"password session": first(h.me(pwSession, "")),
 		"sso session":      first(h.me(ssoSession, "")),
-		"bearer":           first(h.me(nil, bearer)),
 	} {
 		if st != http.StatusOK {
 			t.Fatalf("%s before disable: /users/me = %d, want 200", name, st)
 		}
+	}
+	if st, _ := h.me(nil, bearer); st != http.StatusUnauthorized {
+		t.Fatalf("signed bearer JWT before disable: /users/me = %d, want 401 (not a credential)", st)
 	}
 
 	if err := h.users.SetDisabled(ctx, user.ID, true); err != nil {
@@ -763,9 +781,9 @@ func TestLoginSecurity_NormalPasswordAndOIDCLoginStillWork(t *testing.T) {
 			t.Fatalf("wrong password: status %d, want 401", resp.StatusCode)
 		}
 	}
-	resp, bearer := h.passwordLogin("pat@example.com", "pat-correct-pw")
-	if resp.StatusCode != http.StatusOK || bearer == "" {
-		t.Fatalf("password login: status %d", resp.StatusCode)
+	resp, token := h.passwordLogin("pat@example.com", "pat-correct-pw")
+	if resp.StatusCode != http.StatusOK || token != "" {
+		t.Fatalf("password login: status %d, token in body=%v", resp.StatusCode, token != "")
 	}
 	session := findCookie(resp, loginTestSessionKey)
 	if session == nil || !session.HttpOnly || session.SameSite != http.SameSiteStrictMode {
@@ -774,8 +792,8 @@ func TestLoginSecurity_NormalPasswordAndOIDCLoginStillWork(t *testing.T) {
 	if st, id := h.me(session, ""); st != http.StatusOK || id != user.ID.String() {
 		t.Fatalf("cookie /users/me = %d id=%q", st, id)
 	}
-	if st, id := h.me(nil, bearer); st != http.StatusOK || id != user.ID.String() {
-		t.Fatalf("bearer /users/me = %d id=%q", st, id)
+	if st, _ := h.me(nil, h.signedToken(user.ID)); st != http.StatusUnauthorized {
+		t.Fatalf("signed bearer JWT /users/me = %d, want 401 (M1: not a credential)", st)
 	}
 	got, err := h.users.Get(t.Context(), user.ID)
 	if err != nil {
@@ -791,5 +809,33 @@ func TestLoginSecurity_NormalPasswordAndOIDCLoginStillWork(t *testing.T) {
 	}
 	if st, id := h.me(findCookie(resp, loginTestSessionKey), ""); st != http.StatusOK || id != user.ID.String() {
 		t.Fatalf("oidc session /users/me = %d id=%q", st, id)
+	}
+}
+
+// M1 (api#191): before, logout revoked only the cookie session and the
+// login JWT from the response body kept working for its full lifetime.
+// Now login returns no token and a signed one is not a credential, so
+// logout leaves nothing that still works.
+func TestLoginSecurity_LogoutLeavesNoWorkingCredential(t *testing.T) {
+	h := newLoginHarness(t)
+	user := h.createUser("m1@example.com", "m1-correct-pw", bcrypt.MinCost)
+	resp, token := h.passwordLogin("m1@example.com", "m1-correct-pw")
+	if resp.StatusCode != http.StatusOK || token != "" {
+		t.Fatalf("login = %d, token in body=%v; want 200 and no token", resp.StatusCode, token != "")
+	}
+	session := findCookie(resp, loginTestSessionKey)
+	if st, _ := h.me(session, ""); st != http.StatusOK {
+		t.Fatalf("cookie before logout = %d, want 200", st)
+	}
+	req, _ := http.NewRequest(http.MethodPost, h.apiURL+"/api/v1/auth/logout", nil)
+	req.AddCookie(&http.Cookie{Name: session.Name, Value: session.Value})
+	if out := h.do(req); out.StatusCode != http.StatusNoContent && out.StatusCode != http.StatusOK {
+		t.Fatalf("logout = %d", out.StatusCode)
+	}
+	if st, _ := h.me(session, ""); st != http.StatusUnauthorized {
+		t.Fatalf("cookie after logout = %d, want 401", st)
+	}
+	if st, _ := h.me(nil, h.signedToken(user.ID)); st != http.StatusUnauthorized {
+		t.Fatalf("signed bearer after logout = %d, want 401", st)
 	}
 }

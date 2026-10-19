@@ -18,7 +18,7 @@ import (
 func TestAuthWith_HeaderIdentityIgnoredByDefault(t *testing.T) {
 	// Default (flag unset) must NOT honour the header.
 	app := fiber.New()
-	app.Use(AuthWith(nil, nil))
+	app.Use(AuthWith(nil))
 	app.Get("/x", func(c fiber.Ctx) error { return c.SendString(actor(c)) })
 
 	req := httptest.NewRequest("GET", "/x", nil)
@@ -39,7 +39,7 @@ func TestAuthWith_HeaderIdentityHonouredWhenExplicitlyEnabled(t *testing.T) {
 	t.Cleanup(func() { AllowInsecureHeaderIdentity = prev })
 
 	app := fiber.New()
-	app.Use(AuthWith(nil, nil))
+	app.Use(AuthWith(nil))
 	app.Get("/x", func(c fiber.Ctx) error { return c.SendString(actor(c)) })
 
 	req := httptest.NewRequest("GET", "/x", nil)
@@ -61,7 +61,7 @@ func TestAuthWith_HeaderIdentityHonouredWhenExplicitlyEnabled(t *testing.T) {
 
 func TestRequireAuthedExcept_AnonymousProtectedIs401(t *testing.T) {
 	app := fiber.New()
-	app.Use(AuthWith(nil, nil))
+	app.Use(AuthWith(nil))
 	app.Use(RequireAuthedExcept(map[string]bool{"/api/v1/auth/login": true}))
 	app.Get("/api/v1/policies", func(c fiber.Ctx) error { return c.SendString("leaked") })
 
@@ -76,7 +76,7 @@ func TestRequireAuthedExcept_AnonymousProtectedIs401(t *testing.T) {
 
 func TestRequireAuthedExcept_PublicPathPassesAnonymous(t *testing.T) {
 	app := fiber.New()
-	app.Use(AuthWith(nil, nil))
+	app.Use(AuthWith(nil))
 	app.Use(RequireAuthedExcept(map[string]bool{"/api/v1/auth/login": true}))
 	app.Post("/api/v1/auth/login", func(c fiber.Ctx) error { return c.SendString("ok") })
 
@@ -95,7 +95,7 @@ func TestRequireAuthedExcept_AuthenticatedProtectedPasses(t *testing.T) {
 	t.Cleanup(func() { AllowInsecureHeaderIdentity = prev })
 
 	app := fiber.New()
-	app.Use(AuthWith(nil, nil))
+	app.Use(AuthWith(nil))
 	app.Use(RequireAuthedExcept(map[string]bool{}))
 	app.Get("/api/v1/policies", func(c fiber.Ctx) error { return c.SendString("ok") })
 
@@ -119,7 +119,7 @@ func TestRequireAuthedExcept_AuthenticatedProtectedPasses(t *testing.T) {
 // unauthenticated-read P0 stays closed.
 func TestRequireAuthedExcept_PublicPrefixExemptsAgentSubtree(t *testing.T) {
 	app := fiber.New()
-	app.Use(AuthWith(nil, nil)) // resolves to anonymous (no session/header)
+	app.Use(AuthWith(nil)) // resolves to anonymous (no session/header)
 	app.Use(RequireAuthedExcept(map[string]bool{}, "/api/v1/agents/"))
 	app.Post("/api/v1/agents/00000000-0000-4000-8000-000000000001/jobs/claim",
 		func(c fiber.Ctx) error { return c.SendString("reached") })

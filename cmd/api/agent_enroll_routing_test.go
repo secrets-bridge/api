@@ -29,7 +29,7 @@ func newAgentEnrollRoutingApp() *fiber.App {
 	// EXACTLY mirrors cmd/api/main.go's group chain, including the
 	// "/api/v1/agents/" prefix exemption.
 	v1 := app.Group("/api/v1",
-		middleware.AuthWith(nil, nil),
+		middleware.AuthWith(nil),
 		middleware.RequireAuthedExcept(publicV1Paths, "/api/v1/agents/"),
 	)
 	reachable := func(c fiber.Ctx) error { return c.SendString("reachable") }

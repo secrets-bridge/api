@@ -99,7 +99,7 @@ func bootstrapBindAuthz(t *testing.T) *bindAuthzFixture {
 	psH := handlers.NewProjectSecrets(bindings, projectRepo, secretsRepo, envRepo).WithScope(resolver, tsr)
 
 	app := fiber.New()
-	app.Use(middleware.Auth(nil))
+	app.Use(middleware.Auth())
 	app.Post("/api/v1/projects/:id/secrets", psH.Bind)
 	app.Delete("/api/v1/projects/:id/secrets/:secret_id", psH.Unbind)
 	fx.app = app

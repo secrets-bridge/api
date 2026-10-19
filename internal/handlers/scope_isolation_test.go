@@ -162,7 +162,7 @@ func bootstrapScopeIso(t *testing.T) *scopeIsoFixture {
 	requestsH := handlers.NewRequests(reqSvc).WithTenancyGate(bindings, secretsRepo, resolver).WithTeamScope(tsr)
 
 	app := fiber.New()
-	app.Use(middleware.Auth(nil))
+	app.Use(middleware.Auth())
 	app.Get("/api/v1/projects", tenancyH.ListProjects)
 	app.Get("/api/v1/projects/:id/environments", tenancyH.ListEnvironmentsForProject)
 	app.Get("/api/v1/projects/:id/secrets", projectSecretsH.List)

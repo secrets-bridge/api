@@ -55,11 +55,11 @@ type LoginBody struct {
 	Password string `json:"password"`
 }
 
-// LoginResponse is the outbound shape. The UI persists the token in
-// memory only (see ui src/auth/AuthContext.tsx); never localStorage.
+// LoginResponse is the outbound shape. There is no token: the HttpOnly
+// session cookie set with it is the only credential (M1, api#191).
+// ExpiresAt is the session's absolute expiry.
 type LoginResponse struct {
-	Token     string       `json:"token"`
-	ExpiresAt string       `json:"expires_at"`
+	ExpiresAt string        `json:"expires_at"`
 	User      LoginRespUser `json:"user"`
 }
 
@@ -98,20 +98,20 @@ func (h *Auth) Login(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 
-	if h.sessions != nil {
-		issued, err := h.sessions.Issue(c.Context(), result.User.ID, c.IP(), c.Get("User-Agent"))
-		if err != nil {
-			// Session mint failed but the user proved their credentials.
-			// Don't refuse the login — fall back to the JWT-only shape
-			// the UI already handles. Audit will carry the failure.
-		} else {
-			h.setSessionCookie(c, issued.CookieValue, issued.AbsoluteExpiry)
-		}
+	// The session is the credential: without one the login fails
+	// rather than falling back to anything else.
+	if h.sessions == nil {
+		return fiber.NewError(fiber.StatusServiceUnavailable, "sign-in is not available")
 	}
+	issued, err := h.sessions.Issue(c.Context(), result.User.ID, c.IP(), c.Get("User-Agent"))
+	if err != nil {
+		logInternalError(c, "login: start session", err)
+		return fiber.NewError(fiber.StatusInternalServerError, "could not start a session")
+	}
+	h.setSessionCookie(c, issued.CookieValue, issued.AbsoluteExpiry)
 
 	return c.JSON(LoginResponse{
-		Token:     result.Token,
-		ExpiresAt: result.ExpiresAt.UTC().Format("2006-01-02T15:04:05Z"),
+		ExpiresAt: issued.AbsoluteExpiry.UTC().Format("2006-01-02T15:04:05Z"),
 		User: LoginRespUser{
 			ID:          result.User.ID.String(),
 			Email:       result.User.Email,
