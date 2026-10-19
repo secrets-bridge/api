@@ -135,10 +135,11 @@ func ByIP() BucketFunc {
 }
 
 // ByIdentity keys the bucket on the authenticated identity the auth
-// middleware resolved (session or bearer). Unauthenticated requests are
-// not bucketed; the default-deny gate in front 401s them anyway. The
-// identity never comes from the request body or query, so it cannot be
-// rotated to dodge the budget (same reasoning as API-02).
+// middleware resolved (session, or the dev-only header).
+// Unauthenticated requests are not bucketed; the default-deny gate in
+// front 401s them anyway. The identity never comes from the request
+// body or query, so it cannot be rotated to dodge the budget (same
+// reasoning as API-02).
 func ByIdentity() BucketFunc {
 	return func(c fiber.Ctx) (string, bool) {
 		a := actor(c)

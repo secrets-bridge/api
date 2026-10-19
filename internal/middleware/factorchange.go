@@ -12,11 +12,11 @@
 //	user has a factor       -> the session must carry a FRESH MFA stamp
 //	                           (same StepUpTTL as Tier-2 routes)
 //
-// Identities without a session (bearer JWT, see M1) can never carry a
-// stamp, so once a factor exists they are refused. Lookup errors fail
-// closed. Every factor row in Postgres is a confirmed one (pending
-// enrollments live only in Redis), so "has a factor" is "has a
-// confirmed factor".
+// Identities without a session (only the dev-only X-User-Id header
+// since M1) can never carry a stamp, so once a factor exists they are
+// refused. Lookup errors fail closed. Every factor row in Postgres is
+// a confirmed one (pending enrollments live only in Redis), so "has a
+// factor" is "has a confirmed factor".
 //
 // Confirm is gated too, not only enroll: an enrollment started while
 // the user had no factor must not be confirmable after a factor exists
@@ -61,7 +61,7 @@ func RequireFreshMFAForFactorChange(verifier StepUpVerifier, enrollment MFAEnrol
 			return c.Next()
 		}
 		// Enrolled (or unknown because the lookup failed): the caller
-		// needs fresh MFA. A bearer identity has no session to stamp,
+		// needs fresh MFA. An identity without a session has nothing to stamp,
 		// so it stays refused.
 		challenge(c, verifier)
 		return fiber.NewError(fiber.StatusUnauthorized, "step_up_required")

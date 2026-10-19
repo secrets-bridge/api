@@ -1,10 +1,11 @@
-// Auth handler — exposes the local-admin login endpoint behind
-// /api/v1/auth/login. Slice A2 adds a sibling /auth/logout endpoint
-// and a Set-Cookie path so the SPA can drop JWT-in-sessionStorage.
+// Auth handler: the local-admin login endpoint behind
+// /api/v1/auth/login and its sibling /auth/logout. A successful login
+// sets the `sb_session` cookie, which is the only credential.
 
 package handlers
 
 import (
+	"context"
 	"errors"
 	"time"
 
@@ -15,13 +16,13 @@ import (
 	"github.com/secrets-bridge/api/internal/services"
 )
 
-// Auth is the HTTP-side wrapper around AuthService + the optional
-// SessionService. When `sessions` is nil the JWT-only path stays in
-// effect (test harnesses keep working unchanged).
+// Auth is the HTTP-side wrapper around AuthService + the
+// SessionService. Without a SessionService, login answers 503: there
+// is no other credential to hand out.
 type Auth struct {
-	svc         *services.AuthService
-	sessions    *services.SessionService
-	cookieMode  CookieMode
+	svc        *services.AuthService
+	sessions   *services.SessionService
+	cookieMode CookieMode
 }
 
 // CookieMode flips between dev (no Secure flag — required for
@@ -63,24 +64,23 @@ type LoginResponse struct {
 	User      LoginRespUser `json:"user"`
 }
 
-// LoginRespUser is the value-free projection returned alongside the
-// token.
+// LoginRespUser is the value-free projection returned with the
+// session cookie.
 type LoginRespUser struct {
 	ID          string `json:"id"`
 	Email       string `json:"email"`
 	DisplayName string `json:"display_name"`
 }
 
-// Login handles POST /api/v1/auth/login. Public route — no auth
+// Login handles POST /api/v1/auth/login. Public route, no auth
 // middleware in front. Generic 401 on every failure shape; the audit
 // log carries the specific error kind so triage stays possible
 // without disclosing it on the wire.
 //
-// When the SessionService is wired (Slice A2), a successful login
-// ALSO mints a server-side session and sets the `sb_session` cookie.
-// The JWT in the response body stays for backwards compatibility —
-// the SPA flips to cookie-only in Slice C, after which we drop the
-// token field.
+// A successful login starts a server-side session and sets the
+// `sb_session` cookie. The service records the sign-in as a success
+// only after the session exists; if the session can't be started the
+// answer is 500 and the audit row is a failure.
 func (h *Auth) Login(c fiber.Ctx) error {
 	var body LoginBody
 	if err := c.Bind().JSON(&body); err != nil {
@@ -90,23 +90,33 @@ func (h *Auth) Login(c fiber.Ctx) error {
 	password := []byte(body.Password)
 	body.Password = "" // best-effort drop the original string ref
 
-	result, err := h.svc.Login(c.Context(), body.Email, password)
+	// The session is the credential: without a session service the
+	// login fails rather than falling back to anything else.
+	if h.sessions == nil {
+		zero(password)
+		return fiber.NewError(fiber.StatusServiceUnavailable, "sign-in is not available")
+	}
+
+	var issued *services.IssuedSession
+	start := func(ctx context.Context, userID uuid.UUID) error {
+		s, err := h.sessions.Issue(ctx, userID, c.IP(), c.Get("User-Agent"))
+		if err != nil {
+			return err
+		}
+		issued = s
+		return nil
+	}
+	result, err := h.svc.Login(c.Context(), body.Email, password, start)
 	if err != nil {
 		if errors.Is(err, services.ErrInvalidCredentials) {
 			return fiber.NewError(fiber.StatusUnauthorized, "invalid credentials")
 		}
-		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
-	}
-
-	// The session is the credential: without one the login fails
-	// rather than falling back to anything else.
-	if h.sessions == nil {
-		return fiber.NewError(fiber.StatusServiceUnavailable, "sign-in is not available")
-	}
-	issued, err := h.sessions.Issue(c.Context(), result.User.ID, c.IP(), c.Get("User-Agent"))
-	if err != nil {
-		logInternalError(c, "login: start session", err)
-		return fiber.NewError(fiber.StatusInternalServerError, "could not start a session")
+		if errors.Is(err, services.ErrSessionStart) {
+			logInternalError(c, "login: start session", err)
+			return fiber.NewError(fiber.StatusInternalServerError, "could not start a session")
+		}
+		logInternalError(c, "login", err)
+		return fiber.NewError(fiber.StatusInternalServerError, "sign-in failed")
 	}
 	h.setSessionCookie(c, issued.CookieValue, issued.AbsoluteExpiry)
 
@@ -167,8 +177,3 @@ func (h *Auth) clearSessionCookie(c fiber.Ctx) {
 		SameSite: fiber.CookieSameSiteStrictMode,
 	})
 }
-
-// Compile-time confirmation that uuid is consumed (kept for the
-// session-id projection we'll add when the /auth/sessions admin
-// endpoint lands in a follow-up).
-var _ = uuid.Nil

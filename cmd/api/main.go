@@ -646,9 +646,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 
 	// Authenticated API surface. Admin auth + RBAC + audit are stub
 	// placeholders today; real implementations land with workflow
-	// (issue #10). `AuthWith` adds the cookie path at the front of
-	// the resolution chain (cookie -> Bearer JWT -> X-User-Id ->
-	// anonymous).
+	// (issue #10). `AuthWith` resolves the actor from the session
+	// cookie, then the dev-only X-User-Id header, then anonymous.
+	// `Authorization: Bearer` is not read (M1, api#191).
 	// Slice K — login-time MFA gate. When enabled, every authenticated
 	// route requires the session to have been MFA-verified at least
 	// once. The middleware has its own carve-out list for the routes
@@ -711,11 +711,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	}
 	v1 := app.Group("/api/v1", v1Middlewares...)
 
-	// Authentication — public route, no auth gating. The UI POSTs
-	// email + password here and receives a signed JWT in return. The
-	// rest of the platform reads identity from `middleware.CtxKeyActor`
-	// which the upstream `middleware.Auth()` populated from
-	// either the Bearer JWT or the legacy X-User-Id header.
+	// Authentication: public route, no auth gating. The UI POSTs
+	// email + password here and gets the HttpOnly `sb_session` cookie
+	// back; there is no token in the body. The rest of the platform
+	// reads identity from `middleware.CtxKeyActor`, which the upstream
+	// `middleware.AuthWith` populated from that session cookie (or,
+	// in local dev only, the X-User-Id header).
 	//
 	// Rate limit per architect Q7 + NAT-aware tuning (Slice A1):
 	// 30 attempts / 60s per source IP. The architect's original
