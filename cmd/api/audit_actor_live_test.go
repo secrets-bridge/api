@@ -31,6 +31,10 @@ func (l *liveApp) callAs(t *testing.T, method, path string, headers map[string]s
 		req.Header.Set("Content-Type", "application/json")
 	}
 	for k, v := range headers {
+		if k == "Host" {
+			req.Host = v // the Host header is taken from req.Host, not req.Header
+			continue
+		}
 		req.Header.Set(k, v)
 	}
 	resp, err := l.app.Test(req, fiber.TestConfig{Timeout: 15 * time.Second})

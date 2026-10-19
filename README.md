@@ -97,6 +97,7 @@ Tier 2 ops (approve / reject / reveal wrap) additionally require `last_mfa_at` w
 | `SB_JWT_SECRET` | required | HMAC-SHA256 key, ≥32 bytes (base64 preferred). Used for legacy Bearer JWT path. |
 | `SB_JWT_TOKEN_TTL` | `8h` | Lifetime of the legacy JWT issued by `/auth/login`. Cookie session has its own policy. |
 | `SB_BOOTSTRAP_ADMIN_EMAIL` + `SB_BOOTSTRAP_ADMIN_PASSWORD` | (unset) | First-boot seed of the local-admin user. Idempotent. |
+| `SB_PUBLIC_URL` | (unset) | The install's public address, e.g. `https://secrets.example.com`. Sign-in redirect URIs are built from it, never from request headers. When unset, an admin with `auth.sso.edit` saves it from the console's sign-in settings; when set, it wins and the console shows it read-only. |
 | `SB_BOOTSTRAP_ADMIN_USER_ID` | (unset) | First-boot grant of `admin` role to this user_id. Idempotent. |
 | `SB_DEV_SEED_PASSWORD` | (unset) | Shared password for the three dev seed users when `SB_ENV=dev`. Without it, a random password per user is logged ONCE at WARN. |
 | `SB_OIDC_ISSUER` | (unset) | OIDC provider URL. **OIDC routes only mount when set.** Discovery URL like `https://authentik.example.com/application/o/secrets-bridge/`. |
