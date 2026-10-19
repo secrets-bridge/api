@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Role is a named bundle of permission strings.
@@ -49,6 +50,11 @@ type RoleRepository interface {
 // platform starts in a usable state and removing them would lock the
 // admin out.
 var ErrSystemRow = errors.New("storage: cannot delete system row")
+
+// ErrRoleInUse is returned by Delete when something that doesn't
+// cascade still points at the role: a sign-in provider's default role
+// (sso_providers.default_role_id, ON DELETE RESTRICT).
+var ErrRoleInUse = errors.New("storage: role is in use")
 
 // Roles is the Postgres implementation of RoleRepository.
 type Roles struct {
@@ -136,6 +142,10 @@ func (r *Roles) Delete(ctx context.Context, id uuid.UUID) error {
 	const q = `DELETE FROM roles WHERE id = $1 AND is_system = false`
 	tag, err := r.pool.Exec(ctx, q, id)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && (pgErr.Code == "23503" || pgErr.Code == "23001") {
+			return ErrRoleInUse
+		}
 		return fmt.Errorf("storage: delete role: %w", err)
 	}
 	if tag.RowsAffected() == 1 {

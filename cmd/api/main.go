@@ -387,7 +387,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	agentsH := handlers.NewAgents(agentSvc).WithDirectMint(cfg.AllowDirectAgentMint)
 	jobsH := handlers.NewJobs(jobSvc)
 	adminH := handlers.NewAdmin(roleRepo, userRoleRepo, workflowRepo, policyRepo).
-		WithAudit(auditRepo)
+		WithAudit(auditRepo).
+		WithSSODefaultRoles(storage.NewSSOStore(pool))
 	// R-follow-up #5 slice 1c — adminH.WithHistory is called further
 	// down where policyHistorySvc is constructed alongside the scoped
 	// handlers (search for "policyHistorySvc := ").
@@ -1003,7 +1004,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// console (api#267). A global auth.sso.edit for every route, and a
 	// fresh second factor for every write: whoever holds it decides who
 	// can sign in.
-	ssoSvc, err := services.NewSSOService(storage.NewSSOStore(pool), roleRepo, km, cfg.PublicURL, cfg.OIDCIssuer)
+	ssoSvc, err := services.NewSSOService(storage.NewSSOStore(pool), roleRepo, km, cfg.PublicURL, cfg.OIDCIssuer, cfg.Env == ModeDev)
 	if err != nil {
 		logger.Error("sign-in settings", "error", err)
 		os.Exit(1)
@@ -1020,6 +1021,28 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Delete("/sso/providers/:id", ssoEdit, requireMFA, ssoH.DeleteProvider)
 	v1.Get("/sso/settings", ssoEdit, ssoH.GetSettings)
 	v1.Put("/sso/settings", ssoEdit, requireMFA, ssoH.UpdateSettings)
+
+	// Signing in with those providers (api#267 part 2). Start, callback
+	// and the provider list are public (publicV1Paths) and rate-limited
+	// like the env-var OIDC routes; connecting and disconnecting an
+	// account need a fresh second factor.
+	ssoSignIn := services.NewSSOSignIn(ssoSvc, storage.NewSSOStore(pool), storage.NewUserIdentities(pool),
+		localUsersRepoInApp, sessionSvc, auditRepo, rdb)
+	meH.WithPasswordLookup(ssoSignIn)
+	ssoSignInH := handlers.NewSSOSignIn(ssoSignIn, ssoSvc, cfg.OIDCIssuer != "", cookieMode)
+	ssoLimit := func(name string, limit int) fiber.Handler {
+		return middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
+			Name: name, Bucket: middleware.ByIP(), Limit: limit, Window: 60 * time.Second,
+		})
+	}
+	v1.Get("/auth/providers", ssoLimit("auth:providers", 120), ssoSignInH.Providers)
+	v1.Get("/auth/sso/:type/start", ssoLimit("auth:sso:start", 30), ssoSignInH.Start)
+	v1.Get("/auth/sso/:type/callback", ssoLimit("auth:sso:callback", 60), ssoSignInH.Callback)
+	v1.Post("/auth/sso/:type/connect", requireMFA, ssoSignInH.Connect)
+	v1.Post("/auth/sso/:type/finish", ssoSignInH.Finish)
+	v1.Post("/sso/providers/:id/test", ssoEdit, requireMFA, ssoSignInH.Test)
+	v1.Get("/users/me/identities", ssoSignInH.Identities)
+	v1.Delete("/users/me/identities/:type", requireMFA, ssoSignInH.Unlink)
 
 	// Pre-launch triage (item 2): direct-reveal auto-approves and enqueues
 	// a read of a live value, so the SUBMIT is itself a Tier-2 action and

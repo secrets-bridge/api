@@ -7,8 +7,10 @@
 //     POST   /roles                       create
 //     GET    /roles                       list
 //     GET    /roles/:id                   get
-//     PUT    /roles/:id/permissions       replace permission list
-//     DELETE /roles/:id                   delete (404 / 409 for system)
+//     PUT    /roles/:id/permissions       replace permission list (409 when a sign-in
+//                                         provider's default role would be widened)
+//     DELETE /roles/:id                   delete (404; 409 for system, or a sign-in
+//                                         provider's default role)
 //
 //   User ↔ Role assignments
 //     POST   /user-roles                  grant
@@ -35,9 +37,11 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -62,6 +66,10 @@ type Admin struct {
 	// authoring actions.
 	audit storage.AuditEventRepository
 
+	// ssoDefaults tells whether a sign-in provider gives a role to new
+	// accounts. Optional; when nil, role edits aren't checked against it.
+	ssoDefaults SSODefaultRoles
+
 	// R-follow-up #5 slice 1c (api#135) — history service for the
 	// admin PolicyHistory endpoint. nil-safe: when not wired, returns
 	// 503. Production main always wires this via WithHistory.
@@ -71,6 +79,19 @@ type Admin struct {
 // NewAdmin constructs an Admin handler bound to its repositories.
 func NewAdmin(roles storage.RoleRepository, userRoles storage.UserRoleRepository, workflows storage.WorkflowRepository, policies storage.PolicyRepository) *Admin {
 	return &Admin{roles: roles, userRoles: userRoles, workflows: workflows, policies: policies}
+}
+
+// SSODefaultRoles is the slice of the sign-in store the role routes use.
+type SSODefaultRoles interface {
+	RoleIsDefault(ctx context.Context, roleID uuid.UUID) (bool, error)
+}
+
+// WithSSODefaultRoles makes PUT /roles/:id/permissions refuse to widen
+// a role that a sign-in provider gives to every new account. Returns
+// the handler for chaining.
+func (h *Admin) WithSSODefaultRoles(d SSODefaultRoles) *Admin {
+	h.ssoDefaults = d
+	return h
 }
 
 // WithAudit enables audit emission for admin policy mutations per the
@@ -107,6 +128,8 @@ func adminErr(err error) error {
 		return fiber.NewError(fiber.StatusNotFound, "not found")
 	case errors.Is(err, storage.ErrSystemRow):
 		return fiber.NewError(fiber.StatusConflict, "system row cannot be deleted (edit instead)")
+	case errors.Is(err, storage.ErrRoleInUse):
+		return fiber.NewError(fiber.StatusConflict, "role is a sign-in provider's default role; choose another default first")
 	default:
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
@@ -211,6 +234,19 @@ func (h *Admin) UpdateRolePermissions(c fiber.Ctx) error {
 	existing, err := h.roles.Get(c.Context(), id)
 	if err != nil {
 		return adminErr(err)
+	}
+	// A sign-in provider's default role goes to every new account with
+	// approval off, so it stays within the non-privileged permissions.
+	// Sign-in checks the role again too; this says so at edit time.
+	if h.ssoDefaults != nil && services.HoldsPrivileged(perms) {
+		used, err := h.ssoDefaults.RoleIsDefault(c.Context(), id)
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, "could not check sign-in providers")
+		}
+		if used {
+			return stableErr(c, fiber.StatusConflict, "role_is_sso_default",
+				"a sign-in provider gives this role to new accounts, so it can only hold "+strings.Join(services.NonPrivilegedPermissions, ", "), nil)
+		}
 	}
 	if err := h.roles.UpdatePermissions(c.Context(), id, perms); err != nil {
 		return adminErr(err)

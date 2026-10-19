@@ -120,6 +120,11 @@ func (s *SSOStore) GetProvider(ctx context.Context, id uuid.UUID) (*SSOProvider,
 	return scanSSOProvider(s.pool.QueryRow(ctx, `SELECT `+ssoProviderColumns+` FROM sso_providers WHERE id = $1`, id))
 }
 
+// GetProviderByType returns the provider of a type, or ErrNotFound.
+func (s *SSOStore) GetProviderByType(ctx context.Context, providerType string) (*SSOProvider, error) {
+	return scanSSOProvider(s.pool.QueryRow(ctx, `SELECT `+ssoProviderColumns+` FROM sso_providers WHERE type = $1`, providerType))
+}
+
 // ListProviders returns every provider, by type.
 func (s *SSOStore) ListProviders(ctx context.Context) ([]*SSOProvider, error) {
 	rows, err := s.pool.Query(ctx, `SELECT `+ssoProviderColumns+` FROM sso_providers ORDER BY type`)
@@ -219,32 +224,52 @@ func (s *SSOStore) GetSettings(ctx context.Context) (*SSOSettings, error) {
 	return &st, nil
 }
 
-// UpdateSettings writes the settings and returns them as they were.
-func (s *SSOStore) UpdateSettings(ctx context.Context, st *SSOSettings) (*SSOSettings, error) {
+// UpdateSettings changes the settings and returns them before and
+// after. publicURL or pendingCap nil keeps that field; publicURL ""
+// clears the address. The new row is built from the one read under the
+// row lock, so two saves of different fields can't undo each other.
+func (s *SSOStore) UpdateSettings(ctx context.Context, publicURL *string, pendingCap *int, by string) (before, after *SSOSettings, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("storage: begin update sso settings: %w", err)
+		return nil, nil, fmt.Errorf("storage: begin update sso settings: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var before SSOSettings
-	var publicURL *string
+	before = &SSOSettings{}
+	var current *string
 	if err := tx.QueryRow(ctx, `
 		SELECT public_url, pending_cap, COALESCE(updated_by, ''), updated_at FROM sso_settings WHERE id FOR UPDATE`).
-		Scan(&publicURL, &before.PendingCap, &before.UpdatedBy, &before.UpdatedAt); err != nil {
-		return nil, fmt.Errorf("storage: lock sso settings: %w", err)
+		Scan(&current, &before.PendingCap, &before.UpdatedBy, &before.UpdatedAt); err != nil {
+		return nil, nil, fmt.Errorf("storage: lock sso settings: %w", err)
 	}
+	if current != nil {
+		before.PublicURL = *current
+	}
+	after = &SSOSettings{PublicURL: before.PublicURL, PendingCap: before.PendingCap, UpdatedBy: by}
 	if publicURL != nil {
-		before.PublicURL = *publicURL
+		after.PublicURL = *publicURL
+	}
+	if pendingCap != nil {
+		after.PendingCap = *pendingCap
 	}
 	if err := tx.QueryRow(ctx, `
 		UPDATE sso_settings SET public_url = NULLIF($1, ''), pending_cap = $2, updated_by = NULLIF($3, ''), updated_at = now()
-		WHERE id RETURNING updated_at`, st.PublicURL, st.PendingCap, st.UpdatedBy).Scan(&st.UpdatedAt); err != nil {
-		return nil, fmt.Errorf("storage: update sso settings: %w", err)
+		WHERE id RETURNING updated_at`, after.PublicURL, after.PendingCap, after.UpdatedBy).Scan(&after.UpdatedAt); err != nil {
+		return nil, nil, fmt.Errorf("storage: update sso settings: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("storage: commit sso settings: %w", err)
+		return nil, nil, fmt.Errorf("storage: commit sso settings: %w", err)
 	}
-	return &before, nil
+	return before, after, nil
+}
+
+// RoleIsDefault reports whether a sign-in provider gives this role to
+// new accounts, so its permissions are limited.
+func (s *SSOStore) RoleIsDefault(ctx context.Context, roleID uuid.UUID) (bool, error) {
+	var used bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM sso_providers WHERE default_role_id = $1)`, roleID).Scan(&used); err != nil {
+		return false, fmt.Errorf("storage: check sso default role: %w", err)
+	}
+	return used, nil
 }
 
 func mapSSOWriteErr(err error) error {

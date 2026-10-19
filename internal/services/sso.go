@@ -93,7 +93,7 @@ type ssoStore interface {
 	SetProviderEnabled(ctx context.Context, id uuid.UUID, enabled bool, by string) error
 	DeleteProvider(ctx context.Context, id uuid.UUID) (*storage.SSOProvider, error)
 	GetSettings(ctx context.Context) (*storage.SSOSettings, error)
-	UpdateSettings(ctx context.Context, st *storage.SSOSettings) (*storage.SSOSettings, error)
+	UpdateSettings(ctx context.Context, publicURL *string, pendingCap *int, by string) (before, after *storage.SSOSettings, err error)
 }
 
 type roleGetter interface {
@@ -107,14 +107,17 @@ type SSOService struct {
 	km        keymgmt.KeyManager
 	envPublic string // SB_PUBLIC_URL, normalised; empty when unset
 	envIssuer string // SB_OIDC_ISSUER
+	dev       bool   // SB_ENV=dev: a plain-http loopback address is allowed
 }
 
 // NewSSOService wires the service. envPublicURL is SB_PUBLIC_URL and
-// envOIDCIssuer is SB_OIDC_ISSUER; either may be empty.
-func NewSSOService(store ssoStore, roles roleGetter, km keymgmt.KeyManager, envPublicURL, envOIDCIssuer string) (*SSOService, error) {
-	s := &SSOService{store: store, roles: roles, km: km, envIssuer: envOIDCIssuer}
+// envOIDCIssuer is SB_OIDC_ISSUER; either may be empty. dev is
+// SB_ENV=dev, the only mode that accepts a plain-http public address
+// (localhost or loopback).
+func NewSSOService(store ssoStore, roles roleGetter, km keymgmt.KeyManager, envPublicURL, envOIDCIssuer string, dev bool) (*SSOService, error) {
+	s := &SSOService{store: store, roles: roles, km: km, envIssuer: envOIDCIssuer, dev: dev}
 	if envPublicURL != "" {
-		u, err := NormalizePublicURL(envPublicURL)
+		u, err := NormalizePublicURL(envPublicURL, dev)
 		if err != nil {
 			return nil, fmt.Errorf("SB_PUBLIC_URL: %w", err)
 		}
@@ -163,6 +166,11 @@ func (s *SSOService) CreateProvider(ctx context.Context, in SSOProviderInput, by
 // UpdateProvider replaces the editable fields and returns the provider
 // before and after.
 func (s *SSOService) UpdateProvider(ctx context.Context, id uuid.UUID, in SSOProviderInput, by string) (before, after *storage.SSOProvider, err error) {
+	// The secret only changes through SetSecret, which audits the
+	// rotation. One sent here used to be ignored with a 200.
+	if in.ClientSecret != "" {
+		return nil, nil, &SSOInputError{"client_secret", "can't be changed here; replace it with PUT /sso/providers/:id/secret"}
+	}
 	current, err := s.store.GetProvider(ctx, id)
 	if err != nil {
 		return nil, nil, err
@@ -199,6 +207,11 @@ func (s *SSOService) SetEnabled(ctx context.Context, id uuid.UUID, enabled bool,
 		return err
 	}
 	if enabled {
+		// Also checked on create; this covers a provider saved before
+		// SB_OIDC_ISSUER was pointed at Google.
+		if s.envIsGoogle() {
+			return ErrSSOEnvProviderIsGoogle
+		}
 		var missing []string
 		if url, _, err := s.PublicURL(ctx); err != nil {
 			return err
@@ -270,37 +283,28 @@ func (s *SSOService) Settings(ctx context.Context) (*storage.SSOSettings, string
 
 // UpdateSettings sets the public address (unless SB_PUBLIC_URL does) and
 // the waiting-account cap. Returns the settings before and after.
-// publicURL nil leaves it as it is; "" clears it.
+// publicURL nil leaves it as it is; "" clears it. The store merges the
+// fields under the row lock, so two saves of different fields can't
+// undo each other.
 func (s *SSOService) UpdateSettings(ctx context.Context, publicURL *string, pendingCap *int, by string) (before, after *storage.SSOSettings, err error) {
-	cur, err := s.store.GetSettings(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	next := &storage.SSOSettings{PublicURL: cur.PublicURL, PendingCap: cur.PendingCap, UpdatedBy: by}
 	if publicURL != nil {
 		if s.envPublic != "" {
 			return nil, nil, ErrSSOPublicURLFromEnv
 		}
-		next.PublicURL = ""
+		normalized := ""
 		if strings.TrimSpace(*publicURL) != "" {
-			u, err := NormalizePublicURL(*publicURL)
+			u, err := NormalizePublicURL(*publicURL, s.dev)
 			if err != nil {
 				return nil, nil, &SSOInputError{"public_url", err.Error()}
 			}
-			next.PublicURL = u
+			normalized = u
 		}
+		publicURL = &normalized
 	}
-	if pendingCap != nil {
-		if *pendingCap < 1 || *pendingCap > 10000 {
-			return nil, nil, &SSOInputError{"pending_cap", "must be between 1 and 10000"}
-		}
-		next.PendingCap = *pendingCap
+	if pendingCap != nil && (*pendingCap < 1 || *pendingCap > 10000) {
+		return nil, nil, &SSOInputError{"pending_cap", "must be between 1 and 10000"}
 	}
-	before, err = s.store.UpdateSettings(ctx, next)
-	if err != nil {
-		return nil, nil, err
-	}
-	return before, next, nil
+	return s.store.UpdateSettings(ctx, publicURL, pendingCap, by)
 }
 
 // RedirectURL is the redirect URI for a provider type, from the public
@@ -344,15 +348,40 @@ func (s *SSOService) apply(ctx context.Context, p *storage.SSOProvider, in SSOPr
 			}
 			return err
 		}
-		for _, perm := range role.Permissions {
-			if !slices.Contains(NonPrivilegedPermissions, perm) {
-				return ErrSSOPrivilegedDefaultRole
-			}
+		if HoldsPrivileged(role.Permissions) {
+			return ErrSSOPrivilegedDefaultRole
 		}
 		id := *in.DefaultRoleID
 		p.DefaultRoleID = &id
 	}
 	return nil
+}
+
+// HoldsPrivileged reports whether any permission is outside
+// NonPrivilegedPermissions, the only ones a sign-in provider's default
+// role may hold.
+func HoldsPrivileged(perms []string) bool {
+	for _, perm := range perms {
+		if !slices.Contains(NonPrivilegedPermissions, perm) {
+			return true
+		}
+	}
+	return false
+}
+
+// defaultRoleUsable reports whether a provider's default role may be
+// granted now: it still exists and holds only non-privileged
+// permissions. The check at save time isn't enough, because the role's
+// permissions can change afterwards (PUT /roles/:id/permissions).
+func (s *SSOService) defaultRoleUsable(ctx context.Context, id uuid.UUID) (bool, error) {
+	role, err := s.roles.Get(ctx, id)
+	if errors.Is(err, storage.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return !HoldsPrivileged(role.Permissions), nil
 }
 
 func (s *SSOService) envIsGoogle() bool {
@@ -401,9 +430,10 @@ func normalizeDomains(in []string) ([]string, error) {
 }
 
 // NormalizePublicURL checks an install's public address: an absolute
-// https URL (http only for localhost), no query, fragment or user info,
-// and returns it without a trailing slash.
-func NormalizePublicURL(raw string) (string, error) {
+// https URL, no query, fragment or user info, and returns it without a
+// trailing slash. Plain http is accepted only with dev (SB_ENV=dev), and
+// then only for localhost or a loopback address.
+func NormalizePublicURL(raw string, dev bool) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || u.Host == "" {
 		return "", errors.New("must be an absolute address such as https://secrets.example.com")
@@ -412,9 +442,9 @@ func NormalizePublicURL(raw string) (string, error) {
 	loopback := host == "localhost" || (net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback())
 	switch {
 	case u.Scheme == "https":
-	case u.Scheme == "http" && loopback:
+	case u.Scheme == "http" && loopback && dev:
 	default:
-		return "", errors.New("must use https (http is allowed for localhost only)")
+		return "", errors.New("must use https (http is allowed for localhost with SB_ENV=dev only)")
 	}
 	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return "", errors.New("must not carry user info, a query or a fragment")

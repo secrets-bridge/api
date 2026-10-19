@@ -18,18 +18,34 @@ func TestNormalizePublicURL(t *testing.T) {
 		"https://secrets.example.com/":      "https://secrets.example.com",
 		" https://secrets.example.com/sb/ ": "https://secrets.example.com/sb",
 		"https://secrets.example.com:8443":  "https://secrets.example.com:8443",
-		"http://localhost:18080":            "http://localhost:18080",
-		"http://127.0.0.1:18080/":           "http://127.0.0.1:18080",
 	}
 	for in, want := range good {
-		if got, err := NormalizePublicURL(in); err != nil || got != want {
-			t.Errorf("NormalizePublicURL(%q) = %q, %v; want %q", in, got, err, want)
+		for _, dev := range []bool{false, true} {
+			if got, err := NormalizePublicURL(in, dev); err != nil || got != want {
+				t.Errorf("NormalizePublicURL(%q, dev=%v) = %q, %v; want %q", in, dev, got, err, want)
+			}
 		}
 	}
 	for _, in := range []string{"", "secrets.example.com", "http://secrets.example.com", "ftp://x.example.com",
 		"https://u:p@x.example.com", "https://x.example.com/?a=b", "https://x.example.com/#f"} {
-		if got, err := NormalizePublicURL(in); err == nil {
-			t.Errorf("NormalizePublicURL(%q) = %q; want an error", in, got)
+		for _, dev := range []bool{false, true} {
+			if got, err := NormalizePublicURL(in, dev); err == nil {
+				t.Errorf("NormalizePublicURL(%q, dev=%v) = %q; want an error", in, dev, got)
+			}
+		}
+	}
+	// Plain http for localhost and loopback only with SB_ENV=dev.
+	loopback := map[string]string{
+		"http://localhost:18080":  "http://localhost:18080",
+		"http://127.0.0.1:18080/": "http://127.0.0.1:18080",
+		"http://[::1]:18080":      "http://[::1]:18080",
+	}
+	for in, want := range loopback {
+		if got, err := NormalizePublicURL(in, true); err != nil || got != want {
+			t.Errorf("NormalizePublicURL(%q, dev) = %q, %v; want %q", in, got, err, want)
+		}
+		if got, err := NormalizePublicURL(in, false); err == nil {
+			t.Errorf("NormalizePublicURL(%q) outside dev = %q; want an error", in, got)
 		}
 	}
 }
@@ -44,6 +60,13 @@ func (f *fakeSSOStore) CreateProvider(_ context.Context, p *storage.SSOProvider)
 	p.ID = uuid.New()
 	f.created = p
 	return nil
+}
+
+func (f *fakeSSOStore) GetProvider(_ context.Context, id uuid.UUID) (*storage.SSOProvider, error) {
+	if f.created == nil || f.created.ID != id {
+		return nil, storage.ErrNotFound
+	}
+	return f.created, nil
 }
 
 type fakeRoles map[uuid.UUID]*storage.Role
@@ -62,7 +85,7 @@ func newTestSSO(t *testing.T, envIssuer string, roles fakeRoles) (*SSOService, *
 		t.Fatal(err)
 	}
 	store := &fakeSSOStore{}
-	s, err := NewSSOService(store, roles, km, "", envIssuer)
+	s, err := NewSSOService(store, roles, km, "", envIssuer, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,6 +106,33 @@ func TestSSO_RefusesGoogleWhenEnvProviderIsGoogle(t *testing.T) {
 		Type: "google", ClientID: "x", ClientSecret: "y", AllowedDomains: []string{"example.com"}, RequireApproval: true,
 	}, "user:a"); err != nil {
 		t.Fatalf("create with another env provider = %v; want ok", err)
+	}
+}
+
+// A provider saved before SB_OIDC_ISSUER was pointed at Google can't be
+// turned on, and isn't offered on the login page.
+func TestSSO_EnvGoogleBlocksEnableAndListing(t *testing.T) {
+	s, store := newTestSSO(t, "https://idp.example.com", nil)
+	p, err := s.CreateProvider(t.Context(), SSOProviderInput{
+		Type: "google", ClientID: "x", ClientSecret: "y", AllowedDomains: []string{"example.com"}, RequireApproval: true,
+	}, "user:a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	km, err := keymgmt.NewLocalKMS(bytes.Repeat([]byte{7}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	google, err := NewSSOService(store, nil, km, "", "https://accounts.google.com", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := google.SetEnabled(t.Context(), p.ID, true, "user:a"); !errors.Is(err, ErrSSOEnvProviderIsGoogle) {
+		t.Fatalf("enable with a Google env provider = %v; want ErrSSOEnvProviderIsGoogle", err)
+	}
+	listed, err := (&SSOSignIn{cfg: google}).Enabled(t.Context())
+	if err != nil || len(listed) != 0 {
+		t.Fatalf("Enabled with a Google env provider = %v, %v; want none", listed, err)
 	}
 }
 

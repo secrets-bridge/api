@@ -28,6 +28,11 @@ var publicV1Paths = map[string]bool{
 	"/api/v1/auth/oidc/callback":    true,
 	"/api/v1/auth/oidc/logout":      true,
 	"/api/v1/auth/oidc/backchannel": true,
+	// Sign-in with providers set from the console (api#267). Exact
+	// paths, one pair per provider type.
+	"/api/v1/auth/providers":           true,
+	"/api/v1/auth/sso/google/start":    true,
+	"/api/v1/auth/sso/google/callback": true,
 }
 
 // hs is sugar for building a handler chain (middleware first, final

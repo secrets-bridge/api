@@ -188,6 +188,7 @@ type loginHarness struct {
 	idp    *fakeIdP
 	apiURL string
 	client *http.Client
+	km     keymgmt.KeyManager
 }
 
 func newLoginHarness(t *testing.T, opts ...func(*Config)) *loginHarness {
@@ -209,9 +210,12 @@ func newLoginHarness(t *testing.T, opts ...func(*Config)) *loginHarness {
 	}
 	t.Cleanup(pool.Close)
 	if _, err := pool.Exec(ctx, `
-		TRUNCATE TABLE audit_events, sessions, user_roles, local_users
+		TRUNCATE TABLE audit_events, sessions, user_roles, user_identities, sso_providers, local_users
 		RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE sso_settings SET public_url = NULL, pending_cap = 50`); err != nil {
+		t.Fatalf("reset sso settings: %v", err)
 	}
 
 	// Fresh namespace per test: no rate-limit buckets or OIDC states
@@ -267,7 +271,7 @@ func newLoginHarness(t *testing.T, opts ...func(*Config)) *loginHarness {
 	t.Cleanup(func() { _ = app.ShutdownWithTimeout(5 * time.Second) })
 
 	return &loginHarness{
-		t: t, pool: pool, rdb: rdb, users: users, idp: idp, apiURL: apiURL,
+		t: t, pool: pool, rdb: rdb, users: users, idp: idp, apiURL: apiURL, km: km,
 		client: &http.Client{
 			Timeout: 60 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
