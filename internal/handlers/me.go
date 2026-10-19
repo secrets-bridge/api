@@ -48,6 +48,20 @@ type Me struct {
 	teams        storage.TeamRepository
 	mfa          MFAEnrollmentLookup
 	logos        LogoVersionLookup
+	passwords    PasswordLookup
+}
+
+// PasswordLookup tells whether an account can sign in with a password:
+// an account that a Google sign-in created has none anyone knows.
+type PasswordLookup interface {
+	HasPassword(ctx context.Context, userID uuid.UUID) (bool, error)
+}
+
+// WithPasswordLookup adds has_password to GET /users/me. Returns the
+// handler for chaining.
+func (h *Me) WithPasswordLookup(p PasswordLookup) *Me {
+	h.passwords = p
+	return h
 }
 
 // LogoVersionLookup is the slice of the logo service /users/me needs:
@@ -192,6 +206,10 @@ type MeResponse struct {
 	// approval. Such an account can only read this and sign out; the
 	// console shows a "waiting for approval" page.
 	PendingApproval bool `json:"pending_approval"`
+	// HasPassword is false for an account that a Google sign-in
+	// created: it has no password anyone knows, so its Google identity
+	// is its only way in and can't be disconnected.
+	HasPassword bool `json:"has_password"`
 }
 
 // GetMe handles GET /api/v1/users/me. Returns the bundle the UI needs
@@ -280,6 +298,15 @@ func (h *Me) GetMe(c fiber.Ctx) error {
 		}
 	}
 
+	hasPassword := true
+	if h.passwords != nil {
+		// Like mfa_enrolled, a failed lookup doesn't fail the call. The
+		// api refuses the disconnect on its own either way.
+		if v, err := h.passwords.HasPassword(c.Context(), uid); err == nil {
+			hasPassword = v
+		}
+	}
+
 	return c.JSON(MeResponse{
 		ID:          user.ID.String(),
 		Email:       user.Email,
@@ -290,6 +317,7 @@ func (h *Me) GetMe(c fiber.Ctx) error {
 		MFAEnrolled: mfaEnrolled,
 
 		PendingApproval: user.PendingApproval,
+		HasPassword:     hasPassword,
 	})
 }
 

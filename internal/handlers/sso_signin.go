@@ -9,7 +9,8 @@
 //	POST   /auth/sso/:type/finish       signed in: redeem a Connect or Test ticket
 //	POST   /sso/providers/:id/test      auth.sso.edit + fresh second factor: begin a test
 //	GET    /users/me/identities         signed in: connected accounts
-//	DELETE /users/me/identities/:type   signed in + fresh second factor: disconnect
+//	DELETE /users/me/identities/:type   signed in + fresh second factor: disconnect,
+//	                                    unless it created the account (409 identity_required)
 //
 // A refused sign-in always lands on the same page, /login?error=sso,
 // whatever the reason, so it can't tell an outsider which emails have
@@ -76,7 +77,7 @@ func (h *SSOSignIn) Start(c fiber.Ctx) error {
 	typ := c.Params("type")
 	start, err := h.svc.Start(c.Context(), typ, services.SSOPurposeSignIn, c.Query("return_to"), "")
 	if err != nil {
-		h.svc.AuditRefusal(c.Context(), typ, services.SSOPurposeSignIn, err)
+		h.svc.AuditRefusal(c.Context(), auth.AuditActor(c.Context()), typ, services.SSOPurposeSignIn, err)
 		return c.Redirect().Status(fiber.StatusFound).To(ssoRefusedPage)
 	}
 	h.setStateCookie(c, start.State)
@@ -94,7 +95,7 @@ func (h *SSOSignIn) Callback(c fiber.Ctx) error {
 	}
 	res, purpose, err := h.svc.Callback(c.Context(), typ, c.Query("state"), bound, code, c.IP(), c.Get("User-Agent"))
 	if err != nil {
-		h.svc.AuditRefusal(c.Context(), typ, purpose, err)
+		h.svc.AuditRefusal(c.Context(), auth.AuditActor(c.Context()), typ, purpose, err)
 		return c.Redirect().Status(fiber.StatusFound).To(ssoRefusedPage)
 	}
 	switch res.Purpose {
@@ -103,7 +104,7 @@ func (h *SSOSignIn) Callback(c fiber.Ctx) error {
 	case services.SSOPurposeTest:
 		return c.Redirect().Status(fiber.StatusFound).To("/admin/sign-in#sso_ticket=" + res.Ticket)
 	}
-	h.svc.AuditSuccess(c.Context(), typ, res)
+	h.svc.AuditSuccess(c.Context(), "user:"+res.User.ID.String(), typ, res)
 	h.setSessionCookie(c, res.Issued.CookieValue, res.Issued.AbsoluteExpiry)
 	return c.Redirect().Status(fiber.StatusFound).To(res.ReturnTo)
 }
@@ -172,8 +173,11 @@ func (h *SSOSignIn) Finish(c fiber.Ctx) error {
 	if res != nil {
 		purpose = res.Purpose
 	}
+	// The caller is signed in here, so failed links and tests, and
+	// passing tests, are audited as that user (not anonymous).
+	actor := auth.AuditActor(c.Context())
 	if err != nil {
-		h.svc.AuditRefusal(c.Context(), typ, purpose, err)
+		h.svc.AuditRefusal(c.Context(), actor, typ, purpose, err)
 		var r *services.SSORefusal
 		if !errors.As(err, &r) {
 			return fiber.NewError(fiber.StatusInternalServerError, "could not finish")
@@ -187,7 +191,7 @@ func (h *SSOSignIn) Finish(c fiber.Ctx) error {
 			return stableErr(c, fiber.StatusConflict, "link_refused", "Google couldn't be connected to this account", map[string]any{"reason": r.Reason})
 		}
 	}
-	h.svc.AuditSuccess(c.Context(), typ, &services.SSOCallbackResult{Purpose: res.Purpose, User: res.User})
+	h.svc.AuditSuccess(c.Context(), actor, typ, &services.SSOCallbackResult{Purpose: res.Purpose, User: res.User})
 	result := "ok"
 	if res.Purpose == services.SSOPurposeLink {
 		result = "linked"
@@ -227,6 +231,10 @@ func (h *SSOSignIn) Unlink(c fiber.Ctx) error {
 	removed, err := h.svc.Unlink(c.Context(), uid, c.Params("type"))
 	if errors.Is(err, storage.ErrNotFound) {
 		return fiber.NewError(fiber.StatusNotFound, "not connected")
+	}
+	if errors.Is(err, storage.ErrIdentityRequired) {
+		return stableErr(c, fiber.StatusConflict, "identity_required",
+			"this account signs in only with this provider, so it can't be disconnected", nil)
 	}
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "could not disconnect")

@@ -1027,6 +1027,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// account need a fresh second factor.
 	ssoSignIn := services.NewSSOSignIn(ssoSvc, storage.NewSSOStore(pool), storage.NewUserIdentities(pool),
 		localUsersRepoInApp, sessionSvc, auditRepo, rdb)
+	meH.WithPasswordLookup(ssoSignIn)
 	ssoSignInH := handlers.NewSSOSignIn(ssoSignIn, ssoSvc, cfg.OIDCIssuer != "", cookieMode)
 	ssoLimit := func(name string, limit int) fiber.Handler {
 		return middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{

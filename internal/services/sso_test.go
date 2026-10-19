@@ -46,6 +46,13 @@ func (f *fakeSSOStore) CreateProvider(_ context.Context, p *storage.SSOProvider)
 	return nil
 }
 
+func (f *fakeSSOStore) GetProvider(_ context.Context, id uuid.UUID) (*storage.SSOProvider, error) {
+	if f.created == nil || f.created.ID != id {
+		return nil, storage.ErrNotFound
+	}
+	return f.created, nil
+}
+
 type fakeRoles map[uuid.UUID]*storage.Role
 
 func (f fakeRoles) Get(_ context.Context, id uuid.UUID) (*storage.Role, error) {
@@ -83,6 +90,33 @@ func TestSSO_RefusesGoogleWhenEnvProviderIsGoogle(t *testing.T) {
 		Type: "google", ClientID: "x", ClientSecret: "y", AllowedDomains: []string{"example.com"}, RequireApproval: true,
 	}, "user:a"); err != nil {
 		t.Fatalf("create with another env provider = %v; want ok", err)
+	}
+}
+
+// A provider saved before SB_OIDC_ISSUER was pointed at Google can't be
+// turned on, and isn't offered on the login page.
+func TestSSO_EnvGoogleBlocksEnableAndListing(t *testing.T) {
+	s, store := newTestSSO(t, "https://idp.example.com", nil)
+	p, err := s.CreateProvider(t.Context(), SSOProviderInput{
+		Type: "google", ClientID: "x", ClientSecret: "y", AllowedDomains: []string{"example.com"}, RequireApproval: true,
+	}, "user:a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	km, err := keymgmt.NewLocalKMS(bytes.Repeat([]byte{7}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	google, err := NewSSOService(store, nil, km, "", "https://accounts.google.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := google.SetEnabled(t.Context(), p.ID, true, "user:a"); !errors.Is(err, ErrSSOEnvProviderIsGoogle) {
+		t.Fatalf("enable with a Google env provider = %v; want ErrSSOEnvProviderIsGoogle", err)
+	}
+	listed, err := (&SSOSignIn{cfg: google}).Enabled(t.Context())
+	if err != nil || len(listed) != 0 {
+		t.Fatalf("Enabled with a Google env provider = %v, %v; want none", listed, err)
 	}
 }
 

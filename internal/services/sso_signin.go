@@ -33,6 +33,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strconv"
 	"strings"
@@ -66,6 +67,14 @@ const ssoStateTTL = 5 * time.Minute
 // cap are counted into one audit event.
 const ssoRefusalWindow = 10 * time.Minute
 
+// An ID token is used right after the code exchange, so its iat must be
+// recent: no older than ssoMaxTokenAge, and no further in the future
+// than ssoClockSkew.
+const (
+	ssoMaxTokenAge = 10 * time.Minute
+	ssoClockSkew   = 5 * time.Minute
+)
+
 // ErrSSORefused is a refused sign-in, link or test. SSORefusal carries
 // the reason, which goes to the audit log (and, for a test, back to the
 // admin who ran it), never to an anonymous browser.
@@ -90,13 +99,13 @@ type identityStore interface {
 	ListByUser(ctx context.Context, userID uuid.UUID) ([]*storage.UserIdentity, error)
 	Link(ctx context.Context, id *storage.UserIdentity) error
 	Unlink(ctx context.Context, userID uuid.UUID, providerType string) (*storage.UserIdentity, error)
-	CreateAccount(ctx context.Context, u *storage.LocalUser, id *storage.UserIdentity, defaultRole *uuid.UUID, grantedBy string) error
+	CreateAccount(ctx context.Context, u *storage.LocalUser, id *storage.UserIdentity, defaultRole *uuid.UUID, grantedBy string, pendingCap int) error
+	HasPassword(ctx context.Context, userID uuid.UUID) (bool, error)
 }
 
 type ssoUserStore interface {
 	Get(ctx context.Context, id uuid.UUID) (*storage.LocalUser, error)
 	GetByEmail(ctx context.Context, email string) (*storage.LocalUser, error)
-	ListPending(ctx context.Context, limit int) ([]*storage.LocalUser, int, error)
 }
 
 // SSOSignIn runs the round trips.
@@ -128,8 +137,13 @@ type SSOListedProvider struct {
 }
 
 // Enabled lists the console providers people can sign in with: enabled,
-// and an install address is set.
+// and an install address is set. None while SB_OIDC_ISSUER is Google:
+// the env-var provider is the Google sign-in then, and the two would
+// match the same people differently.
 func (s *SSOSignIn) Enabled(ctx context.Context) ([]SSOListedProvider, error) {
+	if s.cfg.envIsGoogle() {
+		return []SSOListedProvider{}, nil
+	}
 	base, _, err := s.cfg.PublicURL(ctx)
 	if err != nil || base == "" {
 		return []SSOListedProvider{}, err
@@ -172,7 +186,7 @@ func (s *SSOSignIn) Start(ctx context.Context, providerType, purpose, returnTo, 
 	if err != nil {
 		return nil, refuse("no_provider")
 	}
-	if purpose != SSOPurposeTest && !p.Enabled {
+	if purpose != SSOPurposeTest && (!p.Enabled || s.cfg.envIsGoogle()) {
 		return nil, refuse("provider_disabled")
 	}
 	if (purpose == SSOPurposeLink || purpose == SSOPurposeTest) && sessionID == "" {
@@ -255,25 +269,30 @@ func (s *SSOSignIn) Callback(ctx context.Context, providerType, state, boundStat
 	}
 	purpose = st.Purpose
 
-	p, err := s.providers.GetProviderByType(ctx, providerType)
-	if err != nil {
-		return nil, purpose, refuse("no_provider")
-	}
 	var claims *googleClaims
-	if purpose != SSOPurposeTest && !p.Enabled {
+	p, err := s.providers.GetProviderByType(ctx, providerType)
+	switch {
+	case err != nil:
+		err = refuse("no_provider")
+	case purpose != SSOPurposeTest && (!p.Enabled || s.cfg.envIsGoogle()):
 		err = refuse("provider_disabled")
-	} else if claims, err = s.exchange(ctx, p, code, st); err == nil {
-		err = checkGoogleClaims(p, claims)
+	default:
+		if claims, err = s.exchange(ctx, p, code, st); err == nil {
+			err = checkGoogleClaims(p, claims)
+		}
 	}
 
+	// From here on the purpose is known, so a link or test always comes
+	// back to the console with a ticket, refused or not, instead of
+	// landing a signed-in user on the login page.
 	if purpose == SSOPurposeLink || purpose == SSOPurposeTest {
 		t := ssoTicket{Purpose: purpose, Type: providerType, SessionID: st.SessionID}
 		if err != nil {
+			t.Refusal = "error"
 			var r *SSORefusal
-			if !errors.As(err, &r) {
-				return nil, purpose, err
+			if errors.As(err, &r) {
+				t.Refusal = r.Reason
 			}
-			t.Refusal = r.Reason
 		} else {
 			t.Iss, t.Sub, t.Email = claims.Iss, claims.Sub, strings.ToLower(strings.TrimSpace(claims.Email))
 		}
@@ -389,6 +408,10 @@ func (s *SSOSignIn) exchange(ctx context.Context, p *storage.SSOProvider, code s
 	if err != nil {
 		return nil, refuse("id_token_invalid")
 	}
+	// go-oidc checks exp but not iat.
+	if age := time.Since(idTok.IssuedAt); idTok.IssuedAt.IsZero() || age > ssoMaxTokenAge || age < -ssoClockSkew {
+		return nil, refuse("iat_invalid")
+	}
 	var c googleClaims
 	if err := idTok.Claims(&c); err != nil {
 		return nil, refuse("claims_invalid")
@@ -446,17 +469,33 @@ func (s *SSOSignIn) signIn(ctx context.Context, p *storage.SSOProvider, c *googl
 		return nil, err
 	}
 
-	if p.RequireApproval {
+	// With approval off the account gets the default role, but only if
+	// that role is still non-privileged: its permissions may have been
+	// widened since the provider was saved. If not, the account waits
+	// for approval like any other.
+	pending := p.RequireApproval
+	var role *uuid.UUID
+	if !pending && p.DefaultRoleID != nil {
+		usable, err := s.cfg.defaultRoleUsable(ctx, *p.DefaultRoleID)
+		if err != nil {
+			return nil, err
+		}
+		if usable {
+			role = p.DefaultRoleID
+		} else {
+			pending = true
+			s.appendAudit(ctx, "system:sso", "sso_provider.default_role_refused", "sso_provider:"+p.ID.String(),
+				storage.AuditStatusDenied, map[string]any{"provider_type": p.Type, "default_role_id": p.DefaultRoleID.String(),
+					"reason": "default_role_privileged"})
+		}
+	}
+	pendingCap := 0
+	if pending {
 		settings, err := s.providers.GetSettings(ctx)
 		if err != nil {
 			return nil, err
 		}
-		if _, waiting, err := s.users.ListPending(ctx, 1); err != nil {
-			return nil, err
-		} else if waiting >= settings.PendingCap {
-			s.countCapRefusal(ctx, settings.PendingCap)
-			return nil, refuse("pending_cap")
-		}
+		pendingCap = settings.PendingCap
 	}
 
 	randomPW, err := randomURLToken(32)
@@ -471,13 +510,13 @@ func (s *SSOSignIn) signIn(ctx context.Context, p *storage.SSOProvider, c *googl
 	if name == "" {
 		name = email
 	}
-	u := &storage.LocalUser{Email: email, PasswordHash: hash, DisplayName: name, PendingApproval: p.RequireApproval}
+	u := &storage.LocalUser{Email: email, PasswordHash: hash, DisplayName: name, PendingApproval: pending}
 	ident := &storage.UserIdentity{ProviderType: p.Type, Issuer: c.Iss, Subject: c.Sub, EmailAtLink: email}
-	var role *uuid.UUID
-	if !p.RequireApproval {
-		role = p.DefaultRoleID
-	}
-	if err := s.identities.CreateAccount(ctx, u, ident, role, "system:sso"); err != nil {
+	if err := s.identities.CreateAccount(ctx, u, ident, role, "system:sso", pendingCap); err != nil {
+		if errors.Is(err, storage.ErrPendingCap) {
+			s.countCapRefusal(ctx, pendingCap)
+			return nil, refuse("pending_cap")
+		}
 		if errors.Is(err, storage.ErrLocalUserExists) {
 			return nil, refuse("email_has_account")
 		}
@@ -487,7 +526,7 @@ func (s *SSOSignIn) signIn(ctx context.Context, p *storage.SSOProvider, c *googl
 		return nil, err
 	}
 	action := "user.pending"
-	if !p.RequireApproval {
+	if !pending {
 		action = "user.sso_provision"
 	}
 	meta := map[string]any{"provider_type": p.Type, "email": email}
@@ -531,8 +570,15 @@ func (s *SSOSignIn) Identities(ctx context.Context, userID uuid.UUID) ([]*storag
 }
 
 // Unlink removes an account's identity of a provider type.
+// storage.ErrIdentityRequired when that identity created the account:
+// the account has no password anyone knows, so it would be locked out.
 func (s *SSOSignIn) Unlink(ctx context.Context, userID uuid.UUID, providerType string) (*storage.UserIdentity, error) {
 	return s.identities.Unlink(ctx, userID, providerType)
+}
+
+// HasPassword reports whether an account can sign in with a password.
+func (s *SSOSignIn) HasPassword(ctx context.Context, userID uuid.UUID) (bool, error) {
+	return s.identities.HasPassword(ctx, userID)
 }
 
 // countCapRefusal aggregates refusals at the waiting cap: the first in
@@ -572,27 +618,34 @@ func (s *SSOSignIn) countCapRefusal(ctx context.Context, limit int) {
 }
 
 // AuditRefusal records a refused round trip with its reason and the
-// provider type. Claims beyond the reason are not recorded for an
-// anonymous caller.
-func (s *SSOSignIn) AuditRefusal(ctx context.Context, providerType, purpose string, err error) {
+// provider type. actor is "anonymous" at the start and the callback,
+// where no session is visible, and the signed-in user for Finish.
+// Claims beyond the reason are not recorded. A refusal at the waiting
+// cap isn't recorded here: countCapRefusal aggregates those, so a burst
+// can't write one row per attempt.
+func (s *SSOSignIn) AuditRefusal(ctx context.Context, actor, providerType, purpose string, err error) {
 	reason := "error"
 	var r *SSORefusal
 	if errors.As(err, &r) {
 		reason = r.Reason
 	}
+	if reason == "pending_cap" {
+		return
+	}
 	action := "auth.sso.callback"
 	if purpose == SSOPurposeTest {
 		action = "sso_provider.test"
 	}
-	s.appendAudit(ctx, "anonymous", action, "auth:sso:"+providerType, storage.AuditStatusDenied,
+	s.appendAudit(ctx, actor, action, "auth:sso:"+providerType, storage.AuditStatusDenied,
 		map[string]any{"provider_type": providerType, "purpose": purpose, "error_kind": reason})
 }
 
-// AuditSuccess records a successful round trip.
-func (s *SSOSignIn) AuditSuccess(ctx context.Context, providerType string, res *SSOCallbackResult) {
-	actor, resource := "anonymous", "auth:sso:"+providerType
+// AuditSuccess records a successful round trip by actor: the user who
+// signed in, or the signed-in user who redeemed a link or test ticket.
+func (s *SSOSignIn) AuditSuccess(ctx context.Context, actor, providerType string, res *SSOCallbackResult) {
+	resource := "auth:sso:" + providerType
 	if res.User != nil {
-		actor, resource = "user:"+res.User.ID.String(), "user:"+res.User.ID.String()
+		resource = "user:" + res.User.ID.String()
 	}
 	action := "auth.sso.callback"
 	if res.Purpose == SSOPurposeTest {
@@ -606,7 +659,9 @@ func (s *SSOSignIn) appendAudit(ctx context.Context, actor, action, resource str
 	if s.audit == nil {
 		return
 	}
-	_ = s.audit.Append(ctx, &storage.AuditEvent{Actor: actor, Action: action, Resource: resource, Status: status, Metadata: meta})
+	if err := s.audit.Append(ctx, &storage.AuditEvent{Actor: actor, Action: action, Resource: resource, Status: status, Metadata: meta}); err != nil {
+		slog.WarnContext(ctx, "audit append failed", "action", action, "resource", resource, "err", err)
+	}
 }
 
 // oauthConfig builds the OAuth client for a provider from its current

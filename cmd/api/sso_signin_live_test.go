@@ -7,11 +7,13 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
@@ -305,6 +307,10 @@ func TestSSO_WaitingCap(t *testing.T) {
 	if n := h.count(`SELECT count(*) FROM audit_events WHERE action = 'user.pending_refused'`); n != 1 {
 		t.Fatalf("user.pending_refused events for 3 refusals in one window = %d, want 1", n)
 	}
+	// Review S1: and no row per attempt next to the aggregate.
+	if n := h.auditReasons("pending_cap"); n != 0 {
+		t.Fatalf("per-attempt pending_cap rows = %d, want 0", n)
+	}
 }
 
 // With approval off, a new account is active with the default role.
@@ -369,6 +375,10 @@ func TestSSO_AdminTest(t *testing.T) {
 	if n := h.count(`SELECT count(*) FROM user_identities`); n != 0 {
 		t.Fatalf("a test created %d identities", n)
 	}
+	// Review S2: both results are audited as the admin, not anonymous.
+	if n := h.count(`SELECT count(*) FROM audit_events WHERE action = 'sso_provider.test' AND actor = $1`, "user:"+admin.ID.String()); n != 2 {
+		t.Fatalf("sso_provider.test events by the admin = %d, want 2 (one ok, one failed)", n)
+	}
 }
 
 // Review: Connect Google is bound to the session that started it, and an
@@ -376,7 +386,7 @@ func TestSSO_AdminTest(t *testing.T) {
 func TestSSO_ConnectGoogle(t *testing.T) {
 	h := newSSOHarness(t, nil)
 	alice, aliceSession := h.freshSession("alice@example.com")
-	_, bobSession := h.freshSession("bob@example.com")
+	bob, bobSession := h.freshSession("bob@example.com")
 	aliceGoogle := googleClaims("alice-google", "alice@example.com", "example.com")
 
 	t.Run("a ticket redeemed on another session is refused", func(t *testing.T) {
@@ -412,6 +422,10 @@ func TestSSO_ConnectGoogle(t *testing.T) {
 		code, body := h.finish(bobSession, ticket)
 		if code != http.StatusConflict || !strings.Contains(string(body), "identity_taken") {
 			t.Fatalf("bob linking alice's Google = %d %s; want 409 identity_taken", code, body)
+		}
+		// Review S2: the refused link is audited as bob.
+		if n := h.count(`SELECT count(*) FROM audit_events WHERE metadata->>'error_kind' = 'identity_taken' AND actor = $1`, "user:"+bob.ID.String()); n != 1 {
+			t.Fatalf("identity_taken refusals audited as bob = %d, want 1", n)
 		}
 	})
 
@@ -465,5 +479,250 @@ func TestSSO_ChangesTakeEffectWithoutRestart(t *testing.T) {
 	}
 	if n := h.count(`SELECT count(*) FROM audit_events WHERE metadata::text LIKE '%' || $1 || '%'`, ssoClientSecret); n != 0 {
 		t.Fatalf("the client secret appears in %d audit rows", n)
+	}
+}
+
+// staleSecondFactor gives the account an enrolled second factor and makes its
+// sessions stale, so a step-up route answers the challenge (401) rather
+// than "enroll a factor first" (412).
+func (h *ssoHarness) staleSecondFactor(userID uuid.UUID) {
+	h.t.Helper()
+	if _, err := h.pool.Exec(h.t.Context(), `
+		INSERT INTO user_mfa_factors (user_id, kind, label, secret_ciphertext, secret_nonce, data_key_ciphertext, kms_key_id)
+		VALUES ($1, 'totp', 'test', '\x00', '\x00', '\x00', 'test')`, userID); err != nil {
+		h.t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(h.t.Context(), `UPDATE sessions SET last_mfa_at = NULL WHERE user_id = $1`, userID); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *ssoHarness) accounts() int { return h.count(`SELECT count(*) FROM local_users`) }
+
+// Review B1: the default role is checked again at every sign-in. Widened
+// after the provider was saved, it isn't granted: the account waits for
+// approval instead, and the refusal is audited.
+func TestSSO_WidenedDefaultRoleIsNotGranted(t *testing.T) {
+	role := uuid.New()
+	h := newSSOHarness(t, func(lh *loginHarness, in *services.SSOProviderInput) {
+		if _, err := lh.pool.Exec(t.Context(),
+			`INSERT INTO roles (id, name, permissions) VALUES ($1, $2, '["secret.request"]')`, role, "sso-widen-"+role.String()[:8]); err != nil {
+			t.Fatal(err)
+		}
+		in.RequireApproval = false
+		in.DefaultRoleID = &role
+	})
+	admin, adminSession := h.freshSession("ada@example.com")
+	h.grantAdmin(admin.ID)
+	if code, body, _ := h.authed(http.MethodPut, "/api/v1/roles/"+role.String()+"/permissions", adminSession,
+		map[string]any{"permissions": []string{"secret.request", "secret.reveal.direct", "user_role.edit"}}); code != http.StatusNoContent {
+		t.Fatalf("widen the role = %d %s", code, body)
+	}
+
+	r := h.signIn(googleClaims("wide-1", "wes@example.com", "example.com"))
+	session := findCookie(r, loginTestSessionKey)
+	if session == nil {
+		t.Fatal("no session")
+	}
+	if n := h.count(`SELECT count(*) FROM user_roles ur JOIN local_users u ON u.id::text = ur.user_id WHERE u.email = 'wes@example.com'`); n != 0 {
+		t.Fatalf("the widened default role was granted (%d grants)", n)
+	}
+	if code, body, _ := h.authed(http.MethodGet, "/api/v1/users/me/projects", session, nil); code != http.StatusForbidden || !strings.Contains(string(body), "account_pending_approval") {
+		t.Fatalf("the account isn't waiting for approval: %d %s", code, body)
+	}
+	if n := h.count(`SELECT count(*) FROM audit_events WHERE action = 'sso_provider.default_role_refused' AND metadata->>'reason' = 'default_role_privileged'`); n != 1 {
+		t.Fatalf("default_role_refused audit events = %d, want 1", n)
+	}
+}
+
+// Review B2: an account that a Google sign-in created has no password
+// anyone knows. /users/me says so, and its Google identity can't be
+// disconnected, so it can't lock itself out.
+func TestSSO_AccountCreatedByGoogleKeepsItsIdentity(t *testing.T) {
+	h := newSSOHarness(t, func(_ *loginHarness, in *services.SSOProviderInput) { in.RequireApproval = false })
+	pat := googleClaims("pat-1", "pat@example.com", "example.com")
+	session := findCookie(h.signIn(pat), loginTestSessionKey)
+	if session == nil {
+		t.Fatal("no session")
+	}
+	if _, body, _ := h.authed(http.MethodGet, "/api/v1/users/me", session, nil); !strings.Contains(string(body), `"has_password":false`) {
+		t.Fatalf("/users/me for a Google-created account = %s; want has_password false", body)
+	}
+	if _, err := h.pool.Exec(h.t.Context(), `UPDATE sessions SET last_mfa_at = now()`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(h.t.Context(), `
+		INSERT INTO user_mfa_factors (user_id, kind, label, secret_ciphertext, secret_nonce, data_key_ciphertext, kms_key_id)
+		SELECT id, 'totp', 'test', '\x00', '\x00', '\x00', 'test' FROM local_users WHERE email = 'pat@example.com'`); err != nil {
+		t.Fatal(err)
+	}
+	code, body, _ := h.authed(http.MethodDelete, "/api/v1/users/me/identities/google", session, nil)
+	if code != http.StatusConflict || !strings.Contains(string(body), "identity_required") {
+		t.Fatalf("disconnecting the only way in = %d %s; want 409 identity_required", code, body)
+	}
+	if findCookie(h.signIn(pat), loginTestSessionKey) == nil {
+		t.Fatal("the account can't sign in with Google any more")
+	}
+
+	_, local := h.freshSession("lee@example.com")
+	if _, body, _ := h.authed(http.MethodGet, "/api/v1/users/me", local, nil); !strings.Contains(string(body), `"has_password":true`) {
+		t.Fatalf("/users/me for a password account = %s; want has_password true", body)
+	}
+}
+
+// Review S3: the state cookie must be this browser's. A callback with no
+// cookie, or another browser's, is refused even though the state itself
+// is valid.
+func TestSSO_StateCookieMustMatch(t *testing.T) {
+	h := newSSOHarness(t, nil)
+	claims := googleClaims("sc-1", "sam@example.com", "example.com")
+
+	_, rt := h.startSignIn("")
+	rt.cookie = nil
+	if r := h.callbackWith(rt, h.idp.issueCode(rt.nonce, rt.challenge, claims)); findCookie(r, loginTestSessionKey) != nil {
+		t.Fatal("a callback without the state cookie signed in")
+	}
+	_, rt = h.startSignIn("")
+	_, other := h.startSignIn("")
+	rt.cookie = other.cookie
+	if r := h.callbackWith(rt, h.idp.issueCode(rt.nonce, rt.challenge, claims)); findCookie(r, loginTestSessionKey) != nil {
+		t.Fatal("a callback with another browser's state cookie signed in")
+	}
+	if n := h.accounts(); n != 0 || h.auditReasons("state_cookie") != 2 {
+		t.Fatalf("accounts %d, state_cookie refusals %d; want 0 and 2", n, h.auditReasons("state_cookie"))
+	}
+}
+
+// Review S3: an ID token issued for another round trip's nonce is refused.
+func TestSSO_NonceMustMatch(t *testing.T) {
+	h := newSSOHarness(t, nil)
+	_, rt := h.startSignIn("")
+	claims := googleClaims("n-1", "nia@example.com", "example.com")
+	claims["nonce"] = "another-round-trip"
+	if r := h.callbackWith(rt, h.idp.issueCode(rt.nonce, rt.challenge, claims)); findCookie(r, loginTestSessionKey) != nil {
+		t.Fatal("an ID token with the wrong nonce signed in")
+	}
+	if h.accounts() != 0 || h.auditReasons("nonce_mismatch") != 1 {
+		t.Fatalf("accounts %d, nonce_mismatch refusals %d", h.accounts(), h.auditReasons("nonce_mismatch"))
+	}
+}
+
+// Review S3: with hd allowed, the email's own domain must be allowed too.
+func TestSSO_EmailDomainMustBeAllowedToo(t *testing.T) {
+	h := newSSOHarness(t, nil)
+	if r := h.signIn(googleClaims("ed-1", "pat@other.org", "example.com")); findCookie(r, loginTestSessionKey) != nil {
+		t.Fatal("an email outside the allowed domains signed in")
+	}
+	if h.accounts() != 0 || h.auditReasons("email_domain_not_allowed") != 1 {
+		t.Fatalf("accounts %d, email_domain_not_allowed refusals %d", h.accounts(), h.auditReasons("email_domain_not_allowed"))
+	}
+}
+
+// Review S3: disconnecting Google and starting an admin test both need a
+// fresh second factor.
+func TestSSO_StepUpOnDisconnectAndTest(t *testing.T) {
+	h := newSSOHarness(t, nil)
+	alice, session := h.freshSession("alice@example.com")
+	h.grantAdmin(alice.ID)
+	if code, body := h.finish(session, h.connect(session, googleClaims("alice-g", "alice@example.com", "example.com"))); code != http.StatusOK {
+		t.Fatalf("connect = %d %s", code, body)
+	}
+	h.staleSecondFactor(alice.ID)
+
+	if code, body, _ := h.authed(http.MethodDelete, "/api/v1/users/me/identities/google", session, nil); code != http.StatusUnauthorized || !strings.Contains(string(body), "step_up_required") {
+		t.Fatalf("disconnect without a fresh second factor = %d %s; want 401", code, body)
+	}
+	if n := h.count(`SELECT count(*) FROM user_identities`); n != 1 {
+		t.Fatalf("identities = %d after a refused disconnect", n)
+	}
+	if code, body, _ := h.authed(http.MethodPost, "/api/v1/sso/providers/"+h.provider.ID.String()+"/test", session, nil); code != http.StatusUnauthorized || !strings.Contains(string(body), "step_up_required") {
+		t.Fatalf("test without a fresh second factor = %d %s; want 401", code, body)
+	}
+}
+
+// Review S3: a provider turned off while someone is at Google refuses the
+// callback.
+func TestSSO_ProviderTurnedOffMidRoundTrip(t *testing.T) {
+	h := newSSOHarness(t, nil)
+	_, rt := h.startSignIn("")
+	if _, err := h.pool.Exec(h.t.Context(), `UPDATE sso_providers SET enabled = FALSE`); err != nil {
+		t.Fatal(err)
+	}
+	if r := h.callbackWith(rt, h.idp.issueCode(rt.nonce, rt.challenge, googleClaims("off-1", "oz@example.com", "example.com"))); findCookie(r, loginTestSessionKey) != nil {
+		t.Fatal("a callback after the provider was turned off signed in")
+	}
+	if h.accounts() != 0 || h.auditReasons("provider_disabled") != 1 {
+		t.Fatalf("accounts %d, provider_disabled refusals %d", h.accounts(), h.auditReasons("provider_disabled"))
+	}
+}
+
+// Review nit: go-oidc checks exp but not iat. An ID token issued long ago,
+// or in the future, is refused.
+func TestSSO_IssuedAtMustBeRecent(t *testing.T) {
+	h := newSSOHarness(t, nil)
+	for i, iat := range []int64{time.Now().Add(-time.Hour).Unix(), time.Now().Add(time.Hour).Unix()} {
+		claims := googleClaims(fmt.Sprintf("iat-%d", i), fmt.Sprintf("iat%d@example.com", i), "example.com")
+		claims["iat"] = iat
+		if r := h.signIn(claims); findCookie(r, loginTestSessionKey) != nil {
+			t.Fatalf("an ID token with iat %d signed in", iat)
+		}
+	}
+	if h.accounts() != 0 || h.auditReasons("iat_invalid") != 2 {
+		t.Fatalf("accounts %d, iat_invalid refusals %d", h.accounts(), h.auditReasons("iat_invalid"))
+	}
+}
+
+// Review (ui#155): a Connect cancelled at Google comes back to the profile
+// with a ticket that explains it, not to the login page.
+func TestSSO_CancelledConnectComesBackToTheProfile(t *testing.T) {
+	h := newSSOHarness(t, nil)
+	_, session := h.freshSession("cy@example.com")
+	code, body, resp := h.authed(http.MethodPost, "/api/v1/auth/sso/google/connect", session, nil)
+	if code != http.StatusOK {
+		t.Fatalf("connect = %d %s", code, body)
+	}
+	var out struct {
+		RedirectURL string `json:"redirect_url"`
+	}
+	_ = json.Unmarshal(body, &out)
+	rt := parseAuthorize(t, out.RedirectURL, resp.Cookies())
+	q := url.Values{"state": {rt.state}, "error": {"access_denied"}}
+	req, _ := http.NewRequest(http.MethodGet, h.apiURL+"/api/v1/auth/sso/google/callback?"+q.Encode(), nil)
+	req.AddCookie(&http.Cookie{Name: rt.cookie.Name, Value: rt.cookie.Value})
+	cb := h.do(req)
+	loc := cb.Header.Get("Location")
+	if !strings.HasPrefix(loc, "/me#sso_ticket=") {
+		t.Fatalf("a cancelled connect went to %q; want the profile page", loc)
+	}
+	if code, body := h.finish(session, strings.TrimPrefix(loc, "/me#sso_ticket=")); code != http.StatusConflict || !strings.Contains(string(body), `"reason":"no_code"`) {
+		t.Fatalf("finish = %d %s; want 409 with reason no_code", code, body)
+	}
+}
+
+// Review (ui#155): a Connect whose provider is removed while the user is
+// at Google also comes back to the profile with a ticket. It used to end
+// on the login page before any ticket existed.
+func TestSSO_ConnectWithTheProviderGoneComesBackToTheProfile(t *testing.T) {
+	h := newSSOHarness(t, nil)
+	_, session := h.freshSession("di@example.com")
+	code, body, resp := h.authed(http.MethodPost, "/api/v1/auth/sso/google/connect", session, nil)
+	if code != http.StatusOK {
+		t.Fatalf("connect = %d %s", code, body)
+	}
+	var out struct {
+		RedirectURL string `json:"redirect_url"`
+	}
+	_ = json.Unmarshal(body, &out)
+	rt := parseAuthorize(t, out.RedirectURL, resp.Cookies())
+	if _, err := h.pool.Exec(h.t.Context(), `DELETE FROM sso_providers`); err != nil {
+		t.Fatal(err)
+	}
+	cb := h.callbackWith(rt, h.idp.issueCode(rt.nonce, rt.challenge, googleClaims("di-g", "di@example.com", "example.com")))
+	loc := cb.Header.Get("Location")
+	if !strings.HasPrefix(loc, "/me#sso_ticket=") {
+		t.Fatalf("connect with the provider gone went to %q; want the profile page", loc)
+	}
+	if code, body := h.finish(session, strings.TrimPrefix(loc, "/me#sso_ticket=")); code != http.StatusConflict || !strings.Contains(string(body), `"reason":"no_provider"`) {
+		t.Fatalf("finish = %d %s; want 409 with reason no_provider", code, body)
 	}
 }

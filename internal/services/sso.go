@@ -199,6 +199,11 @@ func (s *SSOService) SetEnabled(ctx context.Context, id uuid.UUID, enabled bool,
 		return err
 	}
 	if enabled {
+		// Also checked on create; this covers a provider saved before
+		// SB_OIDC_ISSUER was pointed at Google.
+		if s.envIsGoogle() {
+			return ErrSSOEnvProviderIsGoogle
+		}
 		var missing []string
 		if url, _, err := s.PublicURL(ctx); err != nil {
 			return err
@@ -344,15 +349,39 @@ func (s *SSOService) apply(ctx context.Context, p *storage.SSOProvider, in SSOPr
 			}
 			return err
 		}
-		for _, perm := range role.Permissions {
-			if !slices.Contains(NonPrivilegedPermissions, perm) {
-				return ErrSSOPrivilegedDefaultRole
-			}
+		if privileged(role.Permissions) {
+			return ErrSSOPrivilegedDefaultRole
 		}
 		id := *in.DefaultRoleID
 		p.DefaultRoleID = &id
 	}
 	return nil
+}
+
+// privileged reports whether any permission is outside
+// NonPrivilegedPermissions.
+func privileged(perms []string) bool {
+	for _, perm := range perms {
+		if !slices.Contains(NonPrivilegedPermissions, perm) {
+			return true
+		}
+	}
+	return false
+}
+
+// defaultRoleUsable reports whether a provider's default role may be
+// granted now: it still exists and holds only non-privileged
+// permissions. The check at save time isn't enough, because the role's
+// permissions can change afterwards (PUT /roles/:id/permissions).
+func (s *SSOService) defaultRoleUsable(ctx context.Context, id uuid.UUID) (bool, error) {
+	role, err := s.roles.Get(ctx, id)
+	if errors.Is(err, storage.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return !privileged(role.Permissions), nil
 }
 
 func (s *SSOService) envIsGoogle() bool {

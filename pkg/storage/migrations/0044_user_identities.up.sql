@@ -10,6 +10,10 @@
 -- account. Deleting the account removes its identities. The env-var
 -- OIDC provider still matches by verified email; moving it here is
 -- api#268.
+--
+-- created_account marks the identity whose sign-in created the account.
+-- Such an account has no password anyone knows, so that identity is its
+-- only way in and can't be disconnected.
 
 BEGIN;
 
@@ -21,6 +25,7 @@ CREATE TABLE user_identities (
     subject       TEXT NOT NULL,
     email_at_link TEXT NOT NULL,
     linked_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_account BOOLEAN NOT NULL DEFAULT FALSE,
     UNIQUE (issuer, subject),
     UNIQUE (user_id, issuer)
 );
