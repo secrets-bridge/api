@@ -1491,9 +1491,6 @@ func bootstrapAdminGrant(ctx context.Context, pool *storage.Pool, userID string,
 	return nil
 }
 
-// logRetiredEnv notes the retired settings that are still set. Login no
-// longer issues bearer tokens (M1, api#191), so the JWT settings are not
-// read any more. It logs the names only, never the values.
 // logSelfApprovalIgnored says how many stored workflows still have
 // allow_self_approval set. The flag is no longer honoured: a requester
 // can never approve their own request, Admin included.
@@ -1506,6 +1503,9 @@ func logSelfApprovalIgnored(ctx context.Context, logger *slog.Logger, pool *stor
 		"workflows", n)
 }
 
+// logRetiredEnv notes the retired settings that are still set. Login no
+// longer issues bearer tokens (M1, api#191), so the JWT settings are not
+// read any more. It logs the names only, never the values.
 func logRetiredEnv(logger *slog.Logger, set []string) {
 	if len(set) == 0 {
 		return

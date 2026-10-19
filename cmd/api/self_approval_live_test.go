@@ -109,6 +109,16 @@ func (fx *sodFixture) refusedAudit(t *testing.T, action string, id uuid.UUID) ma
 	return meta
 }
 
+// sodCode is the stable error code of a refusal body.
+func sodCode(t *testing.T, body []byte) string {
+	t.Helper()
+	var e struct {
+		Error string `json:"error"`
+	}
+	mustJSON(t, body, &e)
+	return e.Error
+}
+
 func (fx *sodFixture) submit(t *testing.T, kind string) uuid.UUID {
 	t.Helper()
 	path, body := "/api/v1/requests/read", map[string]any{
@@ -145,16 +155,16 @@ func TestLive_SelfApproval_RefusedForAdminEvenWhenTheWorkflowAllowsIt(t *testing
 			id := fx.submit(t, kind)
 			base := "/api/v1/requests/" + id.String()
 
-			if code, body := fx.as(t, fx.adminCK, http.MethodPost, base+"/approve", map[string]any{"comment": "mine"}); code != http.StatusForbidden {
-				t.Fatalf("admin approving own %s request = %d %s, want 403", kind, code, body)
+			if code, body := fx.as(t, fx.adminCK, http.MethodPost, base+"/approve", map[string]any{"comment": "mine"}); code != http.StatusForbidden || sodCode(t, body) != "separation_of_duties_violated" {
+				t.Fatalf("admin approving own %s request = %d %s, want 403 separation_of_duties_violated", kind, code, body)
 			}
 			fx.refusedAudit(t, "request.approve", id)
 			if s := fx.status(t, id); s != "pending" {
 				t.Fatalf("status after a refused self-approval = %q, want pending", s)
 			}
 
-			if code, body := fx.as(t, fx.adminCK, http.MethodPost, base+"/reject", map[string]any{"reason": "mine to close"}); code != http.StatusForbidden {
-				t.Fatalf("admin rejecting own %s request = %d %s, want 403", kind, code, body)
+			if code, body := fx.as(t, fx.adminCK, http.MethodPost, base+"/reject", map[string]any{"reason": "mine to close"}); code != http.StatusForbidden || sodCode(t, body) != "separation_of_duties_violated" {
+				t.Fatalf("admin rejecting own %s request = %d %s, want 403 separation_of_duties_violated", kind, code, body)
 			}
 			fx.refusedAudit(t, "request.reject", id)
 			if s := fx.status(t, id); s != "pending" {
