@@ -8,8 +8,10 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -97,13 +99,21 @@ func scanSSOProvider(row pgx.Row) (*SSOProvider, error) {
 
 // CreateProvider inserts p, disabled. ErrSSOProviderExists when one of
 // that type exists; ErrNotFound when DefaultRoleID names no role.
-func (s *SSOStore) CreateProvider(ctx context.Context, p *SSOProvider) error {
+func (s *SSOStore) CreateProvider(ctx context.Context, p *SSOProvider, allowedDefaultPerms []string) error {
 	var ct, nonce, dk []byte
 	var keyID *string
 	if p.Secret != nil {
 		ct, nonce, dk, keyID = p.Secret.Ciphertext, p.Secret.Nonce, p.Secret.DataKeyCiphertext, &p.Secret.KMSKeyID
 	}
-	err := s.pool.QueryRow(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("storage: begin create sso provider: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := checkDefaultRole(ctx, tx, p.DefaultRoleID, allowedDefaultPerms); err != nil {
+		return err
+	}
+	err = tx.QueryRow(ctx, `
 		INSERT INTO sso_providers (type, display_name, client_id,
 			client_secret_ciphertext, client_secret_nonce, client_secret_data_key_ciphertext, client_secret_kms_key_id,
 			allowed_domains, require_approval, default_role_id, enabled, created_by, updated_by)
@@ -112,7 +122,95 @@ func (s *SSOStore) CreateProvider(ctx context.Context, p *SSOProvider) error {
 		p.Type, p.DisplayName, p.ClientID, ct, nonce, dk, keyID,
 		p.AllowedDomains, p.RequireApproval, p.DefaultRoleID, p.CreatedBy,
 	).Scan(&p.ID, &p.Enabled, &p.CreatedAt, &p.UpdatedAt)
-	return mapSSOWriteErr(err)
+	if err := mapSSOWriteErr(err); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("storage: commit create sso provider: %w", err)
+	}
+	return nil
+}
+
+// ErrDefaultRolePrivileged is returned when a provider's default role
+// holds a permission outside the allowed list at the moment it's saved.
+var ErrDefaultRolePrivileged = errors.New("storage: default role holds permissions a sign-in provider can't give")
+
+// ErrDefaultRoleMissing is returned when a provider's default role no
+// longer exists when the provider is saved.
+var ErrDefaultRoleMissing = errors.New("storage: default role not found")
+
+// ErrRoleIsSSODefault is returned when a role edit would widen a role
+// that a sign-in provider gives to new accounts.
+var ErrRoleIsSSODefault = errors.New("storage: role is a sign-in provider's default role")
+
+// checkDefaultRole checks a provider's default role inside the save's
+// transaction, holding the role row (FOR SHARE) until the provider row
+// is committed. A concurrent role edit (UpdateRolePermissionsUnlessDefault,
+// FOR UPDATE) then either finishes first, and this sees its new
+// permissions, or waits, and then sees this provider.
+// ErrDefaultRoleMissing when the role is gone.
+func checkDefaultRole(ctx context.Context, tx pgx.Tx, roleID *uuid.UUID, allowed []string) error {
+	if roleID == nil {
+		return nil
+	}
+	var raw []byte
+	if err := tx.QueryRow(ctx, `SELECT permissions FROM roles WHERE id = $1 FOR SHARE`, *roleID).Scan(&raw); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrDefaultRoleMissing
+		}
+		return fmt.Errorf("storage: lock default role: %w", err)
+	}
+	var perms []string
+	if err := json.Unmarshal(raw, &perms); err != nil {
+		return fmt.Errorf("storage: decode default role permissions: %w", err)
+	}
+	for _, perm := range perms {
+		if !slices.Contains(allowed, perm) {
+			return ErrDefaultRolePrivileged
+		}
+	}
+	return nil
+}
+
+// UpdateRolePermissionsUnlessDefault replaces a role's permissions,
+// unless a sign-in provider uses it as its default role
+// (ErrRoleIsSSODefault). The role row is locked (FOR UPDATE) before the
+// check, so a provider save that's choosing this role either commits
+// first and is seen, or waits and then sees the new permissions.
+// ErrNotFound when the role doesn't exist.
+func (s *SSOStore) UpdateRolePermissionsUnlessDefault(ctx context.Context, roleID uuid.UUID, perms []string) error {
+	if perms == nil {
+		perms = []string{}
+	}
+	raw, err := json.Marshal(perms)
+	if err != nil {
+		return fmt.Errorf("storage: marshal role permissions: %w", err)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("storage: begin update role permissions: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := tx.QueryRow(ctx, `SELECT 1 FROM roles WHERE id = $1 FOR UPDATE`, roleID).Scan(new(int)); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("storage: lock role: %w", err)
+	}
+	var used bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM sso_providers WHERE default_role_id = $1)`, roleID).Scan(&used); err != nil {
+		return fmt.Errorf("storage: check sso default role: %w", err)
+	}
+	if used {
+		return ErrRoleIsSSODefault
+	}
+	if _, err := tx.Exec(ctx, `UPDATE roles SET permissions = $2 WHERE id = $1`, roleID, raw); err != nil {
+		return fmt.Errorf("storage: update role permissions: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("storage: commit role permissions: %w", err)
+	}
+	return nil
 }
 
 // GetProvider returns one provider, or ErrNotFound.
@@ -145,7 +243,7 @@ func (s *SSOStore) ListProviders(ctx context.Context) ([]*SSOProvider, error) {
 
 // UpdateProvider replaces the editable fields (not the secret, not
 // enabled) and returns the row as it was before, for the audit trail.
-func (s *SSOStore) UpdateProvider(ctx context.Context, p *SSOProvider) (*SSOProvider, error) {
+func (s *SSOStore) UpdateProvider(ctx context.Context, p *SSOProvider, allowedDefaultPerms []string) (*SSOProvider, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("storage: begin update sso provider: %w", err)
@@ -153,6 +251,9 @@ func (s *SSOStore) UpdateProvider(ctx context.Context, p *SSOProvider) (*SSOProv
 	defer func() { _ = tx.Rollback(ctx) }()
 	before, err := scanSSOProvider(tx.QueryRow(ctx, `SELECT `+ssoProviderColumns+` FROM sso_providers WHERE id = $1 FOR UPDATE`, p.ID))
 	if err != nil {
+		return nil, err
+	}
+	if err := checkDefaultRole(ctx, tx, p.DefaultRoleID, allowedDefaultPerms); err != nil {
 		return nil, err
 	}
 	err = tx.QueryRow(ctx, `
@@ -260,16 +361,6 @@ func (s *SSOStore) UpdateSettings(ctx context.Context, publicURL *string, pendin
 		return nil, nil, fmt.Errorf("storage: commit sso settings: %w", err)
 	}
 	return before, after, nil
-}
-
-// RoleIsDefault reports whether a sign-in provider gives this role to
-// new accounts, so its permissions are limited.
-func (s *SSOStore) RoleIsDefault(ctx context.Context, roleID uuid.UUID) (bool, error) {
-	var used bool
-	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM sso_providers WHERE default_role_id = $1)`, roleID).Scan(&used); err != nil {
-		return false, fmt.Errorf("storage: check sso default role: %w", err)
-	}
-	return used, nil
 }
 
 func mapSSOWriteErr(err error) error {
