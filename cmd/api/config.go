@@ -214,6 +214,13 @@ type Config struct {
 	// allows them. Off by default because the ArgoCD bearer token
 	// travels on every call to that URL. Logged as a WARN at boot.
 	AllowInsecureArgoCDAddr bool
+	// AllowUnsealedWraps=true brings back the two legacy wrap shapes
+	// (api#264): a plaintext-over-TLS `value` returned to an agent with
+	// no X25519 public key on file, and a plaintext `value` accepted on
+	// agent wrap creation. OFF by default, so wraps reach an agent only
+	// sealed to its key. A break-glass for an agent that predates
+	// wire-envelope; logged as a WARN at boot.
+	AllowUnsealedWraps bool
 	// ProviderConnRejectSecretValues=true (default) enforces the
 	// AKIA / hvs. / JWT / OAuth regex check on scope values. The
 	// deployment-level override (false) disables that pass; the
@@ -247,6 +254,7 @@ func loadConfig() Config {
 		GitOpsEnabled:                  envBool("SB_GITOPS_ENABLED", false),
 		AllowInsecureVaultAddr:         envBool("SB_ALLOW_INSECURE_VAULT_ADDR", false),
 		AllowInsecureArgoCDAddr:        envBool("SB_ALLOW_INSECURE_ARGOCD_ADDR", false),
+		AllowUnsealedWraps:             envBool("SB_ALLOW_UNSEALED_WRAPS", false),
 		ProviderConnRejectSecretValues: envBool("SB_PROVIDER_CONN_REJECT_SECRETS", true),
 		BootstrapAdminUserID:           envOr("SB_BOOTSTRAP_ADMIN_USER_ID", ""),
 		JWTSecret:                      loadJWTSecret(),

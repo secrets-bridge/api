@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"encoding/base64"
 	"net/http"
 	"regexp"
@@ -112,7 +115,7 @@ func TestLive_ReadFlow_AuditChainSharesCorrelationID(t *testing.T) {
 	const fakeValue = "fake-db-user-value"
 	if code, body := l.callAs(t, http.MethodPost, agentBase+"/wraps", agentHdr, map[string]any{
 		"request_id": req.ID.String(), "key_name": "DB_USER",
-		"value": base64.StdEncoding.EncodeToString([]byte(fakeValue)),
+		"envelope": l.agentEnvelope(t, agentBase, agentHdr, []byte(fakeValue)),
 	}); code != http.StatusCreated && code != http.StatusOK {
 		t.Fatalf("agent wrap = %d %s", code, body)
 	}
@@ -286,5 +289,45 @@ func TestLive_TeamWrites_AuditedOncePerWrite(t *testing.T) {
 	}
 	if n := len(l.auditRows(t, "team.create")); n != 1 {
 		t.Errorf("team.create rows after refused write = %d, want 1", n)
+	}
+}
+
+// agentEnvelope wire-envelopes value the way the agent does: a DEK from
+// POST /dek, AES-256-GCM locally, then the ciphertext and the wrapped
+// DEK. Plaintext `value` posts are refused (api#264).
+func (l *liveApp) agentEnvelope(t *testing.T, agentBase string, agentHdr map[string]string, value []byte) map[string]any {
+	t.Helper()
+	code, body := l.callAs(t, http.MethodPost, agentBase+"/dek", agentHdr, nil)
+	if code != http.StatusCreated {
+		t.Fatalf("dek = %d %s", code, body)
+	}
+	var dek struct {
+		Plaintext  string `json:"plaintext"`
+		Ciphertext string `json:"ciphertext"`
+		KeyID      string `json:"kms_key_id"`
+	}
+	mustJSON(t, body, &dek)
+	key, err := base64.StdEncoding.DecodeString(dek.Plaintext)
+	if err != nil {
+		t.Fatalf("dek plaintext: %v", err)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatalf("aes: %v", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("gcm: %v", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatalf("nonce: %v", err)
+	}
+	return map[string]any{
+		"algorithm":      "aes-256-gcm",
+		"ciphertext":     base64.StdEncoding.EncodeToString(gcm.Seal(nil, nonce, value, nil)),
+		"nonce":          base64.StdEncoding.EncodeToString(nonce),
+		"dek_ciphertext": dek.Ciphertext,
+		"dek_kms_key_id": dek.KeyID,
 	}
 }
