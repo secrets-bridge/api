@@ -36,6 +36,14 @@ const DiscoverMaxErrorLen = 280
 //   - Vault token v1+      hvs.{20+}
 //   - JWT (3-part base64)  eyJ{20+}.{20+}.{20+}
 //   - Google OAuth token   ya29.{1+}
+//   - GitHub token         ghp_/gho_/ghu_/ghs_/ghr_ + 36, github_pat_ + 22
+//   - GitLab token         glpat- + 20
+//   - Slack token          xoxa-/xoxb-/xoxp-/xoxr- + 10
+//   - "sk-" API key        sk- + 20 (OpenAI style keys)
+//   - PEM block            -----BEGIN ..., up to its END line or the end
+//
+// The prefixed tokens must start at a word boundary and carry a long
+// tail, so an enum such as "risk-high" or a short "sk-1" never matches.
 //
 // The compile happens once at package load — the regexes are
 // effectively constants. Adding a pattern is a one-line append.
@@ -44,6 +52,12 @@ var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`hvs\.[A-Za-z0-9_-]{20,}`),
 	regexp.MustCompile(`eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}`),
 	regexp.MustCompile(`ya29\.[A-Za-z0-9_-]+`),
+	regexp.MustCompile(`\bgh[pousr]_[A-Za-z0-9]{36,}`),
+	regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{22,}`),
+	regexp.MustCompile(`\bglpat-[A-Za-z0-9_-]{20,}`),
+	regexp.MustCompile(`\bxox[abpr]-[A-Za-z0-9-]{10,}`),
+	regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{20,}`),
+	regexp.MustCompile(`-----BEGIN(?:[\s\S]*?-----END[^\n]*?-----|[\s\S]*)`),
 }
 
 // jsonBlobPattern matches a JSON object 200+ chars long. The

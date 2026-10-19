@@ -3,9 +3,11 @@ package storage
 import (
 	"encoding/json"
 	"log/slog"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
@@ -22,12 +24,16 @@ import (
 // only when it is on the list below and its value has the shape the
 // list allows. It does not rely on spotting secrets: an unknown key is
 // dropped whatever it holds, free-text error strings never persist, and
-// the credential patterns are a second check on the few name fields.
+// the credential patterns are a second check on every string value
+// (names, ids, tokens, digests and scalar strings alike), and URLs lose
+// their user info, query and fragment.
 //
 // What is dropped is named (never shown) in `_dropped_keys` (unknown
-// key) and `_rejected_keys` (known key, value of the wrong shape), and
-// logged with the action and key name, so a missing entry shows up in
-// tests and logs instead of silently losing metadata.
+// key) and `_rejected_keys` (known key, value of the wrong shape or
+// credential-shaped), by its path for a nested key ("new.display_name"),
+// logged with the action and key name, and counted (AuditMetadataDrops),
+// so a missing entry shows up in tests and logs instead of silently
+// losing metadata.
 
 type auditMetaKind int
 
@@ -46,6 +52,7 @@ const (
 	metaNameList                              // list of metaName
 	metaNameListOrScalar                      // list of metaName, or number/bool/token
 	metaObject                                // nested map, its keys checked against this table
+	metaURL                                   // absolute URL: user info, query and fragment are stripped
 	metaErrorText                             // free-text error: never stored, logged sanitized instead
 )
 
@@ -78,11 +85,11 @@ var auditMetaKeys = map[string]auditMetaKind{
 	"target_provider_type": metaToken, "triggered_by": metaToken, "type": metaToken, "voted_as": metaToken,
 
 	// names
-	"acr": metaName, "agent_version": metaName, "application_name": metaName, "base_url": metaName,
+	"acr": metaName, "agent_version": metaName, "application_name": metaName, "base_url": metaURL,
 	"client_id": metaName, "cluster_name": metaName, "destination_secret_ref": metaName,
 	"display_name": metaName, "email": metaEmail, "environment": metaName, "role": metaName, "email_at_link": metaEmail, "environment_name": metaName,
 	"expected_cluster_name": metaName, "ip": metaName, "iss": metaName, "key": metaName, "label": metaName,
-	"name": metaName, "project_filter": metaName, "public_url": metaName, "reason": metaName, "sub": metaName, "target_secret_ref": metaName,
+	"name": metaName, "project_filter": metaName, "public_url": metaURL, "reason": metaName, "sub": metaName, "target_secret_ref": metaName,
 	"user_agent": metaName,
 
 	// numbers
@@ -107,8 +114,10 @@ var auditMetaKeys = map[string]auditMetaKind{
 	"self_service_bindable": metaBool, "transitioned": metaBool, "all_keys": metaBool, "locked": metaBool,
 
 	// number, bool or token
-	"enqueued": metaScalar, "failed": metaScalar, "flipped": metaScalar, "new_value": metaScalar,
-	"old_value": metaScalar, "succeeded": metaScalar,
+	"enqueued": metaScalar, "failed": metaScalar, "flipped": metaScalar, "succeeded": metaScalar,
+	// platform settings: the only setting (platform_reserved_priority)
+	// is an integer, so a string here is never a legitimate value.
+	"new_value": metaNumber, "old_value": metaNumber,
 	"added": metaNameListOrScalar, "deleted": metaNameListOrScalar, "revoked": metaNameListOrScalar,
 
 	// times
@@ -149,6 +158,63 @@ var (
 	auditMetaEmailRe  = regexp.MustCompile(`^[^\s@]{1,64}@[^\s@]{1,253}$`)
 )
 
+// Reasons a key is dropped or rejected, as logged and counted.
+const (
+	AuditDropUnknownKey = "unknown_key" // not on the allowlist
+	AuditDropBadValue   = "bad_value"   // on the list, value of the wrong shape
+	AuditDropCredential = "credential"  // on the list, value carries a credential shape
+	AuditDropNotJSON    = "not_json"    // the whole map could not be encoded
+)
+
+// AuditMetadataDrop is one (action, key, reason) that SanitizeAuditMetadata
+// dropped or rejected. Key is the path of the key ("new.display_name").
+type AuditMetadataDrop struct {
+	Action string
+	Key    string
+	Reason string
+}
+
+// auditDropMaxEntries bounds the counter map: an unknown key name can
+// come from data, so past this many distinct entries the rest are
+// counted under one overflow entry.
+const auditDropMaxEntries = 1024
+
+var auditDrops = struct {
+	sync.Mutex
+	n map[AuditMetadataDrop]int
+}{n: map[AuditMetadataDrop]int{}}
+
+func countAuditDrop(action, key, reason string) {
+	d := AuditMetadataDrop{Action: action, Key: key, Reason: reason}
+	auditDrops.Lock()
+	defer auditDrops.Unlock()
+	if _, seen := auditDrops.n[d]; !seen && len(auditDrops.n) >= auditDropMaxEntries {
+		d = AuditMetadataDrop{Action: "<overflow>", Key: "<overflow>", Reason: reason}
+	}
+	auditDrops.n[d]++
+}
+
+// AuditMetadataDrops returns how many times each (action, key, reason)
+// was dropped or rejected since the process started or the last
+// ResetAuditMetadataDrops. Tests use it to assert that real writers
+// lose nothing, without reading the log.
+func AuditMetadataDrops() map[AuditMetadataDrop]int {
+	auditDrops.Lock()
+	defer auditDrops.Unlock()
+	out := make(map[AuditMetadataDrop]int, len(auditDrops.n))
+	for k, v := range auditDrops.n {
+		out[k] = v
+	}
+	return out
+}
+
+// ResetAuditMetadataDrops clears the counts.
+func ResetAuditMetadataDrops() {
+	auditDrops.Lock()
+	defer auditDrops.Unlock()
+	auditDrops.n = map[AuditMetadataDrop]int{}
+}
+
 // SanitizeAuditMetadata returns the metadata that may be written to the
 // audit table for action. It never returns nil and never modifies meta.
 func SanitizeAuditMetadata(action string, meta map[string]any) map[string]any {
@@ -161,27 +227,46 @@ func SanitizeAuditMetadata(action string, meta map[string]any) map[string]any {
 	raw, err := json.Marshal(meta)
 	if err != nil {
 		slog.Warn("audit metadata dropped: not JSON", "action", action)
+		countAuditDrop(action, "*", AuditDropNotJSON)
 		out["_dropped_keys"] = []string{"*"}
 		return out
 	}
 	var norm map[string]any
 	if err := json.Unmarshal(raw, &norm); err != nil {
 		slog.Warn("audit metadata dropped: not a JSON object", "action", action)
+		countAuditDrop(action, "*", AuditDropNotJSON)
 		out["_dropped_keys"] = []string{"*"}
 		return out
 	}
-	var dropped, rejected []string
-	sanitizeAuditMap(action, norm, out, &dropped, &rejected, 0)
-	if len(dropped) > 0 {
-		out["_dropped_keys"] = dropped
+	s := auditSanitizer{action: action}
+	s.sanitizeMap(norm, out, "", 0)
+	if len(s.dropped) > 0 {
+		out["_dropped_keys"] = s.dropped
 	}
-	if len(rejected) > 0 {
-		out["_rejected_keys"] = rejected
+	if len(s.rejected) > 0 {
+		out["_rejected_keys"] = s.rejected
 	}
 	return out
 }
 
-func sanitizeAuditMap(action string, in, out map[string]any, dropped, rejected *[]string, depth int) {
+type auditSanitizer struct {
+	action            string
+	dropped, rejected []string
+}
+
+func (s *auditSanitizer) drop(path string) {
+	s.dropped = append(s.dropped, path)
+	slog.Warn("audit metadata key dropped", "action", s.action, "key", path, "reason", AuditDropUnknownKey)
+	countAuditDrop(s.action, path, AuditDropUnknownKey)
+}
+
+func (s *auditSanitizer) reject(path, reason string) {
+	s.rejected = append(s.rejected, path)
+	slog.Warn("audit metadata key dropped", "action", s.action, "key", path, "reason", reason)
+	countAuditDrop(s.action, path, reason)
+}
+
+func (s *auditSanitizer) sanitizeMap(in, out map[string]any, prefix string, depth int) {
 	keys := make([]string, 0, len(in))
 	for k := range in {
 		keys = append(keys, k)
@@ -189,13 +274,14 @@ func sanitizeAuditMap(action string, in, out map[string]any, dropped, rejected *
 	sort.Strings(keys)
 	for _, k := range keys {
 		v := in[k]
+		path := prefix + auditMetaKeyName(k)
 		kind, known := auditMetaKeys[k]
 		if !known {
-			*dropped = append(*dropped, auditMetaKeyName(k))
-			slog.Warn("audit metadata key dropped", "action", action, "key", auditMetaKeyName(k), "reason", "unknown_key")
+			s.drop(path)
 			continue
 		}
-		if kind == metaErrorText {
+		switch kind {
+		case metaErrorText:
 			if v == nil || v == "" {
 				continue
 			}
@@ -203,40 +289,92 @@ func sanitizeAuditMap(action string, in, out map[string]any, dropped, rejected *
 			// append-only audit row.
 			switch x := v.(type) {
 			case string:
-				slog.Warn("audit error detail", "action", action, "key", k, "error", sanitize.LogError(x))
+				slog.Warn("audit error detail", "action", s.action, "key", path, "error", sanitize.LogError(x))
 			case []any:
 				for _, e := range x {
-					if s, ok := e.(string); ok {
-						slog.Warn("audit error detail", "action", action, "key", k, "error", sanitize.LogError(s))
+					if str, ok := e.(string); ok {
+						slog.Warn("audit error detail", "action", s.action, "key", path, "error", sanitize.LogError(str))
 					}
 				}
 			}
 			out[k] = auditMetaErrorMarker
-			continue
-		}
-		if kind == metaObject {
-			obj, ok := v.(map[string]any)
+		case metaObject:
 			if v == nil {
 				out[k] = nil
 				continue
 			}
+			obj, ok := v.(map[string]any)
 			if !ok || depth >= auditMetaMaxDepth {
-				*rejected = append(*rejected, k)
-				slog.Warn("audit metadata key dropped", "action", action, "key", k, "reason", "bad_value")
+				s.reject(path, AuditDropBadValue)
 				continue
 			}
 			nested := map[string]any{}
-			sanitizeAuditMap(action, obj, nested, dropped, rejected, depth+1)
+			s.sanitizeMap(obj, nested, path+".", depth+1)
 			out[k] = nested
-			continue
+		case metaURL:
+			clean, reason := auditMetaURL(v)
+			if reason != "" {
+				s.reject(path, reason)
+				continue
+			}
+			out[k] = clean
+		default:
+			if auditMetaHasCredential(v) {
+				s.reject(path, AuditDropCredential)
+				continue
+			}
+			if !auditMetaValueOK(kind, v) {
+				s.reject(path, AuditDropBadValue)
+				continue
+			}
+			out[k] = v
 		}
-		if !auditMetaValueOK(kind, v) {
-			*rejected = append(*rejected, k)
-			slog.Warn("audit metadata key dropped", "action", action, "key", k, "reason", "bad_value")
-			continue
-		}
-		out[k] = v
 	}
+}
+
+// auditMetaHasCredential runs the credential patterns over every string
+// in a value, whatever its kind: an id, token, digest or scalar string
+// can carry a token just as well as a name can.
+func auditMetaHasCredential(v any) bool {
+	switch x := v.(type) {
+	case string:
+		return sanitize.HasCredential(x)
+	case []any:
+		for _, e := range x {
+			if auditMetaHasCredential(e) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// auditMetaURL keeps an absolute URL as scheme://host/path: user info,
+// a query and a fragment can carry a password or a token, so they are
+// stripped. A value that is not an absolute URL is rejected.
+func auditMetaURL(v any) (any, string) {
+	if v == nil {
+		return nil, ""
+	}
+	raw, ok := v.(string)
+	if !ok {
+		return nil, AuditDropBadValue
+	}
+	if raw == "" {
+		return "", ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" || u.Opaque != "" {
+		return nil, AuditDropBadValue
+	}
+	clean := (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path, RawPath: u.RawPath}).String()
+	if !auditMetaNameOK(clean) {
+		if sanitize.HasCredential(clean) {
+			return nil, AuditDropCredential
+		}
+		return nil, AuditDropBadValue
+	}
+	return clean, ""
 }
 
 // auditMetaKeyName is how a dropped key is named in the row and the log:

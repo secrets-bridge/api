@@ -56,8 +56,8 @@ func (s *ArgoCDEndpointService) WithAllowInsecureAddr(v bool) *ArgoCDEndpointSer
 }
 
 // ErrInvalidArgoCDURL is returned when a base URL is not an absolute
-// http(s) URL with a host.
-var ErrInvalidArgoCDURL = errors.New("services: argocd base_url must be an absolute http(s) URL with a host")
+// http(s) URL with a host, or carries user info, a query or a fragment.
+var ErrInvalidArgoCDURL = errors.New("services: argocd base_url must be an absolute http(s) URL with a host and no user info, query or fragment")
 
 // ErrInsecureArgoCDURL is returned when a base URL uses http:// and the
 // deployment has not opted in to clear-text ArgoCD traffic. Returned on
@@ -65,11 +65,17 @@ var ErrInvalidArgoCDURL = errors.New("services: argocd base_url must be an absol
 var ErrInsecureArgoCDURL = errors.New("services: argocd base_url must use https")
 
 // checkBaseURL validates the scheme and host of an ArgoCD base URL.
-// Private and in-cluster hosts (argocd-server.argocd.svc) are fine;
-// only the transport matters here.
+// Private and in-cluster hosts (argocd-server.argocd.svc) are fine.
+// User info, a query and a fragment are refused, as for the public URL
+// (NormalizePublicURL): the token travels in a header, so a password or
+// token in the URL can only be a mistake, and the URL is shown in the
+// console and written to the audit log.
 func (s *ArgoCDEndpointService) checkBaseURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
+		return ErrInvalidArgoCDURL
+	}
+	if u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return ErrInvalidArgoCDURL
 	}
 	switch strings.ToLower(u.Scheme) {
@@ -128,16 +134,16 @@ func (s *ArgoCDEndpointService) Create(ctx context.Context, in CreateArgoCDEndpo
 		return nil, fmt.Errorf("services: encrypt token: %w", err)
 	}
 	e := &storage.ArgoCDEndpoint{
-		Name:                    in.Name,
-		EnvironmentID:           in.EnvironmentID,
-		BaseURL:                 in.BaseURL,
-		TokenCiphertext:         ct,
-		TokenDataKeyCiphertext:  dek.Ciphertext,
-		TokenNonce:              nonce,
-		TokenKMSKeyID:           dek.KeyID,
-		TLSCAPEM:                in.TLSCAPEM,
-		TLSServerName:           in.TLSServerName,
-		Enabled:                 true,
+		Name:                   in.Name,
+		EnvironmentID:          in.EnvironmentID,
+		BaseURL:                in.BaseURL,
+		TokenCiphertext:        ct,
+		TokenDataKeyCiphertext: dek.Ciphertext,
+		TokenNonce:             nonce,
+		TokenKMSKeyID:          dek.KeyID,
+		TLSCAPEM:               in.TLSCAPEM,
+		TLSServerName:          in.TLSServerName,
+		Enabled:                true,
 	}
 	if err := s.repo.Create(ctx, e); err != nil {
 		return nil, fmt.Errorf("services: persist argocd endpoint: %w", err)
@@ -148,10 +154,10 @@ func (s *ArgoCDEndpointService) Create(ctx context.Context, in CreateArgoCDEndpo
 		Resource: "argocd_endpoint:" + e.ID.String(),
 		Status:   storage.AuditStatusSuccess,
 		Metadata: map[string]any{
-			"name":         e.Name,
-			"base_url":     e.BaseURL,
-			"kms_key_id":   e.TokenKMSKeyID,
-			"environment":  e.EnvironmentID,
+			"name":        e.Name,
+			"base_url":    e.BaseURL,
+			"kms_key_id":  e.TokenKMSKeyID,
+			"environment": e.EnvironmentID,
 		},
 	})
 	return e, nil
