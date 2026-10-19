@@ -498,8 +498,11 @@ func TestHygiene_WrapEnvelope_KMSErrorIsStable(t *testing.T) {
 		t.Fatalf("envelope KMS failure: status = %d; want 400 (%s)", r.status, r.body)
 	}
 	hygAssertNoLeak(t, "wrap envelope", r, hygVaultHost, hygTransitKey, "transit", "keymgmt", "invalid ciphertext")
-	if got, _ := r.json(t)["error"].(string); got != "envelope: data key could not be decrypted" {
-		t.Errorf("error = %q; want the stable envelope message", got)
+	if got, _ := r.json(t)["error"].(string); got != "envelope_data_key_undecryptable" {
+		t.Errorf("error = %q; want the stable envelope code", got)
+	}
+	if got, _ := r.json(t)["message"].(string); got != "envelope: data key could not be decrypted" {
+		t.Errorf("message = %q; want the stable envelope message", got)
 	}
 	if !strings.Contains(fx.logs.String(), hygTransitKey) {
 		t.Errorf("KMS detail should be logged server side for triage")
@@ -518,8 +521,11 @@ func TestHygiene_WrapEnvelope_KMSErrorIsStable(t *testing.T) {
 		t.Fatalf("bad ciphertext: status = %d; want 400 (%s)", r.status, r.body)
 	}
 	hygAssertNoLeak(t, "bad ciphertext", r, "cipher:", "message authentication failed")
-	if got, _ := r.json(t)["error"].(string); got != "envelope: ciphertext could not be authenticated" {
-		t.Errorf("error = %q; want the stable envelope message", got)
+	if got, _ := r.json(t)["error"].(string); got != "envelope_unauthenticated" {
+		t.Errorf("error = %q; want the stable envelope code", got)
+	}
+	if got, _ := r.json(t)["message"].(string); got != "envelope: ciphertext could not be authenticated" {
+		t.Errorf("message = %q; want the stable envelope message", got)
 	}
 
 	// DEK issuance on a KMS outage: generic 500.

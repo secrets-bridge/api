@@ -112,10 +112,12 @@ func (s *WrapService) wrapWith(ctx context.Context, req WrapRequest, store func(
 // status change together, so a fill that loses a race leaves nothing
 // behind). Once the row is committed the caller emits RecordCreated.
 // Seal does not zero req.Plaintext; the caller does.
+//
+// An empty plaintext is a valid value (api#286): provider bundles often
+// hold keys set to "". It is sealed like any other value, with its own
+// data key and nonce, so the stored ciphertext is the 16-byte GCM tag,
+// content_hash is SHA-256 of the empty input and byte_length is 0.
 func (s *WrapService) Seal(ctx context.Context, req WrapRequest) (*storage.SecretWrap, error) {
-	if len(req.Plaintext) == 0 {
-		return nil, errors.New("wraps: plaintext is empty")
-	}
 	if req.TTL <= 0 {
 		return nil, errors.New("wraps: TTL must be positive")
 	}
@@ -403,7 +405,16 @@ func aeadDecrypt(key, nonce, ciphertext []byte) ([]byte, error) {
 	if len(nonce) != gcm.NonceSize() || len(ciphertext) < gcm.Overhead() {
 		return nil, errors.New("wraps: stored ciphertext is malformed")
 	}
-	return gcm.Open(nil, nonce, ciphertext, nil)
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+	// An empty value opens to a nil slice. Hand callers a non-nil empty
+	// one so "no value" (nil) and "the value is empty" never look alike.
+	if plaintext == nil {
+		plaintext = []byte{}
+	}
+	return plaintext, nil
 }
 
 // zero overwrites b in place. Best-effort: Go's compiler can elide
