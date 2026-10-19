@@ -3,7 +3,7 @@
 //
 // Two responsibilities:
 //
-//  1. **Login**: email + password -> bcrypt verify -> issue JWT
+//  1. **Login**: email + password -> bcrypt verify -> start a session
 //  2. **Bootstrap**: on api boot, when no local users exist AND the
 //     operator has set the SB_BOOTSTRAP_ADMIN_EMAIL + _PASSWORD env
 //     vars, create the seed admin user and bind it to the seed admin
@@ -19,8 +19,9 @@
 //   - Generic "invalid credentials" error on every failure shape
 //     (unknown email, wrong password, disabled user) so a probe can't
 //     enumerate. Audit log holds the specifics with error_kind.
-//   - JWT is HS256 with a SB_JWT_SECRET-backed key. The secret must
-//     be at least 32 bytes; the config layer fails loud if not.
+//   - No bearer token: the caller's SessionStarter opens a server-side
+//     session and its HttpOnly cookie is the only credential (M1,
+//     api#191).
 //   - Plaintext password NEVER persisted; the input string is
 //     overwritten with zeros after bcrypt.
 
@@ -58,7 +59,7 @@ func DefaultLockoutPolicy() LockoutPolicy {
 	return LockoutPolicy{Threshold: 5, Duration: 15 * time.Minute}
 }
 
-// AuthService wires the local-users repo + JWT signer + audit pipe.
+// AuthService wires the local-users repo, the role repos and the audit pipe.
 type AuthService struct {
 	users     storage.LocalUserRepository
 	roles     storage.RoleRepository
@@ -114,11 +115,24 @@ type LoggedInUser struct {
 	DisplayName string
 }
 
-// Login verifies email + password and returns a signed JWT on
-// success. Failure modes (unknown email / wrong password / disabled
-// / locked) all return `ErrInvalidCredentials` with the same generic
-// message — audit metadata carries the specific `error_kind` for
-// triage without disclosure on the wire.
+// ErrSessionStart is returned by Login when the credentials were
+// correct but the caller's SessionStarter failed. The login is audited
+// as a failure (`error_kind=session_start_failed`), never as a success.
+var ErrSessionStart = errors.New("services: could not start a session")
+
+// SessionStarter starts the session for a user whose credentials Login
+// has verified. Login records the successful sign-in only after it
+// returns nil, so the audit log never shows a login that did not end
+// with a session.
+type SessionStarter func(ctx context.Context, userID uuid.UUID) error
+
+// Login verifies email + password, calls start to open the session and
+// records the successful sign-in once the session exists. Failure modes
+// (unknown email / wrong password / disabled / locked) all return
+// `ErrInvalidCredentials` with the same generic message; audit metadata
+// carries the specific `error_kind` for triage without disclosure on
+// the wire. A failing start returns an error wrapping
+// `ErrSessionStart`.
 //
 // Lockout state machine: each wrong-password failure bumps
 // `local_users.failed_login_count`; reaching the configured threshold
@@ -133,7 +147,7 @@ type LoggedInUser struct {
 //
 // The `password` []byte is zeroed after the bcrypt compare regardless
 // of outcome.
-func (s *AuthService) Login(ctx context.Context, email string, password []byte) (*LoginResult, error) {
+func (s *AuthService) Login(ctx context.Context, email string, password []byte, start SessionStarter) (*LoginResult, error) {
 	defer zero(password)
 
 	email = strings.ToLower(strings.TrimSpace(email))
@@ -203,6 +217,16 @@ func (s *AuthService) Login(ctx context.Context, email string, password []byte) 
 			Status:   storage.AuditStatusFailure,
 			Metadata: map[string]any{"error": clearErr.Error()},
 		})
+	}
+
+	// Only a login that ends with a session is a successful one.
+	startErr := errNoSessionStarter
+	if start != nil {
+		startErr = start(ctx, user.ID)
+	}
+	if startErr != nil {
+		s.auditSessionStartFailed(ctx, user)
+		return nil, fmt.Errorf("%w: %w", ErrSessionStart, startErr)
 	}
 
 	s.auditSuccess(ctx, user)
@@ -419,6 +443,23 @@ func (s *AuthService) auditSuccess(ctx context.Context, u *storage.LocalUser) {
 		Resource: "user:" + u.ID.String(),
 		Status:   storage.AuditStatusSuccess,
 		Metadata: map[string]any{"email": u.Email},
+	})
+}
+
+// errNoSessionStarter stands in for a start error when Login is called
+// without a SessionStarter: there is no session, so no success.
+var errNoSessionStarter = errors.New("services: no session starter")
+
+// auditSessionStartFailed records a login whose credentials were right
+// but whose session could not be started. The error text stays out of
+// the audit row; the handler logs it.
+func (s *AuthService) auditSessionStartFailed(ctx context.Context, u *storage.LocalUser) {
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "user:" + u.ID.String(),
+		Action:   "auth.login",
+		Resource: "user:" + u.ID.String(),
+		Status:   storage.AuditStatusFailure,
+		Metadata: map[string]any{"error_kind": "session_start_failed"},
 	})
 }
 

@@ -4,12 +4,15 @@ package services_test
 // Requires TEST_DATABASE_URL; SKIPs otherwise.
 
 import (
+	"context"
 	"crypto/rand"
+	"errors"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/secrets-bridge/api/internal/services"
@@ -225,7 +228,7 @@ func TestLogin_LocksAfterFiveWrongPasswordAttempts(t *testing.T) {
 	user := mustCreateUser(t, repo, "alice@example.com", "ZZZ-canary-correct-ZZZ")
 
 	for i := 1; i <= 5; i++ {
-		if _, err := svc.Login(ctx, "alice@example.com", []byte("YYY-canary-badpw-YYY")); err == nil {
+		if _, err := svc.Login(ctx, "alice@example.com", []byte("YYY-canary-badpw-YYY"), noSession); err == nil {
 			t.Fatalf("attempt %d: expected ErrInvalidCredentials", i)
 		}
 	}
@@ -245,7 +248,7 @@ func TestLogin_LocksAfterFiveWrongPasswordAttempts(t *testing.T) {
 	}
 
 	// Even the CORRECT password is rejected while locked.
-	if _, err := svc.Login(ctx, "alice@example.com", []byte("ZZZ-canary-correct-ZZZ")); err == nil {
+	if _, err := svc.Login(ctx, "alice@example.com", []byte("ZZZ-canary-correct-ZZZ"), noSession); err == nil {
 		t.Fatal("expected ErrInvalidCredentials while locked even with correct password")
 	}
 
@@ -282,7 +285,7 @@ func TestLogin_SuccessClearsCounter(t *testing.T) {
 
 	// Two wrong attempts.
 	for i := 0; i < 2; i++ {
-		_, _ = svc.Login(ctx, "bob@example.com", []byte("nope"))
+		_, _ = svc.Login(ctx, "bob@example.com", []byte("nope"), noSession)
 	}
 	pre, err := repo.Get(ctx, user.ID)
 	if err != nil {
@@ -293,7 +296,7 @@ func TestLogin_SuccessClearsCounter(t *testing.T) {
 	}
 
 	// Correct login.
-	res, err := svc.Login(ctx, "bob@example.com", []byte("secret123"))
+	res, err := svc.Login(ctx, "bob@example.com", []byte("secret123"), noSession)
 	if err != nil {
 		t.Fatalf("Login success: %v", err)
 	}
@@ -320,7 +323,7 @@ func TestLogin_EmitsBreakGlassAuditEvent(t *testing.T) {
 	repo := storage.NewLocalUsers(pool)
 	mustCreateUser(t, repo, "carol@example.com", "pw-c")
 
-	if _, err := svc.Login(ctx, "carol@example.com", []byte("pw-c")); err != nil {
+	if _, err := svc.Login(ctx, "carol@example.com", []byte("pw-c"), noSession); err != nil {
 		t.Fatalf("Login: %v", err)
 	}
 
@@ -348,6 +351,82 @@ func TestLogin_EmitsBreakGlassAuditEvent(t *testing.T) {
 	}
 }
 
+// noSession is a SessionStarter that always succeeds, for tests that
+// only care about the credential checks.
+func noSession(context.Context, uuid.UUID) error { return nil }
+
+// A login whose session can't be started must not be audited as a
+// success: no auth.login success row, no BREAK_GLASS_LOGIN, and one
+// auth.login failure row with a generic error_kind and no error text.
+func TestLogin_SessionStartFailureIsAuditedAsFailure(t *testing.T) {
+	svc, pool := bootstrapAuth(t)
+	ctx := t.Context()
+
+	repo := storage.NewLocalUsers(pool)
+	user := mustCreateUser(t, repo, "erin@example.com", "pw-e")
+
+	startErr := errors.New("XXX-canary-session-store-down-XXX")
+	var startedFor uuid.UUID
+	_, err := svc.Login(ctx, "erin@example.com", []byte("pw-e"), func(_ context.Context, id uuid.UUID) error {
+		startedFor = id
+		return startErr
+	})
+	if !errors.Is(err, services.ErrSessionStart) || !errors.Is(err, startErr) {
+		t.Fatalf("Login err = %v, want ErrSessionStart wrapping the start error", err)
+	}
+	if errors.Is(err, services.ErrInvalidCredentials) {
+		t.Fatal("a session failure must not look like bad credentials")
+	}
+	if startedFor != user.ID {
+		t.Fatalf("start called for %s, want %s", startedFor, user.ID)
+	}
+
+	count := func(q string, args ...any) int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, q, args...).Scan(&n); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		return n
+	}
+	if n := count(`SELECT count(*) FROM audit_events WHERE action = 'auth.login' AND status = 'success'`); n != 0 {
+		t.Fatalf("%d auth.login success rows, want 0", n)
+	}
+	if n := count(`SELECT count(*) FROM audit_events WHERE action = 'BREAK_GLASS_LOGIN'`); n != 0 {
+		t.Fatalf("%d BREAK_GLASS_LOGIN rows, want 0", n)
+	}
+	if n := count(`SELECT count(*) FROM audit_events
+		WHERE action = 'auth.login' AND status = 'failure' AND resource = $1
+		  AND metadata->>'error_kind' = 'session_start_failed'`, "user:"+user.ID.String()); n != 1 {
+		t.Fatalf("%d session_start_failed rows, want 1", n)
+	}
+	if n := count(`SELECT count(*) FROM audit_events WHERE metadata::text LIKE '%canary%' OR metadata::text LIKE '%pw-e%'`); n != 0 {
+		t.Fatal("audit metadata carries the start error text or the password")
+	}
+}
+
+// Without a SessionStarter there is no session, so there is no success.
+func TestLogin_NilSessionStarterIsNotASuccess(t *testing.T) {
+	svc, pool := bootstrapAuth(t)
+	ctx := t.Context()
+
+	repo := storage.NewLocalUsers(pool)
+	mustCreateUser(t, repo, "gina@example.com", "pw-g")
+
+	if _, err := svc.Login(ctx, "gina@example.com", []byte("pw-g"), nil); !errors.Is(err, services.ErrSessionStart) {
+		t.Fatalf("Login err = %v, want ErrSessionStart", err)
+	}
+	var n int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_events WHERE action IN ('auth.login', 'BREAK_GLASS_LOGIN') AND status = 'success'`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("%d success rows, want 0", n)
+	}
+}
+
 func TestLogin_ExpiredLockoutAllowsNextSuccess(t *testing.T) {
 	svc, pool := bootstrapAuth(t)
 	svc = svc.WithLockoutPolicy(services.LockoutPolicy{Threshold: 3, Duration: 1 * time.Hour})
@@ -358,7 +437,7 @@ func TestLogin_ExpiredLockoutAllowsNextSuccess(t *testing.T) {
 
 	// Trip the lock.
 	for i := 0; i < 3; i++ {
-		_, _ = svc.Login(ctx, "dave@example.com", []byte("nope"))
+		_, _ = svc.Login(ctx, "dave@example.com", []byte("nope"), noSession)
 	}
 
 	// Backdate the lock by hand to simulate expiry without sleeping.
@@ -368,7 +447,7 @@ func TestLogin_ExpiredLockoutAllowsNextSuccess(t *testing.T) {
 	}
 
 	// Lock has expired -> correct password now succeeds and resets state.
-	if _, err := svc.Login(ctx, "dave@example.com", []byte("pw-d")); err != nil {
+	if _, err := svc.Login(ctx, "dave@example.com", []byte("pw-d"), noSession); err != nil {
 		t.Fatalf("Login after expiry: %v", err)
 	}
 	got, err := repo.Get(ctx, user.ID)
@@ -432,13 +511,13 @@ func TestLogin_ExpiredLockoutAllowsOneGuessThenRelocks(t *testing.T) {
 	repo := storage.NewLocalUsers(pool)
 	user := mustCreateUser(t, repo, "frank@example.com", "pw-f")
 	for i := 0; i < 3; i++ {
-		_, _ = svc.Login(ctx, "frank@example.com", []byte("nope"))
+		_, _ = svc.Login(ctx, "frank@example.com", []byte("nope"), noSession)
 	}
 	if err := repo.Lock(ctx, user.ID, time.Now().UTC().Add(-time.Minute)); err != nil {
 		t.Fatalf("Lock backdate: %v", err)
 	}
 
-	if _, err := svc.Login(ctx, "frank@example.com", []byte("still-wrong")); err == nil {
+	if _, err := svc.Login(ctx, "frank@example.com", []byte("still-wrong"), noSession); err == nil {
 		t.Fatal("wrong password after expiry: expected ErrInvalidCredentials")
 	}
 	got, err := repo.Get(ctx, user.ID)
@@ -448,7 +527,7 @@ func TestLogin_ExpiredLockoutAllowsOneGuessThenRelocks(t *testing.T) {
 	if got.FailedLoginCount != 4 || got.LockedUntil == nil || !got.LockedUntil.After(time.Now()) {
 		t.Fatalf("count=%d locked_until=%v, want 4 and a fresh lock", got.FailedLoginCount, got.LockedUntil)
 	}
-	if _, err := svc.Login(ctx, "frank@example.com", []byte("pw-f")); err == nil {
+	if _, err := svc.Login(ctx, "frank@example.com", []byte("pw-f"), noSession); err == nil {
 		t.Fatal("correct password right after re-lock: expected ErrInvalidCredentials")
 	}
 }

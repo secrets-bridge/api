@@ -372,8 +372,9 @@ func (c Config) ValidateEnv() error {
 }
 
 // loadJWTSecret reads SB_JWT_SECRET as base64 (preferred) or raw
-// bytes. Returns nil when the env var is unset; main fails the boot
-// in that case.
+// bytes. Returns nil when the env var is unset. Nothing signs with it
+// any more (M1, api#191): main only logs that a set value is unused,
+// and an unset one is fine.
 func loadJWTSecret() []byte {
 	raw, ok := os.LookupEnv("SB_JWT_SECRET")
 	if !ok || raw == "" {
@@ -388,15 +389,6 @@ func loadJWTSecret() []byte {
 	}
 	// Fall back to raw bytes.
 	return []byte(raw)
-}
-
-// ValidateJWTSecret returns an error when the secret is too short or
-// missing. Called by main on boot.
-func (c Config) ValidateJWTSecret() error {
-	if len(c.JWTSecret) < 32 {
-		return errors.New("SB_JWT_SECRET must be set and ≥32 bytes (base64 or raw)")
-	}
-	return nil
 }
 
 func envBool(key string, fallback bool) bool {

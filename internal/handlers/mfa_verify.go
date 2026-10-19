@@ -144,9 +144,8 @@ func authIdentity(c fiber.Ctx) (uuid.UUID, uuid.UUID, error) {
 	}
 	session := middleware.SessionFromContext(c.Context())
 	if session == nil {
-		// /auth/mfa/* requires the cookie path specifically. Bearer
-		// JWTs (legacy) can't carry a step-up stamp; force a real
-		// session.
+		// /auth/mfa/* needs a session to stamp. Only the dev-only
+		// X-User-Id header reaches here without one.
 		return uuid.Nil, uuid.Nil, fiber.NewError(fiber.StatusUnauthorized, "session cookie required")
 	}
 	return uid, session.ID, nil
