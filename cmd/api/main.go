@@ -147,6 +147,7 @@ func main() {
 	}
 
 	logRetiredEnv(logger, cfg.RetiredEnvSet)
+	logSelfApprovalIgnored(bootCtx, logger, pool)
 
 	// Local-admin bootstrap. Creates the seed admin user + role
 	// assignment on first boot when local_users is empty. Idempotent
@@ -1493,6 +1494,18 @@ func bootstrapAdminGrant(ctx context.Context, pool *storage.Pool, userID string,
 // logRetiredEnv notes the retired settings that are still set. Login no
 // longer issues bearer tokens (M1, api#191), so the JWT settings are not
 // read any more. It logs the names only, never the values.
+// logSelfApprovalIgnored says how many stored workflows still have
+// allow_self_approval set. The flag is no longer honoured: a requester
+// can never approve their own request, Admin included.
+func logSelfApprovalIgnored(ctx context.Context, logger *slog.Logger, pool *storage.Pool) {
+	n, err := storage.CountWorkflowsAllowingSelfApproval(ctx, pool)
+	if err != nil || n == 0 {
+		return
+	}
+	logger.Warn("allow_self_approval is no longer honoured: a requester can never approve their own request; saving these workflows clears it",
+		"workflows", n)
+}
+
 func logRetiredEnv(logger *slog.Logger, set []string) {
 	if len(set) == 0 {
 		return

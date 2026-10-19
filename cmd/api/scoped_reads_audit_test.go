@@ -528,14 +528,14 @@ func TestLive_PrivilegeAndTenancyWrites_AuditedWithSessionActor(t *testing.T) {
 	mustJSON(t, body, &wf)
 	l.requireOneAudit(t, "workflow.create", admin)
 	wfBody["min_approvers"] = 0
-	wfBody["allow_self_approval"] = true
+	wfBody["require_justification"] = true
 	if code, body = l.call(t, http.MethodPut, "/api/v1/workflows/"+wf.ID.String(), admin, wfBody); code != http.StatusNoContent {
 		t.Fatalf("update workflow = %d %s", code, body)
 	}
 	wu := l.requireOneAudit(t, "workflow.update", admin)
 	changed, _ := wu.Metadata["changed_keys"].([]any)
-	if !containsAll(changed, "min_approvers", "allow_self_approval") {
-		t.Errorf("workflow.update changed_keys = %v, want min_approvers + allow_self_approval", changed)
+	if !containsAll(changed, "min_approvers", "require_justification") {
+		t.Errorf("workflow.update changed_keys = %v, want min_approvers + require_justification", changed)
 	}
 	if code, body = l.call(t, http.MethodDelete, "/api/v1/workflows/"+wf.ID.String(), admin, nil); code != http.StatusNoContent {
 		t.Fatalf("delete workflow = %d %s", code, body)
