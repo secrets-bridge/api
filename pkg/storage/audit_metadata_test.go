@@ -159,3 +159,38 @@ func TestAuditEvents_MetadataCanariesNeverPersist(t *testing.T) {
 		check(t, evt.ID)
 	})
 }
+
+// Keys written by the waiting-cap summary (user.pending_refused), the
+// environment events and the request events must survive the
+// allowlist: environment and role names are free text a person typed,
+// so a space or non-ASCII letters are fine there.
+func TestSanitizeAuditMetadata_KeepsCapEnvironmentAndNameKeys(t *testing.T) {
+	in := map[string]any{
+		"window_start":      "2026-10-19T08:00:00Z",
+		"window_minutes":    10,
+		"first_in_window":   true,
+		"first":             "2026-10-19T08:01:00Z",
+		"last":              "2026-10-19T08:09:30+03:00",
+		"count":             4,
+		"pending_cap":       50,
+		"risk_level":        3,
+		"risk_level_before": 1,
+		"environment":       "Production EU",
+		"role":              "release manager",
+	}
+	out := storage.SanitizeAuditMetadata("test.cap_and_environment", in)
+	if d, ok := out["_dropped_keys"]; ok {
+		t.Fatalf("dropped keys: %v", d)
+	}
+	if r, ok := out["_rejected_keys"]; ok {
+		t.Fatalf("rejected keys: %v", r)
+	}
+	for k := range in {
+		if _, ok := out[k]; !ok {
+			t.Errorf("key %q missing from %v", k, out)
+		}
+	}
+	if got := storage.SanitizeAuditMetadata("test.environment", map[string]any{"environment": "الإنتاج"}); got["environment"] != "الإنتاج" {
+		t.Errorf("non-ASCII environment name not kept: %v", got)
+	}
+}
