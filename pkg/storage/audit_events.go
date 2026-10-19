@@ -122,6 +122,8 @@ func (r *AuditEvents) AppendTx(ctx context.Context, tx pgx.Tx, evt *AuditEvent) 
 	if evt.Metadata == nil {
 		evt.Metadata = map[string]any{}
 	}
+	// Only allowlisted metadata reaches the append-only table (api#263).
+	evt.Metadata = SanitizeAuditMetadata(evt.Action, evt.Metadata)
 	metadataJSON, err := json.Marshal(evt.Metadata)
 	if err != nil {
 		return fmt.Errorf("storage: marshal audit metadata: %w", err)
@@ -150,6 +152,8 @@ func (r *AuditEvents) Append(ctx context.Context, evt *AuditEvent) error {
 	if evt.Metadata == nil {
 		evt.Metadata = map[string]any{}
 	}
+	// Only allowlisted metadata reaches the append-only table (api#263).
+	evt.Metadata = SanitizeAuditMetadata(evt.Action, evt.Metadata)
 
 	metadataJSON, err := json.Marshal(evt.Metadata)
 	if err != nil {

@@ -85,6 +85,17 @@ func LogError(raw string) string {
 	return scrub(raw, LogMaxErrorLen)
 }
 
+// HasCredential reports whether s contains a credential-shaped
+// substring (the same patterns DiscoverError redacts).
+func HasCredential(s string) bool {
+	for _, re := range secretPatterns {
+		if re.MatchString(s) {
+			return true
+		}
+	}
+	return false
+}
+
 // scrub is the shared pipeline: redact credentials, strip JSON blobs,
 // truncate to max. The order is load-bearing (see DiscoverError).
 func scrub(raw string, max int) string {
