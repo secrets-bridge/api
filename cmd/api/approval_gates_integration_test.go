@@ -549,6 +549,16 @@ func TestVerify_SameUserCannotCastBothLanes(t *testing.T) {
 	if got := fx.requestRow(t, id); got.Status != storage.AccessRequestStatusPendingVerification {
 		t.Fatalf("status = %s; want pending_verification", got.Status)
 	}
+	// api#289: the refused second-lane vote is audited.
+	var denied int
+	if err := fx.pool.QueryRow(t.Context(), `SELECT count(*) FROM audit_events
+		WHERE action = 'request.cross_team.verify.denied' AND correlation_id = $1 AND status = 'denied'
+		  AND metadata->>'error_kind' = 'second_lane_vote' AND metadata->>'voted_as' = 'security'`, id).Scan(&denied); err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	if denied != 1 {
+		t.Fatalf("second_lane_vote denied rows = %d, want 1", denied)
+	}
 }
 
 // API-N-01: lanes are counted, not inferred from "some other approver".
