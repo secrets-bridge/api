@@ -71,6 +71,19 @@ func TestRequestToBody_IncludesCrossTeamMetadata(t *testing.T) {
 		t.Error("snap_requires_security_approval not surfaced")
 	}
 
+	// A refused row carries the provider's reason in both bodies, so the
+	// requester sees why.
+	refused := &storage.AccessRequest{
+		ID: uuid.New(), RequesterID: "requester@example.com", Type: storage.AccessRequestTypeCrossTeam,
+		Status: storage.AccessRequestStatusRefused, TargetTeamID: &teamID, RefuseReason: "not our values to give",
+	}
+	if got := requestToBody(refused).RefuseReason; got != "not our values to give" {
+		t.Errorf("requestToBody refuse_reason = %q", got)
+	}
+	if got := crossTeamRequestToBody(refused).RefuseReason; got != "not our values to give" {
+		t.Errorf("crossTeamRequestToBody refuse_reason = %q", got)
+	}
+
 	// A patch row must NOT gain any cross_team field.
 	patch := &storage.AccessRequest{
 		ID: uuid.New(), RequesterID: "u", Type: storage.AccessRequestTypePatch,

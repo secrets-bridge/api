@@ -423,7 +423,7 @@ func crossTeamRequestToBody(r *storage.AccessRequest) CrossTeamRequestBody {
 		DestinationSecretRef: r.DestinationSecretRef,
 		DestinationKeys:      r.DestinationKeys,
 		FillComment:          r.FillComment,
-		RefuseReason:         "",
+		RefuseReason:         r.RefuseReason,
 		FilledByUserID:       r.FilledByUserID,
 		CreatedAt:            r.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 		UpdatedAt:            r.UpdatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
