@@ -693,7 +693,14 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		// data plane offline (agents could not heartbeat or claim jobs).
 		// Every route under that prefix carries its own auth (AgentAuth,
 		// or auth.Require on /agents/:id/revoke), so the exemption is safe.
-		middleware.RequireAuthedExcept(publicV1Paths, "/api/v1/agents/"),
+		//
+		// The /api/v1/gateways/ subtree (api#293) is exempt for the same
+		// reason: E1 enroll is authenticated by its one-time token and
+		// everything under /gateways/:id by GatewayAuth (X-Gateway-Secret).
+		// The Gateway admin routes live under /admin/gateways, behind this
+		// gate. sessionExemptPrefixes in routes.go lists both prefixes,
+		// and a live test pins every route registered under them.
+		middleware.RequireAuthedExcept(publicV1Paths, sessionExemptPrefixes...),
 		// An account waiting for an admin's approval (api#266) may only
 		// read /users/me and sign out; everything else is 403
 		// account_pending_approval. Group-level for the same reason as
@@ -1348,6 +1355,55 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// the AgentAuth group further down).
 	v1.Get("/secrets", secretsH.List)
 	v1.Get("/secrets/:id", secretsH.Get)
+
+	// Gateway registry (api#293). Machine routes under the
+	// session-exempt /api/v1/gateways/ prefix: E1 enroll first (its
+	// token is its authentication, per-IP rate limited like login), then
+	// the GatewayAuth group, rate limited AFTER auth on the
+	// authenticated Gateway id. Admin routes under /admin/gateways stay
+	// behind the session gate, each with a gateway.* permission and a
+	// fresh second factor on every write.
+	gatewaySvc := services.NewGatewayService(storage.NewGateways(pool), auditRepo, rdb)
+	gatewaysH := handlers.NewGateways(gatewaySvc, cfg.Env != ModeDev)
+	gatewayMachineRoutes{
+		auth: middleware.GatewayAuth(gatewaySvc),
+		enroll: hs(
+			middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
+				Name: "gateway:enroll", Bucket: middleware.ByIP(), Limit: 10, Window: 60 * time.Second,
+			}),
+			middleware.BodyLimit(4<<10),
+			gatewaysH.Enroll,
+		),
+		heartbeat: hs(
+			middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
+				Name: "gateway:heartbeat", Bucket: middleware.ByAuthenticatedGateway(), Limit: 1200, Window: 60 * time.Second,
+			}),
+			middleware.BodyLimit(64<<10),
+			gatewaysH.Heartbeat,
+		),
+		catalog: hs(
+			middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
+				Name: "gateway:catalog", Bucket: middleware.ByAuthenticatedGateway(), Limit: 120, Window: 60 * time.Second,
+			}),
+			middleware.BodyLimit(64<<10),
+			gatewaysH.Catalog,
+		),
+	}.register(v1)
+
+	gatewayMint := auth.Require(auth.PermGatewayMint, rbacResolver)
+	gatewayRevoke := auth.Require(auth.PermGatewayRevoke, rbacResolver)
+	gatewayList := auth.Require(auth.PermGatewayList, rbacResolver)
+	gatewayBind := auth.Require(auth.PermGatewayBind, rbacResolver)
+	v1.Post("/admin/gateways", gatewayMint, requireMFA, gatewaysH.AdminCreate)
+	v1.Get("/admin/gateways", gatewayList, gatewaysH.AdminList)
+	v1.Get("/admin/gateways/:id", gatewayList, gatewaysH.AdminGet)
+	v1.Post("/admin/gateways/:id/enrollment-token", gatewayMint, requireMFA, gatewaysH.AdminMintToken)
+	v1.Post("/admin/gateways/:id/revoke", gatewayRevoke, requireMFA, gatewaysH.AdminRevoke)
+	v1.Post("/admin/gateways/:id/connectors/:cid/approve", gatewayBind, requireMFA, gatewaysH.AdminApproveConnector)
+	v1.Post("/admin/gateway-enrollment-tokens/:id/revoke", gatewayMint, requireMFA, gatewaysH.AdminRevokeToken)
+	v1.Post("/admin/gateway-bindings", gatewayBind, requireMFA, gatewaysH.AdminCreateBinding)
+	v1.Get("/admin/gateway-bindings", gatewayBind, gatewaysH.AdminListBindings)
+	v1.Delete("/admin/gateway-bindings/:id", gatewayBind, requireMFA, gatewaysH.AdminDeleteBinding)
 
 	// Agent-side endpoints. The `/agents/:id` sub-group is gated by
 	// the AgentAuth middleware which validates X-Agent-Secret and

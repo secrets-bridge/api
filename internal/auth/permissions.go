@@ -64,6 +64,14 @@ const (
 	PermAgentRevoke Permission = "agent.revoke"
 	PermAgentList   Permission = "agent.list"
 
+	// Gateway admin (api#293) -----------------------------------------
+	// Mirror the agent group. PermGatewayBind is separate from
+	// integration.bind: neither implies the other.
+	PermGatewayMint   Permission = "gateway.mint"
+	PermGatewayRevoke Permission = "gateway.revoke"
+	PermGatewayList   Permission = "gateway.list"
+	PermGatewayBind   Permission = "gateway.bind"
+
 	// PermJobEnqueue gates the manual admin enqueue surface POST /jobs
 	// (API-03). Sync jobs are otherwise created internally by
 	// RequestService on approval and by the worker's discover scheduler;
@@ -161,6 +169,11 @@ var Catalog = []Descriptor{
 	{PermAgentRevoke, "Agents", "Revoke an agent. Its heartbeats are refused from then on."},
 	{PermAgentList, "Agents", "List all registered agents and their status."},
 	{PermJobEnqueue, "Agents", "Manually enqueue a sync job via POST /jobs. Not carried by any seed role — grant explicitly. Normal request/discover flows enqueue jobs internally without this permission."},
+
+	{PermGatewayMint, "Gateways", "Create a Gateway record and create or revoke its one-time enrollment tokens. Every change also needs a fresh second factor."},
+	{PermGatewayRevoke, "Gateways", "Revoke a Gateway. Its heartbeats and catalog uploads are refused from then on. Needs a fresh second factor."},
+	{PermGatewayList, "Gateways", "List Gateways with their replicas, advertised connectors and targets, bindings and token metadata. Never credentials."},
+	{PermGatewayBind, "Gateways", "Approve a Gateway's advertised connectors and create or delete bindings from a secret scope to an advertised target. Does not imply integration.bind, and integration.bind does not imply it. Needs a fresh second factor."},
 
 	{PermSecretRequest, "Secrets", "Submit a patch or read request against a provider secret."},
 	{PermSecretApprove, "Secrets", "Approve or reject pending secret requests."},

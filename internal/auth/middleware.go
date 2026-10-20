@@ -395,6 +395,9 @@ func AuditActor(ctx context.Context) string {
 	if agentID, ok := middleware.AgentIDFromContext(ctx); ok {
 		return "agent:" + agentID.String()
 	}
+	if gatewayID, ok := middleware.GatewayIDFromContext(ctx); ok {
+		return "gateway:" + gatewayID.String()
+	}
 	if _, inRequest := ctx.Value(middleware.CtxKeyActor).(string); inRequest {
 		return "anonymous"
 	}
