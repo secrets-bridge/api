@@ -345,6 +345,11 @@ func TestCrossTeam_RefuseHappyPath(t *testing.T) {
 	if got.RejectReason != "" {
 		t.Errorf("RejectReason should not be set on refuse: %q", got.RejectReason)
 	}
+	// Get reads it back, so the requester can see why: the select used to
+	// leave the column out and every read returned "".
+	if got.RefuseReason != "out-of-scope ask" {
+		t.Errorf("RefuseReason from Get = %q want %q", got.RefuseReason, "out-of-scope ask")
+	}
 	// Verify the refuse_reason landed in its own column.
 	var stored string
 	_ = f.pool.QueryRow(ctx, `SELECT refuse_reason FROM access_requests WHERE id = $1`, req.ID).Scan(&stored)

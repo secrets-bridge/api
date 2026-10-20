@@ -580,6 +580,7 @@ const accessRequestSelect = `
 	       COALESCE(destination_secret_ref, ''), destination_keys,
 	       COALESCE(fill_comment, ''), filled_at,
 	       COALESCE(filled_by_user_id, ''), fill_expires_at,
+	       COALESCE(refuse_reason, ''),
 	       matched_policy_rule_id, snap_requires_security_approval,
 	       snap_min_approvers
 	FROM access_requests`
@@ -616,6 +617,7 @@ func scanAccessRequest(row interface {
 		&targetTeamID, &targetProjectID, &targetEnvID,
 		&destProvConnID, &ar.DestinationSecretRef, &destKeys,
 		&ar.FillComment, &filledAt, &ar.FilledByUserID, &fillExpiresAt,
+		&ar.RefuseReason,
 		&policyRuleID, &snapRequiresSec, &snapMinApprovers,
 	)
 	if err != nil {
