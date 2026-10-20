@@ -67,6 +67,8 @@ type GatewayStore interface {
 	Get(ctx context.Context, id uuid.UUID) (*storage.Gateway, error)
 	GetAuth(ctx context.Context, id uuid.UUID) (storage.GatewayStatus, []byte, error)
 	List(ctx context.Context, seenSince time.Time) ([]*storage.Gateway, error)
+	GetView(ctx context.Context, id uuid.UUID, seenSince time.Time) (*storage.Gateway, error)
+	ListConnectorSummaries(ctx context.Context) ([]*storage.GatewayConnectorSummary, error)
 	CreateEnrollmentToken(ctx context.Context, t *storage.GatewayEnrollmentToken) error
 	GetEnrollmentTokenByHash(ctx context.Context, hash []byte) (*storage.GatewayEnrollmentToken, error)
 	GetEnrollmentToken(ctx context.Context, id uuid.UUID) (*storage.GatewayEnrollmentToken, error)
@@ -681,9 +683,24 @@ func (s *GatewayService) List(ctx context.Context) ([]*storage.Gateway, error) {
 	return s.store.List(ctx, s.now().UTC().Add(-GatewayReplicaWindow))
 }
 
-// Get returns one Gateway's detail.
+// ConnectorSummaries returns every Gateway's connectors as kind, status
+// and target count, keyed by Gateway id, for the list.
+func (s *GatewayService) ConnectorSummaries(ctx context.Context) (map[uuid.UUID][]*storage.GatewayConnectorSummary, error) {
+	cs, err := s.store.ListConnectorSummaries(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := map[uuid.UUID][]*storage.GatewayConnectorSummary{}
+	for _, c := range cs {
+		out[c.GatewayID] = append(out[c.GatewayID], c)
+	}
+	return out, nil
+}
+
+// Get returns one Gateway's detail. The Gateway carries the same replica
+// rollup (replicas_seen, over_privileged) as List.
 func (s *GatewayService) Get(ctx context.Context, id uuid.UUID) (*GatewayDetail, error) {
-	g, err := s.store.Get(ctx, id)
+	g, err := s.store.GetView(ctx, id, s.now().UTC().Add(-GatewayReplicaWindow))
 	if err != nil {
 		return nil, err
 	}

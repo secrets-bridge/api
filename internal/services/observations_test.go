@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
@@ -262,5 +264,51 @@ func TestCanonicalize_RefusesDuplicateKeys(t *testing.T) {
 	}
 	if _, err := canonicalize([]byte(`{"a":1,"A":2}`)); err != nil {
 		t.Errorf("keys differing in case are distinct for RFC 8785: %v", err)
+	}
+}
+
+// TestTimedOutAtRead: an open task at or past its deadline is shown as
+// done / timed_out with the reason the sweeper would write, on a copy;
+// the input is not changed. Closed or not yet due tasks pass through.
+func TestTimedOutAtRead(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	attempt := uuid.New()
+	for _, tc := range []struct {
+		name        string
+		state       storage.ObservationTaskState
+		deadline    time.Time
+		unavailable bool
+		want        bool
+		reason      string
+	}{
+		{"queued overdue, gateway offline", storage.ObservationTaskQueued, now.Add(-time.Second), true, true, storage.ObservationReasonGatewayUnavailable},
+		{"leased overdue, gateway seen", storage.ObservationTaskLeased, now.Add(-time.Second), false, true, storage.ObservationReasonDeadlineReached},
+		{"deadline exactly now", storage.ObservationTaskQueued, now, false, true, storage.ObservationReasonDeadlineReached},
+		{"not yet due", storage.ObservationTaskLeased, now.Add(time.Second), true, false, ""},
+		{"already done", storage.ObservationTaskDone, now.Add(-time.Hour), true, false, ""},
+		{"dead", storage.ObservationTaskDead, now.Add(-time.Hour), false, false, ""},
+		{"cancelled", storage.ObservationTaskCancelled, now.Add(-time.Hour), false, false, ""},
+	} {
+		in := &storage.ObservationTask{
+			State: tc.state, Verdict: storage.ObservationVerdictPending, DeadlineAt: tc.deadline,
+			GatewayUnavailable: tc.unavailable, CurrentAttemptID: &attempt,
+		}
+		got, ok := timedOutAtRead(in, now)
+		if ok != tc.want {
+			t.Fatalf("%s: ok = %v; want %v", tc.name, ok, tc.want)
+		}
+		if !ok {
+			if got != in {
+				t.Fatalf("%s: a task that is not overdue must pass through", tc.name)
+			}
+			continue
+		}
+		if got == in || in.State != tc.state || in.Verdict != storage.ObservationVerdictPending || in.CurrentAttemptID == nil {
+			t.Fatalf("%s: the input task was changed", tc.name)
+		}
+		if got.State != storage.ObservationTaskDone || got.Verdict != storage.ObservationVerdictTimedOut ||
+			got.VerdictReason != tc.reason || got.TerminalAt == nil || !got.TerminalAt.Equal(tc.deadline) || got.CurrentAttemptID != nil {
+			t.Fatalf("%s: view = %s %s %q terminal %v attempt %v", tc.name, got.State, got.Verdict, got.VerdictReason, got.TerminalAt, got.CurrentAttemptID)
+		}
 	}
 }

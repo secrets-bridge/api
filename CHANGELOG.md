@@ -65,6 +65,22 @@ on `main`.
   activate post-`v0.1.0`.
 
 ### Changed
+- `GET /requests/:id/observations` no longer writes (#297). The
+  worker's observation-deadlines sweeper closes tasks past their
+  deadline. Until it does, or when the worker runs without the gateway
+  sweepers, the read shows such a task as `done` / `timed_out` with the
+  reason the sweeper would store and `timed_out_at_read: true`, without
+  changing the row or adding an audit row.
+- Gateway admin views (#298): every Gateway view has `over_privileged`
+  and `over_privileged_reported_at` (a replica seen in the last 10
+  minutes last reported `over_privileged`). `GET /admin/gateways` items
+  have `connectors` (id, connector_id, kind, status, target_count).
+  `replicas_seen` on `GET /admin/gateways/:id` is computed like the
+  list. `counts` in `GET /admin/gateways/:id/tasks` covers all of the
+  Gateway's tasks per state (every state present), plus `total`.
+  `GET /admin/gateway-bindings` and
+  `GET /admin/environments/:id/observation-source` need `gateway.list`;
+  writes stay on `gateway.bind` with a fresh second factor.
 - `pkg/keymgmt.FromEnv(ctx)` now takes a second `env` argument so the
   resolver can reject `BackendLocal` outside dev. Sole caller
   (`cmd/api/main.go`) updated.

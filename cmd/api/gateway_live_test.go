@@ -763,14 +763,14 @@ func TestLive_Gateway_AdminRoutesNeedPermissionAndFreshMFA(t *testing.T) {
 		{http.MethodPost, "/api/v1/admin/gateways/" + gw + "/connectors/" + anyID + "/approve", "gateway.bind", true},
 		{http.MethodPost, "/api/v1/admin/gateway-bindings", "gateway.bind", true},
 		{http.MethodDelete, "/api/v1/admin/gateway-bindings/" + anyID, "gateway.bind", true},
-		{http.MethodGet, "/api/v1/admin/gateway-bindings", "gateway.bind", false},
+		{http.MethodGet, "/api/v1/admin/gateway-bindings", "gateway.list", false}, // api#298
 		{http.MethodGet, "/api/v1/admin/gateways", "gateway.list", false},
 		{http.MethodGet, "/api/v1/admin/gateways/" + gw, "gateway.list", false},
 		// api#294
 		{http.MethodPut, "/api/v1/admin/gateways/" + gw + "/enabled", "gateway.revoke", true},
 		{http.MethodGet, "/api/v1/admin/gateways/" + gw + "/tasks", "gateway.list", false},
 		{http.MethodPut, "/api/v1/admin/environments/" + anyID + "/observation-source", "gateway.bind", true},
-		{http.MethodGet, "/api/v1/admin/environments/" + permEnv.String() + "/observation-source", "gateway.bind", false},
+		{http.MethodGet, "/api/v1/admin/environments/" + permEnv.String() + "/observation-source", "gateway.list", false}, // api#298
 	}
 	body := map[string]any{"name": "x", "boundary": "x"}
 

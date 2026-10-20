@@ -186,6 +186,10 @@ type ObservationTask struct {
 	// GatewayName is joined from gateways by the read queries. Not a
 	// column.
 	GatewayName string
+	// GatewayUnavailable is set by ListForRequest with the same rule
+	// ExpireDeadlines uses for its reason: the Gateway is not active or
+	// has not been seen since the task was created. Not a column.
+	GatewayUnavailable bool
 }
 
 // ObservationTaskColumns is the column list every task query returns,
@@ -1100,13 +1104,26 @@ func (r *ObservationTasks) Get(ctx context.Context, id uuid.UUID) (*ObservationT
 // ListForRequest returns a request's tasks, oldest first, with the
 // Gateway name.
 func (r *ObservationTasks) ListForRequest(ctx context.Context, requestID uuid.UUID) ([]*ObservationTask, error) {
-	rows, err := r.pool.Query(ctx, `SELECT `+ObservationTaskColumns+`, g.name
+	rows, err := r.pool.Query(ctx, `SELECT `+ObservationTaskColumns+`, g.name,
+		(g.status <> 'active' OR g.last_seen_at IS NULL OR g.last_seen_at < t.created_at)
 		FROM observation_tasks t JOIN gateways g ON g.id = t.gateway_id
 		WHERE t.request_id = $1 ORDER BY t.created_at, t.id`, requestID)
 	if err != nil {
 		return nil, fmt.Errorf("storage: list request observation tasks: %w", err)
 	}
-	return collectObservationTasks(rows, true)
+	defer rows.Close()
+	var out []*ObservationTask
+	for rows.Next() {
+		var name string
+		var unavailable bool
+		t, err := ScanObservationTask(rows, &name, &unavailable)
+		if err != nil {
+			return nil, err
+		}
+		t.GatewayName, t.GatewayUnavailable = name, unavailable
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }
 
 // ListForGateway returns a Gateway's tasks, newest first, optionally of
@@ -1127,6 +1144,26 @@ func (r *ObservationTasks) ListForGateway(ctx context.Context, gatewayID uuid.UU
 		return nil, fmt.Errorf("storage: list gateway observation tasks: %w", err)
 	}
 	return collectObservationTasks(rows, true)
+}
+
+// CountForGateway returns the number of a Gateway's tasks in each state,
+// over all of its tasks (not a page).
+func (r *ObservationTasks) CountForGateway(ctx context.Context, gatewayID uuid.UUID) (map[ObservationTaskState]int, error) {
+	rows, err := r.pool.Query(ctx, `SELECT state, count(*) FROM observation_tasks WHERE gateway_id = $1 GROUP BY state`, gatewayID)
+	if err != nil {
+		return nil, fmt.Errorf("storage: count gateway observation tasks: %w", err)
+	}
+	defer rows.Close()
+	out := map[ObservationTaskState]int{}
+	for rows.Next() {
+		var st ObservationTaskState
+		var n int
+		if err := rows.Scan(&st, &n); err != nil {
+			return nil, fmt.Errorf("storage: scan gateway observation task count: %w", err)
+		}
+		out[st] = n
+	}
+	return out, rows.Err()
 }
 
 // LatestEvidence returns, for each of taskIDs, the most recently
