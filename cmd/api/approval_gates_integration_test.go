@@ -302,7 +302,7 @@ func (fx *gateFixture) scenario(t *testing.T, requiresSecurity bool) *gateScenar
 	// The scenario's own workflow, selected for the source project by a
 	// high-priority rule so leftovers from other suites can't interfere.
 	wf := &storage.WorkflowDefinition{
-		Name: uniq("gate-wf"), MinApprovers: 1, AllowSelfApproval: false,
+		Name: uniq("gate-wf"), MinApprovers: 1,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour,
 		FillTTLSeconds: 3600, RequiresSecurityApproval: requiresSecurity, Enabled: true,

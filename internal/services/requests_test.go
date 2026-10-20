@@ -238,7 +238,7 @@ func TestApprove_DuplicateVoteRejected(t *testing.T) {
 
 	// Custom workflow needing 2 approvers so bob's first vote doesn't
 	// flip the request to approved on its own.
-	wf := newWorkflow(t, ctx, h, "two-approvers", 2, false)
+	wf := newWorkflow(t, ctx, h, "two-approvers", 2)
 	policyRule(t, ctx, h, "two-approvers-rule", wf.ID, 100)
 
 	req, _ := h.requests.Submit(ctx, samplePatch("alice"))
@@ -254,7 +254,7 @@ func TestApprove_TwoApproversThresholdCrossed(t *testing.T) {
 	h := bootstrapRequests(t)
 	ctx := t.Context()
 
-	wf := newWorkflow(t, ctx, h, "two-approvers", 2, false)
+	wf := newWorkflow(t, ctx, h, "two-approvers", 2)
 	policyRule(t, ctx, h, "two-approvers-rule", wf.ID, 100)
 
 	req, _ := h.requests.Submit(ctx, samplePatch("alice"))
@@ -377,12 +377,11 @@ func TestSubmit_ValidatesRequiredFields(t *testing.T) {
 
 // --------- helpers ---------------------------------------------------
 
-func newWorkflow(t *testing.T, ctx context.Context, h *requestHarness, name string, minApprovers int, allowSelf bool) *storage.WorkflowDefinition {
+func newWorkflow(t *testing.T, ctx context.Context, h *requestHarness, name string, minApprovers int) *storage.WorkflowDefinition {
 	t.Helper()
 	wf := &storage.WorkflowDefinition{
 		Name:                 name,
 		MinApprovers:         minApprovers,
-		AllowSelfApproval:    allowSelf,
 		WrapTTLCreated:       24 * time.Hour,
 		WrapTTLApproved:      time.Hour,
 		WrapTTLClaimed:       5 * time.Minute,

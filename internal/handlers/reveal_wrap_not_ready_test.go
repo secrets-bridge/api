@@ -70,7 +70,7 @@ func TestRevealOpen_NoWrapsProduced_Returns503WrapNotReady(t *testing.T) {
 
 	wfRepo := storage.NewWorkflows(pool)
 	wf := &storage.WorkflowDefinition{
-		Name: "rs-notready-wf", MinApprovers: 0, AllowSelfApproval: true,
+		Name: "rs-notready-wf", MinApprovers: 0,
 		WrapTTLCreated: time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: time.Hour, Enabled: true,
 	}

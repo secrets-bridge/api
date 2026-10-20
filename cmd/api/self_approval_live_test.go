@@ -13,7 +13,8 @@ import (
 // skills#103: separation of duties. A requester can never approve or
 // reject their own request, whatever their role (the seeded admin role
 // here) or the workflow says. The workflow below has allow_self_approval
-// stored as true, the way an older install may have saved it.
+// set to true in its row, the way an older install stored it before
+// migration 0045 cleared it, to show the api never reads it.
 
 type sodFixture struct {
 	l          *liveApp
@@ -46,7 +47,7 @@ func newSoDFixture(t *testing.T) *sodFixture {
 		t.Fatalf("seed binding: %v", err)
 	}
 	wf := &storage.WorkflowDefinition{
-		Name: "sod-wf-" + uuid.NewString()[:8], MinApprovers: 1, AllowSelfApproval: true,
+		Name: "sod-wf-" + uuid.NewString()[:8], MinApprovers: 1,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
 	}
@@ -54,6 +55,9 @@ func newSoDFixture(t *testing.T) *sodFixture {
 		t.Fatalf("seed workflow: %v", err)
 	}
 	t.Cleanup(func() { _, _ = l.pool.Exec(t.Context(), `DELETE FROM workflow_definitions WHERE id = $1`, wf.ID) })
+	if _, err := l.pool.Exec(ctx, `UPDATE workflow_definitions SET allow_self_approval = true WHERE id = $1`, wf.ID); err != nil {
+		t.Fatalf("store the old flag: %v", err)
+	}
 	if err := storage.NewPolicies(l.pool).Create(ctx, &storage.PolicyRule{
 		Name: "sod-rule", Selector: map[string]any{"project_id": fx.proj.String(), "environment": "uat"},
 		WorkflowID: wf.ID, Priority: 500, Enabled: true,
@@ -199,8 +203,8 @@ func TestLive_Workflows_SelfApprovalCannotBeTurnedOn(t *testing.T) {
 		t.Fatalf("create with allow_self_approval=true = %d %s, want 400 self_approval_not_allowed", code, body)
 	}
 
-	// A workflow stored with the flag set reads back as false, refuses
-	// being set to true, and any other save clears the stored flag.
+	// A workflow whose row still has the flag reads back as false and
+	// refuses being set to true.
 	path := "/api/v1/workflows/" + fx.workflowID.String()
 	code, body = fx.as(t, fx.adminCK, http.MethodGet, path, nil)
 	var got struct {
@@ -222,19 +226,5 @@ func TestLive_Workflows_SelfApprovalCannotBeTurnedOn(t *testing.T) {
 	}
 	if !stored() {
 		t.Fatal("a refused PUT changed the stored row")
-	}
-	// The boot notice counts the stored flags that are now ignored.
-	before, err := storage.CountWorkflowsAllowingSelfApproval(t.Context(), fx.l.pool)
-	if err != nil || before < 1 {
-		t.Fatalf("count before save = %d, %v; want >= 1", before, err)
-	}
-	if code, body := fx.as(t, fx.adminCK, http.MethodPut, path, map[string]any{"description": "saved again"}); code != http.StatusNoContent && code != http.StatusOK {
-		t.Fatalf("PUT description = %d %s", code, body)
-	}
-	if stored() {
-		t.Fatal("saving the workflow left allow_self_approval set")
-	}
-	if after, err := storage.CountWorkflowsAllowingSelfApproval(t.Context(), fx.l.pool); err != nil || after != before-1 {
-		t.Fatalf("count after save = %d, %v; want %d", after, err, before-1)
 	}
 }

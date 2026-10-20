@@ -169,7 +169,7 @@ func TestApprove_ThresholdNotCrossed_NoJobYet(t *testing.T) {
 	h := bootstrapRequests(t)
 	ctx := t.Context()
 
-	wf := newWorkflow(t, ctx, h, "two-approvers-"+t.Name(), 2, false)
+	wf := newWorkflow(t, ctx, h, "two-approvers-"+t.Name(), 2)
 	policyRule(t, ctx, h, "two-approvers-rule-"+t.Name(), wf.ID, 100)
 
 	req, _ := h.requests.Submit(ctx, services.PatchInput{

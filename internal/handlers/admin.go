@@ -483,7 +483,6 @@ func bodyToWorkflow(b WorkflowBody) *storage.WorkflowDefinition {
 		WrapTTLClaimed:       time.Duration(b.WrapTTLClaimedSec) * time.Second,
 		RequestTTL:           time.Duration(b.RequestTTLSec) * time.Second,
 		RequireJustification: b.RequireJustification,
-		AllowSelfApproval:    false,
 		NotificationChannels: b.NotificationChannels,
 		IsDefault:            b.IsDefault, Enabled: b.Enabled,
 		FillTTLSeconds:           b.FillTTLSeconds,
@@ -681,9 +680,6 @@ func (h *Admin) UpdateWorkflow(c fiber.Ctx) error {
 	if body.AllowSelfApproval != nil && *body.AllowSelfApproval {
 		return selfApprovalRefused(c)
 	}
-	// Any save clears a flag an older row still stores; it is ignored
-	// either way.
-	w.AllowSelfApproval = false
 	if body.NotificationChannels != nil {
 		w.NotificationChannels = *body.NotificationChannels
 	}
@@ -727,7 +723,6 @@ func workflowChangedKeys(before, after *storage.WorkflowDefinition) []string {
 	add("wrap_ttl_claimed_seconds", before.WrapTTLClaimed != after.WrapTTLClaimed)
 	add("request_ttl_seconds", before.RequestTTL != after.RequestTTL)
 	add("require_justification", before.RequireJustification != after.RequireJustification)
-	add("allow_self_approval", before.AllowSelfApproval != after.AllowSelfApproval)
 	add("notification_channels", !sameStrings(before.NotificationChannels, after.NotificationChannels))
 	add("enabled", before.Enabled != after.Enabled)
 	add("fill_ttl_seconds", before.FillTTLSeconds != after.FillTTLSeconds)

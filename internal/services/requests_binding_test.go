@@ -81,7 +81,7 @@ func TestApprove_LegacyRowProviderConfigNotForwarded(t *testing.T) {
 	env := newUATEnv(t, envRepo, projectID)
 
 	wf := &storage.WorkflowDefinition{
-		Name: "legacy-cfg-wf", MinApprovers: 1, AllowSelfApproval: false,
+		Name: "legacy-cfg-wf", MinApprovers: 1,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
 	}
@@ -177,7 +177,7 @@ func TestApprove_NoGoverningBindingFailsRequest(t *testing.T) {
 	}
 
 	wf := &storage.WorkflowDefinition{
-		Name: "b1-strict-wf", MinApprovers: 1, AllowSelfApproval: false,
+		Name: "b1-strict-wf", MinApprovers: 1,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
 	}
@@ -325,7 +325,7 @@ func TestSubmit_NoGoverningBindingRefused(t *testing.T) {
 func seedApproveRule(t *testing.T, workflows *storage.Workflows, policies *storage.Policies, projectID uuid.UUID, name string) uuid.UUID {
 	t.Helper()
 	wf := &storage.WorkflowDefinition{
-		Name: name + "-wf", MinApprovers: 1, AllowSelfApproval: false,
+		Name: name + "-wf", MinApprovers: 1,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
 	}

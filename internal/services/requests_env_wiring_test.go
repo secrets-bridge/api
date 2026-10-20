@@ -150,7 +150,7 @@ func TestSubmit_ProdEnv_FiresPolicyInvariant(t *testing.T) {
 	}
 
 	wf := &storage.WorkflowDefinition{
-		Name: "envwire-prod-wf", MinApprovers: 1, AllowSelfApproval: true,
+		Name: "envwire-prod-wf", MinApprovers: 1,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
 	}

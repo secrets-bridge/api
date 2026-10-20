@@ -109,7 +109,7 @@ func TestSubmitDirectReveal_HappyPath_AutoExecutes(t *testing.T) {
 	}
 
 	wf := &storage.WorkflowDefinition{
-		Name: "uat-direct-wf", MinApprovers: 0, AllowSelfApproval: true,
+		Name: "uat-direct-wf", MinApprovers: 0,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
 	}
