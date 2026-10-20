@@ -58,6 +58,11 @@ type gatewayMachineRoutes struct {
 	enroll    []fiber.Handler
 	heartbeat []fiber.Handler
 	catalog   []fiber.Handler
+	// E4 to E7 (api#294).
+	claim   []fiber.Handler
+	lease   []fiber.Handler
+	release []fiber.Handler
+	result  []fiber.Handler
 }
 
 func (g gatewayMachineRoutes) register(v1 fiber.Router) {
@@ -65,6 +70,13 @@ func (g gatewayMachineRoutes) register(v1 fiber.Router) {
 	grp := v1.Group("/gateways/:id", g.auth)
 	mount(grp.Post, "/heartbeat", g.heartbeat)
 	mount(grp.Put, "/catalog", g.catalog)
+	// The literal /tasks/claim is registered before /tasks/:task_id/...;
+	// the two never overlap (different segment counts), but keep the
+	// literal first by convention.
+	mount(grp.Post, "/tasks/claim", g.claim)
+	mount(grp.Post, "/tasks/:task_id/lease", g.lease)
+	mount(grp.Post, "/tasks/:task_id/release", g.release)
+	mount(grp.Post, "/tasks/:task_id/result", g.result)
 }
 
 // hs is sugar for building a handler chain (middleware first, final

@@ -12,6 +12,24 @@ on `main`.
 ## [Unreleased]
 
 ### Added
+- Gateway observation tasks (#294, Gateway Release 1): migration 0048
+  adds `observation_tasks`, `observation_task_attempts`, the
+  append-only `observation_evidence` and
+  `environments.observation_source` (`control_plane` by default,
+  `gateway`, `none`). A request executed in a `gateway` environment
+  gets one task per matching Argo CD binding, and never also a
+  control-plane GitOps observation. The Gateway claims tasks
+  (`FOR UPDATE SKIP LOCKED`, scoped to the authenticated Gateway),
+  renews and releases leases fenced on `attempt_id`, and posts closed-
+  schema, metadata-only evidence that is accepted only for the attempt
+  dispatched to it and the target bound in the request's environment.
+  Argo CD Healthy and Synced is shown as observed operational state
+  with the `argocd_health_not_proof` caveat and never as verified.
+  New routes: E4 to E7 under `/api/v1/gateways/:id/tasks`,
+  `PUT /admin/gateways/:id/enabled`, `GET /admin/gateways/:id/tasks`,
+  `GET` and `PUT /admin/environments/:id/observation-source` and
+  `GET /requests/:id/observations`. Revoke and disable move leased
+  tasks back to queued.
 - Gateway registry (#293, Gateway Release 1): migrations 0046 and 0047
   add `gateways`, `gateway_enrollment_tokens`, `gateway_replicas`,
   `gateway_connectors` and `gateway_connector_bindings`, and the
