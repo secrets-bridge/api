@@ -210,11 +210,11 @@ func TestLive_Observation_TaskNotCreatedOnceSourceLeftGateway(t *testing.T) {
 	ctx := t.Context()
 	reqID, _ := f.executeOn(t, f.env, f.secret)
 	existing := f.taskRows(t, reqID)[0]
-	f.setSource(t, f.env, "control_plane")
+	f.setSource(t, f.env, "none")
 
 	// The same insert the starter makes, for a later request in the same
 	// environment, after the switch.
-	req2, _ := f.executeOn(t, f.env, f.secret) // control_plane now: no task
+	req2, _ := f.executeOn(t, f.env, f.secret) // none now: no task
 	tk := *existing
 	tk.ID, tk.RequestID = uuid.Nil, req2
 	created, superseded, err := storage.NewObservationTasks(f.l.pool).CreateTask(ctx, &tk, time.Now())

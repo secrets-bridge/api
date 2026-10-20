@@ -212,7 +212,7 @@ type CrossTeamDestinationBindingLookup interface {
 }
 
 // WithCrossTeamRepos wires the extra repositories cross_team submit
-// needs. Builder pattern matches WithEnvironments / WithGitOps. A nil
+// needs. Builder pattern matches WithEnvironments. A nil
 // destBindings makes every cross-team submit fail closed with
 // ErrCrossTeamDestinationUnbound.
 func (s *RequestService) WithCrossTeamRepos(

@@ -29,7 +29,7 @@
 | Dev-facing per-env endpoints + `secret.reveal.direct` permission | Live | `internal/handlers/dev_secrets.go` + `internal/services/requests.go::SubmitDirectReveal` (Slice L4) |
 | RBAC + permission catalog | Live | `internal/auth/` |
 | Team hierarchy + section-head pattern | Live | `internal/auth/scope_projects.go` + migration 0018 |
-| GitOps observation panel (ArgoCD, read-only) | Live (opt-in) | `pkg/argocd/`, `SB_GITOPS_ENABLED=true` |
+| Argo CD rollout state on the request page | Live, through the Gateway only | `internal/services/observations.go`; the api holds no Argo CD client or credential ([gateway#13](https://github.com/secrets-bridge/gateway/issues/13)) |
 | Cookie auth + server-side sessions | Live | `pkg/storage/sessions.go` + `internal/services/sessions.go` |
 | Account lockout + login rate limit | Live | `internal/services/auth.go` (5 wrong → 15min lock; per-IP rate limit) |
 | OIDC client (PKCE + back-channel logout) | Live (opt-in via `SB_OIDC_ISSUER`) | `internal/services/oidc.go` |
@@ -49,7 +49,6 @@ internal/
   observability/        structured logger (slog JSON)
   services/             business logic: testable in isolation
 pkg/
-  argocd/               read-only ArgoCD client (BRD §26 GitOps integration)
   keymgmt/              KeyManager interface + local / vault-transit / aws-kms
   objectstore/          media in S3-compatible object storage (AWS S3, MinIO)
   runtime/              Redis primitives: locks, idempotency, rate limit, pub/sub
@@ -136,11 +135,22 @@ Logos (and later other uploads) are stored in a private S3-compatible bucket. Po
 
 A setting without a bucket, an invalid value or a bucket the api can't reach (`HeadBucket`) fails the boot. The api needs `s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on its prefix, plus `kms:GenerateDataKey` and `kms:Decrypt` on the key for SSE-KMS.
 
-### GitOps integration (BRD §26, opt-in)
+### Argo CD (Gateway only)
+
+The Gateway is the only Secrets Bridge component that talks to Argo CD (secrets-bridge/gateway#13). The api has no Argo CD client, stores no Argo CD credential and serves no Argo CD endpoint, discovery or app-mapping route. Request pages show Argo CD state from accepted Gateway evidence (`GET /requests/:id/observations`), labelled observed operational state, never proof that a secret value propagated.
 
 | Env var | Default | Notes |
 |---|---|---|
-| `SB_GITOPS_ENABLED` | `false` | When off, ArgoCD admin + observation endpoints aren't mounted; request lifecycle has no GitOps fan-out. |
+| `SB_GITOPS_ENABLED` | unused | Retired. It switched on the removed control-plane Argo CD integration. Logged by name at startup if set; nothing turns that integration back on. Remove it. |
+| `SB_ALLOW_INSECURE_ARGOCD_ADDR` | unused | Retired with it. Remove it. |
+
+Migration 0049 (Gateway R1 cutover):
+
+- drops `argocd_endpoints` (and with it every stored Argo CD token envelope) and `gitops_app_mappings`, with one `argocd_endpoint.token_purged` audit row per endpoint (actor `system:migration`, ids only). **Rotate the Argo CD account token on the Argo CD side**: the old one sat in this database, and backups taken before the migration keep its ciphertext until they age out.
+- moves every environment whose `observation_source` was `control_plane` to `none` (audited), makes `none` the default and refuses `control_plane` from then on. `PUT /admin/environments/:id/observation-source` answers `400 source_retired` for it. Move an environment to `gateway` once a Gateway serves it; until then its requests show observation as unavailable.
+- keeps `gitops_observations` as read-only history. `GET /requests/:id/gitops` returns those rows to the requester, each with `history: true`, `label: history_context_only` and a `history_status` (`argocd_healthy_synced_context_only`, `timed_out_unverified`, `failed` or `not_completed_poller_removed`). Nothing writes the table any more.
+
+A rollback of the api does not bring the control-plane path back: the tokens are gone and the down migration restores the schema only.
 
 ## Hard rules
 

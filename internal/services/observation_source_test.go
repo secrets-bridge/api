@@ -20,10 +20,6 @@ func (r *recAudit) Append(_ context.Context, e *storage.AuditEvent) error {
 	return nil
 }
 
-type countGitOps struct{ n int }
-
-func (g *countGitOps) Start(context.Context, *storage.AccessRequest) error { g.n++; return nil }
-
 type fakeObserver struct {
 	src    storage.ObservationSource
 	err    error
@@ -39,32 +35,36 @@ func (o *fakeObserver) Start(context.Context, *storage.AccessRequest, *storage.S
 	return nil
 }
 
-// TestStartObservation_OneObserverPerSource is the single decision point:
-// each source starts exactly one observer (or none), and a source that
-// cannot be read starts neither: never the control-plane poller by
-// default (secrets-bridge/gateway#13).
-func TestStartObservation_OneObserverPerSource(t *testing.T) {
+// TestStartObservation_GatewayOrNothing is the single decision point:
+// gateway starts the Gateway path, none starts nothing, and a source
+// that cannot be read, or the retired control_plane, starts nothing.
+// There is no control-plane observer to fall back to
+// (secrets-bridge/gateway#13).
+func TestStartObservation_GatewayOrNothing(t *testing.T) {
 	env := uuid.New()
-	req := &storage.AccessRequest{ID: uuid.New(), EnvironmentID: &env}
+	withEnv := &storage.AccessRequest{ID: uuid.New(), EnvironmentID: &env}
+	noEnv := &storage.AccessRequest{ID: uuid.New()}
 	job := &storage.SyncJob{ID: uuid.New(), CorrelationID: uuid.New()}
 	for _, tc := range []struct {
-		name            string
-		src             storage.ObservationSource
-		err             error
-		gitops, gateway int
-		reason          string
+		name    string
+		req     *storage.AccessRequest
+		src     storage.ObservationSource
+		err     error
+		gateway int
+		reason  string
 	}{
-		{"control_plane", storage.ObservationSourceControlPlane, nil, 1, 0, ""},
-		{"gateway", storage.ObservationSourceGateway, nil, 0, 1, "source_gateway"},
-		{"none", storage.ObservationSourceNone, nil, 0, 0, "source_none"},
-		{"unreadable", "", errors.New("connection refused"), 0, 0, "source_unreadable"},
+		{"gateway", withEnv, storage.ObservationSourceGateway, nil, 1, ""},
+		{"none", withEnv, storage.ObservationSourceNone, nil, 0, "source_none"},
+		{"none without environment", noEnv, storage.ObservationSourceNone, nil, 0, ""},
+		{"retired control_plane", withEnv, storage.ObservationSourceRetiredControlPlane, nil, 0, "source_unreadable"},
+		{"unreadable", withEnv, "", errors.New("connection refused"), 0, "source_unreadable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			audit, g, o := &recAudit{}, &countGitOps{}, &fakeObserver{src: tc.src, err: tc.err}
-			s := &RequestService{audit: audit, gitops: g, observer: o}
-			s.startObservation(context.Background(), req, job)
-			if g.n != tc.gitops || o.starts != tc.gateway {
-				t.Fatalf("gitops starts %d, gateway starts %d; want %d, %d", g.n, o.starts, tc.gitops, tc.gateway)
+			audit, o := &recAudit{}, &fakeObserver{src: tc.src, err: tc.err}
+			s := &RequestService{audit: audit, observer: o}
+			s.startObservation(context.Background(), tc.req, job)
+			if o.starts != tc.gateway {
+				t.Fatalf("gateway starts %d; want %d", o.starts, tc.gateway)
 			}
 			if tc.reason == "" {
 				if len(audit.events) != 0 {
@@ -76,5 +76,18 @@ func TestStartObservation_OneObserverPerSource(t *testing.T) {
 				t.Fatalf("audit = %+v; want one row with reason %s", audit.events, tc.reason)
 			}
 		})
+	}
+}
+
+// TestObservationSource_ControlPlaneIsNotValid: the retired value is
+// never a valid source, so no code path can store or start it.
+func TestObservationSource_ControlPlaneIsNotValid(t *testing.T) {
+	if storage.ObservationSourceRetiredControlPlane.Valid() {
+		t.Fatal("control_plane is a valid observation source")
+	}
+	for _, s := range []storage.ObservationSource{storage.ObservationSourceGateway, storage.ObservationSourceNone} {
+		if !s.Valid() {
+			t.Fatalf("%s is not valid", s)
+		}
 	}
 }

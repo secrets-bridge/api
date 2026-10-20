@@ -11,7 +11,26 @@ on `main`.
 
 ## [Unreleased]
 
+### Removed
+- The control-plane Argo CD integration (secrets-bridge/gateway#13):
+  `pkg/argocd`, the Argo CD endpoint and GitOps services, the
+  `/argocd-endpoints` (CRUD, `enabled`, `discovered-apps`) and
+  `/gitops-app-mappings` routes, `RequestService.WithGitOps` and
+  `GitOpsService.Start`. The Gateway is the only Argo CD client.
+  `SB_GITOPS_ENABLED` and `SB_ALLOW_INSECURE_ARGOCD_ADDR` are retired
+  settings, logged by name if set.
+- Migration 0049 drops `argocd_endpoints` (the stored token envelopes)
+  and `gitops_app_mappings`, one audit row per endpoint; moves
+  `observation_source = control_plane` to `none`, makes `none` the
+  default and refuses `control_plane`. Rotate the Argo CD account
+  token on the Argo CD side.
+
 ### Added
+- Parity tests: the Gateway evidence path shows every Argo CD fact the
+  poller recorded (sync, health, operation phase, revision), per bound
+  application, labelled operational state.
+- `internal/archguard`: fails if non-test code imports an Argo CD
+  client or builds an Argo CD API path.
 - Gateway observation tasks (#294, Gateway Release 1): migration 0048
   adds `observation_tasks`, `observation_task_attempts`, the
   append-only `observation_evidence` and
@@ -65,6 +84,11 @@ on `main`.
   activate post-`v0.1.0`.
 
 ### Changed
+- `PUT /admin/environments/:id/observation-source` answers
+  `400 source_retired` for `control_plane`; `GET` never returns it.
+- `GET /requests/:id/gitops` is always mounted and read-only: the
+  history of the removed poller, each row labelled
+  `history_context_only`.
 - `pkg/keymgmt.FromEnv(ctx)` now takes a second `env` argument so the
   resolver can reject `BackendLocal` outside dev. Sole caller
   (`cmd/api/main.go`) updated.

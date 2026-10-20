@@ -421,8 +421,8 @@ func TestLive_Observation_ArgoCDEndToEnd(t *testing.T) {
 	if len(created) != 1 || created[0].CorrelationID != correlation {
 		t.Fatalf("observation.task.created = %+v; want one row with the job correlation id", created)
 	}
-	if rows := f.l.auditRows(t, "request.gitops_observation_skipped"); len(rows) != 1 || rows[0].Metadata["reason"] != "source_gateway" {
-		t.Fatalf("request.gitops_observation_skipped = %+v; want one row, reason source_gateway", rows)
+	if rows := f.l.auditRows(t, "request.gitops_observation_skipped"); len(rows) != 0 {
+		t.Fatalf("request.gitops_observation_skipped = %+v; the control-plane observer is gone, want none", rows)
 	}
 
 	// Not claimable before not_before (10s after executed).
@@ -595,10 +595,12 @@ func reorderJSON(t *testing.T, v any) []byte {
 	return b.Bytes()
 }
 
-// TestLive_Observation_SourceDecidesTheObserver: control_plane creates no
-// Gateway task (and runs the control-plane observer), gateway creates
-// one (and skips the control-plane observer), none runs neither. The
-// environment column is read once per request in OnJobCompleted.
+// TestLive_Observation_SourceDecidesTheObserver: gateway creates a
+// Gateway task, none creates nothing, and the retired control_plane is
+// refused with 400 source_retired and never read back
+// (secrets-bridge/gateway#13). No source starts a control-plane
+// observer: no request gets a gitops_observations row. The environment
+// column is read once per request in OnJobCompleted.
 func TestLive_Observation_SourceDecidesTheObserver(t *testing.T) {
 	f := newObsFixture(t)
 
@@ -607,28 +609,23 @@ func TestLive_Observation_SourceDecidesTheObserver(t *testing.T) {
 	if n := len(f.taskRows(t, gwReq)); n != 1 {
 		t.Fatalf("gateway source: tasks = %d; want 1", n)
 	}
-	// The control-plane observer was not started: its only trace for a
-	// request without a mapping is this skip row, which must not exist.
-	for _, r := range f.l.auditRows(t, "request.gitops_observation_skipped") {
-		if r.Resource == "request:"+gwReq.String() && r.Metadata["reason"] != "source_gateway" {
-			t.Fatalf("gateway source: GitOpsService.Start ran too (%v)", r.Metadata)
-		}
+	if n := f.gitopsRows(t, gwReq); n != 0 {
+		t.Fatalf("gateway source: gitops_observations rows = %d; want 0", n)
 	}
 
-	// control_plane.
-	f.setSource(t, f.env, "control_plane")
-	cpReq, _ := f.executeOn(t, f.env, f.secret)
-	if n := len(f.taskRows(t, cpReq)); n != 0 {
-		t.Fatalf("control_plane source: tasks = %d; want 0", n)
+	// control_plane is retired: refused, nothing changes.
+	code, body := f.l.callAs(t, http.MethodPut, "/api/v1/admin/environments/"+f.env.String()+"/observation-source", f.admin,
+		map[string]any{"observation_source": "control_plane"})
+	if code != http.StatusBadRequest || errCode(t, body) != "source_retired" {
+		t.Fatalf("set control_plane = %d %s; want 400 source_retired", code, body)
 	}
-	sawGitOps := false
-	for _, r := range f.l.auditRows(t, "request.gitops_observation_skipped") {
-		if r.Resource == "request:"+cpReq.String() {
-			sawGitOps = r.Metadata["reason"] != "source_gateway"
-		}
+	code, body = f.l.callAs(t, http.MethodGet, "/api/v1/admin/environments/"+f.env.String()+"/observation-source", f.admin, nil)
+	if code != http.StatusOK || !strings.Contains(string(body), `"observation_source":"gateway"`) {
+		t.Fatalf("get after refused control_plane = %d %s; want gateway unchanged", code, body)
 	}
-	if !sawGitOps {
-		t.Fatal("control_plane source: GitOpsService.Start did not run")
+	// Even a row written around the api cannot hold it.
+	if _, err := f.l.pool.Exec(t.Context(), `UPDATE environments SET observation_source = 'control_plane' WHERE id = $1`, f.env); err == nil {
+		t.Fatal("the schema accepted observation_source = control_plane")
 	}
 
 	// none.
@@ -637,6 +634,9 @@ func TestLive_Observation_SourceDecidesTheObserver(t *testing.T) {
 	if n := len(f.taskRows(t, noneReq)); n != 0 {
 		t.Fatalf("none source: tasks = %d; want 0", n)
 	}
+	if n := f.gitopsRows(t, noneReq); n != 0 {
+		t.Fatalf("none source: gitops_observations rows = %d; want 0", n)
+	}
 	found := false
 	for _, r := range f.l.auditRows(t, "request.observation_skipped") {
 		found = found || (r.Resource == "request:"+noneReq.String() && r.Metadata["reason"] == "source_none")
@@ -644,10 +644,15 @@ func TestLive_Observation_SourceDecidesTheObserver(t *testing.T) {
 	if !found {
 		t.Fatal("none source: no request.observation_skipped source_none row")
 	}
-	for _, r := range f.l.auditRows(t, "request.gitops_observation_skipped") {
-		if r.Resource == "request:"+noneReq.String() {
-			t.Fatalf("none source: GitOpsService.Start ran (%v)", r.Metadata)
-		}
+	if rows := f.l.auditRows(t, "request.gitops_observation_skipped"); len(rows) != 0 {
+		t.Fatalf("request.gitops_observation_skipped = %+v; want none", rows)
+	}
+
+	// A new environment starts at none.
+	var src string
+	if err := f.l.pool.QueryRow(t.Context(), `INSERT INTO environments (project_id, name, type, kind)
+		VALUES ($1, 'tenant-a-new', 'uat', 'non_prod') RETURNING observation_source`, f.proj).Scan(&src); err != nil || src != "none" {
+		t.Fatalf("new environment observation_source = %q, %v; want none", src, err)
 	}
 
 	// Gateway with no binding for the secret: no task, audited.
@@ -1233,7 +1238,7 @@ func TestLive_Observation_RevokeAndDisableRequeueLeasedTasks(t *testing.T) {
 // TestLive_Observation_LaterWriteAndSourceSwitchCancel: a second write to
 // the same secret cancels the open older task (superseded_by_later_write)
 // and its result is refused; switching the environment back to
-// control_plane cancels open tasks (source_changed); deleting a binding
+// none cancels open tasks (source_changed); deleting a binding
 // cancels its tasks (binding_removed).
 func TestLive_Observation_LaterWriteAndSourceSwitchCancel(t *testing.T) {
 	f := newObsFixture(t)
@@ -1253,7 +1258,7 @@ func TestLive_Observation_LaterWriteAndSourceSwitchCancel(t *testing.T) {
 		t.Fatalf("observation.task.superseded rows = %d; want 1", len(rows))
 	}
 
-	body := f.setSource(t, f.env, "control_plane")
+	body := f.setSource(t, f.env, "none")
 	if !strings.Contains(string(body), `"tasks_cancelled":1`) {
 		t.Fatalf("source switch = %s; want one task cancelled", body)
 	}
@@ -1261,7 +1266,7 @@ func TestLive_Observation_LaterWriteAndSourceSwitchCancel(t *testing.T) {
 		t.Fatalf("after source switch: %s %s; want cancelled, source_changed", t2.State, t2.VerdictReason)
 	}
 	if code, body := f.l.callAs(t, http.MethodGet, "/api/v1/admin/environments/"+f.env.String()+"/observation-source", f.admin, nil); code != http.StatusOK ||
-		!strings.Contains(string(body), `"observation_source":"control_plane"`) {
+		!strings.Contains(string(body), `"observation_source":"none"`) {
 		t.Fatalf("read observation source = %d %s", code, body)
 	}
 	noPerm := map[string]string{"Cookie": f.l.sessionFor(t, uuid.New(), "obs-noperm@example.com")}

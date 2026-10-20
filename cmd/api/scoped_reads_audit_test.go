@@ -62,8 +62,6 @@ func newLiveApp(t *testing.T, opts ...func(*Config)) *liveApp {
 		DELETE FROM gateway_connector_bindings;
 		DELETE FROM gateways;
 		DELETE FROM gitops_observations;
-		DELETE FROM gitops_app_mappings;
-		DELETE FROM argocd_endpoints;
 		DELETE FROM reveal_sessions;
 		DELETE FROM secret_wraps;
 		DELETE FROM approvals;
@@ -117,7 +115,6 @@ func newLiveApp(t *testing.T, opts ...func(*Config)) *liveApp {
 
 	appCfg := Config{
 		Env:                     ModeDev,
-		GitOpsEnabled:           true,
 		AllowInsecureHeaderAuth: true,
 		AllowDirectAgentMint:    true,
 		AllowInsecureVaultAddr:  true,
@@ -684,21 +681,10 @@ func containsAll(have []any, want ...string) bool {
 	return true
 }
 
-// ---- API-15: real actor on job, agent and argocd actions -------------
+// ---- API-15: real actor on job and agent actions ---------------------
 
-func TestLive_JobAgentArgoCDActions_RecordRealActor(t *testing.T) {
+func TestLive_JobAgentActions_RecordRealActor(t *testing.T) {
 	l := newLiveApp(t)
-
-	// A tiny ArgoCD stand-in for the read-only discovery call.
-	argo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/api/v1/applications") {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"items":[]}`))
-	}))
-	t.Cleanup(argo.Close)
 
 	op := l.grantUser(t, []string{"job.enqueue", "agent.mint", "integration.edit"}, `{}`)
 
@@ -712,31 +698,6 @@ func TestLive_JobAgentArgoCDActions_RecordRealActor(t *testing.T) {
 		t.Fatalf("mint = %d %s", code, body)
 	}
 	l.requireOneAudit(t, "agent.mint", op)
-
-	code, body := l.call(t, http.MethodPost, "/api/v1/argocd-endpoints", op, map[string]any{
-		"name": "argo-a", "base_url": argo.URL, "token_b64": "ZmFrZS10b2tlbg==",
-	})
-	if code != http.StatusCreated {
-		t.Fatalf("argocd create = %d %s", code, body)
-	}
-	var ep struct{ ID string }
-	mustJSON(t, body, &ep)
-	l.requireOneAudit(t, "argocd_endpoint.create", op)
-
-	if code, body := l.call(t, http.MethodGet, "/api/v1/argocd-endpoints/"+ep.ID+"/discovered-apps", op, nil); code != http.StatusOK {
-		t.Fatalf("discover = %d %s", code, body)
-	}
-	l.requireOneAudit(t, "argocd_endpoint.discover", op)
-
-	if code, body := l.call(t, http.MethodPut, "/api/v1/argocd-endpoints/"+ep.ID+"/enabled", op, map[string]any{"enabled": false}); code != http.StatusNoContent {
-		t.Fatalf("set enabled = %d %s", code, body)
-	}
-	l.requireOneAudit(t, "argocd_endpoint.set_enabled", op)
-
-	if code, body := l.call(t, http.MethodDelete, "/api/v1/argocd-endpoints/"+ep.ID, op, nil); code != http.StatusNoContent {
-		t.Fatalf("delete = %d %s", code, body)
-	}
-	l.requireOneAudit(t, "argocd_endpoint.delete", op)
 
 	// Nothing on this flow is attributed to the old hard-coded "admin".
 	var hardcoded int

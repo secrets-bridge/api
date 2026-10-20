@@ -384,7 +384,7 @@ func ScopeFromJSONBody(keys ...string) ScopeFn {
 //	"system:background"  no request identity at all (boot, background work)
 //
 // Subsystems that act on their own write their own "system:<kind>"
-// (system:oidc, system:request-lifecycle, system:gitops).
+// (system:oidc, system:request-lifecycle, system:migration).
 //
 // It is the single place audit actors are derived from a context, so a
 // row never says "admin" or a bare id that the audit UI can't resolve.

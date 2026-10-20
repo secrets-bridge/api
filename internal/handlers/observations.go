@@ -322,6 +322,8 @@ func (h *Gateways) AdminSetObservationSource(c fiber.Ctx) error {
 	src := storage.ObservationSource(req.ObservationSource)
 	out, err := h.obs.SetObservationSource(c.Context(), id, src, actor)
 	switch {
+	case errors.Is(err, services.ErrObservationSourceRetired):
+		return fiber.NewError(fiber.StatusBadRequest, "source_retired")
 	case errors.Is(err, services.ErrObservationInvalidSource):
 		return fiber.NewError(fiber.StatusBadRequest, "invalid_observation_source")
 	case errors.Is(err, storage.ErrNotFound):

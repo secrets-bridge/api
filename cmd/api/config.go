@@ -47,13 +47,6 @@ type Config struct {
 	//      services.AuthService.BootstrapDevUsers.
 	Env string
 
-	// GitOpsEnabled gates the read-only ArgoCD visibility integration
-	// (BRD §26). Default OFF — operators opt in via Helm value or env
-	// var. When false: the admin CRUD endpoints + user observation
-	// endpoint are NOT mounted and the request lifecycle has no GitOps
-	// fan-out step. Existing deployments behave exactly as before.
-	GitOpsEnabled bool
-
 	// DevSeedPassword is the shared password the dev seeder assigns
 	// to all three seeded users (admin / approver / requester) when
 	// SB_ENV=dev. Optional — when unset, the seeder generates a
@@ -207,11 +200,6 @@ type Config struct {
 	// on provider_connections — the deployment-level override for
 	// dev clusters. Audited at boot if true.
 	AllowInsecureVaultAddr bool
-	// AllowInsecureArgoCDAddr=true permits http:// ArgoCD base_url
-	// values when SB_ENV=production (API-S-22). SB_ENV=dev always
-	// allows them. Off by default because the ArgoCD bearer token
-	// travels on every call to that URL. Logged as a WARN at boot.
-	AllowInsecureArgoCDAddr bool
 	// AllowUnsealedWraps=true brings back the two legacy wrap shapes
 	// (api#264): a plaintext-over-TLS `value` returned to an agent with
 	// no X25519 public key on file, and a plaintext `value` accepted on
@@ -249,9 +237,7 @@ func loadConfig() Config {
 		LogoBackfill:                   envBool(envLogoBackfill, true),
 		ShutdownGrace:                  envDuration("API_SHUTDOWN_GRACE", 15*time.Second),
 		Env:                            envOr("SB_ENV", ModeProduction),
-		GitOpsEnabled:                  envBool("SB_GITOPS_ENABLED", false),
 		AllowInsecureVaultAddr:         envBool("SB_ALLOW_INSECURE_VAULT_ADDR", false),
-		AllowInsecureArgoCDAddr:        envBool("SB_ALLOW_INSECURE_ARGOCD_ADDR", false),
 		AllowUnsealedWraps:             envBool("SB_ALLOW_UNSEALED_WRAPS", false),
 		ProviderConnRejectSecretValues: envBool("SB_PROVIDER_CONN_REJECT_SECRETS", true),
 		BootstrapAdminUserID:           envOr("SB_BOOTSTRAP_ADMIN_USER_ID", ""),
@@ -366,18 +352,39 @@ func (c Config) ValidateEnv() error {
 	}
 }
 
-// retiredEnv are settings the api no longer reads. SB_JWT_SECRET and
-// SB_JWT_TOKEN_TTL signed and timed the login bearer token, which login
-// stopped issuing in M1 (api#191).
-var retiredEnv = []string{"SB_JWT_SECRET", "SB_JWT_TOKEN_TTL"}
+// retiredSetting is a setting the api no longer reads, and why.
+type retiredSetting struct {
+	name, note string
+}
+
+// Notes logged next to the names of retired settings that are still set.
+const (
+	retiredNoteJWT    = "sign-in is cookie-session only"
+	retiredNoteArgoCD = "the Gateway is the only Argo CD client; nothing turns the control-plane integration back on"
+)
+
+// retiredEnv are settings the api no longer reads.
+//
+//   - SB_JWT_SECRET and SB_JWT_TOKEN_TTL signed and timed the login
+//     bearer token, which login stopped issuing in M1 (api#191).
+//   - SB_GITOPS_ENABLED and SB_ALLOW_INSECURE_ARGOCD_ADDR switched on
+//     the control-plane Argo CD integration and allowed its http://
+//     endpoints. It was removed at the Gateway R1 cutover
+//     (secrets-bridge/gateway#13). They are not a switch any more.
+var retiredEnv = []retiredSetting{
+	{"SB_JWT_SECRET", retiredNoteJWT},
+	{"SB_JWT_TOKEN_TTL", retiredNoteJWT},
+	{"SB_GITOPS_ENABLED", retiredNoteArgoCD},
+	{"SB_ALLOW_INSECURE_ARGOCD_ADDR", retiredNoteArgoCD},
+}
 
 // retiredEnvSet returns the names of the retiredEnv entries that are
 // set to a non-empty value. It never returns or reads out the values.
 func retiredEnvSet() []string {
 	var set []string
-	for _, k := range retiredEnv {
-		if v, ok := os.LookupEnv(k); ok && v != "" {
-			set = append(set, k)
+	for _, r := range retiredEnv {
+		if v, ok := os.LookupEnv(r.name); ok && v != "" {
+			set = append(set, r.name)
 		}
 	}
 	return set
