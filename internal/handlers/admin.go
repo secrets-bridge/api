@@ -460,7 +460,9 @@ func workflowToBody(w *storage.WorkflowDefinition) WorkflowBody {
 		WrapTTLClaimedSec:    int64(w.WrapTTLClaimed.Seconds()),
 		RequestTTLSec:        int64(w.RequestTTL.Seconds()),
 		RequireJustification: w.RequireJustification,
-		AllowSelfApproval:    w.AllowSelfApproval,
+		// Self-approval is never allowed (separation of duties), so the
+		// field is always false whatever an older row stored.
+		AllowSelfApproval:    false,
 		NotificationChannels: w.NotificationChannels,
 		IsDefault:            w.IsDefault, Enabled: w.Enabled, IsSystem: w.IsSystem,
 		// Always emit the current value on the wire so clients that
@@ -481,7 +483,7 @@ func bodyToWorkflow(b WorkflowBody) *storage.WorkflowDefinition {
 		WrapTTLClaimed:       time.Duration(b.WrapTTLClaimedSec) * time.Second,
 		RequestTTL:           time.Duration(b.RequestTTLSec) * time.Second,
 		RequireJustification: b.RequireJustification,
-		AllowSelfApproval:    b.AllowSelfApproval,
+		AllowSelfApproval:    false,
 		NotificationChannels: b.NotificationChannels,
 		IsDefault:            b.IsDefault, Enabled: b.Enabled,
 		FillTTLSeconds:           b.FillTTLSeconds,
@@ -494,6 +496,14 @@ func bodyToWorkflow(b WorkflowBody) *storage.WorkflowDefinition {
 		w.ScopedPolicyAuthorable = *b.ScopedPolicyAuthorable
 	}
 	return w
+}
+
+// selfApprovalRefused answers a workflow that asks for self-approval.
+// A requester can never approve their own request, Admin included, so
+// there is nothing to configure.
+func selfApprovalRefused(c fiber.Ctx) error {
+	return stableErr(c, fiber.StatusBadRequest, "self_approval_not_allowed",
+		"allow_self_approval is not supported: a requester can never approve their own request", nil)
 }
 
 // CreateWorkflow handles POST /workflows.
@@ -514,6 +524,9 @@ func (h *Admin) CreateWorkflow(c fiber.Ctx) error {
 	}
 	if body.MinApprovers < 0 {
 		return fiber.NewError(fiber.StatusBadRequest, "min_approvers must not be negative")
+	}
+	if body.AllowSelfApproval {
+		return selfApprovalRefused(c)
 	}
 	w := bodyToWorkflow(body)
 	if err := h.workflows.Create(c.Context(), w); err != nil {
@@ -665,9 +678,12 @@ func (h *Admin) UpdateWorkflow(c fiber.Ctx) error {
 	if body.RequireJustification != nil {
 		w.RequireJustification = *body.RequireJustification
 	}
-	if body.AllowSelfApproval != nil {
-		w.AllowSelfApproval = *body.AllowSelfApproval
+	if body.AllowSelfApproval != nil && *body.AllowSelfApproval {
+		return selfApprovalRefused(c)
 	}
+	// Any save clears a flag an older row still stores; it is ignored
+	// either way.
+	w.AllowSelfApproval = false
 	if body.NotificationChannels != nil {
 		w.NotificationChannels = *body.NotificationChannels
 	}

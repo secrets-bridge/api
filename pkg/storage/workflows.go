@@ -397,3 +397,13 @@ func scanWorkflow(row interface {
 func intervalString(d time.Duration) string {
 	return fmt.Sprintf("%d seconds", int64(d.Seconds()))
 }
+
+// CountWorkflowsAllowingSelfApproval counts workflows whose stored
+// allow_self_approval is still true. The flag is no longer honoured
+// (a requester can never approve their own request); the api logs the
+// count at boot so operators know which saved setting stopped working.
+func CountWorkflowsAllowingSelfApproval(ctx context.Context, pool *Pool) (int, error) {
+	var n int
+	err := pool.QueryRow(ctx, `SELECT count(*) FROM workflow_definitions WHERE allow_self_approval`).Scan(&n)
+	return n, err
+}

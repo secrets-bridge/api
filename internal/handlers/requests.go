@@ -188,7 +188,9 @@ func requestErr(err error) error {
 	case errors.Is(err, services.ErrInvalidInput):
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	case errors.Is(err, services.ErrSelfApprovalDenied):
-		return fiber.NewError(fiber.StatusForbidden, "requester cannot approve own request")
+		// The same stable code cross-team verify answers, so the console
+		// explains a refused self-approval one way on every path.
+		return fiber.NewError(fiber.StatusForbidden, "separation_of_duties_violated")
 	case errors.Is(err, services.ErrDuplicateVote):
 		return fiber.NewError(fiber.StatusConflict, "approver has already voted on this request")
 	case errors.Is(err, services.ErrRequestExpired):

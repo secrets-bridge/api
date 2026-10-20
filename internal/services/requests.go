@@ -686,8 +686,8 @@ func keyInAllowlist(allowed []string, target string) bool {
 //
 // Errors:
 //   - ErrRequestNotPending if request is already decided
-//   - ErrSelfApprovalDenied if approverID == requesterID and the
-//     workflow disallows self-approval
+//   - ErrSelfApprovalDenied if approverID == requesterID, whatever the
+//     workflow or the caller's role says (separation of duties)
 //   - ErrDuplicateVote if approverID has already voted on this request
 func (s *RequestService) Approve(ctx context.Context, requestID uuid.UUID, approverID, comment string) (*storage.AccessRequest, error) {
 	if approverID == "" {
@@ -707,7 +707,8 @@ func (s *RequestService) Approve(ctx context.Context, requestID uuid.UUID, appro
 	if err != nil {
 		return nil, fmt.Errorf("services: load workflow: %w", err)
 	}
-	if approverID == req.RequesterID && !wf.AllowSelfApproval {
+	if approverID == req.RequesterID {
+		s.auditSelfDecisionRefused(ctx, "request.approve", req)
 		return nil, ErrSelfApprovalDenied
 	}
 	if err := s.checkApproverScope(ctx, approverID, req); err != nil {
@@ -838,11 +839,11 @@ func (s *RequestService) Reject(ctx context.Context, requestID uuid.UUID, approv
 	if req.WorkflowID == nil {
 		return nil, errors.New("services: request has no workflow (corrupt state)")
 	}
-	wf, err := s.workflows.Get(ctx, *req.WorkflowID)
-	if err != nil {
+	if _, err := s.workflows.Get(ctx, *req.WorkflowID); err != nil {
 		return nil, fmt.Errorf("services: load workflow: %w", err)
 	}
-	if approverID == req.RequesterID && !wf.AllowSelfApproval {
+	if approverID == req.RequesterID {
+		s.auditSelfDecisionRefused(ctx, "request.reject", req)
 		return nil, ErrSelfApprovalDenied
 	}
 	if err := s.checkApproverScope(ctx, approverID, req); err != nil {
@@ -1123,6 +1124,26 @@ func (s *RequestService) CreateAgentWrap(ctx context.Context, agentID, requestID
 // by an agent with no usable X25519 key, or a create with `value`.
 func (s *RequestService) AuditUnsealedWrapRefused(ctx context.Context, action string, agentID, wrapID uuid.UUID, reason string) {
 	s.auditAgentWrapRefused(ctx, action, agentID, uuid.Nil, wrapID, reason)
+}
+
+// auditSelfDecisionRefused records a requester trying to approve or
+// reject their own request. Separation of duties is not a workflow
+// setting: it is refused whatever the workflow or the caller's role
+// says, Admin included, and the stored allow_self_approval flag is
+// ignored. Ids only, no values.
+func (s *RequestService) auditSelfDecisionRefused(ctx context.Context, action string, req *storage.AccessRequest) {
+	meta := map[string]any{"request_id": req.ID.String(), "error_kind": "self_approval"}
+	if req.WorkflowID != nil {
+		meta["workflow_id"] = req.WorkflowID.String()
+	}
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:         "user:" + req.RequesterID,
+		Action:        action,
+		Resource:      "request:" + req.ID.String(),
+		Status:        storage.AuditStatusDenied,
+		CorrelationID: req.ID,
+		Metadata:      meta,
+	})
 }
 
 func (s *RequestService) auditAgentWrapRefused(ctx context.Context, action string, agentID, requestID, wrapID uuid.UUID, reason string) {
