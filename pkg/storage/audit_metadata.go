@@ -145,6 +145,15 @@ var auditMetaKeys = map[string]auditMetaKind{
 	"connectors_missing": metaNumber, "max_replicas": metaNumber, "max_inflight_tasks": metaNumber,
 	"enrollment_tokens_revoked": metaNumber, "observation_timeout_seconds": metaNumber,
 
+	// gateway observation queue (api#294): ids, enums, digests and counts only
+	"task_id": metaID, "attempt_id": metaID, "previous_attempt_id": metaID, "superseding_task_id": metaID,
+	"attempt_count": metaNumber, "failure_count": metaNumber, "tasks_cancelled": metaNumber, "tasks_requeued": metaNumber,
+	"version_source": metaToken, "release_reason": metaToken, "attempt_status": metaToken, "task_state": metaToken,
+	"verdict": metaToken, "verdict_reason": metaToken, "stage": metaToken, "reported_outcome": metaToken,
+	"cp_outcome": metaToken, "next": metaToken, "observation_source": metaToken,
+	"observation_source_before": metaToken, "observation_source_after": metaToken,
+	"stages": metaTokenList, "outcomes": metaTokenList, "linkages": metaTokenList,
+
 	// free-text errors: never stored
 	"error": metaErrorText, "sessions_revoke_err": metaErrorText, "wrap_refresh_errors": metaErrorText,
 }

@@ -463,41 +463,108 @@ func (r *Gateways) ConsumeTokenAndEnroll(ctx context.Context, tokenID uuid.UUID,
 	return gatewayID, nil
 }
 
-// Revoke sets the Gateway to revoked and revokes its unused enrollment
-// tokens in one transaction. Returns the number of tokens revoked.
-func (r *Gateways) Revoke(ctx context.Context, id uuid.UUID, by string, at time.Time) (int, error) {
+// GatewayRevokeOutcome is what Revoke and SetEnabled changed.
+type GatewayRevokeOutcome struct {
+	TokensRevoked int
+	// TasksRequeued is the number of leased observation tasks moved back
+	// to queued with their attempts closed as cancelled.
+	TasksRequeued int
+}
+
+// Revoke sets the Gateway to revoked, revokes its unused enrollment
+// tokens and moves its leased observation tasks back to queued (closing
+// those attempts, so a late result is refused), in one transaction.
+func (r *Gateways) Revoke(ctx context.Context, id uuid.UUID, by string, at time.Time) (*GatewayRevokeOutcome, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("storage: begin gateway revoke: %w", err)
+		return nil, fmt.Errorf("storage: begin gateway revoke: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var status GatewayStatus
 	err = tx.QueryRow(ctx, `SELECT status FROM gateways WHERE id = $1 FOR UPDATE`, id).Scan(&status)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, ErrNotFound
+		return nil, ErrNotFound
 	}
 	if err != nil {
-		return 0, fmt.Errorf("storage: lock gateway: %w", err)
+		return nil, fmt.Errorf("storage: lock gateway: %w", err)
 	}
 	if status == GatewayStatusRevoked {
-		return 0, ErrGatewayAlreadyRevoked
+		return nil, ErrGatewayAlreadyRevoked
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE gateways SET status = 'revoked', revoked_at = $2, revoked_by = NULLIF($3, '')
 		WHERE id = $1`, id, at, by); err != nil {
-		return 0, fmt.Errorf("storage: revoke gateway: %w", err)
+		return nil, fmt.Errorf("storage: revoke gateway: %w", err)
 	}
 	tag, err := tx.Exec(ctx, `
 		UPDATE gateway_enrollment_tokens SET revoked_at = $2, revoked_by = NULLIF($3, '')
 		WHERE gateway_id = $1 AND consumed_at IS NULL AND revoked_at IS NULL`, id, at, by)
 	if err != nil {
-		return 0, fmt.Errorf("storage: revoke gateway enrollment tokens: %w", err)
+		return nil, fmt.Errorf("storage: revoke gateway enrollment tokens: %w", err)
+	}
+	out := &GatewayRevokeOutcome{TokensRevoked: int(tag.RowsAffected())}
+	if out.TasksRequeued, err = requeueLeasedForGateway(ctx, tx, id, at); err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("storage: commit gateway revoke: %w", err)
+		return nil, fmt.Errorf("storage: commit gateway revoke: %w", err)
 	}
-	return int(tag.RowsAffected()), nil
+	return out, nil
+}
+
+// ErrGatewayStatusConflict: the Gateway cannot move to the asked state
+// (a revoked Gateway cannot be enabled or disabled).
+var ErrGatewayStatusConflict = errors.New("storage: gateway status does not allow this change")
+
+// SetEnabled disables or re-enables a Gateway. Disable sets disabled
+// (from pending, active or stale) and moves its leased observation tasks
+// back to queued, closing their attempts, in the same transaction.
+// Enable returns a disabled Gateway to active when it has a credential,
+// else to pending. changed is false when the Gateway was already in the
+// asked state.
+func (r *Gateways) SetEnabled(ctx context.Context, id uuid.UUID, enabled bool, at time.Time) (changed bool, out *GatewayRevokeOutcome, err error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return false, nil, fmt.Errorf("storage: begin gateway enable: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var status GatewayStatus
+	var hasSecret bool
+	err = tx.QueryRow(ctx, `SELECT status, secret_hash IS NOT NULL FROM gateways WHERE id = $1 FOR UPDATE`, id).Scan(&status, &hasSecret)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil, ErrNotFound
+	}
+	if err != nil {
+		return false, nil, fmt.Errorf("storage: lock gateway: %w", err)
+	}
+	out = &GatewayRevokeOutcome{}
+	switch {
+	case status == GatewayStatusRevoked:
+		return false, nil, ErrGatewayStatusConflict
+	case enabled && status != GatewayStatusDisabled, !enabled && status == GatewayStatusDisabled:
+		return false, out, nil
+	case enabled:
+		next := GatewayStatusPending
+		if hasSecret {
+			next = GatewayStatusActive
+		}
+		if _, err := tx.Exec(ctx, `UPDATE gateways SET status = $2, disabled_at = NULL WHERE id = $1`, id, next); err != nil {
+			return false, nil, fmt.Errorf("storage: enable gateway: %w", err)
+		}
+	default:
+		if _, err := tx.Exec(ctx, `UPDATE gateways SET status = 'disabled', disabled_at = $2 WHERE id = $1`, id, at); err != nil {
+			return false, nil, fmt.Errorf("storage: disable gateway: %w", err)
+		}
+		if out.TasksRequeued, err = requeueLeasedForGateway(ctx, tx, id, at); err != nil {
+			return false, nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, nil, fmt.Errorf("storage: commit gateway enable: %w", err)
+	}
+	return true, out, nil
 }
 
 // --- heartbeat ---------------------------------------------------------
@@ -903,18 +970,32 @@ func (r *Gateways) ListBindings(ctx context.Context, gatewayID *uuid.UUID) ([]*G
 	return out, rows.Err()
 }
 
-// DeleteBinding soft-deletes a live binding.
-func (r *Gateways) DeleteBinding(ctx context.Context, id uuid.UUID, at time.Time) error {
-	tag, err := r.pool.Exec(ctx, `
+// DeleteBinding soft-deletes a live binding and cancels its open
+// observation tasks (reason binding_removed) in one transaction.
+// Returns the tasks cancelled.
+func (r *Gateways) DeleteBinding(ctx context.Context, id uuid.UUID, at time.Time) ([]*ObservationTask, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("storage: begin delete gateway binding: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tag, err := tx.Exec(ctx, `
 		UPDATE gateway_connector_bindings SET deleted_at = $2, enabled = false
 		WHERE id = $1 AND deleted_at IS NULL`, id, at)
 	if err != nil {
-		return fmt.Errorf("storage: delete gateway binding: %w", err)
+		return nil, fmt.Errorf("storage: delete gateway binding: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return ErrNotFound
+		return nil, ErrNotFound
 	}
-	return nil
+	cancelled, err := cancelOpenTasks(ctx, tx, `t.binding_id = $1`, []any{id}, ObservationReasonBindingRemoved, at)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("storage: commit delete gateway binding: %w", err)
+	}
+	return cancelled, nil
 }
 
 // EnvironmentProject returns the project an environment belongs to.

@@ -52,6 +52,14 @@ type GitOpsStarter interface {
 	Start(ctx context.Context, request *storage.AccessRequest) error
 }
 
+// ObservationStarter is the Gateway observation path (api#294): it reads
+// an environment's observation source and starts Gateway tasks for a
+// request executed in a gateway environment.
+type ObservationStarter interface {
+	Source(ctx context.Context, envID *uuid.UUID) storage.ObservationSource
+	Start(ctx context.Context, request *storage.AccessRequest, job *storage.SyncJob) error
+}
+
 // RequestService orchestrates the patch-request lifecycle.
 type RequestService struct {
 	requests  storage.AccessRequestRepository
@@ -62,6 +70,7 @@ type RequestService struct {
 	audit     storage.AuditEventRepository
 	jobs      JobEnqueuer
 	gitops    GitOpsStarter
+	observer  ObservationStarter
 	// envs is optional. When non-nil, Submit / SubmitRead look up the
 	// environment row by (project_id, name) and populate both
 	// AccessRequest.EnvironmentID and Scope.EnvironmentKind. Slice L3
@@ -127,6 +136,16 @@ func NewRequestService(
 // for chaining. Pass nil to disable the integration.
 func (s *RequestService) WithGitOps(g GitOpsStarter) *RequestService {
 	s.gitops = g
+	return s
+}
+
+// WithGatewayObservation attaches the Gateway observation starter. With
+// it, OnJobCompleted reads the request environment's observation_source
+// once and starts exactly one observer: the control-plane poller
+// (GitOpsStarter) for control_plane, the Gateway for gateway, neither
+// for none.
+func (s *RequestService) WithGatewayObservation(o ObservationStarter) *RequestService {
+	s.observer = o
 	return s
 }
 
@@ -1446,15 +1465,51 @@ func (s *RequestService) OnJobCompleted(ctx context.Context, job *storage.SyncJo
 		},
 	})
 
-	// GitOps observation fan-out runs only on successful transition to
-	// `executed`. Failure is audited inside Start; we don't bubble it
-	// because the underlying request transition is already complete.
-	if s.gitops != nil && target == storage.AccessRequestStatusExecuted {
+	// Observation runs only on a successful transition to `executed`.
+	// Failure is audited inside the starters; it is not bubbled because
+	// the request transition is already complete.
+	if target == storage.AccessRequestStatusExecuted && (s.gitops != nil || s.observer != nil) {
 		req, err := s.requests.Get(ctx, *job.RequestID)
 		if err == nil && req != nil {
+			s.startObservation(ctx, req, job)
+		}
+	}
+}
+
+// startObservation is the single decision point between the two
+// observers (gateway control-plane design section 7, ADR 0001 section
+// 9): the environment's observation_source is read once and exactly one
+// of GitOpsService.Start and the Gateway starter runs, so a request
+// never gets both a gitops_observations row and a Gateway task.
+func (s *RequestService) startObservation(ctx context.Context, req *storage.AccessRequest, job *storage.SyncJob) {
+	src := storage.ObservationSourceControlPlane
+	if s.observer != nil {
+		src = s.observer.Source(ctx, req.EnvironmentID)
+	}
+	switch src {
+	case storage.ObservationSourceGateway:
+		if s.gitops != nil {
+			s.auditObservationSkipped(ctx, "request.gitops_observation_skipped", req, job, src, "source_gateway")
+		}
+		_ = s.observer.Start(ctx, req, job)
+	case storage.ObservationSourceNone:
+		s.auditObservationSkipped(ctx, "request.observation_skipped", req, job, src, "source_none")
+	default:
+		if s.gitops != nil {
 			_ = s.gitops.Start(ctx, req)
 		}
 	}
+}
+
+func (s *RequestService) auditObservationSkipped(ctx context.Context, action string, req *storage.AccessRequest, job *storage.SyncJob, src storage.ObservationSource, reason string) {
+	meta := map[string]any{"reason": reason, "request_id": req.ID.String(), "observation_source": string(src)}
+	if req.EnvironmentID != nil {
+		meta["environment_id"] = req.EnvironmentID.String()
+	}
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor: "system:request-lifecycle", Action: action, Resource: "request:" + req.ID.String(),
+		Status: storage.AuditStatusSuccess, CorrelationID: job.CorrelationID, Metadata: meta,
+	})
 }
 
 // enqueueRequestJob creates the sync_job that an agent will claim to

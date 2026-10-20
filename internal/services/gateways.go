@@ -73,7 +73,8 @@ type GatewayStore interface {
 	ListEnrollmentTokens(ctx context.Context, gatewayID uuid.UUID) ([]*storage.GatewayEnrollmentToken, error)
 	RevokeEnrollmentToken(ctx context.Context, id uuid.UUID, by string, at time.Time) error
 	ConsumeTokenAndEnroll(ctx context.Context, tokenID uuid.UUID, at time.Time, secretHash []byte) (uuid.UUID, error)
-	Revoke(ctx context.Context, id uuid.UUID, by string, at time.Time) (int, error)
+	Revoke(ctx context.Context, id uuid.UUID, by string, at time.Time) (*storage.GatewayRevokeOutcome, error)
+	SetEnabled(ctx context.Context, id uuid.UUID, enabled bool, at time.Time) (bool, *storage.GatewayRevokeOutcome, error)
 	RecordHeartbeat(ctx context.Context, hb storage.GatewayHeartbeat, at, seenSince time.Time) (*storage.GatewayHeartbeatOutcome, error)
 	ListReplicas(ctx context.Context, gatewayID uuid.UUID) ([]*storage.GatewayReplica, error)
 	ListConnectors(ctx context.Context, gatewayID uuid.UUID) ([]*storage.GatewayConnector, error)
@@ -83,7 +84,7 @@ type GatewayStore interface {
 	CreateBinding(ctx context.Context, b *storage.GatewayBinding) error
 	GetBinding(ctx context.Context, id uuid.UUID) (*storage.GatewayBinding, error)
 	ListBindings(ctx context.Context, gatewayID *uuid.UUID) ([]*storage.GatewayBinding, error)
-	DeleteBinding(ctx context.Context, id uuid.UUID, at time.Time) error
+	DeleteBinding(ctx context.Context, id uuid.UUID, at time.Time) ([]*storage.ObservationTask, error)
 	EnvironmentProject(ctx context.Context, envID uuid.UUID) (uuid.UUID, error)
 	SecretBoundToProject(ctx context.Context, secretID, projectID uuid.UUID) (bool, error)
 	ProviderConnectionExists(ctx context.Context, id uuid.UUID) (bool, error)
@@ -251,15 +252,20 @@ func (s *GatewayService) RevokeEnrollmentToken(ctx context.Context, id uuid.UUID
 	return nil
 }
 
-// Revoke revokes a Gateway and its unused tokens, then deletes the auth
-// cache entry so the next call is refused.
+// Revoke revokes a Gateway and its unused tokens, moves its leased
+// observation tasks back to queued (their attempts closed, so a late
+// result is refused), then deletes the auth cache entry so the next call
+// is refused.
 func (s *GatewayService) Revoke(ctx context.Context, id uuid.UUID, by, reason string) (*storage.Gateway, error) {
-	n, err := s.store.Revoke(ctx, id, by, s.now().UTC())
+	out, err := s.store.Revoke(ctx, id, by, s.now().UTC())
 	if err != nil {
 		return nil, err
 	}
 	s.invalidateSecretHashCache(ctx, id)
-	meta := map[string]any{"gateway_id": id.String(), "enrollment_tokens_revoked": n}
+	meta := map[string]any{
+		"gateway_id": id.String(), "enrollment_tokens_revoked": out.TokensRevoked,
+		"tasks_requeued": out.TasksRequeued,
+	}
 	if reason != "" {
 		meta["reason"] = reason
 	}
@@ -267,6 +273,32 @@ func (s *GatewayService) Revoke(ctx context.Context, id uuid.UUID, by, reason st
 		Actor: auditActor(ctx, by), Action: "gateway.revoke",
 		Resource: gatewayActor(id), Status: storage.AuditStatusSuccess, Metadata: meta,
 	})
+	return s.store.Get(ctx, id)
+}
+
+// SetEnabled disables or re-enables a Gateway (design section 9,
+// gateway.revoke). Disabling refuses the Gateway's next call with 401,
+// like revoke, and moves its leased observation tasks back to queued;
+// unlike revoke it can be undone and keeps the credential. The auth
+// cache entry is dropped either way.
+func (s *GatewayService) SetEnabled(ctx context.Context, id uuid.UUID, enabled bool, by string) (*storage.Gateway, error) {
+	changed, out, err := s.store.SetEnabled(ctx, id, enabled, s.now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	s.invalidateSecretHashCache(ctx, id)
+	if changed {
+		action := "gateway.enable"
+		meta := map[string]any{"gateway_id": id.String()}
+		if !enabled {
+			action = "gateway.disable"
+			meta["tasks_requeued"] = out.TasksRequeued
+		}
+		s.appendAudit(ctx, &storage.AuditEvent{
+			Actor: auditActor(ctx, by), Action: action,
+			Resource: gatewayActor(id), Status: storage.AuditStatusSuccess, Metadata: meta,
+		})
+	}
 	return s.store.Get(ctx, id)
 }
 
@@ -845,19 +877,26 @@ func (s *GatewayService) ListBindings(ctx context.Context, gatewayID *uuid.UUID)
 	return s.store.ListBindings(ctx, gatewayID)
 }
 
-// DeleteBinding soft-deletes a binding.
+// DeleteBinding soft-deletes a binding and cancels its open
+// observation tasks (reason binding_removed).
 func (s *GatewayService) DeleteBinding(ctx context.Context, id uuid.UUID, by string) error {
 	b, err := s.store.GetBinding(ctx, id)
 	if err != nil {
 		return err
 	}
-	if err := s.store.DeleteBinding(ctx, id, s.now().UTC()); err != nil {
+	cancelled, err := s.store.DeleteBinding(ctx, id, s.now().UTC())
+	if err != nil {
 		return err
 	}
 	s.appendAudit(ctx, &storage.AuditEvent{
 		Actor: auditActor(ctx, by), Action: "gateway.binding.delete", Resource: gatewayActor(b.GatewayID),
-		Status:   storage.AuditStatusSuccess,
-		Metadata: map[string]any{"binding_id": id.String(), "gateway_id": b.GatewayID.String()},
+		Status: storage.AuditStatusSuccess,
+		Metadata: map[string]any{
+			"binding_id": id.String(), "gateway_id": b.GatewayID.String(), "tasks_cancelled": len(cancelled),
+		},
 	})
+	for _, t := range cancelled {
+		auditTaskClosed(ctx, s.audit, auditActor(ctx, by), "observation.task.cancelled", t)
+	}
 	return nil
 }

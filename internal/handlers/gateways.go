@@ -37,6 +37,7 @@ import (
 // Gateways serves the Gateway machine and admin routes.
 type Gateways struct {
 	svc          *services.GatewayService
+	obs          *services.GatewayObservationService
 	requireHTTPS bool
 }
 

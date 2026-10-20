@@ -52,7 +52,8 @@ func newGatewayFixture(t *testing.T, opts ...func(*Config)) *gwFixture {
 	l := newLiveApp(t, opts...)
 	resetGatewayEnrollLimit(t)
 	t.Cleanup(func() {
-		_, _ = l.pool.Exec(context.Background(), `DELETE FROM gateway_connector_bindings; DELETE FROM gateways;`)
+		_, _ = l.pool.Exec(context.Background(), `TRUNCATE observation_evidence, observation_task_attempts, observation_tasks;
+			DELETE FROM gateway_connector_bindings; DELETE FROM gateways;`)
 	})
 	admin := uuid.New()
 	cookie := l.sessionFor(t, admin, "gw-admin-"+admin.String()[:8]+"@example.com")
@@ -764,6 +765,10 @@ func TestLive_Gateway_AdminRoutesNeedPermissionAndFreshMFA(t *testing.T) {
 		{http.MethodGet, "/api/v1/admin/gateway-bindings", "gateway.bind", false},
 		{http.MethodGet, "/api/v1/admin/gateways", "gateway.list", false},
 		{http.MethodGet, "/api/v1/admin/gateways/" + gw, "gateway.list", false},
+		// api#294
+		{http.MethodPut, "/api/v1/admin/gateways/" + gw + "/enabled", "gateway.revoke", true},
+		{http.MethodGet, "/api/v1/admin/gateways/" + gw + "/tasks", "gateway.list", false},
+		{http.MethodPut, "/api/v1/admin/environments/" + anyID + "/observation-source", "gateway.bind", true},
 	}
 	body := map[string]any{"name": "x", "boundary": "x"}
 
@@ -931,6 +936,11 @@ func TestLive_Gateway_MachineRoutesArePinned(t *testing.T) {
 		"POST /api/v1/gateways/enroll":        true,
 		"POST /api/v1/gateways/:id/heartbeat": true,
 		"PUT /api/v1/gateways/:id/catalog":    true,
+		// api#294
+		"POST /api/v1/gateways/:id/tasks/claim":            true,
+		"POST /api/v1/gateways/:id/tasks/:task_id/lease":   true,
+		"POST /api/v1/gateways/:id/tasks/:task_id/release": true,
+		"POST /api/v1/gateways/:id/tasks/:task_id/result":  true,
 	}
 	got := map[string]bool{}
 	for _, r := range f.l.app.GetRoutes(true) {
@@ -953,6 +963,9 @@ func TestLive_Gateway_MachineRoutesArePinned(t *testing.T) {
 		{http.MethodPost, "/api/v1/gateways/" + uuid.NewString() + "/heartbeat"},
 		{http.MethodPut, "/api/v1/gateways/" + uuid.NewString() + "/catalog"},
 		{http.MethodPost, "/api/v1/gateways/" + uuid.NewString() + "/tasks/claim"},
+		{http.MethodPost, "/api/v1/gateways/" + uuid.NewString() + "/tasks/" + uuid.NewString() + "/lease"},
+		{http.MethodPost, "/api/v1/gateways/" + uuid.NewString() + "/tasks/" + uuid.NewString() + "/release"},
+		{http.MethodPost, "/api/v1/gateways/" + uuid.NewString() + "/tasks/" + uuid.NewString() + "/result"},
 		{http.MethodGet, "/api/v1/gateways/" + uuid.NewString()},
 		{http.MethodPost, "/api/v1/gateways/not-a-uuid/heartbeat"},
 	} {

@@ -60,6 +60,9 @@ type Requests struct {
 	envNames  envNamer
 	connNames connNamer
 	userNames userNamer
+
+	// obs serves the request's Gateway evidence (api#294). Optional.
+	obs *services.GatewayObservationService
 }
 
 // Narrow name-lookup interfaces so the request-detail response can carry

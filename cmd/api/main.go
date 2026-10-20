@@ -444,6 +444,16 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// bound catalog row. Without them the direct-reveal and per-env
 	// request submits fail closed.
 	requestSvc.WithProjectBindings(projectSecretsRepo, secretsRepo)
+
+	// Gateway observation (api#294). OnJobCompleted reads the request
+	// environment's observation_source once and starts either the
+	// control-plane poller (GitOps, when enabled) or Gateway tasks, never
+	// both. The default source is control_plane, so nothing changes
+	// until an admin switches an environment to gateway.
+	observationSvc := services.NewGatewayObservationService(storage.NewObservationTasks(pool), auditRepo, services.GatewayObservationConfig{}).
+		WithProjectBindings(projectSecretsRepo, secretsRepo)
+	requestSvc.WithGatewayObservation(observationSvc)
+	requestsH.WithObservations(observationSvc)
 	revealSessionSvc.WithAllowlist(projectSecretsRepo, secretsRepo)
 	// API-S-20: GET /requests/:id/wraps/:wrap_id hands out a wrap of the
 	// reveal-session flow (direct reveal, or any wrap bundled in a
@@ -1364,7 +1374,12 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// behind the session gate, each with a gateway.* permission and a
 	// fresh second factor on every write.
 	gatewaySvc := services.NewGatewayService(storage.NewGateways(pool), auditRepo, rdb)
-	gatewaysH := handlers.NewGateways(gatewaySvc, cfg.Env != ModeDev)
+	gatewaysH := handlers.NewGateways(gatewaySvc, cfg.Env != ModeDev).WithObservations(observationSvc)
+	gatewayLimit := func(name string, limit int) fiber.Handler {
+		return middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
+			Name: name, Bucket: middleware.ByAuthenticatedGateway(), Limit: limit, Window: 60 * time.Second,
+		})
+	}
 	gatewayMachineRoutes{
 		auth: middleware.GatewayAuth(gatewaySvc),
 		enroll: hs(
@@ -1388,6 +1403,13 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 			middleware.BodyLimit(64<<10),
 			gatewaysH.Catalog,
 		),
+		// E4 to E7 (api#294), rate limited after GatewayAuth on the
+		// authenticated Gateway: claim allows 200 replicas polling every
+		// 5s; the others are per task and far below it.
+		claim:   hs(gatewayLimit("gateway:claim", 2400), middleware.BodyLimit(4<<10), gatewaysH.Claim),
+		lease:   hs(gatewayLimit("gateway:lease", 1200), middleware.BodyLimit(4<<10), gatewaysH.RenewLease),
+		release: hs(gatewayLimit("gateway:release", 1200), middleware.BodyLimit(4<<10), gatewaysH.Release),
+		result:  hs(gatewayLimit("gateway:result", 1200), middleware.BodyLimit(64<<10), gatewaysH.Result),
 	}.register(v1)
 
 	gatewayMint := auth.Require(auth.PermGatewayMint, rbacResolver)
@@ -1404,6 +1426,15 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Post("/admin/gateway-bindings", gatewayBind, requireMFA, gatewaysH.AdminCreateBinding)
 	v1.Get("/admin/gateway-bindings", gatewayBind, gatewaysH.AdminListBindings)
 	v1.Delete("/admin/gateway-bindings/:id", gatewayBind, requireMFA, gatewaysH.AdminDeleteBinding)
+	// api#294: disable or re-enable, a Gateway's tasks, and an
+	// environment's observation source (design section 9 permissions).
+	v1.Put("/admin/gateways/:id/enabled", gatewayRevoke, requireMFA, gatewaysH.AdminSetEnabled)
+	v1.Get("/admin/gateways/:id/tasks", gatewayList, gatewaysH.AdminTasks)
+	v1.Get("/admin/environments/:id/observation-source", gatewayBind, gatewaysH.AdminGetObservationSource)
+	v1.Put("/admin/environments/:id/observation-source", gatewayBind, requireMFA, gatewaysH.AdminSetObservationSource)
+	// The request page's Gateway evidence, behind the GET /requests/:id
+	// read check.
+	v1.Get("/requests/:id/observations", requestsH.Observations)
 
 	// Agent-side endpoints. The `/agents/:id` sub-group is gated by
 	// the AgentAuth middleware which validates X-Agent-Secret and

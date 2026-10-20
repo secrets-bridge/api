@@ -58,6 +58,7 @@ func newLiveApp(t *testing.T, opts ...func(*Config)) *liveApp {
 	t.Cleanup(pool.Close)
 
 	const wipe = `
+		TRUNCATE observation_evidence, observation_task_attempts, observation_tasks;
 		DELETE FROM gateway_connector_bindings;
 		DELETE FROM gateways;
 		DELETE FROM gitops_observations;
