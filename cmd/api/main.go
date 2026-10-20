@@ -1381,13 +1381,16 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Post("/admin/gateways/:id/connectors/:cid/approve", gatewayBind, requireMFA, gatewaysH.AdminApproveConnector)
 	v1.Post("/admin/gateway-enrollment-tokens/:id/revoke", gatewayMint, requireMFA, gatewaysH.AdminRevokeToken)
 	v1.Post("/admin/gateway-bindings", gatewayBind, requireMFA, gatewaysH.AdminCreateBinding)
-	v1.Get("/admin/gateway-bindings", gatewayBind, gatewaysH.AdminListBindings)
+	// api#298: the binding list and the observation source are metadata
+	// (no credential), so gateway.list reads them; every write stays on
+	// gateway.bind with a fresh second factor.
+	v1.Get("/admin/gateway-bindings", gatewayList, gatewaysH.AdminListBindings)
 	v1.Delete("/admin/gateway-bindings/:id", gatewayBind, requireMFA, gatewaysH.AdminDeleteBinding)
 	// api#294: disable or re-enable, a Gateway's tasks, and an
 	// environment's observation source (design section 9 permissions).
 	v1.Put("/admin/gateways/:id/enabled", gatewayRevoke, requireMFA, gatewaysH.AdminSetEnabled)
 	v1.Get("/admin/gateways/:id/tasks", gatewayList, gatewaysH.AdminTasks)
-	v1.Get("/admin/environments/:id/observation-source", gatewayBind, gatewaysH.AdminGetObservationSource)
+	v1.Get("/admin/environments/:id/observation-source", gatewayList, gatewaysH.AdminGetObservationSource)
 	v1.Put("/admin/environments/:id/observation-source", gatewayBind, requireMFA, gatewaysH.AdminSetObservationSource)
 	// The request page's Gateway evidence, behind the GET /requests/:id
 	// read check.

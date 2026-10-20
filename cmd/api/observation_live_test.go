@@ -364,12 +364,13 @@ type requestEvidence struct {
 	Rollup            string `json:"rollup"`
 	Label             string `json:"label"`
 	Tasks             []struct {
-		TaskID        string `json:"task_id"`
-		GatewayName   string `json:"gateway_name"`
-		State         string `json:"state"`
-		Verdict       string `json:"verdict"`
-		VerdictReason string `json:"verdict_reason"`
-		Stages        []struct {
+		TaskID         string `json:"task_id"`
+		GatewayName    string `json:"gateway_name"`
+		State          string `json:"state"`
+		Verdict        string `json:"verdict"`
+		VerdictReason  string `json:"verdict_reason"`
+		TimedOutAtRead bool   `json:"timed_out_at_read"`
+		Stages         []struct {
 			Stage       string         `json:"stage"`
 			Outcome     string         `json:"outcome"`
 			ObservedAt  time.Time      `json:"observed_at"`
@@ -1075,13 +1076,32 @@ func TestLive_Observation_OfflineGatewayTimesOut(t *testing.T) {
 		deadline_at = now() - interval '1 second' WHERE request_id = $1`, reqID); err != nil {
 		t.Fatal(err)
 	}
+	// The read shows the overdue task as timed out (api#297) but writes
+	// nothing: the row stays open and no audit row is added. Closing it
+	// is the worker's deadline sweeper.
+	before := f.taskRows(t, reqID)[0]
 	ev, body := f.requestEvidence(t, reqID)
 	if ev.Rollup != "timed_out" || ev.Tasks[0].State != "done" || ev.Tasks[0].Verdict != "timed_out" ||
-		ev.Tasks[0].VerdictReason != "gateway_unavailable" || len(ev.Tasks[0].Stages) != 0 {
-		t.Fatalf("after the deadline = %s; want timed_out, gateway_unavailable, no stage", body)
+		ev.Tasks[0].VerdictReason != "gateway_unavailable" || !ev.Tasks[0].TimedOutAtRead || len(ev.Tasks[0].Stages) != 0 {
+		t.Fatalf("after the deadline = %s; want timed_out, gateway_unavailable, timed_out_at_read, no stage", body)
 	}
-	if rows := f.l.auditRows(t, "observation.task.timed_out"); len(rows) != 1 {
-		t.Fatalf("observation.task.timed_out rows = %d; want 1", len(rows))
+	after := f.taskRows(t, reqID)[0]
+	if after.State != storage.ObservationTaskQueued || after.Verdict != storage.ObservationVerdictPending ||
+		after.VerdictReason != "" || after.TerminalAt != nil || !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("task row after the read = %s %s %q terminal %v updated %v (was %v); want unchanged", after.State,
+			after.Verdict, after.VerdictReason, after.TerminalAt, after.UpdatedAt, before.UpdatedAt)
+	}
+	if rows := f.l.auditRows(t, "observation.task.timed_out"); len(rows) != 0 {
+		t.Fatalf("observation.task.timed_out rows after a read = %d; want 0", len(rows))
+	}
+	// The sweeper's storage call closes the row the same way; the read
+	// then shows the stored verdict, no longer computed.
+	if closed, err := storage.NewObservationTasks(f.l.pool).ExpireDeadlines(ctx, time.Now(), &reqID, 10); err != nil || len(closed) != 1 {
+		t.Fatalf("sweep = %d, %v; want 1 closed", len(closed), err)
+	}
+	ev, body = f.requestEvidence(t, reqID)
+	if ev.Rollup != "timed_out" || ev.Tasks[0].State != "done" || ev.Tasks[0].VerdictReason != "gateway_unavailable" || ev.Tasks[0].TimedOutAtRead {
+		t.Fatalf("after the sweep = %s; want stored timed_out, gateway_unavailable, not computed", body)
 	}
 	// A claim never hands out a task past its deadline.
 	if code, _ := f.claim(t, uuid.NewString()); code != http.StatusNoContent {
@@ -1095,6 +1115,18 @@ func TestLive_Observation_OfflineGatewayTimesOut(t *testing.T) {
 	_, task := f.claim(t, f.replica)
 	if _, err := f.l.pool.Exec(ctx, `UPDATE observation_tasks SET deadline_at = now() - interval '1 second' WHERE request_id = $1`, req2); err != nil {
 		t.Fatal(err)
+	}
+	// A leased task past its deadline on a Gateway seen since: shown as
+	// deadline_reached, the lease untouched.
+	if code, body := f.heartbeat(t, f.gw.GatewayID, f.gw.GatewaySecret, f.replica); code != http.StatusOK {
+		t.Fatalf("heartbeat = %d %s", code, body)
+	}
+	ev, body = f.requestEvidence(t, req2)
+	if ev.Tasks[0].Verdict != "timed_out" || ev.Tasks[0].VerdictReason != "deadline_reached" || !ev.Tasks[0].TimedOutAtRead {
+		t.Fatalf("leased past the deadline = %s; want timed_out, deadline_reached, timed_out_at_read", body)
+	}
+	if tk := f.taskRows(t, req2)[0]; tk.State != storage.ObservationTaskLeased || tk.CurrentAttemptID == nil {
+		t.Fatalf("leased row after the read = %s attempt %v; want leased with its attempt", tk.State, tk.CurrentAttemptID)
 	}
 	if code, raw := f.post(t, task.TaskID, argoResult(task, f.gw.GatewayID, f.replica)); code != http.StatusConflict || errCode(t, raw) != "task_closed" {
 		t.Fatalf("result after the deadline = %d %s; want 409 task_closed", code, raw)

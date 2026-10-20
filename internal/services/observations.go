@@ -64,9 +64,9 @@ type ObservationStore interface {
 	Renew(ctx context.Context, gatewayID, taskID, attemptID uuid.UUID, lease time.Duration) (time.Time, error)
 	Release(ctx context.Context, gatewayID, taskID, attemptID uuid.UUID, reason string) (*storage.ObservationTask, bool, error)
 	BeginResult(ctx context.Context, gatewayID, taskID uuid.UUID) (*storage.ObservationResultTx, error)
-	ExpireDeadlines(ctx context.Context, now time.Time, requestID *uuid.UUID, limit int) ([]*storage.ObservationTask, error)
 	ListForRequest(ctx context.Context, requestID uuid.UUID) ([]*storage.ObservationTask, error)
 	ListForGateway(ctx context.Context, gatewayID uuid.UUID, state storage.ObservationTaskState, limit int) ([]*storage.ObservationTask, error)
+	CountForGateway(ctx context.Context, gatewayID uuid.UUID) (map[storage.ObservationTaskState]int, error)
 	LatestEvidence(ctx context.Context, taskIDs []uuid.UUID) ([]*storage.ObservationEvidence, error)
 }
 
@@ -1166,22 +1166,38 @@ func (s *GatewayObservationService) accept(ctx context.Context, rt *storage.Obse
 	return resp, nil
 }
 
-// ---- deadline sweep -------------------------------------------------------------------
+// ---- deadline view -------------------------------------------------------------------
 
-// ExpireDeadlines closes the open tasks past their deadline as
-// timed_out (one request when requestID is set) and audits each. The
-// worker sweeper (worker#38) runs the same storage call for every task;
-// the request read runs it for its own request so an offline Gateway
-// shows timed_out at once, never healthy.
-func (s *GatewayObservationService) ExpireDeadlines(ctx context.Context, requestID *uuid.UUID) ([]*storage.ObservationTask, error) {
-	tasks, err := s.store.ExpireDeadlines(ctx, s.now().UTC(), requestID, 500)
-	if err != nil {
-		return nil, err
+// Closing a task past its deadline is the worker's job: the
+// observation-deadlines sweeper (worker#39) runs
+// storage.ObservationTasks.ExpireDeadlines for every task and audits
+// observation.task.timed_out; a claim or result on such a task closes it
+// too. A read never writes. Between the deadline and the next sweep, or
+// when the api runs with SB_GATEWAY_ENABLED but the worker sweepers are
+// off, a read renders the overdue task as timed out instead (api#297),
+// so an offline Gateway never shows pending past its deadline.
+
+// timedOutAtRead returns the view of an open task whose deadline is at or
+// before now: done, timed_out, with the reason ExpireDeadlines would
+// write, and terminal at the deadline. The row is not changed. ok is
+// false for a task that is not open or not overdue.
+func timedOutAtRead(t *storage.ObservationTask, now time.Time) (view *storage.ObservationTask, ok bool) {
+	if t.State != storage.ObservationTaskQueued && t.State != storage.ObservationTaskLeased {
+		return t, false
 	}
-	for _, t := range tasks {
-		auditTaskClosed(ctx, s.audit, observationSystemActor, "observation.task.timed_out", t)
+	if t.DeadlineAt.After(now) {
+		return t, false
 	}
-	return tasks, nil
+	v := *t
+	v.State, v.Verdict = storage.ObservationTaskDone, storage.ObservationVerdictTimedOut
+	v.VerdictReason = storage.ObservationReasonDeadlineReached
+	if t.GatewayUnavailable {
+		v.VerdictReason = storage.ObservationReasonGatewayUnavailable
+	}
+	at := t.DeadlineAt
+	v.TerminalAt = &at
+	v.CurrentAttemptID, v.LeaseExpiresAt, v.LeasedReplicaID, v.LeasedAt = nil, nil, nil, nil
+	return &v, true
 }
 
 // ---- reads --------------------------------------------------------------------------
@@ -1234,21 +1250,29 @@ type RequestObservationView struct {
 	Rollup   string
 	Tasks    []*storage.ObservationTask
 	Evidence map[uuid.UUID][]*storage.ObservationEvidence
+	// TimedOutAtRead holds the tasks shown as timed out because their
+	// deadline passed while the row is still open (not yet swept).
+	TimedOutAtRead map[uuid.UUID]bool
 }
 
 // RequestObservations returns a request's Gateway tasks and their latest
-// accepted evidence per stage. Tasks past their deadline are closed as
-// timed_out first.
+// accepted evidence per stage. It never writes: an open task past its
+// deadline is shown as timed out without closing it (see timedOutAtRead).
 func (s *GatewayObservationService) RequestObservations(ctx context.Context, req *storage.AccessRequest) (*RequestObservationView, error) {
-	// Best effort: a failed sweep must not fail the read; the worker
-	// sweeper closes the task later.
-	_, _ = s.ExpireDeadlines(ctx, &req.ID)
-	tasks, err := s.store.ListForRequest(ctx, req.ID)
+	rows, err := s.store.ListForRequest(ctx, req.ID)
 	if err != nil {
 		return nil, err
 	}
-	ids := make([]uuid.UUID, 0, len(tasks))
-	for _, t := range tasks {
+	now := s.now().UTC()
+	tasks := make([]*storage.ObservationTask, 0, len(rows))
+	readTimedOut := map[uuid.UUID]bool{}
+	ids := make([]uuid.UUID, 0, len(rows))
+	for _, t := range rows {
+		v, ok := timedOutAtRead(t, now)
+		if ok {
+			readTimedOut[t.ID] = true
+		}
+		tasks = append(tasks, v)
 		ids = append(ids, t.ID)
 	}
 	evs, err := s.store.LatestEvidence(ctx, ids)
@@ -1257,7 +1281,7 @@ func (s *GatewayObservationService) RequestObservations(ctx context.Context, req
 	}
 	v := &RequestObservationView{
 		Rollup: RollupVerdict(tasks), Tasks: tasks,
-		Evidence: map[uuid.UUID][]*storage.ObservationEvidence{},
+		Evidence: map[uuid.UUID][]*storage.ObservationEvidence{}, TimedOutAtRead: readTimedOut,
 	}
 	for _, e := range evs {
 		v.Evidence[e.TaskID] = append(v.Evidence[e.TaskID], e)
@@ -1271,13 +1295,30 @@ func (s *GatewayObservationService) RequestObservations(ctx context.Context, req
 // GatewayTasks lists a Gateway's tasks for the admin page.
 func (s *GatewayObservationService) GatewayTasks(ctx context.Context, gatewayID uuid.UUID, state string, limit int) ([]*storage.ObservationTask, error) {
 	st := storage.ObservationTaskState(state)
-	if st != "" && !slices.Contains([]storage.ObservationTaskState{
-		storage.ObservationTaskQueued, storage.ObservationTaskLeased, storage.ObservationTaskDone,
-		storage.ObservationTaskDead, storage.ObservationTaskCancelled,
-	}, st) {
+	if st != "" && !slices.Contains(observationTaskStates, st) {
 		return nil, ErrObservationInvalidRequest
 	}
 	return s.store.ListForGateway(ctx, gatewayID, st, limit)
+}
+
+// GatewayTaskCounts returns the number of a Gateway's tasks in every
+// state, over all of its tasks; a state with none is 0.
+func (s *GatewayObservationService) GatewayTaskCounts(ctx context.Context, gatewayID uuid.UUID) (map[string]int, error) {
+	got, err := s.store.CountForGateway(ctx, gatewayID)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int, len(observationTaskStates))
+	for _, st := range observationTaskStates {
+		out[string(st)] = got[st]
+	}
+	return out, nil
+}
+
+// observationTaskStates is every task state, in lifecycle order.
+var observationTaskStates = []storage.ObservationTaskState{
+	storage.ObservationTaskQueued, storage.ObservationTaskLeased, storage.ObservationTaskDone,
+	storage.ObservationTaskDead, storage.ObservationTaskCancelled,
 }
 
 // ObservationLabel is how every Gateway-sourced line is labelled: what

@@ -85,8 +85,28 @@ type Gateway struct {
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 	// ReplicasSeen is the number of replicas seen within the window the
-	// list query was given. Not a column.
+	// List or GetView query was given. Not a column.
 	ReplicasSeen int
+	// OverPrivilegedAt is the latest heartbeat time of a replica, seen
+	// within the same window, whose last reported status is
+	// over_privileged. Nil when no such replica. Set by List and
+	// GetView. Not a column.
+	OverPrivilegedAt *time.Time
+}
+
+// OverPrivileged reports whether a replica seen within the window last
+// reported over_privileged.
+func (g *Gateway) OverPrivileged() bool { return g.OverPrivilegedAt != nil }
+
+// GatewayConnectorSummary is the compact connector line of the Gateway
+// list: no target ids, namespaces or names, only the count.
+type GatewayConnectorSummary struct {
+	ID          uuid.UUID
+	GatewayID   uuid.UUID
+	Name        string
+	Kind        string
+	Status      string
+	TargetCount int
 }
 
 // GatewayEnrollmentToken mirrors a gateway_enrollment_tokens row.
@@ -307,11 +327,36 @@ func (r *Gateways) GetAuth(ctx context.Context, id uuid.UUID) (GatewayStatus, []
 	return status, hash, nil
 }
 
+// gatewayReplicaRollup is the replica rollup List and GetView both
+// select after gatewayColumns, so the list and the detail count the same
+// way: replicas seen since $1, and the latest of those whose status is
+// over_privileged.
+const gatewayReplicaRollup = `,
+	(SELECT count(*) FROM gateway_replicas rp WHERE rp.gateway_id = g.id AND rp.last_seen_at > $1),
+	(SELECT max(rp.last_seen_at) FROM gateway_replicas rp
+	 WHERE rp.gateway_id = g.id AND rp.last_seen_at > $1 AND rp.status = 'over_privileged')`
+
+func scanGatewayWithRollup(row pgx.Row) (*Gateway, error) {
+	var n int
+	var op *time.Time
+	g, err := scanGateway(row, &n, &op)
+	if err != nil {
+		return nil, err
+	}
+	g.ReplicasSeen, g.OverPrivilegedAt = n, op
+	return g, nil
+}
+
+// GetView returns a Gateway with the same replica rollup as List.
+func (r *Gateways) GetView(ctx context.Context, id uuid.UUID, seenSince time.Time) (*Gateway, error) {
+	return scanGatewayWithRollup(r.pool.QueryRow(ctx,
+		`SELECT `+gatewayColumns+gatewayReplicaRollup+` FROM gateways g WHERE g.id = $2`, seenSince, id))
+}
+
 // List returns every Gateway, newest first, with the number of replicas
-// seen since seenSince.
+// seen since seenSince and the over_privileged rollup.
 func (r *Gateways) List(ctx context.Context, seenSince time.Time) ([]*Gateway, error) {
-	q := `SELECT ` + gatewayColumns + `,
-		(SELECT count(*) FROM gateway_replicas rp WHERE rp.gateway_id = g.id AND rp.last_seen_at > $1)
+	q := `SELECT ` + gatewayColumns + gatewayReplicaRollup + `
 		FROM gateways g ORDER BY g.created_at DESC, g.id`
 	rows, err := r.pool.Query(ctx, q, seenSince)
 	if err != nil {
@@ -320,12 +365,10 @@ func (r *Gateways) List(ctx context.Context, seenSince time.Time) ([]*Gateway, e
 	defer rows.Close()
 	var out []*Gateway
 	for rows.Next() {
-		var n int
-		g, err := scanGateway(rows, &n)
+		g, err := scanGatewayWithRollup(rows)
 		if err != nil {
 			return nil, err
 		}
-		g.ReplicasSeen = n
 		out = append(out, g)
 	}
 	return out, rows.Err()
@@ -713,6 +756,26 @@ func listGatewayConnectors(ctx context.Context, q querier, gatewayID uuid.UUID) 
 // ListConnectors returns a Gateway's connectors by name.
 func (r *Gateways) ListConnectors(ctx context.Context, gatewayID uuid.UUID) ([]*GatewayConnector, error) {
 	return listGatewayConnectors(ctx, r.pool, gatewayID)
+}
+
+// ListConnectorSummaries returns every Gateway's connectors, by Gateway
+// then name, as kind, status and advertised target count.
+func (r *Gateways) ListConnectorSummaries(ctx context.Context) ([]*GatewayConnectorSummary, error) {
+	rows, err := r.pool.Query(ctx, `SELECT id, gateway_id, name, kind, status, jsonb_array_length(advertised_targets)
+		FROM gateway_connectors ORDER BY gateway_id, name`)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list gateway connector summaries: %w", err)
+	}
+	defer rows.Close()
+	var out []*GatewayConnectorSummary
+	for rows.Next() {
+		var c GatewayConnectorSummary
+		if err := rows.Scan(&c.ID, &c.GatewayID, &c.Name, &c.Kind, &c.Status, &c.TargetCount); err != nil {
+			return nil, fmt.Errorf("storage: scan gateway connector summary: %w", err)
+		}
+		out = append(out, &c)
+	}
+	return out, rows.Err()
 }
 
 // GetConnector returns one connector by id.
