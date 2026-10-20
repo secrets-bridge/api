@@ -295,8 +295,31 @@ type gatewayView struct {
 	EnrolledAt       *string  `json:"enrolled_at,omitempty"`
 	RevokedAt        *string  `json:"revoked_at,omitempty"`
 	ReplicasSeen     int      `json:"replicas_seen"`
-	CreatedBy        string   `json:"created_by"`
-	CreatedAt        string   `json:"created_at"`
+	// OverPrivileged is true while a replica seen in the replica window
+	// last reported over_privileged; OverPrivilegedReportedAt is that
+	// replica's latest heartbeat (api#298). The console alerts on this
+	// flag instead of deriving it from last_status.
+	OverPrivileged           bool    `json:"over_privileged"`
+	OverPrivilegedReportedAt *string `json:"over_privileged_reported_at,omitempty"`
+	CreatedBy                string  `json:"created_by"`
+	CreatedAt                string  `json:"created_at"`
+}
+
+// gatewayConnectorSummaryView is a connector line of GET /admin/gateways:
+// kind, status and target count, no target ids or names (api#298).
+type gatewayConnectorSummaryView struct {
+	ID          string `json:"id"`
+	ConnectorID string `json:"connector_id"`
+	Kind        string `json:"kind"`
+	Status      string `json:"status"`
+	TargetCount int    `json:"target_count"`
+}
+
+// gatewayListItem is one GET /admin/gateways item: the Gateway view plus
+// its connector summary.
+type gatewayListItem struct {
+	gatewayView
+	Connectors []gatewayConnectorSummaryView `json:"connectors"`
 }
 
 func toGatewayView(g *storage.Gateway) gatewayView {
@@ -307,7 +330,8 @@ func toGatewayView(g *storage.Gateway) gatewayView {
 		CatalogVersion: g.CatalogVersion, CatalogUpdatedAt: timePtr(g.CatalogUpdatedAt),
 		LastSeenAt: timePtr(g.LastSeenAt), LastStatus: g.LastStatus,
 		EnrolledAt: timePtr(g.EnrolledAt), RevokedAt: timePtr(g.RevokedAt),
-		ReplicasSeen: g.ReplicasSeen, CreatedBy: g.CreatedBy, CreatedAt: g.CreatedAt.UTC().Format(time.RFC3339),
+		ReplicasSeen: g.ReplicasSeen, OverPrivileged: g.OverPrivileged(), OverPrivilegedReportedAt: timePtr(g.OverPrivilegedAt),
+		CreatedBy: g.CreatedBy, CreatedAt: g.CreatedAt.UTC().Format(time.RFC3339),
 	}
 }
 
@@ -546,15 +570,27 @@ func validReason(s string) bool {
 	return true
 }
 
-// AdminList handles GET /admin/gateways (gateway.list).
+// AdminList handles GET /admin/gateways (gateway.list). Each item carries
+// a compact connector summary, so the console needs no detail call per
+// Gateway.
 func (h *Gateways) AdminList(c fiber.Ctx) error {
 	gs, err := h.svc.List(c.Context())
 	if err != nil {
 		return err
 	}
-	items := make([]gatewayView, 0, len(gs))
+	conns, err := h.svc.ConnectorSummaries(c.Context())
+	if err != nil {
+		return err
+	}
+	items := make([]gatewayListItem, 0, len(gs))
 	for _, g := range gs {
-		items = append(items, toGatewayView(g))
+		it := gatewayListItem{gatewayView: toGatewayView(g), Connectors: []gatewayConnectorSummaryView{}}
+		for _, cn := range conns[g.ID] {
+			it.Connectors = append(it.Connectors, gatewayConnectorSummaryView{
+				ID: cn.ID.String(), ConnectorID: cn.Name, Kind: cn.Kind, Status: cn.Status, TargetCount: cn.TargetCount,
+			})
+		}
+		items = append(items, it)
 	}
 	return c.JSON(fiber.Map{"items": items})
 }
@@ -680,8 +716,9 @@ func (h *Gateways) AdminCreateBinding(c fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(toBindingView(b))
 }
 
-// AdminListBindings handles GET /admin/gateway-bindings (gateway.bind),
-// optionally filtered by ?gateway_id=.
+// AdminListBindings handles GET /admin/gateway-bindings (gateway.list;
+// binding writes stay on gateway.bind), optionally filtered by
+// ?gateway_id=.
 func (h *Gateways) AdminListBindings(c fiber.Ctx) error {
 	var filter *uuid.UUID
 	if raw := c.Query("gateway_id"); raw != "" {

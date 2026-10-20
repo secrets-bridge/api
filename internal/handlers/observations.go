@@ -274,17 +274,26 @@ func (h *Gateways) AdminTasks(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	// counts covers every task of the Gateway per state, not only the
+	// returned page or the ?state= filter (api#298).
+	counts, err := h.obs.GatewayTaskCounts(c.Context(), id)
+	if err != nil {
+		return err
+	}
+	total := 0
+	for _, n := range counts {
+		total += n
+	}
 	items := make([]observationTaskView, 0, len(tasks))
-	counts := map[string]int{}
 	for _, t := range tasks {
 		items = append(items, toObservationTaskView(t))
-		counts[string(t.State)]++
 	}
-	return c.JSON(fiber.Map{"items": items, "counts": counts})
+	return c.JSON(fiber.Map{"items": items, "counts": counts, "total": total})
 }
 
 // AdminGetObservationSource handles GET
-// /admin/environments/:id/observation-source (gateway.bind).
+// /admin/environments/:id/observation-source (gateway.list; the PUT stays
+// on gateway.bind).
 func (h *Gateways) AdminGetObservationSource(c fiber.Ctx) error {
 	id, err := pathUUID(c, "id")
 	if err != nil {
@@ -357,6 +366,10 @@ type requestObservationTaskBody struct {
 	CreatedAt      string                     `json:"created_at"`
 	TerminalAt     *string                    `json:"terminal_at,omitempty"`
 	Stages         []services.EvidenceDisplay `json:"stages"`
+	// TimedOutAtRead is true when the task is shown as timed out because
+	// its deadline passed and the deadline sweeper has not closed the row
+	// yet (api#297). The read does not write.
+	TimedOutAtRead bool `json:"timed_out_at_read,omitempty"`
 }
 
 // Observations handles GET /requests/:id/observations: the request's
@@ -391,7 +404,7 @@ func (h *Requests) Observations(c fiber.Ctx) error {
 			State: string(t.State), Verdict: string(t.Verdict), VerdictReason: t.VerdictReason,
 			ExpectedStages: t.ExpectedStages, VersionSource: t.VersionSource, AttemptCount: t.AttemptCount,
 			DeadlineAt: t.DeadlineAt.UTC().Format(time.RFC3339), CreatedAt: t.CreatedAt.UTC().Format(time.RFC3339),
-			TerminalAt: timePtr(t.TerminalAt), Stages: []services.EvidenceDisplay{},
+			TerminalAt: timePtr(t.TerminalAt), TimedOutAtRead: v.TimedOutAtRead[t.ID], Stages: []services.EvidenceDisplay{},
 		}
 		for _, e := range v.Evidence[t.ID] {
 			b.Stages = append(b.Stages, services.DisplayEvidence(e, t.ConnectorRefs))
