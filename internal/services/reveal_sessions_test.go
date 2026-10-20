@@ -87,7 +87,7 @@ func seedUATEnvWithRule(t *testing.T, h *revealHarness, projectSlug string, ttlS
 		t.Fatalf("env Create: %v", err)
 	}
 	wf := &storage.WorkflowDefinition{
-		Name: projectSlug + "-wf", MinApprovers: 0, AllowSelfApproval: true,
+		Name: projectSlug + "-wf", MinApprovers: 0,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
 	}

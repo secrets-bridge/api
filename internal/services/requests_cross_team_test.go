@@ -317,7 +317,7 @@ func TestSubmitCrossTeam_RejectsMinApproversGreaterThanOne(t *testing.T) {
 	ctx := t.Context()
 	// Custom workflow + a policy that selects it for our scope.
 	wf := &storage.WorkflowDefinition{
-		Name: "ct-strict", MinApprovers: 2, AllowSelfApproval: false,
+		Name: "ct-strict", MinApprovers: 2,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour,
 		FillTTLSeconds: 7200, Enabled: true,
@@ -591,7 +591,7 @@ func TestVerify_SourceApproveStillNeedsSecurityWhenRequired(t *testing.T) {
 	ctx := t.Context()
 	// Custom workflow requiring security approval.
 	wf := &storage.WorkflowDefinition{
-		Name: "ct-prod-sec", MinApprovers: 1, AllowSelfApproval: false,
+		Name: "ct-prod-sec", MinApprovers: 1,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour,
 		FillTTLSeconds: 86400, RequiresSecurityApproval: true, Enabled: true,

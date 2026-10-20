@@ -1129,8 +1129,8 @@ func (s *RequestService) AuditUnsealedWrapRefused(ctx context.Context, action st
 // auditSelfDecisionRefused records a requester trying to approve or
 // reject their own request. Separation of duties is not a workflow
 // setting: it is refused whatever the workflow or the caller's role
-// says, Admin included, and the stored allow_self_approval flag is
-// ignored. Ids only, no values.
+// says, Admin included. allow_self_approval is not read (migration
+// 0045 cleared every stored value). Ids only, no values.
 func (s *RequestService) auditSelfDecisionRefused(ctx context.Context, action string, req *storage.AccessRequest) {
 	meta := map[string]any{"request_id": req.ID.String(), "error_kind": "self_approval"}
 	if req.WorkflowID != nil {

@@ -183,7 +183,7 @@ func bootstrapRevealBinding(t *testing.T) *revealBindingFx {
 	// Policy: direct reveal allowed on tenant-a/uat (never reachable on
 	// prod — Gate 1 refuses before the policy lookup).
 	wf := &storage.WorkflowDefinition{
-		Name: "rb-uat-wf", MinApprovers: 1, AllowSelfApproval: false,
+		Name: "rb-uat-wf", MinApprovers: 1,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
 	}
@@ -206,7 +206,7 @@ func bootstrapRevealBinding(t *testing.T) *revealBindingFx {
 	// Policy: tenant-a/prod gets a stricter workflow of its own, so a
 	// test can tell which environment's workflow a request was given.
 	prodWF := &storage.WorkflowDefinition{
-		Name: "rb-prod-wf", MinApprovers: 2, AllowSelfApproval: false,
+		Name: "rb-prod-wf", MinApprovers: 2,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
 	}

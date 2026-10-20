@@ -62,7 +62,7 @@ func seedDirectRevealRule(t *testing.T, pool *storage.Pool, workflows *storage.W
 	ctx := t.Context()
 	suffix := projectID.String()[:8]
 	wf := &storage.WorkflowDefinition{
-		Name: "dr-allowlist-wf-" + suffix, MinApprovers: 0, AllowSelfApproval: true,
+		Name: "dr-allowlist-wf-" + suffix, MinApprovers: 0,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
 	}

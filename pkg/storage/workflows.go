@@ -24,7 +24,6 @@ type WorkflowDefinition struct {
 	WrapTTLClaimed       time.Duration
 	RequestTTL           time.Duration
 	RequireJustification bool
-	AllowSelfApproval    bool
 	NotificationChannels []string
 	IsDefault            bool
 	Enabled              bool
@@ -124,24 +123,24 @@ func (r *Workflows) Create(ctx context.Context, w *WorkflowDefinition) error {
 		INSERT INTO workflow_definitions (
 		    name, description, min_approvers, approver_role_id,
 		    wrap_ttl_created, wrap_ttl_approved, wrap_ttl_claimed,
-		    request_ttl, require_justification, allow_self_approval,
+		    request_ttl, require_justification,
 		    notification_channels, is_default, enabled, is_system,
 		    fill_ttl_seconds, requires_security_approval,
 		    scoped_policy_authorable
 		) VALUES (
 		    $1, $2, $3, $4,
 		    $5::interval, $6::interval, $7::interval,
-		    $8::interval, $9, $10,
-		    $11, $12, $13, $14,
-		    $15, $16,
-		    $17
+		    $8::interval, $9,
+		    $10, $11, $12, $13,
+		    $14, $15,
+		    $16
 		)
 		RETURNING id, created_at, updated_at`
 	return r.pool.QueryRow(ctx, q,
 		w.Name, w.Description, w.MinApprovers, w.ApproverRoleID,
 		intervalString(w.WrapTTLCreated), intervalString(w.WrapTTLApproved),
 		intervalString(w.WrapTTLClaimed),
-		intervalString(w.RequestTTL), w.RequireJustification, w.AllowSelfApproval,
+		intervalString(w.RequestTTL), w.RequireJustification,
 		channels, w.IsDefault, w.Enabled, w.IsSystem,
 		w.FillTTLSeconds, w.RequiresSecurityApproval,
 		w.ScopedPolicyAuthorable,
@@ -253,18 +252,17 @@ func (r *Workflows) Update(ctx context.Context, w *WorkflowDefinition) error {
 		    wrap_ttl_claimed = $7::interval,
 		    request_ttl = $8::interval,
 		    require_justification = $9,
-		    allow_self_approval = $10,
-		    notification_channels = $11,
-		    enabled = $12,
-		    fill_ttl_seconds = $13,
-		    requires_security_approval = $14,
-		    scoped_policy_authorable = $15
+		    notification_channels = $10,
+		    enabled = $11,
+		    fill_ttl_seconds = $12,
+		    requires_security_approval = $13,
+		    scoped_policy_authorable = $14
 		WHERE id = $1`
 	tag, err := r.pool.Exec(ctx, q,
 		w.ID, w.Description, w.MinApprovers, w.ApproverRoleID,
 		intervalString(w.WrapTTLCreated), intervalString(w.WrapTTLApproved),
 		intervalString(w.WrapTTLClaimed),
-		intervalString(w.RequestTTL), w.RequireJustification, w.AllowSelfApproval,
+		intervalString(w.RequestTTL), w.RequireJustification,
 		channels, w.Enabled,
 		w.FillTTLSeconds, w.RequiresSecurityApproval,
 		w.ScopedPolicyAuthorable,
@@ -348,7 +346,7 @@ const workflowSelect = `
 	       EXTRACT(EPOCH FROM wrap_ttl_approved)::bigint,
 	       EXTRACT(EPOCH FROM wrap_ttl_claimed)::bigint,
 	       EXTRACT(EPOCH FROM request_ttl)::bigint,
-	       require_justification, allow_self_approval,
+	       require_justification,
 	       notification_channels, is_default, enabled, is_system,
 	       fill_ttl_seconds, requires_security_approval,
 	       scoped_policy_authorable,
@@ -368,7 +366,7 @@ func scanWorkflow(row interface {
 	err := row.Scan(
 		&w.ID, &w.Name, &w.Description, &w.MinApprovers, &approverRoleID,
 		&wrapCreated, &wrapApproved, &wrapClaim, &requestTTL,
-		&w.RequireJustification, &w.AllowSelfApproval,
+		&w.RequireJustification,
 		&channelsRaw, &w.IsDefault, &w.Enabled, &w.IsSystem,
 		&w.FillTTLSeconds, &w.RequiresSecurityApproval,
 		&w.ScopedPolicyAuthorable,
@@ -396,14 +394,4 @@ func scanWorkflow(row interface {
 // intervalString renders a Go duration as Postgres interval input.
 func intervalString(d time.Duration) string {
 	return fmt.Sprintf("%d seconds", int64(d.Seconds()))
-}
-
-// CountWorkflowsAllowingSelfApproval counts workflows whose stored
-// allow_self_approval is still true. The flag is no longer honoured
-// (a requester can never approve their own request); the api logs the
-// count at boot so operators know which saved setting stopped working.
-func CountWorkflowsAllowingSelfApproval(ctx context.Context, pool *Pool) (int, error) {
-	var n int
-	err := pool.QueryRow(ctx, `SELECT count(*) FROM workflow_definitions WHERE allow_self_approval`).Scan(&n)
-	return n, err
 }

@@ -109,7 +109,7 @@ func TestResolve_ExactMatchPolicyTakesPrecedence(t *testing.T) {
 	// Create a stricter workflow for prod environments.
 	strict := &storage.WorkflowDefinition{
 		Name: "strict-prod", Description: "Two approvers, no self-approve",
-		MinApprovers: 2, AllowSelfApproval: false,
+		MinApprovers: 2,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour,
 		RequireJustification: true, Enabled: true,
@@ -201,7 +201,7 @@ func TestResolve_PartialMatchDoesNotApply(t *testing.T) {
 	engine, _, policies, workflows := bootstrapPolicy(t)
 	ctx := t.Context()
 	wf := &storage.WorkflowDefinition{
-		Name: "strict", MinApprovers: 2, AllowSelfApproval: false,
+		Name: "strict", MinApprovers: 2,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
 	}
@@ -304,7 +304,7 @@ func TestResolve_DecisionCarriesAccessFields(t *testing.T) {
 	ctx := t.Context()
 
 	wf := &storage.WorkflowDefinition{
-		Name: "uat-direct-wf", MinApprovers: 0, AllowSelfApproval: true,
+		Name: "uat-direct-wf", MinApprovers: 0,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
 	}
@@ -353,7 +353,7 @@ func TestResolve_ProdInvariantZerosDirectReveal(t *testing.T) {
 	ctx := t.Context()
 
 	wf := &storage.WorkflowDefinition{
-		Name: "lax-wf-on-prod", MinApprovers: 1, AllowSelfApproval: true,
+		Name: "lax-wf-on-prod", MinApprovers: 1,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
 	}
@@ -419,7 +419,7 @@ func TestResolve_KindUnsetSkipsInvariant(t *testing.T) {
 	ctx := t.Context()
 
 	wf := &storage.WorkflowDefinition{
-		Name: "kind-unset-wf", MinApprovers: 1, AllowSelfApproval: true,
+		Name: "kind-unset-wf", MinApprovers: 1,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
 	}
@@ -555,7 +555,7 @@ func revealPolicyFixture(t *testing.T, workflows *storage.Workflows, policies *s
 	t.Helper()
 	ctx := t.Context()
 	wf := &storage.WorkflowDefinition{
-		Name: name + "-wf", MinApprovers: 0, AllowSelfApproval: true,
+		Name: name + "-wf", MinApprovers: 0,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
 	}
@@ -643,7 +643,7 @@ func TestResolve_DirectRevealDeniedWhenFlagFalse(t *testing.T) {
 	engine, _, policies, workflows := bootstrapPolicy(t)
 	ctx := t.Context()
 	wf := &storage.WorkflowDefinition{
-		Name: "no-reveal-wf", MinApprovers: 0, AllowSelfApproval: true,
+		Name: "no-reveal-wf", MinApprovers: 0,
 		WrapTTLCreated: 24 * time.Hour, WrapTTLApproved: time.Hour,
 		WrapTTLClaimed: 5 * time.Minute, RequestTTL: 7 * 24 * time.Hour, Enabled: true,
 	}
