@@ -91,16 +91,22 @@ const (
 // handles requests executed in the environment (design section 7).
 type ObservationSource string
 
-// Observation sources.
+// Observation sources. The Gateway is the only observer; none is the
+// default.
 const (
-	ObservationSourceControlPlane ObservationSource = "control_plane"
-	ObservationSourceGateway      ObservationSource = "gateway"
-	ObservationSourceNone         ObservationSource = "none"
+	ObservationSourceGateway ObservationSource = "gateway"
+	ObservationSourceNone    ObservationSource = "none"
 )
+
+// ObservationSourceRetiredControlPlane is the retired control_plane
+// source: the control-plane Argo CD poller it selected was removed
+// (secrets-bridge/gateway#13). Migration 0049 moved every environment
+// off it and the schema refuses it. It is never valid.
+const ObservationSourceRetiredControlPlane ObservationSource = "control_plane"
 
 // Valid reports whether s is a stored observation source.
 func (s ObservationSource) Valid() bool {
-	return s == ObservationSourceControlPlane || s == ObservationSourceGateway || s == ObservationSourceNone
+	return s == ObservationSourceGateway || s == ObservationSourceNone
 }
 
 // Attempt outcomes (observation_task_attempts.outcome).

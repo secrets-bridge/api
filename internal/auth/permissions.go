@@ -122,7 +122,7 @@ const (
 	PermSecretList Permission = "secret.list"
 	PermAuditRead  Permission = "audit.read"
 
-	// Integrations (gated by SB_GITOPS_ENABLED) ------------------------
+	// Integrations: provider connections ---------------------------------
 	PermIntegrationEdit Permission = "integration.edit"
 
 	// EPIC Q (api#99) — scoped self-service binding of platform-approved
@@ -184,7 +184,7 @@ var Catalog = []Descriptor{
 	{PermSecretList, "Observability", "List discovered secrets (metadata only, never values)."},
 	{PermAuditRead, "Observability", "Read the immutable audit event log."},
 
-	{PermIntegrationEdit, "Integrations", "Manage ArgoCD endpoints and GitOps application mappings (when SB_GITOPS_ENABLED is set), and the provider connection lifecycle: create, update, delete, discover now and bindings."},
+	{PermIntegrationEdit, "Integrations", "Manage the provider connection lifecycle: create, update, delete, discover now and bindings."},
 	{PermIntegrationBind, "Integrations", "Bind or unbind self-service-bindable provider connections on projects and environments you cover. NOT auto-covered by integration.edit server-side; grant explicitly (e.g. via the provider_connection_binder seed role)."},
 
 	{PermAuthSSOEdit, "Authentication", "Connect and manage sign-in providers such as Google, and set the install's public address. Global only, and every change also needs a fresh second factor: whoever holds it decides who can sign in."},

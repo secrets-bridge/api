@@ -639,7 +639,7 @@ func TestHygiene_NoStore_SecretBearingResponses(t *testing.T) {
 // deliberate exception is the static permission catalog, which keeps
 // its public cache header for authenticated callers.
 func TestHygiene_NoStore_EveryV1Route(t *testing.T) {
-	fx := newHygFixture(t, Config{GitOpsEnabled: true, AllowDirectAgentMint: true}, nil)
+	fx := newHygFixture(t, Config{AllowDirectAgentMint: true}, nil)
 	id := uuid.NewString()
 	seen := 0
 	for _, rt := range fx.app.GetRoutes(true) {
@@ -680,171 +680,22 @@ func TestHygiene_NoStore_EveryV1Route(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------
-// API-S-22: ArgoCD base URL scheme
-// ---------------------------------------------------------------------
-
-func hygArgoBody(baseURL string) map[string]any {
-	return map[string]any{
-		"name":      hygName("hyg-argocd"),
-		"base_url":  baseURL,
-		"token_b64": base64.StdEncoding.EncodeToString([]byte("hyg-fake-argocd-token")),
-	}
-}
-
-func TestHygiene_ArgoCD_BaseURLSchemeByEnv(t *testing.T) {
-	km := newHygKMS(t)
-	prod := newHygFixture(t, Config{Env: ModeProduction, GitOpsEnabled: true}, km)
-	dev := newHygFixture(t, Config{Env: ModeDev, GitOpsEnabled: true}, km)
-	flagged := newHygFixture(t, Config{Env: ModeProduction, GitOpsEnabled: true, AllowInsecureArgoCDAddr: true}, km)
-
-	cases := []struct {
-		name string
-		fx   *hygFixture
-		url  string
-		want int
-	}{
-		{"prod http refused", prod, "http://argocd.example.com", http.StatusBadRequest},
-		{"prod http in-cluster refused", prod, "http://argocd-server.argocd.svc", http.StatusBadRequest},
-		{"prod https accepted", prod, "https://argocd.example.com", http.StatusCreated},
-		{"prod https in-cluster accepted", prod, "https://argocd-server.argocd.svc.cluster.local", http.StatusCreated},
-		{"prod malformed refused", prod, "ftp://argocd.example.com", http.StatusBadRequest},
-		{"prod no host refused", prod, "https://", http.StatusBadRequest},
-		{"prod user info refused", prod, "https://admin:pw@argocd.example.com", http.StatusBadRequest},
-		{"prod user only refused", prod, "https://admin@argocd.example.com", http.StatusBadRequest},
-		{"prod query refused", prod, "https://argocd.example.com/?token=abc", http.StatusBadRequest},
-		{"prod empty query refused", prod, "https://argocd.example.com/?", http.StatusBadRequest},
-		{"prod fragment refused", prod, "https://argocd.example.com/#x", http.StatusBadRequest},
-		{"dev user info refused", dev, "http://admin:pw@argocd-server.argocd.svc", http.StatusBadRequest},
-		{"prod https with port and path accepted", prod, "https://argocd.example.com:8443/argocd", http.StatusCreated},
-		{"dev http accepted", dev, "http://argocd-server.argocd.svc", http.StatusCreated},
-		{"dev https accepted", dev, "https://argocd.example.com", http.StatusCreated},
-		{"prod+flag http accepted", flagged, "http://argocd-server.argocd.svc", http.StatusCreated},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			admin := tc.fx.user(t, "argo-admin", auth.PermIntegrationEdit)
-			r := tc.fx.do(t, http.MethodPost, "/api/v1/argocd-endpoints", admin, hygArgoBody(tc.url))
-			if r.status != tc.want {
-				t.Fatalf("POST %s: status = %d; want %d (%s)", tc.url, r.status, tc.want, r.body)
-			}
-			if tc.want == http.StatusBadRequest {
-				hygAssertNoLeak(t, tc.name, r, "hyg-fake-argocd-token")
-				if !strings.Contains(r.body, "base_url") {
-					t.Errorf("refusal should name base_url: %s", r.body)
-				}
-			}
-		})
-	}
-}
-
-// A row written before the check (an http:// base URL in production)
-// must not be used to send the bearer token in clear text.
-func TestHygiene_ArgoCD_LegacyHTTPRowNotUsedInProduction(t *testing.T) {
-	var hits atomic.Int32
-	var sawAuth atomic.Bool
-	argo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
-		if r.Header.Get("Authorization") != "" {
-			sawAuth.Store(true)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"items":[]}`))
-	}))
-	t.Cleanup(argo.Close)
-
-	km := newHygKMS(t)
-	dev := newHygFixture(t, Config{Env: ModeDev, GitOpsEnabled: true}, km)
-	prod := newHygFixture(t, Config{Env: ModeProduction, GitOpsEnabled: true}, km)
-
-	devAdmin := dev.user(t, "argo-dev-admin", auth.PermIntegrationEdit)
-	r := dev.do(t, http.MethodPost, "/api/v1/argocd-endpoints", devAdmin, hygArgoBody(argo.URL))
-	if r.status != http.StatusCreated {
-		t.Fatalf("seed legacy http endpoint: %d %s", r.status, r.body)
-	}
-	epID, _ := r.json(t)["id"].(string)
-
-	prodUser := prod.user(t, "argo-prod-user", auth.PermIntegrationEdit)
-	r = prod.do(t, http.MethodGet, "/api/v1/argocd-endpoints/"+epID+"/discovered-apps", prodUser, nil)
-	if r.status != http.StatusConflict {
-		t.Fatalf("production discovery over http: status = %d; want 409 (%s)", r.status, r.body)
-	}
-	if hits.Load() != 0 || sawAuth.Load() {
-		t.Fatalf("production sent %d request(s) to the http endpoint (auth header: %v)", hits.Load(), sawAuth.Load())
-	}
-
-	// Dev still works against the same row.
-	r = dev.do(t, http.MethodGet, "/api/v1/argocd-endpoints/"+epID+"/discovered-apps", devAdmin, nil)
-	if r.status != http.StatusOK {
-		t.Fatalf("dev discovery: status = %d; want 200 (%s)", r.status, r.body)
-	}
-	if hits.Load() == 0 {
-		t.Fatalf("dev discovery should reach the endpoint")
-	}
-}
-
-// A row written before the user-info check (api#279) is refused on use
-// too: nothing goes out to the endpoint.
-func TestHygiene_ArgoCD_LegacyUserInfoRowNotUsed(t *testing.T) {
-	var hits atomic.Int32
-	argo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		hits.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"items":[]}`))
-	}))
-	t.Cleanup(argo.Close)
-
-	dev := newHygFixture(t, Config{Env: ModeDev, GitOpsEnabled: true}, nil)
-	admin := dev.user(t, "argo-userinfo-admin", auth.PermIntegrationEdit)
-	r := dev.do(t, http.MethodPost, "/api/v1/argocd-endpoints", admin, hygArgoBody(argo.URL))
-	if r.status != http.StatusCreated {
-		t.Fatalf("seed endpoint: %d %s", r.status, r.body)
-	}
-	epID, _ := r.json(t)["id"].(string)
-	legacy := strings.Replace(argo.URL, "http://", "http://admin:pw@", 1) + "/?token=abc"
-	if _, err := dev.pool.Exec(t.Context(), `UPDATE argocd_endpoints SET base_url = $1 WHERE id = $2`, legacy, epID); err != nil {
-		t.Fatalf("write legacy row: %v", err)
-	}
-	r = dev.do(t, http.MethodGet, "/api/v1/argocd-endpoints/"+epID+"/discovered-apps", admin, nil)
-	if r.status != http.StatusConflict {
-		t.Fatalf("discovery with user info: status = %d; want 409 (%s)", r.status, r.body)
-	}
-	if hits.Load() != 0 {
-		t.Fatalf("sent %d request(s) to an endpoint whose URL carries user info", hits.Load())
-	}
-}
-
-// ---------------------------------------------------------------------
 // GitOps observation rows: legacy free text and raw last_error
 // ---------------------------------------------------------------------
 
 func TestHygiene_GitOpsObservations_LegacyRowShaped(t *testing.T) {
-	fx := newHygFixture(t, Config{GitOpsEnabled: true}, nil)
+	fx := newHygFixture(t, Config{}, nil)
 	ctx := t.Context()
 	requester := fx.user(t, "gitops-requester")
 	reqID, _ := fx.approvedReadWithWrap(t, requester.id)
-
-	admin := fx.user(t, "gitops-admin", auth.PermIntegrationEdit)
-	r := fx.do(t, http.MethodPost, "/api/v1/argocd-endpoints", admin, hygArgoBody("https://argocd.example.com"))
-	if r.status != http.StatusCreated {
-		t.Fatalf("seed endpoint: %d %s", r.status, r.body)
-	}
-	epID := uuid.MustParse(r.json(t)["id"].(string))
 
 	const (
 		leakToken = "hvs.CAESIhygLegacyTokenLeakCanary0123456789"
 		leakURL   = "https://argocd.example.com/api/v1/applications/billing-api"
 	)
 	obsRepo := storage.NewGitOpsObservations(fx.pool)
-	obs := &storage.GitOpsObservation{
-		RequestID:        reqID,
-		ArgoCDEndpointID: epID,
-		ApplicationName:  "billing-api",
-		PollingState:     storage.GitOpsStateActive,
-	}
-	if err := obsRepo.Create(ctx, obs); err != nil {
-		t.Fatalf("seed observation: %v", err)
-	}
-	// Shape written by the worker before it stopped persisting free text.
+	// Shape written by the removed poller before it stopped persisting
+	// free text. The poller is gone, so the row is seeded directly.
 	legacy := map[string]any{
 		"health_status":   "Degraded",
 		"health_message":  "readiness probe failed: token=" + leakToken,
@@ -858,11 +709,14 @@ func TestHygiene_GitOpsObservations_LegacyRowShaped(t *testing.T) {
 		}},
 	}
 	rawErr := `argocd fetch: argocd: /api/v1/applications/billing-api: Get "` + leakURL + `": dial tcp: lookup argocd.example.com: no such host`
-	if err := obsRepo.RecordPoll(ctx, obs.ID, legacy, rawErr, time.Now().UTC()); err != nil {
-		t.Fatalf("seed poll: %v", err)
+	legacyJSON, _ := json.Marshal(legacy)
+	if _, err := fx.pool.Exec(ctx, `INSERT INTO gitops_observations
+		(request_id, argocd_endpoint_id, application_name, polling_state, observed_state, last_error, last_polled_at, polls_count)
+		VALUES ($1, gen_random_uuid(), 'billing-api', 'active', $2, $3, now(), 3)`, reqID, legacyJSON, rawErr); err != nil {
+		t.Fatalf("seed observation: %v", err)
 	}
 
-	r = fx.do(t, http.MethodGet, "/api/v1/requests/"+reqID.String()+"/gitops", requester, nil)
+	r := fx.do(t, http.MethodGet, "/api/v1/requests/"+reqID.String()+"/gitops", requester, nil)
 	if r.status != http.StatusOK {
 		t.Fatalf("observations: status = %d (%s)", r.status, r.body)
 	}
@@ -873,6 +727,9 @@ func TestHygiene_GitOpsObservations_LegacyRowShaped(t *testing.T) {
 		t.Fatalf("rows: %v (%s)", err, r.body)
 	}
 	row := rows[0]
+	if row["label"] != "history_context_only" || row["history"] != true || row["history_status"] != "not_completed_poller_removed" {
+		t.Errorf("history row not labelled context only: %v", row)
+	}
 	if got := row["last_error"]; got != "argocd_unreachable" {
 		t.Errorf("last_error = %v; want the stable class argocd_unreachable", got)
 	}

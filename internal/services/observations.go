@@ -49,6 +49,9 @@ var (
 	ErrObservationOutOfWindow         = errors.New("services: evidence out of window")
 	ErrObservationGatewayNotLive      = errors.New("services: gateway not live")
 	ErrObservationInvalidSource       = errors.New("services: invalid observation source")
+	// ErrObservationSourceRetired: control_plane selected the removed
+	// control-plane Argo CD poller (secrets-bridge/gateway#13).
+	ErrObservationSourceRetired = errors.New("services: observation source control_plane is retired")
 )
 
 // ObservationStore is the storage surface the service needs.
@@ -164,15 +167,12 @@ func auditTaskClosed(ctx context.Context, audit storage.AuditEventRepository, ac
 // ---- environment observation source ------------------------------------------
 
 // Source returns the observation source of the environment a request
-// was executed in. A request with no environment keeps today's
-// behaviour (control_plane). An environment that cannot be read is an
-// error: the caller starts no observer rather than guess, because
-// falling back to the control-plane poller would reach Argo CD from the
-// CP for an environment the admin moved to the Gateway
-// (secrets-bridge/gateway#13).
+// was executed in. A request with no environment has none. An
+// environment that cannot be read is an error: the caller starts no
+// observer rather than guess.
 func (s *GatewayObservationService) Source(ctx context.Context, envID *uuid.UUID) (storage.ObservationSource, error) {
 	if s == nil || envID == nil {
-		return storage.ObservationSourceControlPlane, nil
+		return storage.ObservationSourceNone, nil
 	}
 	src, err := s.store.EnvironmentObservationSource(ctx, *envID)
 	if err != nil {
@@ -185,15 +185,27 @@ func (s *GatewayObservationService) Source(ctx context.Context, envID *uuid.UUID
 }
 
 // EnvironmentSource returns an environment's stored observation source
-// (ErrNotFound for an unknown environment).
+// (ErrNotFound for an unknown environment). It never returns the
+// retired control_plane: the schema refuses it since migration 0049,
+// and anything not valid reads as none.
 func (s *GatewayObservationService) EnvironmentSource(ctx context.Context, envID uuid.UUID) (storage.ObservationSource, error) {
-	return s.store.EnvironmentObservationSource(ctx, envID)
+	src, err := s.store.EnvironmentObservationSource(ctx, envID)
+	if err != nil {
+		return "", err
+	}
+	if !src.Valid() {
+		return storage.ObservationSourceNone, nil
+	}
+	return src, nil
 }
 
 // SetObservationSource sets an environment's observation source
 // (design section 7, gateway.bind). Leaving gateway cancels the open
 // Gateway tasks of the environment with reason source_changed.
 func (s *GatewayObservationService) SetObservationSource(ctx context.Context, envID uuid.UUID, src storage.ObservationSource, by string) (*storage.ObservationSourceChange, error) {
+	if src == storage.ObservationSourceRetiredControlPlane {
+		return nil, ErrObservationSourceRetired
+	}
 	if !src.Valid() {
 		return nil, ErrObservationInvalidSource
 	}
@@ -302,7 +314,7 @@ func targetStale(b *storage.ObservableBinding) bool {
 // Start creates one task per matching binding for a request that just
 // reached executed in an environment whose observation source is
 // gateway. RequestService.OnJobCompleted calls it only after reading
-// that source; it never calls GitOpsService.Start for the same request.
+// that source.
 // Failures are audited, not returned to the request lifecycle.
 func (s *GatewayObservationService) Start(ctx context.Context, req *storage.AccessRequest, job *storage.SyncJob) error {
 	if s == nil || req == nil || job == nil {

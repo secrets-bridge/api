@@ -21,7 +21,6 @@ The Secrets Bridge control plane API (Go, Fiber v3, Postgres, Redis). The UI and
 | `pkg/keymgmt` | KMS backends selected by `SB_KMS_BACKEND`: `local` (dev only), `vault-transit`, `aws-kms` |
 | `pkg/objectstore` | Media in S3-compatible object storage (`Store` interface, S3 backend, `objectstoretest` fakes and live-test helper) |
 | `pkg/sealing` | X25519 + HKDF + AES-GCM envelope sealing between api and agent |
-| `pkg/argocd` | Read-only ArgoCD client, opt-in with `SB_GITOPS_ENABLED` |
 | `pkg/sanitize` | Scrubbing helpers for user or provider text that might be echoed |
 
 `pkg/*` is imported by `worker`. Changing an exported package must keep `worker` building, so merge here first.
@@ -56,6 +55,7 @@ go test -race -count=1 -p 1 ./...
 - Every workflow-changing action emits an audit event with a correlation ID.
 - Handlers stay thin; logic goes in services, SQL in `pkg/storage`, state transitions in `pkg/workflow`.
 - Migrations are append-only: add a new numbered pair (`.up.sql` and `.down.sql`), never edit a merged one. The `audit_events` table is append-only by trigger.
+- **No Argo CD client here.** The Gateway is the only component that talks to Argo CD (gateway#13). `internal/archguard` fails on an import of an Argo CD package or an Argo CD API path in non-test code, and a route test fails on any gitops or Argo CD route other than the read-only `GET /requests/:id/gitops` history. `SB_GITOPS_ENABLED` is a retired setting, never a switch.
 - Prod environments never allow direct reveal. Do not weaken that check or the policy invariant that strips such rules.
 - Return generic messages on auth failures; put the detail in the audit log.
 - Changes to auth, the policy engine or the schema of existing tables need maintainer agreement in an issue first.

@@ -44,14 +44,6 @@ type JobEnqueuer interface {
 	Enqueue(ctx context.Context, req EnqueueRequest) (*storage.SyncJob, error)
 }
 
-// GitOpsStarter is the slice of *GitOpsService that RequestService
-// calls into after a successful transition to `executed`. Decoupled
-// as an interface so the service stays optional — passing nil is
-// fine when no ArgoCD endpoints / mappings are configured.
-type GitOpsStarter interface {
-	Start(ctx context.Context, request *storage.AccessRequest) error
-}
-
 // ObservationStarter is the Gateway observation path (api#294): it reads
 // an environment's observation source and starts Gateway tasks for a
 // request executed in a gateway environment.
@@ -69,7 +61,6 @@ type RequestService struct {
 	policy    *PolicyEngine
 	audit     storage.AuditEventRepository
 	jobs      JobEnqueuer
-	gitops    GitOpsStarter
 	observer  ObservationStarter
 	// envs is optional. When non-nil, Submit / SubmitRead look up the
 	// environment row by (project_id, name) and populate both
@@ -131,19 +122,10 @@ func NewRequestService(
 	}
 }
 
-// WithGitOps attaches an optional GitOpsStarter that gets invoked
-// after a successful transition to `executed`. Returns the service
-// for chaining. Pass nil to disable the integration.
-func (s *RequestService) WithGitOps(g GitOpsStarter) *RequestService {
-	s.gitops = g
-	return s
-}
-
 // WithGatewayObservation attaches the Gateway observation starter. With
 // it, OnJobCompleted reads the request environment's observation_source
-// once and starts exactly one observer: the control-plane poller
-// (GitOpsStarter) for control_plane, the Gateway for gateway, neither
-// for none.
+// once and starts the Gateway path for gateway and nothing for none.
+// There is no control-plane observer (secrets-bridge/gateway#13).
 func (s *RequestService) WithGatewayObservation(o ObservationStarter) *RequestService {
 	s.observer = o
 	return s
@@ -1468,7 +1450,7 @@ func (s *RequestService) OnJobCompleted(ctx context.Context, job *storage.SyncJo
 	// Observation runs only on a successful transition to `executed`.
 	// Failure is audited inside the starters; it is not bubbled because
 	// the request transition is already complete.
-	if target == storage.AccessRequestStatusExecuted && (s.gitops != nil || s.observer != nil) {
+	if target == storage.AccessRequestStatusExecuted && s.observer != nil {
 		req, err := s.requests.Get(ctx, *job.RequestID)
 		if err == nil && req != nil {
 			s.startObservation(ctx, req, job)
@@ -1476,35 +1458,27 @@ func (s *RequestService) OnJobCompleted(ctx context.Context, job *storage.SyncJo
 	}
 }
 
-// startObservation is the single decision point between the two
-// observers (gateway control-plane design section 7, ADR 0001 section
-// 9): the environment's observation_source is read once and exactly one
-// of GitOpsService.Start and the Gateway starter runs, so a request
-// never gets both a gitops_observations row and a Gateway task.
+// startObservation is the single decision point (gateway control-plane
+// design section 7, ADR 0001 section 9): the environment's
+// observation_source is read once and the Gateway path starts for
+// gateway; anything else starts nothing. The control-plane Argo CD
+// poller was removed (secrets-bridge/gateway#13), so there is no other
+// observer and no fallback to one.
 func (s *RequestService) startObservation(ctx context.Context, req *storage.AccessRequest, job *storage.SyncJob) {
-	src := storage.ObservationSourceControlPlane
-	if s.observer != nil {
-		var err error
-		if src, err = s.observer.Source(ctx, req.EnvironmentID); err != nil {
-			// Unknown source: start neither observer. Falling back to
-			// the control-plane poller could reach Argo CD from the CP
-			// for an environment moved to the Gateway.
-			s.auditObservationSkipped(ctx, "request.observation_skipped", req, job, "", "source_unreadable")
-			return
-		}
+	src, err := s.observer.Source(ctx, req.EnvironmentID)
+	if err != nil {
+		s.auditObservationSkipped(ctx, "request.observation_skipped", req, job, "", "source_unreadable")
+		return
 	}
 	switch src {
 	case storage.ObservationSourceGateway:
-		if s.gitops != nil {
-			s.auditObservationSkipped(ctx, "request.gitops_observation_skipped", req, job, src, "source_gateway")
-		}
 		_ = s.observer.Start(ctx, req, job)
 	case storage.ObservationSourceNone:
-		s.auditObservationSkipped(ctx, "request.observation_skipped", req, job, src, "source_none")
-	default:
-		if s.gitops != nil {
-			_ = s.gitops.Start(ctx, req)
+		if req.EnvironmentID != nil {
+			s.auditObservationSkipped(ctx, "request.observation_skipped", req, job, src, "source_none")
 		}
+	default:
+		s.auditObservationSkipped(ctx, "request.observation_skipped", req, job, "", "source_unreadable")
 	}
 }
 

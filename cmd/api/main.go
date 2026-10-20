@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -33,7 +34,6 @@ import (
 	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/observability"
 	"github.com/secrets-bridge/api/internal/services"
-	"github.com/secrets-bridge/api/pkg/argocd"
 	"github.com/secrets-bridge/api/pkg/keymgmt"
 	"github.com/secrets-bridge/api/pkg/runtime"
 	"github.com/secrets-bridge/api/pkg/storage"
@@ -343,36 +343,15 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		WithEnvironments(environmentRepo)
 	secretsSvc := services.NewSecretsService(secretsRepo, auditRepo)
 
-	// GitOps observation integration (BRD §26) is OFF by default. The
-	// flag is opt-in via `SB_GITOPS_ENABLED=true` (operators set this
-	// via Helm values or a future UI integrations toggle). When the
-	// flag is off, the request lifecycle behaves exactly as before
-	// and the admin / user endpoints are not mounted.
-	var gitopsH *handlers.GitOps
-	if cfg.GitOpsEnabled {
-		argoEndpointRepo := storage.NewArgoCDEndpoints(pool)
-		gitopsMappingRepo := storage.NewGitOpsAppMappings(pool)
-		gitopsObservationRepo := storage.NewGitOpsObservations(pool)
-		gitopsSvc := services.NewGitOpsService(argoEndpointRepo, gitopsMappingRepo, gitopsObservationRepo, requestRepo, auditRepo, services.GitOpsConfig{})
-		// API-S-22: http:// ArgoCD base URLs carry the bearer token in
-		// clear text. Accepted with SB_ENV=dev; in production only with
-		// the explicit SB_ALLOW_INSECURE_ARGOCD_ADDR override.
-		argoEndpointSvc := services.NewArgoCDEndpointService(argoEndpointRepo, km, auditRepo).
-			WithAllowInsecureAddr(cfg.Env == ModeDev || cfg.AllowInsecureArgoCDAddr)
-		if cfg.AllowInsecureArgoCDAddr {
-			logger.Warn("SB_ALLOW_INSECURE_ARGOCD_ADDR=true — http:// ArgoCD base_url values will be accepted and the ArgoCD token sent in clear text")
-		}
-		requestSvc = requestSvc.WithGitOps(gitopsSvc)
-		gitopsH = handlers.NewGitOps(argoEndpointSvc, gitopsMappingRepo, gitopsSvc, requestRepo, newArgoCDDiscoveryFactory())
-		logger.Info("gitops visibility integration enabled (BRD §26)")
-	} else {
-		logger.Info("gitops visibility integration disabled (set SB_GITOPS_ENABLED=true to enable)")
-	}
+	// The control-plane Argo CD poller and its endpoint, discovery and
+	// app-mapping routes were removed (secrets-bridge/gateway#13): the
+	// Gateway is the only component that talks to Argo CD. Rows the
+	// poller wrote stay readable on the request page as history.
+	gitopsHistoryH := handlers.NewGitOpsHistory(storage.NewGitOpsObservations(pool), requestRepo)
 
 	// Wire the back-edge: when a patch job terminates, RequestService
 	// transitions the owning access_request to executed/failed AND,
-	// when GitOps is enabled, fans out observation rows for the
-	// request's configured app mappings. The multiplexer that adds
+	// starts observation through the Gateway path. The multiplexer that adds
 	// pcSvc.OnDiscoverJobCompleted is installed AFTER pcSvc is built
 	// below.
 
@@ -446,10 +425,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	requestSvc.WithProjectBindings(projectSecretsRepo, secretsRepo)
 
 	// Gateway observation (api#294). OnJobCompleted reads the request
-	// environment's observation_source once and starts either the
-	// control-plane poller (GitOps, when enabled) or Gateway tasks, never
-	// both. The default source is control_plane, so nothing changes
-	// until an admin switches an environment to gateway.
+	// environment's observation_source once and starts Gateway tasks
+	// for gateway, nothing for none (the default). There is no
+	// control-plane observer to fall back to (secrets-bridge/gateway#13).
 	observationSvc := services.NewGatewayObservationService(storage.NewObservationTasks(pool), auditRepo, services.GatewayObservationConfig{}).
 		WithProjectBindings(projectSecretsRepo, secretsRepo)
 	requestSvc.WithGatewayObservation(observationSvc)
@@ -1236,35 +1214,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Get("/reveal-sessions/me/active", revealSessionsH.ListActive)
 	v1.Post("/reveal-sessions/:id/expire", revealSessionsH.Expire)
 
-	// GitOps observation panel + ArgoCD admin surface are mounted
-	// ONLY when SB_GITOPS_ENABLED=true. The flag is opt-in via Helm
-	// values or a future UI integrations toggle — disabled deployments
-	// keep the existing wrap-only request shape unchanged.
-	if gitopsH != nil {
-		// User-bound observation panel (BRD §26). Same `user_id`
-		// stub-auth as the wrap retrieval endpoint.
-		v1.Get("/requests/:id/gitops", gitopsH.GetRequestObservations)
-
-		// Admin: ArgoCD endpoint CRUD. Plaintext tokens arrive only
-		// via POST, are envelope-encrypted via KeyManager before
-		// touching Postgres, and never appear in responses.
-		v1.Post("/argocd-endpoints", auth.Require(auth.PermIntegrationEdit, rbacResolver), gitopsH.CreateArgoCDEndpoint)
-		v1.Get("/argocd-endpoints", gitopsH.ListArgoCDEndpoints)
-		v1.Get("/argocd-endpoints/:id", gitopsH.GetArgoCDEndpoint)
-		v1.Put("/argocd-endpoints/:id/enabled", auth.Require(auth.PermIntegrationEdit, rbacResolver), gitopsH.SetArgoCDEndpointEnabled)
-		v1.Delete("/argocd-endpoints/:id", auth.Require(auth.PermIntegrationEdit, rbacResolver), gitopsH.DeleteArgoCDEndpoint)
-
-		// Read-only ArgoCD discovery: drives the UI's bulk-create
-		// mappings flow. Calls ArgoCD via the endpoint's KMS-wrapped
-		// token, returns a trimmed list of applications. NEVER writes
-		// to ArgoCD; the pkg/argocd readOnlyTransport enforces.
-		v1.Get("/argocd-endpoints/:id/discovered-apps", gitopsH.GetDiscoveredApps)
-
-		// Admin: secret_mapping (or provider_connection) → ArgoCD app(s).
-		v1.Post("/gitops-app-mappings", auth.Require(auth.PermIntegrationEdit, rbacResolver), gitopsH.CreateGitOpsMapping)
-		v1.Get("/gitops-app-mappings", gitopsH.ListGitOpsMappings)
-		v1.Delete("/gitops-app-mappings/:id", auth.Require(auth.PermIntegrationEdit, rbacResolver), gitopsH.DeleteGitOpsMapping)
-	}
+	// History of the removed control-plane Argo CD poller, read-only
+	// and labelled context only. No other gitops or Argo CD route exists.
+	v1.Get("/requests/:id/gitops", gitopsHistoryH.GetRequestObservations)
 
 	// EPIC P (Provider Connections) — admin CRUD + bindings + the
 	// developer dropdown. Shared GET /provider-connections branches
@@ -1493,54 +1445,6 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	return app
 }
 
-// newArgoCDDiscoveryFactory returns the factory wired into the GitOps
-// handler so it can build a read-only ArgoCD client for the
-// `discovered-apps` endpoint. The factory is a thin adapter:
-// services.ArgoCDClientConfig → argocd.Config → *argocd.Client wrapped
-// to satisfy services.AppLister (which returns the trimmed
-// DiscoveredApp shape, not pkg/argocd's Application).
-//
-// pkg/argocd stays the canonical source for the wire shape; this
-// adapter just trims to what the discovery flow needs.
-func newArgoCDDiscoveryFactory() services.ArgoCDClientFactory {
-	return func(in services.ArgoCDClientConfig) (services.AppLister, error) {
-		c, err := argocd.New(argocd.Config{
-			BaseURL:       in.BaseURL,
-			Token:         in.Token,
-			TLSCAPEM:      in.TLSCAPEM,
-			TLSServerName: in.TLSServerName,
-			Timeout:       15 * time.Second,
-		})
-		if err != nil {
-			return nil, err
-		}
-		return &argoCDDiscoveryAdapter{c: c}, nil
-	}
-}
-
-type argoCDDiscoveryAdapter struct{ c *argocd.Client }
-
-func (a *argoCDDiscoveryAdapter) ListApplications(ctx context.Context, project string) ([]services.DiscoveredApp, error) {
-	apps, err := a.c.ListApplications(ctx, project)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]services.DiscoveredApp, 0, len(apps))
-	for _, app := range apps {
-		out = append(out, services.DiscoveredApp{
-			Name:                 app.Name,
-			Namespace:            app.Namespace,
-			Project:              app.Project,
-			DestinationServer:    app.DestinationServer,
-			DestinationCluster:   app.DestinationCluster,
-			DestinationNamespace: app.DestinationNamespace,
-			HealthStatus:         app.HealthStatus,
-			SyncStatus:           app.SyncStatus,
-		})
-	}
-	return out, nil
-}
-
 // bootstrapAdminGrant idempotently ensures the configured
 // `BootstrapAdminUserID` holds the seed `admin` role. Runs once at
 // boot:
@@ -1585,12 +1489,24 @@ func bootstrapAdminGrant(ctx context.Context, pool *storage.Pool, userID string,
 	return nil
 }
 
-// logRetiredEnv notes the retired settings that are still set. Login no
-// longer issues bearer tokens (M1, api#191), so the JWT settings are not
-// read any more. It logs the names only, never the values.
+// logRetiredEnv notes the retired settings that are still set, one line
+// per reason (retiredEnv). It logs the names only, never the values.
 func logRetiredEnv(logger *slog.Logger, set []string) {
 	if len(set) == 0 {
 		return
 	}
-	logger.Info("settings no longer used can be removed: sign-in is cookie-session only", "env", set)
+	var notes []string
+	byNote := map[string][]string{}
+	for _, r := range retiredEnv {
+		if !slices.Contains(set, r.name) {
+			continue
+		}
+		if _, ok := byNote[r.note]; !ok {
+			notes = append(notes, r.note)
+		}
+		byNote[r.note] = append(byNote[r.note], r.name)
+	}
+	for _, note := range notes {
+		logger.Info("settings no longer used can be removed: "+note, "env", byNote[note])
+	}
 }
