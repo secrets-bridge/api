@@ -395,6 +395,23 @@ func TestFill_RequesterCannotFill(t *testing.T) {
 	if !errors.Is(err, services.ErrSeparationOfDuties) {
 		t.Fatalf("err = %v want ErrSeparationOfDuties", err)
 	}
+	requireSoDAudit(t, h, req.ID, "request.cross_team.fill.rejected", "self_approval")
+}
+
+// requireSoDAudit asserts the one denied row api#289 writes for a
+// cross-team step refused for separation of duties.
+func requireSoDAudit(t *testing.T, h *crossTeamHarness, reqID uuid.UUID, action, kind string) {
+	t.Helper()
+	var n int
+	if err := h.pool.QueryRow(t.Context(), `SELECT count(*) FROM audit_events
+		WHERE action = $1 AND correlation_id = $2 AND status = 'denied'
+		  AND metadata->>'reason' = 'separation_of_duties' AND metadata->>'error_kind' = $3
+		  AND metadata->>'request_id' = $2::text`, action, reqID, kind).Scan(&n); err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("%s denied rows with error_kind %s = %d, want 1", action, kind, n)
+	}
 }
 
 func TestFill_SecondCallRejected(t *testing.T) {
@@ -445,6 +462,7 @@ func TestRefuse_RequesterCannotRefuse(t *testing.T) {
 	if !errors.Is(err, services.ErrSeparationOfDuties) {
 		t.Fatalf("err = %v want ErrSeparationOfDuties", err)
 	}
+	requireSoDAudit(t, h, req.ID, "request.cross_team.refuse.denied", "self_approval")
 }
 
 func TestVerify_SourceApproveWithoutSecurityRequirement(t *testing.T) {
@@ -673,6 +691,7 @@ func TestVerify_RequesterCannotVote(t *testing.T) {
 	if !errors.Is(err, services.ErrSeparationOfDuties) {
 		t.Fatalf("err = %v want ErrSeparationOfDuties", err)
 	}
+	requireSoDAudit(t, h, req.ID, "request.cross_team.verify.denied", "self_approval")
 }
 
 func TestVerify_FillerCannotVote(t *testing.T) {
@@ -693,6 +712,7 @@ func TestVerify_FillerCannotVote(t *testing.T) {
 	if !errors.Is(err, services.ErrSeparationOfDuties) {
 		t.Fatalf("err = %v want ErrSeparationOfDuties", err)
 	}
+	requireSoDAudit(t, h, req.ID, "request.cross_team.verify.denied", "filler_cannot_verify")
 }
 
 func TestCancel_AllowedFromPendingValues(t *testing.T) {

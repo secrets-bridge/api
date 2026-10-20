@@ -536,6 +536,7 @@ func (s *RequestService) Fill(ctx context.Context, in FillCrossTeamInput) (*stor
 		return nil, storage.ErrCrossTeamAlreadyFilled
 	}
 	if in.FillerID == req.RequesterID {
+		s.auditCrossTeamSoDRefused(ctx, "request.cross_team.fill.rejected", in.FillerID, req, "self_approval", nil)
 		return nil, ErrSeparationOfDuties
 	}
 	if req.WorkflowID == nil {
@@ -671,6 +672,7 @@ func (s *RequestService) Refuse(ctx context.Context, in RefuseCrossTeamInput) (*
 		return nil, storage.ErrCrossTeamStatusInvalidTransition
 	}
 	if in.UserID == req.RequesterID {
+		s.auditCrossTeamSoDRefused(ctx, "request.cross_team.refuse.denied", in.UserID, req, "self_approval", nil)
 		return nil, ErrSeparationOfDuties
 	}
 	if err := s.requests.Refuse(ctx, in.RequestID, in.Reason); err != nil {
@@ -769,10 +771,13 @@ func (s *RequestService) VerifyCrossTeam(ctx context.Context, in VerifyCrossTeam
 	if req.Status != storage.AccessRequestStatusPendingVerification {
 		return nil, storage.ErrCrossTeamStatusInvalidTransition
 	}
+	voteMeta := map[string]any{"voted_as": string(in.VotedAs), "decision": string(in.Decision)}
 	if in.ApproverID == req.RequesterID {
+		s.auditCrossTeamSoDRefused(ctx, "request.cross_team.verify.denied", in.ApproverID, req, "self_approval", voteMeta)
 		return nil, ErrSeparationOfDuties
 	}
 	if in.ApproverID == req.FilledByUserID {
+		s.auditCrossTeamSoDRefused(ctx, "request.cross_team.verify.denied", in.ApproverID, req, "filler_cannot_verify", voteMeta)
 		return nil, ErrSeparationOfDuties
 	}
 
@@ -812,6 +817,7 @@ func (s *RequestService) VerifyCrossTeam(ctx context.Context, in VerifyCrossTeam
 	}
 	for _, ap := range existing {
 		if ap.ApproverID == in.ApproverID && ap.Decision == storage.ApprovalDecisionApprove {
+			s.auditCrossTeamSoDRefused(ctx, "request.cross_team.verify.denied", in.ApproverID, req, "second_lane_vote", voteMeta)
 			return nil, ErrSeparationOfDuties
 		}
 	}
@@ -1082,4 +1088,24 @@ func DecodeFillKeyValues(raw map[string]string) (map[string][]byte, error) {
 		out[k] = decoded
 	}
 	return out, nil
+}
+
+// auditCrossTeamSoDRefused records a cross-team step refused because the
+// caller already plays another part in the request (api#289): the
+// requester filling, refusing or verifying it, the filler verifying it,
+// or one person voting in both lanes. Same shape as the self-approve
+// and self-reject rows: ids and codes only, never a value.
+func (s *RequestService) auditCrossTeamSoDRefused(ctx context.Context, action, actorID string, req *storage.AccessRequest, kind string, extra map[string]any) {
+	meta := map[string]any{"request_id": req.ID.String(), "reason": "separation_of_duties", "error_kind": kind}
+	for k, v := range extra {
+		meta[k] = v
+	}
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:         "user:" + actorID,
+		Action:        action,
+		Resource:      "request:" + req.ID.String(),
+		Status:        storage.AuditStatusDenied,
+		CorrelationID: req.ID,
+		Metadata:      meta,
+	})
 }
