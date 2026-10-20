@@ -482,7 +482,7 @@ func (r *Gateways) Revoke(ctx context.Context, id uuid.UUID, by string, at time.
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var status GatewayStatus
-	err = tx.QueryRow(ctx, `SELECT status FROM gateways WHERE id = $1 FOR UPDATE`, id).Scan(&status)
+	err = tx.QueryRow(ctx, `SELECT status FROM gateways WHERE id = $1 FOR NO KEY UPDATE`, id).Scan(&status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -532,7 +532,7 @@ func (r *Gateways) SetEnabled(ctx context.Context, id uuid.UUID, enabled bool, a
 
 	var status GatewayStatus
 	var hasSecret bool
-	err = tx.QueryRow(ctx, `SELECT status, secret_hash IS NOT NULL FROM gateways WHERE id = $1 FOR UPDATE`, id).Scan(&status, &hasSecret)
+	err = tx.QueryRow(ctx, `SELECT status, secret_hash IS NOT NULL FROM gateways WHERE id = $1 FOR NO KEY UPDATE`, id).Scan(&status, &hasSecret)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil, ErrNotFound
 	}

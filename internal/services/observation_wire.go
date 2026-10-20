@@ -327,12 +327,145 @@ func optEnum(v string, allowed ...string) bool { return v == "" || slices.Contai
 
 func nonNeg(p *int64) bool { return p == nil || (*p >= 0 && *p <= obsMaxNonNeg) }
 
+// ---- exact-key pre-pass -------------------------------------------------------
+
+// keySet is the set of keys allowed in one JSON object of the contract,
+// with the key sets of the nested objects. encoding/json matches keys
+// case-insensitively and keeps the last of duplicate keys, so a
+// "closed" struct decode alone would take "Facts" for "facts" or let a
+// second "facts" replace the first. checkKeys walks the tokens first and
+// refuses both.
+type keySet struct {
+	// fields maps each allowed key to the key set of its value; a nil
+	// value is a scalar or an array of scalars (no object allowed).
+	fields map[string]*keySet
+	// items is the key set of the objects in an array value.
+	items *keySet
+	// any allows every key (duplicates are still refused).
+	any bool
+}
+
+func keys(names ...string) map[string]*keySet {
+	m := make(map[string]*keySet, len(names))
+	for _, n := range names {
+		m[n] = nil
+	}
+	return m
+}
+
+var (
+	anyKeys = func() *keySet { k := &keySet{any: true}; k.items = k; return k }()
+
+	evidenceKeySet = func() *keySet {
+		facts := keys(
+			// argocdFacts
+			"sync_status", "health_status", "sync_revision", "operation_phase", "operation_started_at",
+			"operation_finished_at", "reconciled_at",
+			// esoFacts
+			"ready_status", "ready_reason", "ready_last_transition_time", "refresh_time", "synced_resource_version",
+			"observed_generation_matches", "refresh_interval_seconds", "remote_ref_match", "remote_version_pin",
+			"target_secret_name",
+			// rolloutFacts
+			"generation", "observed_generation", "spec_replicas", "paused", "progress_deadline_seconds", "replicas",
+			"updated_replicas", "ready_replicas", "available_replicas", "unavailable_replicas", "progressing_status",
+			"progressing_reason", "available_status", "deployment_revision", "newest_replicaset_created_at",
+			"rollout_trigger", "reload_mechanism", "consumption_mode",
+		)
+		stage := keys("stage", "observed_at", "outcome", "confidence", "caveats", "linkage", "error_code")
+		stage["source"] = &keySet{fields: keys("connector_id", "target_id", "api")}
+		stage["resource"] = &keySet{fields: keys("api_version", "kind", "namespace", "name", "uid", "resource_version", "generation")}
+		stage["facts"] = &keySet{fields: facts}
+		root := keys("schema_version", "task_id", "attempt_id", "gateway_id", "replica_id", "gateway_version",
+			"started_at", "finished_at", "attempt_status", "refusal_reason")
+		root["stages"] = &keySet{items: &keySet{fields: stage}}
+		root["clock"] = &keySet{fields: keys("cp_offset_ms", "apiserver_offset_ms")}
+		return &keySet{fields: root}
+	}()
+)
+
+// errDuplicateKey marks a duplicate-key refusal.
+var errDuplicateKey = errors.New("duplicate key")
+
+// checkKeys refuses a body with a duplicate key in any object, or a key
+// that is not exactly (case included) one the contract allows there.
+// Errors name the rule, never the key or a value.
+func checkKeys(data []byte, ks *keySet) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := walkKeys(dec, ks, "body"); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return obsViolation("body", "has trailing data")
+	}
+	return nil
+}
+
+func walkKeys(dec *json.Decoder, ks *keySet, path string) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return obsViolation(path, "is not valid JSON")
+	}
+	d, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch d {
+	case '{':
+		seen := map[string]bool{}
+		for dec.More() {
+			kt, err := dec.Token()
+			if err != nil {
+				return obsViolation(path, "is not valid JSON")
+			}
+			k, _ := kt.(string)
+			if seen[k] {
+				return fmt.Errorf("%w: %s has a duplicate key: %w", ErrObservationSchema, path, errDuplicateKey)
+			}
+			seen[k] = true
+			var child *keySet
+			switch {
+			case ks != nil && ks.any:
+				child = ks
+			case ks == nil || ks.fields == nil:
+				return obsViolation(path, "must not be an object")
+			default:
+				c, known := ks.fields[k]
+				if !known {
+					return obsViolation(path, "has an unknown field")
+				}
+				child = c
+			}
+			if err := walkKeys(dec, child, path+".field"); err != nil {
+				return err
+			}
+		}
+	case '[':
+		var items *keySet
+		if ks != nil {
+			items = ks.items
+		}
+		for dec.More() {
+			if err := walkKeys(dec, items, path+"[]"); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return obsViolation(path, "is not valid JSON")
+	}
+	return nil
+}
+
 // DecodeEvidenceResult strictly decodes and validates an E7 body against
 // the closed v1 schema. Errors wrap ErrObservationSchema and name a
 // field, never a value.
 func DecodeEvidenceResult(data []byte) (*EvidenceResult, error) {
 	if len(data) > ObservationResultMaxBytes {
 		return nil, obsViolation("body", "is over the size limit")
+	}
+	if err := checkKeys(data, evidenceKeySet); err != nil {
+		return nil, err
 	}
 	if err := requireKeys("result", data, "schema_version", "task_id", "attempt_id", "gateway_id", "replica_id",
 		"gateway_version", "started_at", "finished_at", "attempt_status", "stages", "clock"); err != nil {
@@ -656,8 +789,16 @@ func ResultDigest(data []byte) ([]byte, error) {
 	return sum[:], nil
 }
 
-// canonicalize returns the RFC 8785 form of one JSON value.
+// canonicalize returns the RFC 8785 form of one JSON value. A duplicate
+// key has no canonical form (RFC 8785 section 3.1) and is an
+// ErrObservationSchema error.
 func canonicalize(data []byte) (string, error) {
+	if err := checkKeys(data, anyKeys); err != nil {
+		if errors.Is(err, errDuplicateKey) {
+			return "", err
+		}
+		return "", errors.New("services: result is not JSON")
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	var v any

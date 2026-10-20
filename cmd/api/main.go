@@ -1375,9 +1375,13 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// fresh second factor on every write.
 	gatewaySvc := services.NewGatewayService(storage.NewGateways(pool), auditRepo, rdb)
 	gatewaysH := handlers.NewGateways(gatewaySvc, cfg.Env != ModeDev).WithObservations(observationSvc)
+	// E4 to E7 fail closed: without Redis the limiter answers 503,
+	// which the Gateway client treats as transient and backs off on,
+	// instead of letting an unbounded claim or result rate through.
 	gatewayLimit := func(name string, limit int) fiber.Handler {
 		return middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
 			Name: name, Bucket: middleware.ByAuthenticatedGateway(), Limit: limit, Window: 60 * time.Second,
+			FailClosed: true,
 		})
 	}
 	gatewayMachineRoutes{
@@ -1404,8 +1408,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 			gatewaysH.Catalog,
 		),
 		// E4 to E7 (api#294), rate limited after GatewayAuth on the
-		// authenticated Gateway: claim allows 200 replicas polling every
-		// 5s; the others are per task and far below it.
+		// authenticated Gateway, failing closed: claim allows 200
+		// replicas polling every 5s; the others are per task and far
+		// below it.
 		claim:   hs(gatewayLimit("gateway:claim", 2400), middleware.BodyLimit(4<<10), gatewaysH.Claim),
 		lease:   hs(gatewayLimit("gateway:lease", 1200), middleware.BodyLimit(4<<10), gatewaysH.RenewLease),
 		release: hs(gatewayLimit("gateway:release", 1200), middleware.BodyLimit(4<<10), gatewaysH.Release),

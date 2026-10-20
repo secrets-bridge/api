@@ -125,6 +125,9 @@ var (
 	ErrObservationAttemptSuperseded   = errors.New("storage: observation attempt superseded")
 	ErrObservationLeaseExpired        = errors.New("storage: observation lease expired")
 	ErrObservationTaskClosed          = errors.New("storage: observation task closed")
+	// ErrObservationSourceNotGateway: the environment is no longer
+	// observed by a Gateway; no task is created.
+	ErrObservationSourceNotGateway = errors.New("storage: environment observation source is not gateway")
 )
 
 // ObservationConnectorRef is one {connector_id, target_id, stage} triple
@@ -501,6 +504,22 @@ func (r *ObservationTasks) CreateTask(ctx context.Context, t *ObservationTask, a
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// The source is read again under a share lock, so a concurrent
+	// switch away from gateway (which takes FOR UPDATE on the row and
+	// then cancels open tasks) either commits first and is seen here, or
+	// waits for this insert and cancels it.
+	var src ObservationSource
+	err = tx.QueryRow(ctx, `SELECT observation_source FROM environments WHERE id = $1 FOR SHARE`, t.EnvironmentID).Scan(&src)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil, ErrNotFound
+	}
+	if err != nil {
+		return false, nil, fmt.Errorf("storage: environment source for task: %w", err)
+	}
+	if src != ObservationSourceGateway {
+		return false, nil, ErrObservationSourceNotGateway
+	}
+
 	superseded, err = cancelOpenTasks(ctx, tx, `t.secret_scope_key = $1 AND t.request_id <> $2`,
 		[]any{t.SecretScopeKey, t.RequestID}, ObservationReasonSupersededByLaterWrite, at)
 	if err != nil {
@@ -545,8 +564,6 @@ type ObservationClaim struct {
 	Attempt *ObservationTaskAttempt
 	// Reclaimed is the attempt whose expired lease this claim replaced.
 	Reclaimed *uuid.UUID
-	// GatewayEnvironmentID is gateways.environment_id, for the task scope.
-	GatewayEnvironmentID *uuid.UUID
 }
 
 // Claim leases at most one task of gatewayID to replicaID (design
@@ -567,8 +584,11 @@ func (r *ObservationTasks) Claim(ctx context.Context, gatewayID, replicaID uuid.
 	var maxInflight int
 	var contracts []byte
 	out := &ObservationClaim{}
-	err = tx.QueryRow(ctx, `SELECT status, max_inflight_tasks, contract_versions, environment_id FROM gateways WHERE id = $1 FOR UPDATE`, gatewayID).
-		Scan(&status, &maxInflight, &contracts, &out.GatewayEnvironmentID)
+	// FOR NO KEY UPDATE, not FOR UPDATE: it serialises claims of one
+	// Gateway without blocking the FOR KEY SHARE that inserting a task
+	// (foreign key to gateways) takes.
+	err = tx.QueryRow(ctx, `SELECT status, max_inflight_tasks, contract_versions FROM gateways WHERE id = $1 FOR NO KEY UPDATE`, gatewayID).
+		Scan(&status, &maxInflight, &contracts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrGatewayNotLive
 	}
@@ -580,14 +600,16 @@ func (r *ObservationTasks) Claim(ctx context.Context, gatewayID, replicaID uuid.
 	}
 	var versions []string
 	_ = json.Unmarshal(contracts, &versions)
-	if len(versions) > 0 {
-		ok := false
-		for _, v := range versions {
-			ok = ok || v == contractVersion
-		}
-		if !ok {
-			return nil, ErrObservationContractUnsupported
-		}
+	if len(versions) == 0 {
+		// Not negotiated yet (no heartbeat accepted): nothing to hand out.
+		return nil, ErrNoObservationTask
+	}
+	ok := false
+	for _, v := range versions {
+		ok = ok || v == contractVersion
+	}
+	if !ok {
+		return nil, ErrObservationContractUnsupported
 	}
 
 	var inflight, replicaInflight int
@@ -672,13 +694,12 @@ func lockTaskForGateway(ctx context.Context, tx pgx.Tx, gatewayID, taskID uuid.U
 	if err != nil {
 		return nil, time.Time{}, fmt.Errorf("storage: gateway status: %w", err)
 	}
+	// Another Gateway's task is not found, and is never locked.
 	var now time.Time
-	t, err := ScanObservationTask(tx.QueryRow(ctx, `SELECT `+ObservationTaskColumns+`, now() FROM observation_tasks t WHERE t.id = $1 FOR UPDATE`, taskID), &now)
+	t, err := ScanObservationTask(tx.QueryRow(ctx, `SELECT `+ObservationTaskColumns+`, now()
+		FROM observation_tasks t WHERE t.id = $1 AND t.gateway_id = $2 FOR UPDATE`, taskID, gatewayID), &now)
 	if err != nil {
 		return nil, time.Time{}, err
-	}
-	if t.GatewayID != gatewayID {
-		return nil, time.Time{}, ErrNotFound
 	}
 	return t, now, nil
 }
@@ -780,40 +801,36 @@ func (r *ObservationTasks) Release(ctx context.Context, gatewayID, taskID, attem
 
 // ---- E7 result -------------------------------------------------------------
 
-// ObservationResultTx is the transaction of one E7 result. It starts
-// with the task row locked FOR UPDATE; the service runs the checks of
-// design section 4.8 in order and writes the evidence, the attempt, the
-// task, the verdict and the audit rows through it before Commit, so the
-// 200 is sent only after all of them are durable.
+// ObservationResultTx is the transaction of one E7 result. It locks
+// the Gateway row FOR SHARE and then the task row FOR UPDATE, the same
+// order as every other path that touches both (claim, renew, release,
+// revoke, disable), so a revoke and a result never deadlock. The
+// service runs the checks of design section 4.8 in order and writes the
+// evidence, the attempt, the task, the verdict and the audit rows
+// through it before Commit, so the 200 is sent only after all of them
+// are durable.
 type ObservationResultTx struct {
 	tx   pgx.Tx
 	Task *ObservationTask
 	// Now is the database clock at the start of the transaction.
 	Now time.Time
-	// GatewayStatus is the status of the task's Gateway, read in the
-	// transaction.
-	GatewayStatus GatewayStatus
 }
 
-// BeginResult opens the result transaction for taskID. ErrNotFound when
-// the task does not exist.
-func (r *ObservationTasks) BeginResult(ctx context.Context, taskID uuid.UUID) (*ObservationResultTx, error) {
+// BeginResult opens the result transaction for gatewayID's task taskID.
+// ErrGatewayNotLive when the Gateway is no longer active or stale (a
+// revoke or disable that committed first), ErrNotFound when the task
+// does not exist or belongs to another Gateway (that task is not locked).
+func (r *ObservationTasks) BeginResult(ctx context.Context, gatewayID, taskID uuid.UUID) (*ObservationResultTx, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("storage: begin result: %w", err)
 	}
-	var now time.Time
-	t, err := ScanObservationTask(tx.QueryRow(ctx, `SELECT `+ObservationTaskColumns+`, now() FROM observation_tasks t WHERE t.id = $1 FOR UPDATE`, taskID), &now)
+	t, now, err := lockTaskForGateway(ctx, tx, gatewayID, taskID)
 	if err != nil {
 		_ = tx.Rollback(ctx)
 		return nil, err
 	}
-	rt := &ObservationResultTx{tx: tx, Task: t, Now: now}
-	if err := tx.QueryRow(ctx, `SELECT status FROM gateways WHERE id = $1 FOR SHARE`, t.GatewayID).Scan(&rt.GatewayStatus); err != nil {
-		_ = tx.Rollback(ctx)
-		return nil, fmt.Errorf("storage: gateway status for result: %w", err)
-	}
-	return rt, nil
+	return &ObservationResultTx{tx: tx, Task: t, Now: now}, nil
 }
 
 // Attempt returns the task's attempt attemptID, or ErrNotFound.

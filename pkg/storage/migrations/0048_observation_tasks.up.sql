@@ -130,7 +130,6 @@ CREATE TABLE observation_task_attempts (
     ),
     CONSTRAINT observation_task_attempts_ended CHECK ((outcome IS NULL) = (ended_at IS NULL))
 );
-CREATE INDEX observation_task_attempts_task_idx ON observation_task_attempts (task_id, attempt_count);
 
 CREATE OR REPLACE FUNCTION observation_evidence_reject_mutations()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$

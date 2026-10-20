@@ -251,3 +251,16 @@ func TestDeadlineFor(t *testing.T) {
 }
 
 func jsonNumber(s string) json.Number { return json.Number(s) }
+
+// TestCanonicalize_RefusesDuplicateKeys: RFC 8785 has no canonical form
+// for an object with a duplicate key, at any depth.
+func TestCanonicalize_RefusesDuplicateKeys(t *testing.T) {
+	for _, in := range []string{`{"a":1,"a":2}`, `{"x":[{"b":1,"b":1}]}`, `{"o":{"k":{},"k":{}}}`} {
+		if _, err := canonicalize([]byte(in)); !errors.Is(err, ErrObservationSchema) {
+			t.Errorf("canonicalize(%s) = %v; want a schema error", in, err)
+		}
+	}
+	if _, err := canonicalize([]byte(`{"a":1,"A":2}`)); err != nil {
+		t.Errorf("keys differing in case are distinct for RFC 8785: %v", err)
+	}
+}

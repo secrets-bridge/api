@@ -60,7 +60,7 @@ type ObservationStore interface {
 	Claim(ctx context.Context, gatewayID, replicaID uuid.UUID, lease time.Duration, perReplica int, contractVersion string) (*storage.ObservationClaim, error)
 	Renew(ctx context.Context, gatewayID, taskID, attemptID uuid.UUID, lease time.Duration) (time.Time, error)
 	Release(ctx context.Context, gatewayID, taskID, attemptID uuid.UUID, reason string) (*storage.ObservationTask, bool, error)
-	BeginResult(ctx context.Context, taskID uuid.UUID) (*storage.ObservationResultTx, error)
+	BeginResult(ctx context.Context, gatewayID, taskID uuid.UUID) (*storage.ObservationResultTx, error)
 	ExpireDeadlines(ctx context.Context, now time.Time, requestID *uuid.UUID, limit int) ([]*storage.ObservationTask, error)
 	ListForRequest(ctx context.Context, requestID uuid.UUID) ([]*storage.ObservationTask, error)
 	ListForGateway(ctx context.Context, gatewayID uuid.UUID, state storage.ObservationTaskState, limit int) ([]*storage.ObservationTask, error)
@@ -164,17 +164,24 @@ func auditTaskClosed(ctx context.Context, audit storage.AuditEventRepository, ac
 // ---- environment observation source ------------------------------------------
 
 // Source returns the observation source of the environment a request
-// was executed in. A request with no environment, or an environment that
-// cannot be read, keeps today's behaviour (control_plane).
-func (s *GatewayObservationService) Source(ctx context.Context, envID *uuid.UUID) storage.ObservationSource {
+// was executed in. A request with no environment keeps today's
+// behaviour (control_plane). An environment that cannot be read is an
+// error: the caller starts no observer rather than guess, because
+// falling back to the control-plane poller would reach Argo CD from the
+// CP for an environment the admin moved to the Gateway
+// (secrets-bridge/gateway#13).
+func (s *GatewayObservationService) Source(ctx context.Context, envID *uuid.UUID) (storage.ObservationSource, error) {
 	if s == nil || envID == nil {
-		return storage.ObservationSourceControlPlane
+		return storage.ObservationSourceControlPlane, nil
 	}
 	src, err := s.store.EnvironmentObservationSource(ctx, *envID)
-	if err != nil || !src.Valid() {
-		return storage.ObservationSourceControlPlane
+	if err != nil {
+		return "", err
 	}
-	return src
+	if !src.Valid() {
+		return "", fmt.Errorf("observations: stored observation source %q is not valid", src)
+	}
+	return src, nil
 }
 
 // EnvironmentSource returns an environment's stored observation source
@@ -346,6 +353,11 @@ func (s *GatewayObservationService) Start(ctx context.Context, req *storage.Acce
 			DeadlineAt:    now.Add(deadlineFor(b)),
 		}
 		isNew, superseded, err := s.store.CreateTask(ctx, t, now)
+		if errors.Is(err, storage.ErrObservationSourceNotGateway) {
+			// The source left gateway after OnJobCompleted read it.
+			s.auditSkipped(ctx, req, correlation, "source_changed")
+			return nil
+		}
 		if err != nil {
 			s.appendAudit(ctx, &storage.AuditEvent{
 				Actor: observationSystemActor, Action: "observation.task.create_failed", Resource: "request:" + req.ID.String(),
@@ -658,31 +670,31 @@ func (s *GatewayObservationService) SubmitResult(ctx context.Context, gatewayID,
 		return nil, ErrObservationAttemptSuperseded
 	}
 	digest, err := ResultDigest(body)
+	if errors.Is(err, ErrObservationSchema) {
+		// A duplicate key: RFC 8785 has no canonical form for it, and Go
+		// would keep the last one.
+		s.auditRejected(ctx, gatewayID, nil, taskID, ids.AttemptID, rejectSchema)
+		return nil, err
+	}
 	if err != nil {
 		return nil, ErrObservationInvalidRequest
 	}
 
-	rt, err := s.store.BeginResult(ctx, taskID)
-	if errors.Is(err, storage.ErrNotFound) {
+	// 1. Identity and 2. ownership: BeginResult locks the Gateway row
+	// (still active or stale) and then the task, which must be this
+	// Gateway's; another Gateway's task is not found and not locked.
+	rt, err := s.store.BeginResult(ctx, gatewayID, taskID)
+	switch {
+	case errors.Is(err, storage.ErrGatewayNotLive):
+		return nil, ErrObservationGatewayNotLive
+	case errors.Is(err, storage.ErrNotFound):
 		s.auditRejected(ctx, gatewayID, nil, taskID, ids.AttemptID, rejectForeignTask)
 		return nil, ErrObservationNotFound
-	}
-	if err != nil {
+	case err != nil:
 		return nil, err
 	}
 	defer rt.Rollback(ctx)
 	task := rt.Task
-
-	// 1. Identity: the Gateway is still active or stale.
-	if task.GatewayID == gatewayID && !rt.GatewayStatus.Live() {
-		return nil, ErrObservationGatewayNotLive
-	}
-	// 2. Ownership: another Gateway's task is not found.
-	if task.GatewayID != gatewayID {
-		rt.Rollback(ctx)
-		s.auditRejected(ctx, gatewayID, nil, taskID, ids.AttemptID, rejectForeignTask)
-		return nil, ErrObservationNotFound
-	}
 	reject := func(reason string, out error) (*ObservationResultResponse, error) {
 		rt.Rollback(ctx)
 		s.auditRejected(ctx, gatewayID, task, taskID, ids.AttemptID, reason)
@@ -768,8 +780,10 @@ func (s *GatewayObservationService) SubmitResult(ctx context.Context, gatewayID,
 		}
 		return nil, err
 	}
-	// 9. Time window.
-	skew := s.cfg.SkewMargin + absMS(res.Clock.CPOffsetMS) + absMS(res.Clock.APIServerOffsetMS)
+	// 9. Time window. The self-reported offsets widen the window at most
+	// by the clock-skew bound; above it the stage cannot be observed
+	// anyway (clock_skew_suspected).
+	skew := s.cfg.SkewMargin + min(absMS(res.Clock.CPOffsetMS)+absMS(res.Clock.APIServerOffsetMS), s.cfg.ClockSkewBound)
 	if err := checkWindow(res, attempt, rt.Now, skew); err != nil {
 		return reject(rejectOutOfWindow, err)
 	}
@@ -847,9 +861,37 @@ func (s *GatewayObservationService) checkEvidenceBinding(ctx context.Context, rt
 		case st.Resource != nil && st.Resource.Kind != rules.kind:
 			return nil, obsViolation("resource.kind", "does not match the connector kind")
 		}
+		if err := resourceMatchesTarget(conn, st); err != nil {
+			return nil, err
+		}
 		out[st.Stage] = conn
 	}
 	return out, nil
+}
+
+// resourceMatchesTarget ties the object the evidence describes to the
+// target the Gateway advertised: resource.name must be the advertised
+// name, and resource.namespace the advertised namespace when the
+// catalog carried one (an Argo CD target advertises its app namespace
+// only for "apps in any namespace"). A target with no advertised name
+// cannot be tied to an object and is refused. An error stage carries no
+// resource and is not checked.
+func resourceMatchesTarget(conn *storage.GatewayConnector, st StageEvidence) error {
+	if st.Resource == nil {
+		return nil
+	}
+	target, ok := conn.Target(st.Source.TargetID)
+	switch {
+	case !ok:
+		return obsViolation("source.target_id", "is not advertised by the connector")
+	case target.Name == "":
+		return obsViolation("source.target_id", "has no advertised object name")
+	case st.Resource.Name != target.Name:
+		return obsViolation("resource.name", "is not the object the target advertises")
+	case target.Namespace != "" && st.Resource.Namespace != target.Namespace:
+		return obsViolation("resource.namespace", "is not the namespace the target advertises")
+	}
+	return nil
 }
 
 // checkWindow is design section 4.8 rule 9: observed_at within
@@ -1186,9 +1228,9 @@ type RequestObservationView struct {
 // accepted evidence per stage. Tasks past their deadline are closed as
 // timed_out first.
 func (s *GatewayObservationService) RequestObservations(ctx context.Context, req *storage.AccessRequest) (*RequestObservationView, error) {
-	if _, err := s.ExpireDeadlines(ctx, &req.ID); err != nil {
-		return nil, err
-	}
+	// Best effort: a failed sweep must not fail the read; the worker
+	// sweeper closes the task later.
+	_, _ = s.ExpireDeadlines(ctx, &req.ID)
 	tasks, err := s.store.ListForRequest(ctx, req.ID)
 	if err != nil {
 		return nil, err
@@ -1202,11 +1244,14 @@ func (s *GatewayObservationService) RequestObservations(ctx context.Context, req
 		return nil, err
 	}
 	v := &RequestObservationView{
-		Source: s.Source(ctx, req.EnvironmentID), Rollup: RollupVerdict(tasks), Tasks: tasks,
+		Rollup: RollupVerdict(tasks), Tasks: tasks,
 		Evidence: map[uuid.UUID][]*storage.ObservationEvidence{},
 	}
 	for _, e := range evs {
 		v.Evidence[e.TaskID] = append(v.Evidence[e.TaskID], e)
+	}
+	if src, err := s.Source(ctx, req.EnvironmentID); err == nil {
+		v.Source = src
 	}
 	return v, nil
 }

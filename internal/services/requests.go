@@ -56,7 +56,7 @@ type GitOpsStarter interface {
 // an environment's observation source and starts Gateway tasks for a
 // request executed in a gateway environment.
 type ObservationStarter interface {
-	Source(ctx context.Context, envID *uuid.UUID) storage.ObservationSource
+	Source(ctx context.Context, envID *uuid.UUID) (storage.ObservationSource, error)
 	Start(ctx context.Context, request *storage.AccessRequest, job *storage.SyncJob) error
 }
 
@@ -1484,7 +1484,14 @@ func (s *RequestService) OnJobCompleted(ctx context.Context, job *storage.SyncJo
 func (s *RequestService) startObservation(ctx context.Context, req *storage.AccessRequest, job *storage.SyncJob) {
 	src := storage.ObservationSourceControlPlane
 	if s.observer != nil {
-		src = s.observer.Source(ctx, req.EnvironmentID)
+		var err error
+		if src, err = s.observer.Source(ctx, req.EnvironmentID); err != nil {
+			// Unknown source: start neither observer. Falling back to
+			// the control-plane poller could reach Argo CD from the CP
+			// for an environment moved to the Gateway.
+			s.auditObservationSkipped(ctx, "request.observation_skipped", req, job, "", "source_unreadable")
+			return
+		}
 	}
 	switch src {
 	case storage.ObservationSourceGateway:
@@ -1502,7 +1509,10 @@ func (s *RequestService) startObservation(ctx context.Context, req *storage.Acce
 }
 
 func (s *RequestService) auditObservationSkipped(ctx context.Context, action string, req *storage.AccessRequest, job *storage.SyncJob, src storage.ObservationSource, reason string) {
-	meta := map[string]any{"reason": reason, "request_id": req.ID.String(), "observation_source": string(src)}
+	meta := map[string]any{"reason": reason, "request_id": req.ID.String()}
+	if src != "" {
+		meta["observation_source"] = string(src)
+	}
 	if req.EnvironmentID != nil {
 		meta["environment_id"] = req.EnvironmentID.String()
 	}

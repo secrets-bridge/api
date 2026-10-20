@@ -749,6 +749,7 @@ func TestLive_Gateway_AdminRoutesNeedPermissionAndFreshMFA(t *testing.T) {
 	ctx := t.Context()
 	gw := f.createGateway(t, "perm-gw")
 	anyID := uuid.NewString()
+	_, permEnv, _ := f.seedScope(t)
 
 	type route struct {
 		method, path, perm string
@@ -769,6 +770,7 @@ func TestLive_Gateway_AdminRoutesNeedPermissionAndFreshMFA(t *testing.T) {
 		{http.MethodPut, "/api/v1/admin/gateways/" + gw + "/enabled", "gateway.revoke", true},
 		{http.MethodGet, "/api/v1/admin/gateways/" + gw + "/tasks", "gateway.list", false},
 		{http.MethodPut, "/api/v1/admin/environments/" + anyID + "/observation-source", "gateway.bind", true},
+		{http.MethodGet, "/api/v1/admin/environments/" + permEnv.String() + "/observation-source", "gateway.bind", false},
 	}
 	body := map[string]any{"name": "x", "boundary": "x"}
 
