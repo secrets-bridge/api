@@ -94,6 +94,9 @@ func TestSeedMigrationStringsAreInCatalog(t *testing.T) {
 
 		// admin, 0043_seed_admin_auth_sso_edit.up.sql (api#267).
 		"auth.sso.edit",
+
+		// admin, 0047_seed_gateway_permissions.up.sql (api#293).
+		"gateway.mint", "gateway.revoke", "gateway.list", "gateway.bind",
 	}
 	for _, p := range seedPermissions {
 		if !IsKnown(p) {

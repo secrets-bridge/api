@@ -35,6 +35,38 @@ var publicV1Paths = map[string]bool{
 	"/api/v1/auth/sso/google/callback": true,
 }
 
+// sessionExemptPrefixes are the /api/v1 subtrees the session gate lets
+// through because every route under them carries its own machine
+// authentication:
+//
+//   - /api/v1/agents/    agent enroll (one-time token) and the AgentAuth
+//     group (X-Agent-Secret)
+//   - /api/v1/gateways/  gateway enroll (one-time token) and the
+//     GatewayAuth group (X-Gateway-Secret), api#293
+//
+// Admin routes for both live elsewhere (/admin/agents, /admin/gateways)
+// and stay behind the gate. Adding a prefix here is a reviewed
+// exception; TestLive_Gateway_MachineRoutesArePinned fails when a route
+// appears under /api/v1/gateways/ without being added to its list.
+var sessionExemptPrefixes = []string{"/api/v1/agents/", "/api/v1/gateways/"}
+
+// gatewayMachineRoutes are the Gateway's machine routes (api#293). E1 is
+// registered before the `:id` group so the group's GatewayAuth never
+// sees `/gateways/enroll`.
+type gatewayMachineRoutes struct {
+	auth      fiber.Handler
+	enroll    []fiber.Handler
+	heartbeat []fiber.Handler
+	catalog   []fiber.Handler
+}
+
+func (g gatewayMachineRoutes) register(v1 fiber.Router) {
+	mount(v1.Post, "/gateways/enroll", g.enroll)
+	grp := v1.Group("/gateways/:id", g.auth)
+	mount(grp.Post, "/heartbeat", g.heartbeat)
+	mount(grp.Put, "/catalog", g.catalog)
+}
+
 // hs is sugar for building a handler chain (middleware first, final
 // handler last) in the literal below. Fiber takes variadic handlers
 // per route and drives `c.Next()` between them, so the chain must be

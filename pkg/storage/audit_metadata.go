@@ -138,6 +138,13 @@ var auditMetaKeys = map[string]auditMetaKind{
 	// nested before/after values, checked against this table
 	"new": metaObject, "old": metaObject,
 
+	// gateway registry (api#293): ids, enums, digests and counts only
+	"gateway_id": metaID, "replica_id": metaID, "connector_id": metaID, "argocd_connector_id": metaID,
+	"argocd_target_id": metaToken, "expected_stages": metaTokenList, "catalog_version": metaDigest,
+	"connector_count": metaNumber, "target_count": metaNumber, "targets_stale": metaNumber,
+	"connectors_missing": metaNumber, "max_replicas": metaNumber, "max_inflight_tasks": metaNumber,
+	"enrollment_tokens_revoked": metaNumber, "observation_timeout_seconds": metaNumber,
+
 	// free-text errors: never stored
 	"error": metaErrorText, "sessions_revoke_err": metaErrorText, "wrap_refresh_errors": metaErrorText,
 }

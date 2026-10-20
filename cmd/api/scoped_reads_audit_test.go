@@ -35,6 +35,8 @@ import (
 type liveApp struct {
 	app  *fiber.App
 	pool *storage.Pool
+	// logs holds everything the app logged, for canary checks.
+	logs *hygLogBuffer
 }
 
 func newLiveApp(t *testing.T, opts ...func(*Config)) *liveApp {
@@ -56,6 +58,8 @@ func newLiveApp(t *testing.T, opts ...func(*Config)) *liveApp {
 	t.Cleanup(pool.Close)
 
 	const wipe = `
+		DELETE FROM gateway_connector_bindings;
+		DELETE FROM gateways;
 		DELETE FROM gitops_observations;
 		DELETE FROM gitops_app_mappings;
 		DELETE FROM argocd_endpoints;
@@ -120,8 +124,9 @@ func newLiveApp(t *testing.T, opts ...func(*Config)) *liveApp {
 	for _, o := range opts {
 		o(&appCfg)
 	}
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return &liveApp{app: newApp(appCfg, logger, pool, rdb, km, authSvc), pool: pool}
+	logs := &hygLogBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return &liveApp{app: newApp(appCfg, logger, pool, rdb, km, authSvc), pool: pool, logs: logs}
 }
 
 // grantUser creates a fresh user holding a fresh role with perms at the

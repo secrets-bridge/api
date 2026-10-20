@@ -12,6 +12,18 @@ on `main`.
 ## [Unreleased]
 
 ### Added
+- Gateway registry (#293, Gateway Release 1): migrations 0046 and 0047
+  add `gateways`, `gateway_enrollment_tokens`, `gateway_replicas`,
+  `gateway_connectors` and `gateway_connector_bindings`, and the
+  `gateway.mint`, `gateway.revoke`, `gateway.list` and `gateway.bind`
+  permissions on the seeded admin role. Machine routes under the
+  session-exempt `/api/v1/gateways/` prefix: one-time-token enrollment,
+  and heartbeat and catalog authenticated by `X-Gateway-Secret`, a
+  credential separate from `X-Agent-Secret`. Admin routes under
+  `/api/v1/admin/gateways` and `/api/v1/admin/gateway-*` create
+  Gateways, mint and revoke tokens, revoke Gateways, approve advertised
+  connectors and bind Argo CD targets; writes need a fresh second
+  factor.
 - Object storage for media (`pkg/objectstore`, #253): an S3 backend on
   AWS SDK v2 for AWS S3 and S3-compatible servers such as MinIO,
   configured with `SB_OBJECTSTORE_*`. Project and team logos are now
