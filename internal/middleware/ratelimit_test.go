@@ -10,6 +10,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/testutil/redisproxy"
 	"github.com/secrets-bridge/api/pkg/runtime"
 )
 
@@ -20,8 +21,10 @@ func openRedisForRateLimit(t *testing.T) *runtime.Client {
 		t.Skip("TEST_REDIS_URL not set; skipping")
 	}
 	cfg := runtime.Config{
-		URL:         url,
-		Namespace:   "test-ratelimit",
+		URL: url,
+		// A namespace per test, so a rerun within the window doesn't find
+		// the previous run's buckets already spent.
+		Namespace:   "test-ratelimit-" + uuid.NewString(),
 		PoolSize:    4,
 		DialTimeout: 5 * time.Second,
 	}
@@ -293,5 +296,44 @@ func TestByIdentity(t *testing.T) {
 	}
 	if ok {
 		t.Fatalf("anonymous request must not be bucketed, got %q", got)
+	}
+}
+
+// A Redis that drops packets must not hold a limited request for the
+// client's read timeout times its retries: the call is bounded, then the
+// fail-open route passes and the fail-closed one answers 503 (api#304).
+func TestRateLimit_BlackholedRedisIsBounded(t *testing.T) {
+	url := os.Getenv("TEST_REDIS_URL")
+	if url == "" {
+		t.Skip("TEST_REDIS_URL not set; skipping")
+	}
+	proxy, proxied := redisproxy.Start(t, url)
+	rdb, err := runtime.Open(t.Context(), runtime.Config{URL: proxied, Namespace: "test-ratelimit-blackhole", PoolSize: 4})
+	if err != nil {
+		t.Fatalf("runtime.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	app := fiber.New()
+	bucket := func(c fiber.Ctx) (string, bool) { return "alice", true }
+	ok := func(c fiber.Ctx) error { return c.SendStatus(200) }
+	app.Get("/open", RateLimit(rdb, nil, RateLimitConfig{Name: "test:bh-open", Bucket: bucket, Limit: 5, Window: time.Minute}), ok)
+	app.Get("/closed", RateLimit(rdb, nil, RateLimitConfig{Name: "test:bh-closed", Bucket: bucket, Limit: 5, Window: time.Minute, FailClosed: true}), ok)
+
+	proxy.Set(redisproxy.Blackhole)
+	for path, want := range map[string]int{"/open": 200, "/closed": 503} {
+		start := time.Now()
+		resp, err := app.Test(httptest.NewRequest("GET", path, nil), fiber.TestConfig{Timeout: 30 * time.Second, FailOnTimeout: true})
+		took := time.Since(start)
+		t.Logf("%s: %s with Redis blackholed", path, took.Round(time.Millisecond))
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		if resp.StatusCode != want {
+			t.Errorf("%s: status %d, want %d", path, resp.StatusCode, want)
+		}
+		if took > 2*time.Second {
+			t.Errorf("%s took %s with Redis blackholed, want under 2s", path, took.Round(time.Millisecond))
+		}
 	}
 }

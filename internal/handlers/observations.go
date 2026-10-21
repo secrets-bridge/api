@@ -205,8 +205,12 @@ func (h *Gateways) AdminSetEnabled(c fiber.Ctx) error {
 	switch {
 	case errors.Is(err, storage.ErrNotFound):
 		return fiber.NewError(fiber.StatusNotFound, "gateway_not_found")
+	case errors.Is(err, services.ErrCredentialCacheUnconfirmed) && *req.Enabled:
+		// Enabled in the database; a stale tombstone may refuse the
+		// Gateway until the background retry clears it.
+		return cacheUnconfirmed(c, "enabled_cache_unconfirmed")
 	case errors.Is(err, services.ErrCredentialCacheUnconfirmed):
-		return fiber.NewError(fiber.StatusServiceUnavailable, "revoked_cache_unconfirmed")
+		return cacheUnconfirmed(c, "revoked_cache_unconfirmed")
 	case errors.Is(err, storage.ErrGatewayStatusConflict):
 		return fiber.NewError(fiber.StatusConflict, "gateway_revoked")
 	case err != nil:

@@ -272,7 +272,7 @@ func (s *GatewayService) Revoke(ctx context.Context, id uuid.UUID, by, reason st
 	if errors.Is(err, storage.ErrGatewayAlreadyRevoked) {
 		// A retry after ErrCredentialCacheUnconfirmed lands here: confirm
 		// the tombstone again before answering.
-		if cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked); cacheErr != nil {
+		if cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked, nil); cacheErr != nil {
 			return nil, cacheErr
 		}
 		return nil, err
@@ -280,7 +280,7 @@ func (s *GatewayService) Revoke(ctx context.Context, id uuid.UUID, by, reason st
 	if err != nil {
 		return nil, err
 	}
-	cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked)
+	cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked, nil)
 	meta := map[string]any{
 		"gateway_id": id.String(), "enrollment_tokens_revoked": out.TokensRevoked,
 		"tasks_requeued": out.TasksRequeued,
@@ -299,8 +299,8 @@ func (s *GatewayService) Revoke(ctx context.Context, id uuid.UUID, by, reason st
 	return s.store.Get(ctx, id)
 }
 
-// auditCacheUnconfirmed records a revoke or disable whose cache tombstone
-// could not be written yet (ErrCredentialCacheUnconfirmed).
+// auditCacheUnconfirmed records a revoke, disable or enable whose cache
+// update could not be confirmed yet (ErrCredentialCacheUnconfirmed).
 func (s *GatewayService) auditCacheUnconfirmed(ctx context.Context, id uuid.UUID, by, action string) {
 	s.appendAudit(ctx, &storage.AuditEvent{
 		Actor: auditActor(ctx, by), Action: action, Resource: gatewayActor(id), Status: storage.AuditStatusFailure,
@@ -325,11 +325,10 @@ func (s *GatewayService) SetEnabled(ctx context.Context, id uuid.UUID, enabled b
 	}
 	var cacheErr error
 	if enabled {
-		// Drops only a "disabled" tombstone, so this never lifts a revoke.
-		s.cache.clearRevoked(ctx, id)
-		s.invalidateSecretHashCache(ctx, id)
+		// Lifts only a "disabled" tombstone, so this never lifts a revoke.
+		cacheErr = s.cache.ensureCleared(ctx, id, s.blockedInDB(id))
 	} else {
-		cacheErr = s.cache.ensureRevoked(ctx, id, tombstoneDisabled)
+		cacheErr = s.cache.ensureRevoked(ctx, id, tombstoneDisabled, s.blockedInDB(id))
 	}
 	if changed {
 		action := "gateway.enable"
@@ -344,10 +343,24 @@ func (s *GatewayService) SetEnabled(ctx context.Context, id uuid.UUID, enabled b
 		})
 	}
 	if cacheErr != nil {
-		s.auditCacheUnconfirmed(ctx, id, by, "gateway.disable.cache_unconfirmed")
+		action := "gateway.disable.cache_unconfirmed"
+		if enabled {
+			action = "gateway.enable.cache_unconfirmed"
+		}
+		s.auditCacheUnconfirmed(ctx, id, by, action)
 		return nil, cacheErr
 	}
 	return s.store.Get(ctx, id)
+}
+
+// blockedInDB is the cache's re-read of the Gateway row: true while the
+// Gateway isn't live, and also when the row can't be read, so a doubt
+// keeps it out rather than letting it in.
+func (s *GatewayService) blockedInDB(id uuid.UUID) func(context.Context) bool {
+	return func(ctx context.Context) bool {
+		status, _, err := s.store.GetAuth(ctx, id)
+		return err != nil || !storage.GatewayStatus(status).Live()
+	}
 }
 
 // ---- E1 enroll ---------------------------------------------------------
@@ -562,7 +575,9 @@ func (s *GatewayService) claimRejectSlot(ctx context.Context, kind, subject, rea
 	if s.rdb == nil {
 		return true
 	}
-	ok, err := s.rdb.Raw().SetNX(ctx, s.rdb.Key(kind, subject+":"+reason), "1", rejectAuditWindow).Result()
+	cctx, cancel := withCacheDeadline(ctx)
+	defer cancel()
+	ok, err := s.rdb.Raw().SetNX(cctx, s.rdb.Key(kind, subject+":"+reason), "1", rejectAuditWindow).Result()
 	if err != nil {
 		return true
 	}

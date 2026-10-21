@@ -19,6 +19,21 @@ on `main`.
   `SB_REQUIRE_MFA_AT_LOGIN=false` still turns it off, and outside dev
   that is logged as a warning at boot.
 
+### Fixed
+- A revoked agent or Gateway can no longer get in through the
+  credential cache (api#303). A revoke or disable writes a tombstone the
+  cache can't fill past. If Redis won't take it, the call answers 503
+  `revoked_cache_unconfirmed`, writes a `*.cache_unconfirmed` audit row
+  and keeps retrying in the background. Enabling a Gateway while Redis
+  can't clear its tombstone answers 503 `enabled_cache_unconfirmed` the
+  same way, and a disable's retry stops once the Gateway is enabled again
+  (api#304).
+- A Redis that drops packets no longer holds agent and Gateway calls,
+  revokes and rate-limited routes for about 15s each (api#304). Those
+  Redis calls now have a deadline (300ms for the auth cache, 500ms for
+  the rate limiter), and the Redis client honours the caller's context
+  deadline for every call.
+
 ### Removed
 - The control-plane Argo CD integration (secrets-bridge/gateway#13):
   `pkg/argocd`, the Argo CD endpoint and GitOps services, the

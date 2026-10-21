@@ -97,6 +97,11 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.DialTimeout > 0 {
 		opts.DialTimeout = cfg.DialTimeout
 	}
+	// Socket reads and writes honour the caller's context deadline.
+	// Without this go-redis swaps in context.Background() at the socket,
+	// so a deadline bounds nothing and a Redis that drops packets holds
+	// each call for the read timeout times the retries (api#304).
+	opts.ContextTimeoutEnabled = true
 	rdb := redis.NewClient(opts)
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		_ = rdb.Close()

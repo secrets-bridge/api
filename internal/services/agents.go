@@ -283,7 +283,9 @@ func (s *AgentService) claimRejectAuditSlot(ctx context.Context, kind, subject, 
 		return true
 	}
 	key := s.rdb.Key(kind, subject+":"+reason)
-	ok, err := s.rdb.Raw().SetNX(ctx, key, "1", rejectAuditWindow).Result()
+	cctx, cancel := withCacheDeadline(ctx)
+	defer cancel()
+	ok, err := s.rdb.Raw().SetNX(cctx, key, "1", rejectAuditWindow).Result()
 	if err != nil {
 		return true
 	}
@@ -304,7 +306,9 @@ func (s *AgentService) Heartbeat(ctx context.Context, id uuid.UUID, agentSecret 
 
 	if s.rdb != nil {
 		key := s.rdb.Key(cacheKindLastSeen, id.String())
-		_, _ = s.rdb.Raw().Set(ctx, key, now.Format(time.RFC3339Nano), s.heartbeatCacheTTL).Result()
+		cctx, cancel := withCacheDeadline(ctx)
+		_, _ = s.rdb.Raw().Set(cctx, key, now.Format(time.RFC3339Nano), s.heartbeatCacheTTL).Result()
+		cancel()
 	}
 	return nil
 }
@@ -370,7 +374,7 @@ func (s *AgentService) Revoke(ctx context.Context, id uuid.UUID, revokedBy, reas
 	if err := s.agents.Revoke(ctx, id, revokedBy, s.now().UTC()); err != nil {
 		return err
 	}
-	cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked)
+	cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked, nil)
 
 	actor := auditActor(ctx, revokedBy)
 	meta := map[string]any{
@@ -432,7 +436,10 @@ func (s *AgentService) List(ctx context.Context) ([]*AgentView, error) {
 			LastSeenAt: a.LastSeenAt,
 		}
 		if s.rdb != nil && a.LastSeenAt == nil {
-			if cached, err := s.rdb.Raw().Get(ctx, "secrets-bridge:agent:lastseen:"+a.ID.String()).Result(); err == nil && cached != "" {
+			cctx, cancel := withCacheDeadline(ctx)
+			cached, err := s.rdb.Raw().Get(cctx, "secrets-bridge:agent:lastseen:"+a.ID.String()).Result()
+			cancel()
+			if err == nil && cached != "" {
 				if t, err := time.Parse(time.RFC3339Nano, cached); err == nil {
 					v.LastSeenAt = &t
 				}

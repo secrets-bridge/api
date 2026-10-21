@@ -10,15 +10,19 @@ import (
 // CredCacheSeams are test hooks into the agent and Gateway credential
 // cache (skills#104). BeforeFill runs after the database read and before
 // the cache write; AfterWrite runs after the write and before the re-read;
-// Del replaces the Redis delete.
+// BeforeConfirm runs before each tombstone write that follows a revoke or
+// disable commit; BeforeClear runs before each tombstone clear that
+// follows an enable commit; Del replaces the Redis delete.
 type CredCacheSeams struct {
-	BeforeFill func()
-	AfterWrite func()
-	Del        func(ctx context.Context, key string) error
+	BeforeFill    func()
+	AfterWrite    func()
+	BeforeConfirm func()
+	BeforeClear   func()
+	Del           func(ctx context.Context, key string) error
 }
 
 func setSeams(c *credCache, s CredCacheSeams) {
-	c.beforeFill, c.afterWrite, c.del = s.BeforeFill, s.AfterWrite, s.Del
+	c.beforeFill, c.afterWrite, c.beforeConfirm, c.beforeClear, c.del = s.BeforeFill, s.AfterWrite, s.BeforeConfirm, s.BeforeClear, s.Del
 }
 
 // SetAgentCacheSeams installs test hooks on an AgentService's cache.
@@ -36,6 +40,12 @@ func SetGatewayCacheRetry(svc *GatewayService, d time.Duration) { svc.cache.retr
 // WriteGatewayTombstone writes a tombstone the way a revoke or disable does.
 func WriteGatewayTombstone(ctx context.Context, svc *GatewayService, id uuid.UUID, reason string) error {
 	return svc.cache.markRevoked(ctx, id, reason)
+}
+
+// DeleteGatewayTombstone drops a Gateway's tombstone, as an expiry or a
+// lost write would.
+func DeleteGatewayTombstone(ctx context.Context, svc *GatewayService, id uuid.UUID) error {
+	return svc.cache.rdb.Raw().Del(ctx, svc.cache.key(svc.cache.revokedKind, id)).Err()
 }
 
 // GatewayTombstone reads a Gateway's tombstone ("" when there is none).
