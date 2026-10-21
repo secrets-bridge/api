@@ -100,12 +100,19 @@ type GatewayService struct {
 	now   func() time.Time
 
 	secretHashCacheTTL time.Duration
+
+	// cache fronts the secret-hash check with a revocation tombstone and
+	// a negative entry for unknown ids (skills#104).
+	cache *credCache
 }
 
 // NewGatewayService builds the service. rdb may be nil (no cache, no
 // audit rollup).
 func NewGatewayService(store GatewayStore, audit storage.AuditEventRepository, rdb *runtime.Client) *GatewayService {
-	return &GatewayService{store: store, audit: audit, rdb: rdb, now: time.Now, secretHashCacheTTL: 60 * time.Second}
+	return &GatewayService{
+		store: store, audit: audit, rdb: rdb, now: time.Now, secretHashCacheTTL: 60 * time.Second,
+		cache: newCredCache(rdb, cacheKindGatewaySecretHash, 60*time.Second),
+	}
 }
 
 func (s *GatewayService) appendAudit(ctx context.Context, e *storage.AuditEvent) {
@@ -259,6 +266,8 @@ func (s *GatewayService) RevokeEnrollmentToken(ctx context.Context, id uuid.UUID
 // result is refused), then deletes the auth cache entry so the next call
 // is refused.
 func (s *GatewayService) Revoke(ctx context.Context, id uuid.UUID, by, reason string) (*storage.Gateway, error) {
+	// Tombstone first, so no cache entry outlives the revoke (skills#104).
+	_ = s.cache.markRevoked(ctx, id, "revoked")
 	out, err := s.store.Revoke(ctx, id, by, s.now().UTC())
 	if err != nil {
 		return nil, err
@@ -284,9 +293,18 @@ func (s *GatewayService) Revoke(ctx context.Context, id uuid.UUID, by, reason st
 // unlike revoke it can be undone and keeps the credential. The auth
 // cache entry is dropped either way.
 func (s *GatewayService) SetEnabled(ctx context.Context, id uuid.UUID, enabled bool, by string) (*storage.Gateway, error) {
+	if !enabled {
+		// Tombstone first, like a revoke (skills#104).
+		_ = s.cache.markRevoked(ctx, id, string(storage.GatewayStatusDisabled))
+	}
 	changed, out, err := s.store.SetEnabled(ctx, id, enabled, s.now().UTC())
 	if err != nil {
 		return nil, err
+	}
+	if enabled && changed {
+		// Disabled -> enabled. A revoked Gateway never gets here
+		// (ErrGatewayStatusConflict), so this never lifts a revoke.
+		s.cache.clearRevoked(ctx, id)
 	}
 	s.invalidateSecretHashCache(ctx, id)
 	if changed {
@@ -456,11 +474,21 @@ type cachedGatewayHash struct {
 // the caller answers a generic 401 and the reason goes to the audit log,
 // rolled up per (id, reason).
 func (s *GatewayService) Authenticate(ctx context.Context, id uuid.UUID, secret string) error {
-	cached, ok := s.readSecretHashCache(ctx, id)
-	if !ok {
+	r := s.cache.read(ctx, id)
+	if r.revoked != "" {
+		s.auditAuthRejected(ctx, id, "status_"+r.revoked)
+		return storage.ErrUnauthorized
+	}
+	if r.missing {
+		s.auditAuthRejected(ctx, id, "unknown_gateway")
+		return storage.ErrNotFound
+	}
+	var cached cachedGatewayHash
+	if !r.hit || json.Unmarshal(r.entry, &cached) != nil {
 		status, hash, err := s.store.GetAuth(ctx, id)
 		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
+				s.cache.markMissing(ctx, id)
 				s.auditAuthRejected(ctx, id, "unknown_gateway")
 			}
 			return err
@@ -513,45 +541,23 @@ func (s *GatewayService) claimRejectSlot(ctx context.Context, kind, subject, rea
 	return ok
 }
 
-func (s *GatewayService) readSecretHashCache(ctx context.Context, id uuid.UUID) (cachedGatewayHash, bool) {
-	if s.rdb == nil {
-		return cachedGatewayHash{}, false
-	}
-	raw, err := s.rdb.Raw().Get(ctx, s.rdb.Key(cacheKindGatewaySecretHash, id.String())).Bytes()
-	if err != nil {
-		return cachedGatewayHash{}, false
-	}
-	var c cachedGatewayHash
-	if json.Unmarshal(raw, &c) != nil {
-		return cachedGatewayHash{}, false
-	}
-	return c, true
-}
-
-// fillSecretHashCache writes the entry, then re-reads the row and drops
-// the entry if it changed, so a revoke that committed between the read
-// and the write never leaves a live entry behind (same as agents,
-// API-S-21).
+// fillSecretHashCache writes the entry unless the Gateway carries a
+// revocation tombstone, then re-reads the row and drops the entry if it
+// changed, so a revoke that committed between the read and the write
+// never leaves a live entry behind (same as agents, API-S-21).
 func (s *GatewayService) fillSecretHashCache(ctx context.Context, id uuid.UUID, c cachedGatewayHash) {
-	if s.rdb == nil {
-		return
-	}
 	raw, err := json.Marshal(c)
 	if err != nil {
 		return
 	}
-	_, _ = s.rdb.Raw().Set(ctx, s.rdb.Key(cacheKindGatewaySecretHash, id.String()), raw, s.secretHashCacheTTL).Result()
-	status, hash, err := s.store.GetAuth(ctx, id)
-	if err != nil || string(status) != c.Status || !bytes.Equal(hash, c.Hash) {
-		s.invalidateSecretHashCache(ctx, id)
-	}
+	s.cache.fill(ctx, id, raw, func() bool {
+		status, hash, err := s.store.GetAuth(ctx, id)
+		return err == nil && string(status) == c.Status && bytes.Equal(hash, c.Hash)
+	})
 }
 
 func (s *GatewayService) invalidateSecretHashCache(ctx context.Context, id uuid.UUID) {
-	if s.rdb == nil {
-		return
-	}
-	_, _ = s.rdb.Raw().Del(ctx, s.rdb.Key(cacheKindGatewaySecretHash, id.String())).Result()
+	s.cache.invalidate(ctx, id)
 }
 
 // ---- E2 heartbeat ------------------------------------------------------
