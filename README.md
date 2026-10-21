@@ -86,7 +86,7 @@ Tier 2 ops (approve / reject / reveal wrap) additionally require `last_mfa_at` w
 | `API_SHUTDOWN_GRACE` | `15s` | Graceful-shutdown deadline |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `DATABASE_URL` | required | Postgres DSN |
-| `REDIS_URL` | required | Redis URL (db index in path) |
+| `REDIS_URL` | required | Redis URL (db index in path). Run it with `maxmemory-policy noeviction`: the agent and Gateway auth cache relies on a revocation tombstone outliving the cached credential, and an evicted tombstone would stop blocking it |
 | `SB_ENV` | `production` | `dev` or `production`. In `production`, `local` KMS backend is REJECTED at boot. |
 
 ### Auth / sessions / OIDC (Slices A1 to E)

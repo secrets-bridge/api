@@ -109,10 +109,9 @@ type GatewayService struct {
 // NewGatewayService builds the service. rdb may be nil (no cache, no
 // audit rollup).
 func NewGatewayService(store GatewayStore, audit storage.AuditEventRepository, rdb *runtime.Client) *GatewayService {
-	return &GatewayService{
-		store: store, audit: audit, rdb: rdb, now: time.Now, secretHashCacheTTL: 60 * time.Second,
-		cache: newCredCache(rdb, cacheKindGatewaySecretHash, 60*time.Second),
-	}
+	s := &GatewayService{store: store, audit: audit, rdb: rdb, now: time.Now, secretHashCacheTTL: 60 * time.Second}
+	s.cache = newCredCache(rdb, cacheKindGatewaySecretHash, s.secretHashCacheTTL)
+	return s
 }
 
 func (s *GatewayService) appendAudit(ctx context.Context, e *storage.AuditEvent) {
@@ -266,13 +265,22 @@ func (s *GatewayService) RevokeEnrollmentToken(ctx context.Context, id uuid.UUID
 // result is refused), then deletes the auth cache entry so the next call
 // is refused.
 func (s *GatewayService) Revoke(ctx context.Context, id uuid.UUID, by, reason string) (*storage.Gateway, error) {
-	// Tombstone first, so no cache entry outlives the revoke (skills#104).
-	_ = s.cache.markRevoked(ctx, id, "revoked")
+	// First tombstone write before the commit; ensureRevoked confirms it
+	// after (skills#104).
+	_ = s.cache.markRevoked(ctx, id, tombstoneRevoked)
 	out, err := s.store.Revoke(ctx, id, by, s.now().UTC())
+	if errors.Is(err, storage.ErrGatewayAlreadyRevoked) {
+		// A retry after ErrCredentialCacheUnconfirmed lands here: confirm
+		// the tombstone again before answering.
+		if cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked); cacheErr != nil {
+			return nil, cacheErr
+		}
+		return nil, err
+	}
 	if err != nil {
 		return nil, err
 	}
-	s.invalidateSecretHashCache(ctx, id)
+	cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked)
 	meta := map[string]any{
 		"gateway_id": id.String(), "enrollment_tokens_revoked": out.TokensRevoked,
 		"tasks_requeued": out.TasksRequeued,
@@ -284,7 +292,20 @@ func (s *GatewayService) Revoke(ctx context.Context, id uuid.UUID, by, reason st
 		Actor: auditActor(ctx, by), Action: "gateway.revoke",
 		Resource: gatewayActor(id), Status: storage.AuditStatusSuccess, Metadata: meta,
 	})
+	if cacheErr != nil {
+		s.auditCacheUnconfirmed(ctx, id, by, "gateway.revoke.cache_unconfirmed")
+		return nil, cacheErr
+	}
 	return s.store.Get(ctx, id)
+}
+
+// auditCacheUnconfirmed records a revoke or disable whose cache tombstone
+// could not be written yet (ErrCredentialCacheUnconfirmed).
+func (s *GatewayService) auditCacheUnconfirmed(ctx context.Context, id uuid.UUID, by, action string) {
+	s.appendAudit(ctx, &storage.AuditEvent{
+		Actor: auditActor(ctx, by), Action: action, Resource: gatewayActor(id), Status: storage.AuditStatusFailure,
+		Metadata: map[string]any{"gateway_id": id.String(), "error_kind": "cache_unconfirmed"},
+	})
 }
 
 // SetEnabled disables or re-enables a Gateway (design section 9,
@@ -294,19 +315,22 @@ func (s *GatewayService) Revoke(ctx context.Context, id uuid.UUID, by, reason st
 // cache entry is dropped either way.
 func (s *GatewayService) SetEnabled(ctx context.Context, id uuid.UUID, enabled bool, by string) (*storage.Gateway, error) {
 	if !enabled {
-		// Tombstone first, like a revoke (skills#104).
-		_ = s.cache.markRevoked(ctx, id, string(storage.GatewayStatusDisabled))
+		// Tombstone first, like a revoke (skills#104). It never replaces
+		// a "revoked" one.
+		_ = s.cache.markRevoked(ctx, id, tombstoneDisabled)
 	}
 	changed, out, err := s.store.SetEnabled(ctx, id, enabled, s.now().UTC())
 	if err != nil {
 		return nil, err
 	}
-	if enabled && changed {
-		// Disabled -> enabled. A revoked Gateway never gets here
-		// (ErrGatewayStatusConflict), so this never lifts a revoke.
+	var cacheErr error
+	if enabled {
+		// Drops only a "disabled" tombstone, so this never lifts a revoke.
 		s.cache.clearRevoked(ctx, id)
+		s.invalidateSecretHashCache(ctx, id)
+	} else {
+		cacheErr = s.cache.ensureRevoked(ctx, id, tombstoneDisabled)
 	}
-	s.invalidateSecretHashCache(ctx, id)
 	if changed {
 		action := "gateway.enable"
 		meta := map[string]any{"gateway_id": id.String()}
@@ -318,6 +342,10 @@ func (s *GatewayService) SetEnabled(ctx context.Context, id uuid.UUID, enabled b
 			Actor: auditActor(ctx, by), Action: action,
 			Resource: gatewayActor(id), Status: storage.AuditStatusSuccess, Metadata: meta,
 		})
+	}
+	if cacheErr != nil {
+		s.auditCacheUnconfirmed(ctx, id, by, "gateway.disable.cache_unconfirmed")
+		return nil, cacheErr
 	}
 	return s.store.Get(ctx, id)
 }

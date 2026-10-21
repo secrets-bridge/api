@@ -36,9 +36,9 @@ import (
 //
 // The heartbeat path uses a Redis cache for the agent's secret hash so
 // validation is one Redis GET (cache hit) instead of one Postgres
-// SELECT under load. Revocation MUST go through Revoke() — direct
-// status updates to the storage layer would leave the cache stale and
-// let a revoked agent keep heartbeating for up to secretHashCacheTTL.
+// SELECT under load. Revocation MUST go through Revoke(), which writes a
+// cache tombstone (skills#104); a direct status update in the storage
+// layer would leave a cached entry valid for up to secretHashCacheTTL.
 type AgentService struct {
 	agents storage.AgentRepository
 	audit  storage.AuditEventRepository
@@ -83,15 +83,16 @@ func (s *AgentService) WithEnrollment(tokens storage.AgentEnrollmentTokenReposit
 
 // NewAgentService constructs an AgentService.
 func NewAgentService(agents storage.AgentRepository, audit storage.AuditEventRepository, rdb *runtime.Client) *AgentService {
-	return &AgentService{
+	s := &AgentService{
 		agents:             agents,
 		audit:              audit,
 		rdb:                rdb,
 		now:                time.Now,
 		heartbeatCacheTTL:  5 * time.Minute,
 		secretHashCacheTTL: 60 * time.Second,
-		cache:              newCredCache(rdb, cacheKindSecretHash, 60*time.Second),
 	}
+	s.cache = newCredCache(rdb, cacheKindSecretHash, s.secretHashCacheTTL)
+	return s
 }
 
 // Redis key prefixes — `kind` slot for the runtime namespace builder.
@@ -362,15 +363,14 @@ func (s *AgentService) Revoke(ctx context.Context, id uuid.UUID, revokedBy, reas
 	if err != nil {
 		return err
 	}
-	// The tombstone goes in first, so no cache entry can outlive the
-	// revoke: not one filled from a read that predates the commit, and not
-	// one a failed delete leaves behind (skills#104). If Redis can't take
-	// it, the delete below and the fill's re-read still apply.
-	_ = s.cache.markRevoked(ctx, id, "revoked")
+	// A first tombstone write before the commit stops a fill whose read
+	// predates it (skills#104). ensureRevoked confirms the tombstone after
+	// the commit and keeps retrying while Redis is unavailable.
+	_ = s.cache.markRevoked(ctx, id, tombstoneRevoked)
 	if err := s.agents.Revoke(ctx, id, revokedBy, s.now().UTC()); err != nil {
 		return err
 	}
-	s.invalidateSecretHashCache(ctx, id)
+	cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked)
 
 	actor := auditActor(ctx, revokedBy)
 	meta := map[string]any{
@@ -387,6 +387,16 @@ func (s *AgentService) Revoke(ctx context.Context, id uuid.UUID, revokedBy, reas
 		Status:   storage.AuditStatusSuccess,
 		Metadata: meta,
 	})
+	if cacheErr != nil {
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:    actor,
+			Action:   "agent.revoke.cache_unconfirmed",
+			Resource: "agent:" + id.String(),
+			Status:   storage.AuditStatusFailure,
+			Metadata: map[string]any{"agent_id": id.String(), "error_kind": "cache_unconfirmed"},
+		})
+		return cacheErr
+	}
 	return nil
 }
 
@@ -402,10 +412,6 @@ func (s *AgentService) fillSecretHashCache(ctx context.Context, id uuid.UUID, c 
 		fresh, err := s.agents.Get(ctx, id)
 		return err == nil && string(fresh.Status) == c.Status && bytes.Equal(fresh.SecretHash, c.Hash)
 	})
-}
-
-func (s *AgentService) invalidateSecretHashCache(ctx context.Context, id uuid.UUID) {
-	s.cache.invalidate(ctx, id)
 }
 
 // List returns every agent, with last-seen pulled from Redis when
