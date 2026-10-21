@@ -525,6 +525,16 @@ type revokeGatewayRequest struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// cacheUnconfirmed answers 503 for services.ErrCredentialCacheUnconfirmed:
+// the change is saved, the auth cache isn't in line with it yet, and
+// repeating the call is safe. It writes the body itself because the app's
+// error handler replaces every 5xx message with a generic one, and the
+// admin needs to know which way the cache may still be wrong.
+func cacheUnconfirmed(c fiber.Ctx, code string) error {
+	c.Set(fiber.HeaderRetryAfter, "1")
+	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": code})
+}
+
 // AdminRevoke handles POST /admin/gateways/:id/revoke (gateway.revoke,
 // fresh MFA). The next heartbeat or catalog upload gets 401.
 func (h *Gateways) AdminRevoke(c fiber.Ctx) error {
@@ -550,7 +560,7 @@ func (h *Gateways) AdminRevoke(c fiber.Ctx) error {
 	case errors.Is(err, storage.ErrNotFound):
 		return fiber.NewError(fiber.StatusNotFound, "gateway_not_found")
 	case errors.Is(err, services.ErrCredentialCacheUnconfirmed):
-		return fiber.NewError(fiber.StatusServiceUnavailable, "revoked_cache_unconfirmed")
+		return cacheUnconfirmed(c, "revoked_cache_unconfirmed")
 	case errors.Is(err, storage.ErrGatewayAlreadyRevoked):
 		return fiber.NewError(fiber.StatusConflict, "gateway_already_revoked")
 	case err != nil:

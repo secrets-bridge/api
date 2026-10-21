@@ -28,6 +28,7 @@
 package middleware
 
 import (
+	"context"
 	"log/slog"
 	"strconv"
 	"time"
@@ -64,6 +65,12 @@ type RateLimitConfig struct {
 	FailClosed bool
 }
 
+// rateLimitCallTimeout bounds the limiter's Redis call. A Redis that
+// drops packets would otherwise hold every limited request for the
+// client's read timeout times its retries before the fail-open or
+// fail-closed branch runs (api#304).
+const rateLimitCallTimeout = 500 * time.Millisecond
+
 // RateLimit returns a Fiber middleware that admits or rejects requests
 // based on the configured bucket. On admission, the request flows
 // through. On rejection, the middleware returns 429 with a
@@ -90,7 +97,9 @@ func RateLimit(rdb *runtime.Client, logger *slog.Logger, cfg RateLimitConfig) fi
 			return c.Next()
 		}
 		fullBucket := cfg.Name + ":" + key
-		rl, err := rdb.AllowN(c.Context(), fullBucket, cfg.Limit, cfg.Window)
+		callCtx, cancel := context.WithTimeout(c.Context(), rateLimitCallTimeout)
+		rl, err := rdb.AllowN(callCtx, fullBucket, cfg.Limit, cfg.Window)
+		cancel()
 		if err != nil {
 			if cfg.FailClosed {
 				if logger != nil {

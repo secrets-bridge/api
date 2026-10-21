@@ -11,9 +11,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"net"
-	"net/url"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -23,6 +20,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/secrets-bridge/api/internal/services"
+	"github.com/secrets-bridge/api/internal/testutil/redisproxy"
 	"github.com/secrets-bridge/api/pkg/runtime"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
@@ -244,77 +242,13 @@ func TestGatewayAuth_UnknownIDIsCachedBriefly(t *testing.T) {
 
 // ---- Redis outages (review of api#303) ------------------------------------
 
-// flakyProxy sits between the services and the test Redis. Down drops
-// every open connection and refuses new ones, the way a real outage looks
-// to the client (a paused container only queues commands).
-type flakyProxy struct {
-	ln     net.Listener
-	target string
-	mu     sync.Mutex
-	down   bool
-	conns  []net.Conn
-}
-
-func newFlakyProxy(t *testing.T, target string) *flakyProxy {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	p := &flakyProxy{ln: ln, target: target}
-	t.Cleanup(func() { _ = ln.Close(); p.setDown(true) })
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			p.mu.Lock()
-			if p.down {
-				p.mu.Unlock()
-				_ = c.Close()
-				continue
-			}
-			up, err := net.Dial("tcp", target)
-			if err != nil {
-				p.mu.Unlock()
-				_ = c.Close()
-				continue
-			}
-			p.conns = append(p.conns, c, up)
-			p.mu.Unlock()
-			go func() { _, _ = io.Copy(up, c); _ = up.Close() }()
-			go func() { _, _ = io.Copy(c, up); _ = c.Close() }()
-		}
-	}()
-	return p
-}
-
-func (p *flakyProxy) setDown(down bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.down = down
-	if down {
-		for _, c := range p.conns {
-			_ = c.Close()
-		}
-		p.conns = nil
-	}
-}
-
 // proxiedServices builds an agent and a Gateway service whose Redis goes
-// through a flakyProxy.
-func proxiedServices(t *testing.T) (*services.AgentService, *services.GatewayService, *flakyProxy, *storage.Pool) {
+// through a redisproxy, so a test can take Redis down or blackhole it.
+func proxiedServices(t *testing.T) (*services.AgentService, *services.GatewayService, *redisproxy.Proxy, *storage.Pool) {
 	t.Helper()
 	_, pool, _ := bootstrap(t)
-	u, err := url.Parse(os.Getenv("TEST_REDIS_URL"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	p := newFlakyProxy(t, u.Host)
-	pu := *u
-	pu.Host = p.ln.Addr().String()
-	rdb, err := runtime.Open(t.Context(), runtime.Config{URL: pu.String(), PoolSize: 4, Namespace: fmt.Sprintf("sb-test-%d", time.Now().UnixNano())})
+	p, proxied := redisproxy.Start(t, os.Getenv("TEST_REDIS_URL"))
+	rdb, err := runtime.Open(t.Context(), runtime.Config{URL: proxied, PoolSize: 4, Namespace: fmt.Sprintf("sb-test-%d", time.Now().UnixNano())})
 	if err != nil {
 		t.Fatalf("Open runtime through the proxy: %v", err)
 	}
@@ -356,7 +290,7 @@ func TestAgentAuth_RevokeDuringARedisOutage(t *testing.T) {
 	if err := svc.Authenticate(ctx, minted.ID, minted.AgentSecret); err != nil {
 		t.Fatalf("prime the cache: %v", err)
 	}
-	proxy.setDown(true)
+	proxy.Set(redisproxy.Down)
 	if err := svc.Revoke(ctx, minted.ID, "test-admin", "outage"); !errors.Is(err, services.ErrCredentialCacheUnconfirmed) {
 		t.Fatalf("Revoke during the outage = %v, want ErrCredentialCacheUnconfirmed", err)
 	}
@@ -369,7 +303,7 @@ func TestAgentAuth_RevokeDuringARedisOutage(t *testing.T) {
 	}
 	// Redis comes back with the old entry still inside its TTL: the
 	// background retry lands the tombstone and the credential stays out.
-	proxy.setDown(false)
+	proxy.Set(redisproxy.Up)
 	if !eventually(func() bool { return services.AgentTombstone(ctx, svc, minted.ID) == "revoked" }) {
 		t.Fatal("the tombstone never landed after Redis came back")
 	}
@@ -385,14 +319,14 @@ func TestGatewayAuth_RevokeDuringARedisOutage(t *testing.T) {
 	if err := svc.Authenticate(ctx, id, secret); err != nil {
 		t.Fatalf("prime the cache: %v", err)
 	}
-	proxy.setDown(true)
+	proxy.Set(redisproxy.Down)
 	if _, err := svc.Revoke(ctx, id, "test-admin", "outage"); !errors.Is(err, services.ErrCredentialCacheUnconfirmed) {
 		t.Fatalf("Revoke during the outage = %v, want ErrCredentialCacheUnconfirmed", err)
 	}
 	if n := countAudit(t, pool, "gateway.revoke.cache_unconfirmed", "gateway:"+id.String()); n != 1 {
 		t.Fatalf("cache_unconfirmed audit rows = %d, want 1", n)
 	}
-	proxy.setDown(false)
+	proxy.Set(redisproxy.Up)
 	if !eventually(func() bool { return services.GatewayTombstone(ctx, svc, id) == "revoked" }) {
 		t.Fatal("the tombstone never landed after Redis came back")
 	}
@@ -418,7 +352,7 @@ func TestAuth_RedisDownFailsSafeToPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	gwID, gwSecret := enrolledGateway(t, gws)
-	proxy.setDown(true)
+	proxy.Set(redisproxy.Down)
 	if err := agents.Authenticate(ctx, live.ID, live.AgentSecret); err != nil {
 		t.Fatalf("active agent with Redis down = %v, want nil", err)
 	}
@@ -497,5 +431,181 @@ func TestAgentAuth_FillNeverWritesPastATombstone(t *testing.T) {
 	<-done
 	if wrote.Load() {
 		t.Fatal("the fill wrote an entry past the revoke's tombstone")
+	}
+}
+
+// ---- api#304 ----------------------------------------------------------------
+
+// A disable's background retry must not shut out a Gateway that was
+// enabled again before Redis came back.
+func TestGatewayAuth_DisableRetryStopsAfterAnEnable(t *testing.T) {
+	_, svc, proxy, _ := proxiedServices(t)
+	services.SetGatewayCacheRetry(svc, time.Second)
+	ctx := t.Context()
+	id, secret := enrolledGateway(t, svc)
+	proxy.Set(redisproxy.Down)
+	if _, err := svc.SetEnabled(ctx, id, false, "test-admin"); !errors.Is(err, services.ErrCredentialCacheUnconfirmed) {
+		t.Fatalf("disable during the outage = %v, want ErrCredentialCacheUnconfirmed", err)
+	}
+	proxy.Set(redisproxy.Up)
+	if _, err := svc.SetEnabled(ctx, id, true, "test-admin"); err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+	var retried atomic.Int32
+	services.SetGatewayCacheSeams(svc, services.CredCacheSeams{BeforeConfirm: func() { retried.Add(1) }})
+	time.Sleep(2500 * time.Millisecond) // two ticks of the disable's retry
+	if n := retried.Load(); n != 0 {
+		t.Fatalf("the disable's retry tried to write a tombstone %d time(s) after the enable", n)
+	}
+	if v := services.GatewayTombstone(ctx, svc, id); v != "" {
+		t.Fatalf("tombstone = %q after the enable, want none", v)
+	}
+	if err := svc.Authenticate(ctx, id, secret); err != nil {
+		t.Fatalf("enabled Gateway = %v, want nil", err)
+	}
+}
+
+// An enable that commits and clears between a disable's commit and its
+// tombstone write must win: the write sees the row live and lifts it.
+func TestGatewayAuth_DisableConfirmLosesToAConcurrentEnable(t *testing.T) {
+	svc, _ := gatewayService(t)
+	ctx := t.Context()
+	id, secret := enrolledGateway(t, svc)
+	var once sync.Once
+	services.SetGatewayCacheSeams(svc, services.CredCacheSeams{BeforeConfirm: func() {
+		once.Do(func() {
+			if _, err := svc.SetEnabled(ctx, id, true, "test-admin"); err != nil {
+				t.Errorf("concurrent enable: %v", err)
+			}
+		})
+	}})
+	if _, err := svc.SetEnabled(ctx, id, false, "test-admin"); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if v := services.GatewayTombstone(ctx, svc, id); v != "" {
+		t.Fatalf("tombstone = %q on a Gateway the database has enabled, want none", v)
+	}
+	if err := svc.Authenticate(ctx, id, secret); err != nil {
+		t.Fatalf("enabled Gateway = %v, want nil", err)
+	}
+}
+
+// An enable that can't clear the cache says so, and the clear lands once
+// Redis is back.
+func TestGatewayAuth_EnableDuringARedisOutage(t *testing.T) {
+	_, svc, proxy, pool := proxiedServices(t)
+	ctx := t.Context()
+	id, secret := enrolledGateway(t, svc)
+	if _, err := svc.SetEnabled(ctx, id, false, "test-admin"); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	proxy.Set(redisproxy.Down)
+	if _, err := svc.SetEnabled(ctx, id, true, "test-admin"); !errors.Is(err, services.ErrCredentialCacheUnconfirmed) {
+		t.Fatalf("enable during the outage = %v, want ErrCredentialCacheUnconfirmed", err)
+	}
+	if n := countAudit(t, pool, "gateway.enable.cache_unconfirmed", "gateway:"+id.String()); n != 1 {
+		t.Fatalf("cache_unconfirmed audit rows = %d, want 1", n)
+	}
+	proxy.Set(redisproxy.Up)
+	if !eventually(func() bool { return svc.Authenticate(ctx, id, secret) == nil }) {
+		t.Fatalf("enabled Gateway still refused after Redis came back (tombstone %q)", services.GatewayTombstone(ctx, svc, id))
+	}
+}
+
+// A retried Gateway revoke whose tombstone is gone (the replica that held
+// the retry died, or the key was lost) re-confirms it instead of only
+// answering "already revoked".
+func TestGatewayAuth_RetriedRevokeReconfirmsTheTombstone(t *testing.T) {
+	_, svc, proxy, _ := proxiedServices(t)
+	ctx := t.Context()
+	id, secret := enrolledGateway(t, svc)
+	if _, err := svc.Revoke(ctx, id, "test-admin", "first"); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+	if err := services.DeleteGatewayTombstone(ctx, svc, id); err != nil {
+		t.Fatal(err)
+	}
+	proxy.Set(redisproxy.Down)
+	if _, err := svc.Revoke(ctx, id, "test-admin", "retry"); !errors.Is(err, services.ErrCredentialCacheUnconfirmed) {
+		t.Fatalf("retried revoke without a tombstone = %v, want ErrCredentialCacheUnconfirmed", err)
+	}
+	proxy.Set(redisproxy.Up)
+	if !eventually(func() bool { return services.GatewayTombstone(ctx, svc, id) == "revoked" }) {
+		t.Fatal("the tombstone never came back")
+	}
+	if err := svc.Authenticate(ctx, id, secret); !errors.Is(err, storage.ErrUnauthorized) {
+		t.Fatalf("revoked Gateway = %v, want ErrUnauthorized", err)
+	}
+}
+
+// A Redis that drops packets costs each call a few hundred milliseconds,
+// not the client's read timeout times its retries.
+func TestAuth_BlackholedRedisIsBounded(t *testing.T) {
+	agents, gws, proxy, _ := proxiedServices(t)
+	ctx := t.Context()
+	a, err := agents.Mint(ctx, services.MintInput{Name: "blackhole"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := agents.Mint(ctx, services.MintInput{Name: "blackhole-revoke"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gwID, gwSecret := enrolledGateway(t, gws)
+	for _, err := range []error{agents.Authenticate(ctx, a.ID, a.AgentSecret), agents.Authenticate(ctx, b.ID, b.AgentSecret), gws.Authenticate(ctx, gwID, gwSecret)} {
+		if err != nil {
+			t.Fatalf("prime the cache: %v", err)
+		}
+	}
+	proxy.Set(redisproxy.Blackhole)
+	timed := func(name string, limit time.Duration, call func() error, check func(error) bool) {
+		t.Helper()
+		start := time.Now()
+		err := call()
+		took := time.Since(start)
+		t.Logf("%s: %s with Redis blackholed", name, took.Round(time.Millisecond))
+		if took > limit {
+			t.Errorf("%s took %s with Redis blackholed, want under %s", name, took.Round(time.Millisecond), limit)
+		}
+		if !check(err) {
+			t.Errorf("%s = %v", name, err)
+		}
+	}
+	isNil := func(err error) bool { return err == nil }
+	timed("agent auth", 2*time.Second, func() error { return agents.Authenticate(ctx, a.ID, a.AgentSecret) }, isNil)
+	timed("agent auth, wrong secret", 2*time.Second, func() error { return agents.Authenticate(ctx, a.ID, "wrong") },
+		func(err error) bool { return errors.Is(err, storage.ErrUnauthorized) })
+	timed("agent heartbeat", 2*time.Second, func() error { return agents.Heartbeat(ctx, a.ID, a.AgentSecret) }, isNil)
+	timed("gateway auth", 2*time.Second, func() error { return gws.Authenticate(ctx, gwID, gwSecret) }, isNil)
+	unconfirmed := func(err error) bool { return errors.Is(err, services.ErrCredentialCacheUnconfirmed) }
+	timed("agent revoke", 3*time.Second, func() error { return agents.Revoke(ctx, b.ID, "test-admin", "blackhole") }, unconfirmed)
+	timed("gateway disable", 3*time.Second, func() error { _, err := gws.SetEnabled(ctx, gwID, false, "test-admin"); return err }, unconfirmed)
+}
+
+// A disable that commits between an enable's commit and its clear keeps
+// its tombstone: the clear sees the row blocked and puts it back.
+func TestGatewayAuth_EnableClearLosesToAConcurrentDisable(t *testing.T) {
+	svc, _ := gatewayService(t)
+	ctx := t.Context()
+	id, secret := enrolledGateway(t, svc)
+	if _, err := svc.SetEnabled(ctx, id, false, "test-admin"); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	var once sync.Once
+	services.SetGatewayCacheSeams(svc, services.CredCacheSeams{BeforeClear: func() {
+		once.Do(func() {
+			if _, err := svc.SetEnabled(ctx, id, false, "test-admin"); err != nil {
+				t.Errorf("concurrent disable: %v", err)
+			}
+		})
+	}})
+	if _, err := svc.SetEnabled(ctx, id, true, "test-admin"); err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+	if v := services.GatewayTombstone(ctx, svc, id); v != "disabled" {
+		t.Fatalf("tombstone = %q on a Gateway the database has disabled, want disabled", v)
+	}
+	if err := svc.Authenticate(ctx, id, secret); !errors.Is(err, storage.ErrUnauthorized) {
+		t.Fatalf("disabled Gateway = %v, want ErrUnauthorized", err)
 	}
 }
