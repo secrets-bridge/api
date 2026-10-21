@@ -643,8 +643,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	var requireStamped fiber.Handler
 	if cfg.RequireMFAAtLogin {
 		requireStamped = middleware.RequireMFAStamped(sessionSvc, mfaVerifySvc)
-	} else if cfg.Env != ModeDev {
-		logger.Warn("login-time MFA is OFF (SB_REQUIRE_MFA_AT_LOGIN=false) outside dev: an account with no second factor can add one from its session alone and then pass step-up")
+	}
+	for _, w := range mfaAtLoginWarnings(cfg) {
+		logger.Warn(w)
 	}
 
 	// Legacy X-User-Id identity header: honoured only when explicitly

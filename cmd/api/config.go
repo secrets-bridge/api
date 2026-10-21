@@ -191,6 +191,10 @@ type Config struct {
 	// primary login. An explicit SB_REQUIRE_MFA_AT_LOGIN wins either
 	// way; turning it off outside dev is logged at boot.
 	RequireMFAAtLogin bool
+	// RequireMFAAtLoginInvalid is true when SB_REQUIRE_MFA_AT_LOGIN is
+	// set to something that isn't a boolean, so the default applied and
+	// boot says so (mfaAtLoginWarnings).
+	RequireMFAAtLoginInvalid bool
 
 	// AllowInsecureHeaderAuth enables the legacy `X-User-Id` identity
 	// header. OFF by default and independent of SB_ENV: honoured
@@ -265,6 +269,7 @@ func loadConfig() Config {
 		MFAWebAuthnRPOrigins:           splitCommaTrim(envOr("SB_MFA_WEBAUTHN_RP_ORIGINS", "")),
 		OIDCTrustAMRForMFA:             envBool("SB_OIDC_TRUSTED_AMR_MFA", false),
 		RequireMFAAtLogin:              envBool("SB_REQUIRE_MFA_AT_LOGIN", env != ModeDev),
+		RequireMFAAtLoginInvalid:       envBoolInvalid("SB_REQUIRE_MFA_AT_LOGIN"),
 		AllowInsecureHeaderAuth:        envBool("SB_ALLOW_INSECURE_HEADER_AUTH", false),
 		AllowDirectAgentMint:           envBool("SB_ALLOW_DIRECT_AGENT_MINT", false),
 	}
@@ -399,14 +404,48 @@ func envBool(key string, fallback bool) bool {
 	if !ok || v == "" {
 		return fallback
 	}
+	if b, valid := parseBoolToken(v); valid {
+		return b
+	}
+	return fallback
+}
+
+// envBoolInvalid reports a key that is set to something envBool doesn't
+// read as a boolean, so it fell back to its default.
+func envBoolInvalid(key string) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return false
+	}
+	_, valid := parseBoolToken(v)
+	return !valid
+}
+
+func parseBoolToken(v string) (value, valid bool) {
 	switch v {
 	case "1", "true", "TRUE", "True", "yes", "YES":
-		return true
+		return true, true
 	case "0", "false", "FALSE", "False", "no", "NO":
-		return false
-	default:
-		return fallback
+		return false, true
 	}
+	return false, false
+}
+
+// mfaAtLoginWarnings are the boot warnings about SB_REQUIRE_MFA_AT_LOGIN.
+// They name the setting, never its value.
+func mfaAtLoginWarnings(cfg Config) []string {
+	var out []string
+	if cfg.RequireMFAAtLoginInvalid {
+		state := "off"
+		if cfg.RequireMFAAtLogin {
+			state = "on"
+		}
+		out = append(out, fmt.Sprintf("SB_REQUIRE_MFA_AT_LOGIN is not a boolean (use true or false), so the default for SB_ENV=%s applies: login-time MFA is %s", cfg.Env, state))
+	}
+	if !cfg.RequireMFAAtLogin && cfg.Env != ModeDev {
+		out = append(out, "login-time MFA is OFF (SB_REQUIRE_MFA_AT_LOGIN=false) outside dev: an account with no second factor can add one from its session alone and then pass step-up")
+	}
+	return out
 }
 
 func envOr(key, fallback string) string {

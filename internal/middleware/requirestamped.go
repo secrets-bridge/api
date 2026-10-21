@@ -4,8 +4,8 @@
 // individual Tier-2 routes — approve / reject / reveal-wrap. Tier-1
 // browsing (lists, dashboards) only needs a valid session cookie.
 //
-// `RequireMFAStamped` lifts the gate up the stack: when the operator
-// opts in via `SB_REQUIRE_MFA_AT_LOGIN=true`, EVERY authenticated
+// `RequireMFAStamped` lifts the gate up the stack: when
+// `SB_REQUIRE_MFA_AT_LOGIN` is on (the default unless SB_ENV=dev), EVERY authenticated
 // route requires the session to have been MFA-verified at least once.
 // The freshness window (15 min step-up TTL) still applies to Tier-2;
 // this gate only cares about "has this session EVER been verified?"
