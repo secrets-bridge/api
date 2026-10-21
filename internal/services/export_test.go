@@ -12,18 +12,24 @@ import (
 // the cache write; AfterWrite runs after the write and before the re-read;
 // BeforeConfirm runs before each tombstone write that follows a revoke or
 // disable commit; BeforeClear runs before each tombstone clear that
-// follows an enable commit; Del replaces the Redis delete.
+// follows an enable commit; FailClear, when it returns true, fails that
+// tombstone clear; Del replaces the Redis delete.
 type CredCacheSeams struct {
 	BeforeFill    func()
 	AfterWrite    func()
 	BeforeConfirm func()
 	BeforeClear   func()
+	FailClear     func() bool
 	Del           func(ctx context.Context, key string) error
 }
 
 func setSeams(c *credCache, s CredCacheSeams) {
-	c.beforeFill, c.afterWrite, c.beforeConfirm, c.beforeClear, c.del = s.BeforeFill, s.AfterWrite, s.BeforeConfirm, s.BeforeClear, s.Del
+	c.beforeFill, c.afterWrite, c.beforeConfirm, c.beforeClear, c.failClear, c.del = s.BeforeFill, s.AfterWrite, s.BeforeConfirm, s.BeforeClear, s.FailClear, s.Del
 }
+
+// GatewayCacheFixesRunning is how many background reconcile goroutines a
+// GatewayService's cache has alive.
+func GatewayCacheFixesRunning(svc *GatewayService) int { return int(svc.cache.running.Load()) }
 
 // SetAgentCacheSeams installs test hooks on an AgentService's cache.
 func SetAgentCacheSeams(svc *AgentService, s CredCacheSeams) { setSeams(svc.cache, s) }
@@ -58,4 +64,9 @@ func GatewayTombstone(ctx context.Context, svc *GatewayService, id uuid.UUID) st
 func AgentTombstone(ctx context.Context, svc *AgentService, id uuid.UUID) string {
 	v, _ := svc.cache.rdb.Raw().Get(ctx, svc.cache.key(svc.cache.revokedKind, id)).Result()
 	return v
+}
+
+// SetGatewayCacheAttemptTimeout shortens one background reconcile attempt.
+func SetGatewayCacheAttemptTimeout(svc *GatewayService, d time.Duration) {
+	svc.cache.attemptTimeout = d
 }

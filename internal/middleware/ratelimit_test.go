@@ -9,7 +9,9 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
+	dto "github.com/prometheus/client_model/go"
 
+	"github.com/secrets-bridge/api/internal/observability"
 	"github.com/secrets-bridge/api/internal/testutil/redisproxy"
 	"github.com/secrets-bridge/api/pkg/runtime"
 )
@@ -320,6 +322,10 @@ func TestRateLimit_BlackholedRedisIsBounded(t *testing.T) {
 	app.Get("/open", RateLimit(rdb, nil, RateLimitConfig{Name: "test:bh-open", Bucket: bucket, Limit: 5, Window: time.Minute}), ok)
 	app.Get("/closed", RateLimit(rdb, nil, RateLimitConfig{Name: "test:bh-closed", Bucket: bucket, Limit: 5, Window: time.Minute, FailClosed: true}), ok)
 
+	timeouts := observability.RedisCallTimeouts.WithLabelValues(observability.RedisSiteRateLimit)
+	var m dto.Metric
+	_ = timeouts.Write(&m)
+	before := m.GetCounter().GetValue()
 	proxy.Set(redisproxy.Blackhole)
 	for path, want := range map[string]int{"/open": 200, "/closed": 503} {
 		start := time.Now()
@@ -335,5 +341,10 @@ func TestRateLimit_BlackholedRedisIsBounded(t *testing.T) {
 		if took > 2*time.Second {
 			t.Errorf("%s took %s with Redis blackholed, want under 2s", path, took.Round(time.Millisecond))
 		}
+	}
+	m.Reset()
+	_ = timeouts.Write(&m)
+	if n := m.GetCounter().GetValue() - before; n != 2 {
+		t.Errorf("redis_call_timeouts_total{site=rate_limit} moved by %v, want 2", n)
 	}
 }
