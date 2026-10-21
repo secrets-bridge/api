@@ -11,6 +11,14 @@ on `main`.
 
 ## [Unreleased]
 
+### Changed
+- `SB_REQUIRE_MFA_AT_LOGIN` is on by default unless `SB_ENV=dev`. With
+  it off, an account with no second factor could add its first one from
+  the session alone and then pass step-up. **On upgrade**, a production
+  user with no factor enrolls one right after signing in. An explicit
+  `SB_REQUIRE_MFA_AT_LOGIN=false` still turns it off, and outside dev
+  that is logged as a warning at boot.
+
 ### Removed
 - The control-plane Argo CD integration (secrets-bridge/gateway#13):
   `pkg/argocd`, the Argo CD endpoint and GitOps services, the

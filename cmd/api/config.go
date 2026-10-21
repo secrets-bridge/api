@@ -184,9 +184,12 @@ type Config struct {
 	// interceptor handles both the 401 (modal opens) and 412
 	// mfa_enrollment_required (route to /me/mfa) flavours.
 	//
-	// Operators who want login-time MFA on every sign-in (the
-	// "AWS-console / GitHub-org-with-2FA-required" posture) flip this
-	// on; deployments comfortable with step-up-only leave it off.
+	// On by default unless SB_ENV=dev (skills#105): with it off, an
+	// account with no second factor can add its first one from the
+	// session alone and then pass step-up, so step-up protects nothing
+	// for it. With it on, a user with no factor enrolls right after
+	// primary login. An explicit SB_REQUIRE_MFA_AT_LOGIN wins either
+	// way; turning it off outside dev is logged at boot.
 	RequireMFAAtLogin bool
 
 	// AllowInsecureHeaderAuth enables the legacy `X-User-Id` identity
@@ -232,11 +235,12 @@ type Config struct {
 }
 
 func loadConfig() Config {
+	env := envOr("SB_ENV", ModeProduction)
 	return Config{
 		Addr:                           envOr("API_ADDR", ":8080"),
 		LogoBackfill:                   envBool(envLogoBackfill, true),
 		ShutdownGrace:                  envDuration("API_SHUTDOWN_GRACE", 15*time.Second),
-		Env:                            envOr("SB_ENV", ModeProduction),
+		Env:                            env,
 		AllowInsecureVaultAddr:         envBool("SB_ALLOW_INSECURE_VAULT_ADDR", false),
 		AllowUnsealedWraps:             envBool("SB_ALLOW_UNSEALED_WRAPS", false),
 		ProviderConnRejectSecretValues: envBool("SB_PROVIDER_CONN_REJECT_SECRETS", true),
@@ -260,7 +264,7 @@ func loadConfig() Config {
 		MFAWebAuthnRPDisplayName:       envOr("SB_MFA_WEBAUTHN_RP_DISPLAY_NAME", "Secrets Bridge"),
 		MFAWebAuthnRPOrigins:           splitCommaTrim(envOr("SB_MFA_WEBAUTHN_RP_ORIGINS", "")),
 		OIDCTrustAMRForMFA:             envBool("SB_OIDC_TRUSTED_AMR_MFA", false),
-		RequireMFAAtLogin:              envBool("SB_REQUIRE_MFA_AT_LOGIN", false),
+		RequireMFAAtLogin:              envBool("SB_REQUIRE_MFA_AT_LOGIN", env != ModeDev),
 		AllowInsecureHeaderAuth:        envBool("SB_ALLOW_INSECURE_HEADER_AUTH", false),
 		AllowDirectAgentMint:           envBool("SB_ALLOW_DIRECT_AGENT_MINT", false),
 	}
