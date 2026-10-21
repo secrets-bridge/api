@@ -184,10 +184,17 @@ type Config struct {
 	// interceptor handles both the 401 (modal opens) and 412
 	// mfa_enrollment_required (route to /me/mfa) flavours.
 	//
-	// Operators who want login-time MFA on every sign-in (the
-	// "AWS-console / GitHub-org-with-2FA-required" posture) flip this
-	// on; deployments comfortable with step-up-only leave it off.
+	// On by default unless SB_ENV=dev (skills#105): with it off, an
+	// account with no second factor can add its first one from the
+	// session alone and then pass step-up, so step-up protects nothing
+	// for it. With it on, a user with no factor enrolls right after
+	// primary login. An explicit SB_REQUIRE_MFA_AT_LOGIN wins either
+	// way; turning it off outside dev is logged at boot.
 	RequireMFAAtLogin bool
+	// RequireMFAAtLoginInvalid is true when SB_REQUIRE_MFA_AT_LOGIN is
+	// set to something that isn't a boolean, so the default applied and
+	// boot says so (mfaAtLoginWarnings).
+	RequireMFAAtLoginInvalid bool
 
 	// AllowInsecureHeaderAuth enables the legacy `X-User-Id` identity
 	// header. OFF by default and independent of SB_ENV: honoured
@@ -232,11 +239,12 @@ type Config struct {
 }
 
 func loadConfig() Config {
+	env := envOr("SB_ENV", ModeProduction)
 	return Config{
 		Addr:                           envOr("API_ADDR", ":8080"),
 		LogoBackfill:                   envBool(envLogoBackfill, true),
 		ShutdownGrace:                  envDuration("API_SHUTDOWN_GRACE", 15*time.Second),
-		Env:                            envOr("SB_ENV", ModeProduction),
+		Env:                            env,
 		AllowInsecureVaultAddr:         envBool("SB_ALLOW_INSECURE_VAULT_ADDR", false),
 		AllowUnsealedWraps:             envBool("SB_ALLOW_UNSEALED_WRAPS", false),
 		ProviderConnRejectSecretValues: envBool("SB_PROVIDER_CONN_REJECT_SECRETS", true),
@@ -260,7 +268,8 @@ func loadConfig() Config {
 		MFAWebAuthnRPDisplayName:       envOr("SB_MFA_WEBAUTHN_RP_DISPLAY_NAME", "Secrets Bridge"),
 		MFAWebAuthnRPOrigins:           splitCommaTrim(envOr("SB_MFA_WEBAUTHN_RP_ORIGINS", "")),
 		OIDCTrustAMRForMFA:             envBool("SB_OIDC_TRUSTED_AMR_MFA", false),
-		RequireMFAAtLogin:              envBool("SB_REQUIRE_MFA_AT_LOGIN", false),
+		RequireMFAAtLogin:              envBool("SB_REQUIRE_MFA_AT_LOGIN", env != ModeDev),
+		RequireMFAAtLoginInvalid:       envBoolInvalid("SB_REQUIRE_MFA_AT_LOGIN"),
 		AllowInsecureHeaderAuth:        envBool("SB_ALLOW_INSECURE_HEADER_AUTH", false),
 		AllowDirectAgentMint:           envBool("SB_ALLOW_DIRECT_AGENT_MINT", false),
 	}
@@ -395,14 +404,48 @@ func envBool(key string, fallback bool) bool {
 	if !ok || v == "" {
 		return fallback
 	}
+	if b, valid := parseBoolToken(v); valid {
+		return b
+	}
+	return fallback
+}
+
+// envBoolInvalid reports a key that is set to something envBool doesn't
+// read as a boolean, so it fell back to its default.
+func envBoolInvalid(key string) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return false
+	}
+	_, valid := parseBoolToken(v)
+	return !valid
+}
+
+func parseBoolToken(v string) (value, valid bool) {
 	switch v {
 	case "1", "true", "TRUE", "True", "yes", "YES":
-		return true
+		return true, true
 	case "0", "false", "FALSE", "False", "no", "NO":
-		return false
-	default:
-		return fallback
+		return false, true
 	}
+	return false, false
+}
+
+// mfaAtLoginWarnings are the boot warnings about SB_REQUIRE_MFA_AT_LOGIN.
+// They name the setting, never its value.
+func mfaAtLoginWarnings(cfg Config) []string {
+	var out []string
+	if cfg.RequireMFAAtLoginInvalid {
+		state := "off"
+		if cfg.RequireMFAAtLogin {
+			state = "on"
+		}
+		out = append(out, fmt.Sprintf("SB_REQUIRE_MFA_AT_LOGIN is not a boolean (use true or false), so the default for SB_ENV=%s applies: login-time MFA is %s", cfg.Env, state))
+	}
+	if !cfg.RequireMFAAtLogin && cfg.Env != ModeDev {
+		out = append(out, "login-time MFA is OFF (SB_REQUIRE_MFA_AT_LOGIN=false) outside dev: an account with no second factor can add one from its session alone and then pass step-up")
+	}
+	return out
 }
 
 func envOr(key, fallback string) string {

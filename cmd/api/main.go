@@ -644,6 +644,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	if cfg.RequireMFAAtLogin {
 		requireStamped = middleware.RequireMFAStamped(sessionSvc, mfaVerifySvc)
 	}
+	for _, w := range mfaAtLoginWarnings(cfg) {
+		logger.Warn(w)
+	}
 
 	// Legacy X-User-Id identity header: honoured only when explicitly
 	// opted in. Default OFF makes every deployment secure regardless of

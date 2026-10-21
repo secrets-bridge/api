@@ -34,7 +34,7 @@
 | Account lockout + login rate limit | Live | `internal/services/auth.go` (5 wrong → 15min lock; per-IP rate limit) |
 | OIDC client (PKCE + back-channel logout) | Live (opt-in via `SB_OIDC_ISSUER`) | `internal/services/oidc.go` |
 | App-MFA enrollment (TOTP + WebAuthn) + step-up on Tier 2 ops | Live | `internal/services/mfa_*.go` + `internal/middleware/stepup.go` (Slices H to I) |
-| Login-time MFA gate (opt-in) | Live | `internal/middleware/requirestamped.go`, `SB_REQUIRE_MFA_AT_LOGIN=true` (Slice K) |
+| Login-time MFA gate (on unless `SB_ENV=dev`) | Live | `internal/middleware/requirestamped.go`, `SB_REQUIRE_MFA_AT_LOGIN` (Slice K) |
 | Group-claim → role mapping at JIT | Open ([#57](https://github.com/secrets-bridge/api/pull/57)) | `RoleReconciler` in oidc.go |
 
 ## Layout
