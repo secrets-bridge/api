@@ -630,9 +630,14 @@ func TestGatewayAuth_EnableClearLosesToAConcurrentDisable(t *testing.T) {
 type failingGateways struct {
 	countingGateways
 	fail atomic.Bool
+	hang atomic.Bool
 }
 
 func (f *failingGateways) GetAuth(ctx context.Context, id uuid.UUID) (storage.GatewayStatus, []byte, error) {
+	if f.hang.Load() {
+		<-ctx.Done() // a query that never comes back
+		return "", nil, ctx.Err()
+	}
 	if f.fail.Load() {
 		f.gets.Add(1)
 		return "", nil, errors.New("test: database unavailable")
@@ -846,4 +851,102 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 		t.Fatal(err)
 	}
 	return m.GetCounter().GetValue()
+}
+
+// ---- api#307 review --------------------------------------------------------
+
+// A row read that never returns times out with its attempt, and the next
+// attempt finishes the job.
+func TestGatewayAuth_HungRowReadDoesNotStallTheRetry(t *testing.T) {
+	svc, store, proxy, _ := proxiedGatewayService(t)
+	services.SetGatewayCacheAttemptTimeout(svc, 300*time.Millisecond)
+	ctx := t.Context()
+	id, _ := enrolledGateway(t, svc)
+	proxy.Set(redisproxy.Down)
+	if _, err := svc.SetEnabled(ctx, id, false, "test-admin"); !errors.Is(err, services.ErrCredentialCacheUnconfirmed) {
+		t.Fatalf("disable during the outage = %v, want ErrCredentialCacheUnconfirmed", err)
+	}
+	store.hang.Store(true)
+	proxy.Set(redisproxy.Up)
+	time.Sleep(time.Second) // attempts reach the hung read
+	store.hang.Store(false)
+	if !eventually(func() bool { return services.GatewayTombstone(ctx, svc, id) == "disabled" }) {
+		t.Fatal("the retry never got past the hung row read")
+	}
+	if !eventually(func() bool { return services.GatewayCacheFixesRunning(svc) == 0 }) {
+		t.Fatal("the retry never finished")
+	}
+}
+
+// When Redis answers but the attempt keeps failing, every attempt reads
+// the row, so the retry backs off instead of reading it every tick.
+func TestGatewayAuth_RetryBacksOffWhileAttemptsFail(t *testing.T) {
+	svc, store, _, _ := proxiedGatewayService(t)
+	ctx := t.Context()
+	id, secret := enrolledGateway(t, svc)
+	var refuse atomic.Bool
+	services.SetGatewayCacheSeams(svc, services.CredCacheSeams{FailClear: refuse.Load})
+	if _, err := svc.SetEnabled(ctx, id, false, "test-admin"); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	refuse.Store(true)
+	if _, err := svc.SetEnabled(ctx, id, true, "test-admin"); !errors.Is(err, services.ErrCredentialCacheUnconfirmed) {
+		t.Fatalf("enable with the clear refused = %v, want ErrCredentialCacheUnconfirmed", err)
+	}
+	before := store.gets.Load()
+	time.Sleep(2 * time.Second) // 40 ticks at the test's 50ms
+	if n := store.gets.Load() - before; n > 8 {
+		t.Fatalf("the retry read the row %d times in 2s while its writes failed, want it to back off", n)
+	}
+	refuse.Store(false)
+	if !eventually(func() bool { return svc.Authenticate(ctx, id, secret) == nil }) {
+		t.Fatal("enabled Gateway still refused once the clear went through")
+	}
+}
+
+// A revoke that joins a pending disable's retry swaps in its own state, so
+// its tombstone lands once Redis is back even while the row can't be read.
+func TestGatewayAuth_PendingRevokeLandsWithoutTheRow(t *testing.T) {
+	svc, store, proxy, _ := proxiedGatewayService(t)
+	ctx := t.Context()
+	id, secret := enrolledGateway(t, svc)
+	proxy.Set(redisproxy.Down)
+	if _, err := svc.SetEnabled(ctx, id, false, "test-admin"); !errors.Is(err, services.ErrCredentialCacheUnconfirmed) {
+		t.Fatalf("disable during the outage = %v, want ErrCredentialCacheUnconfirmed", err)
+	}
+	if _, err := svc.Revoke(ctx, id, "test-admin", "outage"); !errors.Is(err, services.ErrCredentialCacheUnconfirmed) {
+		t.Fatalf("Revoke during the outage = %v, want ErrCredentialCacheUnconfirmed", err)
+	}
+	store.fail.Store(true)
+	proxy.Set(redisproxy.Up)
+	if !eventually(func() bool { return services.GatewayTombstone(ctx, svc, id) == "revoked" }) {
+		t.Fatalf("tombstone = %q with the row unreadable, want revoked", services.GatewayTombstone(ctx, svc, id))
+	}
+	if err := svc.Authenticate(ctx, id, secret); !errors.Is(err, storage.ErrUnauthorized) {
+		t.Fatalf("revoked Gateway = %v, want ErrUnauthorized", err)
+	}
+	store.fail.Store(false)
+}
+
+// A disable that finds the row revoked by the time it confirms writes
+// "revoked", not "disabled".
+func TestGatewayAuth_DisableTakesTheRowsRevokedReason(t *testing.T) {
+	svc, _, _, pool := proxiedGatewayService(t)
+	ctx := t.Context()
+	id, _ := enrolledGateway(t, svc)
+	var once sync.Once
+	services.SetGatewayCacheSeams(svc, services.CredCacheSeams{BeforeConfirm: func() {
+		once.Do(func() {
+			// A revoke whose own cache writes were lost.
+			if _, err := pool.Exec(ctx, `UPDATE gateways SET status = 'revoked', revoked_at = now(), revoked_by = 'test-admin' WHERE id = $1`, id); err != nil {
+				t.Errorf("revoke the row: %v", err)
+			}
+		})
+	}})
+	if _, err := svc.SetEnabled(ctx, id, false, "test-admin"); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if v := services.GatewayTombstone(ctx, svc, id); v != "revoked" {
+		t.Fatalf("tombstone = %q on a revoked row, want revoked", v)
+	}
 }

@@ -65,3 +65,8 @@ func AgentTombstone(ctx context.Context, svc *AgentService, id uuid.UUID) string
 	v, _ := svc.cache.rdb.Raw().Get(ctx, svc.cache.key(svc.cache.revokedKind, id)).Result()
 	return v
 }
+
+// SetGatewayCacheAttemptTimeout shortens one background reconcile attempt.
+func SetGatewayCacheAttemptTimeout(svc *GatewayService, d time.Duration) {
+	svc.cache.attemptTimeout = d
+}

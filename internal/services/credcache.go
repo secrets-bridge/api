@@ -57,6 +57,7 @@ type credCache struct {
 	hashKind, revokedKind, missKind string
 	hashTTL, revokedTTL, missingTTL time.Duration
 	retryEvery                      time.Duration
+	attemptTimeout                  time.Duration // one background attempt, row read included
 
 	pendingMu sync.Mutex
 	pending   map[uuid.UUID]*pendingFix
@@ -106,15 +107,16 @@ return 1`)
 
 func newCredCache(rdb *runtime.Client, hashKind string, hashTTL time.Duration) *credCache {
 	return &credCache{
-		rdb:         rdb,
-		hashKind:    hashKind,
-		revokedKind: hashKind + "-revoked",
-		missKind:    hashKind + "-missing",
-		hashTTL:     hashTTL,
-		revokedTTL:  2 * hashTTL,
-		missingTTL:  30 * time.Second,
-		retryEvery:  100 * time.Millisecond,
-		pending:     map[uuid.UUID]*pendingFix{},
+		rdb:            rdb,
+		hashKind:       hashKind,
+		revokedKind:    hashKind + "-revoked",
+		missKind:       hashKind + "-missing",
+		hashTTL:        hashTTL,
+		revokedTTL:     2 * hashTTL,
+		missingTTL:     30 * time.Second,
+		retryEvery:     100 * time.Millisecond,
+		attemptTimeout: 5 * time.Second,
+		pending:        map[uuid.UUID]*pendingFix{},
 	}
 }
 
@@ -219,7 +221,8 @@ func (c *credCache) ensureRevoked(ctx context.Context, id uuid.UUID, reason stri
 }
 
 // confirmRevoked writes the tombstone and drops the entry, then re-reads
-// the row: if an enable committed meanwhile, it lifts the tombstone again.
+// the row: if an enable committed meanwhile, it lifts the tombstone again,
+// and if a revoke did, it writes "revoked" over "disabled".
 // It reports true only when every Redis call went through and the row
 // could be read; anything else is left to the retry (api#306).
 func (c *credCache) confirmRevoked(ctx context.Context, id uuid.UUID, reason string, state cacheState) bool {
@@ -234,8 +237,16 @@ func (c *credCache) confirmRevoked(ctx context.Context, id uuid.UUID, reason str
 	if err != nil {
 		return false
 	}
-	if want == "" && c.clearRevoked(ctx, id) != nil {
-		return false
+	switch {
+	case want == "":
+		if c.clearRevoked(ctx, id) != nil {
+			return false
+		}
+	case want != reason:
+		// Revoked since the disable committed: keep the reason right.
+		if c.markRevoked(ctx, id, want) != nil {
+			return false
+		}
 	}
 	return true
 }
@@ -287,12 +298,14 @@ type pendingFix struct {
 }
 
 // reconcileLater brings an id's cache keys in line with its row in the
-// background. There is one goroutine per id: a repeated call only swaps in
-// its state and extends the deadline, and every attempt reads the row, so
-// it ends up where the latest revoke, disable or enable left it. An
-// attempt reads the database only after Redis answers a PING, so an outage
-// costs no queries. It gives up revokedTTL after the last call, when every
-// key it could correct has expired.
+// background. There is one goroutine per id: a repeated call swaps in its
+// state and extends the deadline. Swapping is safe because a Gateway's
+// state re-reads the row, so it ends up where the latest revoke, disable or
+// enable left it, and a revoke is final. It also means a revoke's
+// tombstone lands without the row read, even while Postgres is failing.
+// An attempt reads the database only after Redis answers a PING, so an
+// outage costs no queries. It gives up revokedTTL after the last call,
+// when every key it could correct has expired.
 func (c *credCache) reconcileLater(id uuid.UUID, state cacheState) {
 	c.pendingMu.Lock()
 	defer c.pendingMu.Unlock()
@@ -305,14 +318,19 @@ func (c *credCache) reconcileLater(id uuid.UUID, state cacheState) {
 	go c.reconcile(id, p)
 }
 
+// maxReconcileWait caps the backoff between attempts that reached Redis
+// and still failed.
+const maxReconcileWait = 2 * time.Second
+
 func (c *credCache) reconcile(id uuid.UUID, p *pendingFix) {
 	c.running.Add(1)
 	defer c.running.Add(-1)
-	t := time.NewTicker(c.retryEvery)
-	defer t.Stop()
-	for range t.C {
+	wait := c.retryEvery
+	for {
+		time.Sleep(wait)
 		c.pendingMu.Lock()
-		if time.Now().After(p.deadline) {
+		deadline := p.deadline
+		if time.Now().After(deadline) {
 			delete(c.pending, id)
 			c.pendingMu.Unlock()
 			return
@@ -320,12 +338,22 @@ func (c *credCache) reconcile(id uuid.UUID, p *pendingFix) {
 		state := p.state
 		p.again = false
 		c.pendingMu.Unlock()
-		if !c.reconcileOnce(id, state) {
+		done, redisUp := c.reconcileOnce(id, state, deadline)
+		if !done {
+			// Redis down: keep the short tick, it costs no queries. Redis
+			// up and the attempt still failed (the row unreadable, or
+			// writes refused): back off, since each attempt reads the row.
+			if redisUp {
+				wait = min(2*wait, maxReconcileWait)
+			} else {
+				wait = c.retryEvery
+			}
 			continue
 		}
 		c.pendingMu.Lock()
 		if p.again {
 			c.pendingMu.Unlock()
+			wait = c.retryEvery
 			continue
 		}
 		delete(c.pending, id)
@@ -334,20 +362,31 @@ func (c *credCache) reconcile(id uuid.UUID, p *pendingFix) {
 	}
 }
 
-// reconcileOnce is one attempt: true once the keys match the row.
-func (c *credCache) reconcileOnce(id uuid.UUID, state cacheState) bool {
-	ctx := context.Background()
+// reconcileOnce is one attempt, bounded by attemptTimeout and the
+// pending deadline so a hung Postgres or Redis call can't stall the id's
+// only retry (api#307). done is true once the keys match the row;
+// redisUp is false when Redis didn't answer the PING.
+func (c *credCache) reconcileOnce(id uuid.UUID, state cacheState, deadline time.Time) (done, redisUp bool) {
+	ctx, cancel := context.WithDeadline(context.Background(), minTime(time.Now().Add(c.attemptTimeout), deadline))
+	defer cancel()
 	if c.ping(ctx) != nil {
-		return false
+		return false, false
 	}
 	want, err := state(ctx)
 	if err != nil {
-		return false
+		return false, true
 	}
 	if want != "" {
-		return c.confirmRevoked(ctx, id, want, state)
+		return c.confirmRevoked(ctx, id, want, state), true
 	}
-	return c.confirmCleared(ctx, id, state)
+	return c.confirmCleared(ctx, id, state), true
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
 }
 
 func (c *credCache) ping(ctx context.Context) error {
