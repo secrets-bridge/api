@@ -245,6 +245,11 @@ func (h *Agents) Revoke(c fiber.Ctx) error {
 		if errors.Is(err, storage.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "agent not found")
 		}
+		if errors.Is(err, services.ErrCredentialCacheUnconfirmed) {
+			// Revoked in the database; the cache tombstone is still being
+			// retried. Retrying the revoke is safe.
+			return fiber.NewError(fiber.StatusServiceUnavailable, "revoked_cache_unconfirmed")
+		}
 		return fiber.NewError(fiber.StatusInternalServerError, "revoke failed")
 	}
 	return c.SendStatus(fiber.StatusNoContent)

@@ -36,9 +36,9 @@ import (
 //
 // The heartbeat path uses a Redis cache for the agent's secret hash so
 // validation is one Redis GET (cache hit) instead of one Postgres
-// SELECT under load. Revocation MUST go through Revoke() — direct
-// status updates to the storage layer would leave the cache stale and
-// let a revoked agent keep heartbeating for up to secretHashCacheTTL.
+// SELECT under load. Revocation MUST go through Revoke(), which writes a
+// cache tombstone (skills#104); a direct status update in the storage
+// layer would leave a cached entry valid for up to secretHashCacheTTL.
 type AgentService struct {
 	agents storage.AgentRepository
 	audit  storage.AuditEventRepository
@@ -59,6 +59,10 @@ type AgentService struct {
 	// called — the certified mint/heartbeat/auth paths never touch them.
 	enrollTokens storage.AgentEnrollmentTokenRepository
 	provConns    AgentProviderConnectionLookup
+
+	// cache fronts the secret-hash check with a revocation tombstone and
+	// a negative entry for unknown ids (skills#104).
+	cache *credCache
 }
 
 // AgentProviderConnectionLookup is the narrow Get-only slice of the
@@ -79,7 +83,7 @@ func (s *AgentService) WithEnrollment(tokens storage.AgentEnrollmentTokenReposit
 
 // NewAgentService constructs an AgentService.
 func NewAgentService(agents storage.AgentRepository, audit storage.AuditEventRepository, rdb *runtime.Client) *AgentService {
-	return &AgentService{
+	s := &AgentService{
 		agents:             agents,
 		audit:              audit,
 		rdb:                rdb,
@@ -87,6 +91,8 @@ func NewAgentService(agents storage.AgentRepository, audit storage.AuditEventRep
 		heartbeatCacheTTL:  5 * time.Minute,
 		secretHashCacheTTL: 60 * time.Second,
 	}
+	s.cache = newCredCache(rdb, cacheKindSecretHash, s.secretHashCacheTTL)
+	return s
 }
 
 // Redis key prefixes — `kind` slot for the runtime namespace builder.
@@ -188,18 +194,28 @@ func (s *AgentService) Mint(ctx context.Context, in MintInput) (*MintedAgent, er
 //
 // Hot path:
 //
-//  1. Read the secret hash + status from Redis.
-//  2. On cache miss: read from Postgres and prime the cache.
+//  1. Read the secret hash + status, the revocation tombstone and the
+//     unknown-id entry from Redis in one round trip. A tombstone rejects
+//     whatever the entry says (skills#104).
+//  2. On cache miss: read from Postgres and prime the cache (or the
+//     unknown-id entry).
 //  3. ConstantTimeCompare against the cached/loaded hash.
 func (s *AgentService) Authenticate(ctx context.Context, id uuid.UUID, agentSecret string) error {
-	cached, hadCache, err := s.readSecretHashCache(ctx, id)
-	if err != nil {
-		return err
+	r := s.cache.read(ctx, id)
+	if r.revoked != "" {
+		s.auditAuthRejected(ctx, id, "revoked")
+		return storage.ErrUnauthorized
 	}
-	if !hadCache {
+	if r.missing {
+		s.auditAuthRejected(ctx, id, "unknown_agent")
+		return storage.ErrNotFound
+	}
+	var cached cachedSecretHash
+	if !r.hit || json.Unmarshal(r.entry, &cached) != nil {
 		agent, err := s.agents.Get(ctx, id)
 		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
+				s.cache.markMissing(ctx, id)
 				s.auditAuthRejected(ctx, id, "unknown_agent")
 			}
 			return err
@@ -347,10 +363,14 @@ func (s *AgentService) Revoke(ctx context.Context, id uuid.UUID, revokedBy, reas
 	if err != nil {
 		return err
 	}
+	// A first tombstone write before the commit stops a fill whose read
+	// predates it (skills#104). ensureRevoked confirms the tombstone after
+	// the commit and keeps retrying while Redis is unavailable.
+	_ = s.cache.markRevoked(ctx, id, tombstoneRevoked)
 	if err := s.agents.Revoke(ctx, id, revokedBy, s.now().UTC()); err != nil {
 		return err
 	}
-	s.invalidateSecretHashCache(ctx, id)
+	cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked)
 
 	actor := auditActor(ctx, revokedBy)
 	meta := map[string]any{
@@ -367,72 +387,31 @@ func (s *AgentService) Revoke(ctx context.Context, id uuid.UUID, revokedBy, reas
 		Status:   storage.AuditStatusSuccess,
 		Metadata: meta,
 	})
+	if cacheErr != nil {
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:    actor,
+			Action:   "agent.revoke.cache_unconfirmed",
+			Resource: "agent:" + id.String(),
+			Status:   storage.AuditStatusFailure,
+			Metadata: map[string]any{"agent_id": id.String(), "error_kind": "cache_unconfirmed"},
+		})
+		return cacheErr
+	}
 	return nil
 }
 
-// readSecretHashCache returns the cached entry and whether the cache
-// served the lookup. A nil rdb (test injection / boot path) reports
-// "no cache" without erroring.
-func (s *AgentService) readSecretHashCache(ctx context.Context, id uuid.UUID) (cachedSecretHash, bool, error) {
-	if s.rdb == nil {
-		return cachedSecretHash{}, false, nil
-	}
-	key := s.rdb.Key(cacheKindSecretHash, id.String())
-	raw, err := s.rdb.Raw().Get(ctx, key).Bytes()
-	if err != nil {
-		// redis.Nil is the "miss" sentinel; anything else is a real
-		// Redis problem. We treat real Redis errors as cache miss so
-		// the caller falls through to Postgres rather than failing
-		// every heartbeat when Redis flakes.
-		return cachedSecretHash{}, false, nil //nolint:nilerr // intentional cache-miss-on-error
-	}
-	var c cachedSecretHash
-	if err := json.Unmarshal(raw, &c); err != nil {
-		return cachedSecretHash{}, false, nil
-	}
-	return c, true, nil
-}
-
-// fillSecretHashCache primes the cache after a Postgres read, then
-// re-reads the row and drops the entry if it changed (API-S-21).
-//
-// Revoke deletes the cache entry only after its UPDATE commits. Without
-// the re-read, a fill whose Postgres read predates the revoke but whose
-// Redis write lands after that delete would serve the revoked agent as
-// active until the TTL. With it, every interleaving ends with no stale
-// entry: the re-read runs after our write, so either it sees the revoke
-// (we delete our own entry) or the revoke commits later and its delete
-// runs after our write. A failed re-read also drops the entry, so the
-// next call goes back to Postgres.
+// fillSecretHashCache primes the cache after a Postgres read, unless the
+// agent carries a revocation tombstone, then re-reads the row and drops
+// the entry if it changed (API-S-21). A failed re-read also drops it.
 func (s *AgentService) fillSecretHashCache(ctx context.Context, id uuid.UUID, c cachedSecretHash) {
-	if s.rdb == nil {
-		return
-	}
-	s.writeSecretHashCache(ctx, id, c)
-	fresh, err := s.agents.Get(ctx, id)
-	if err != nil || string(fresh.Status) != c.Status || !bytes.Equal(fresh.SecretHash, c.Hash) {
-		s.invalidateSecretHashCache(ctx, id)
-	}
-}
-
-func (s *AgentService) writeSecretHashCache(ctx context.Context, id uuid.UUID, c cachedSecretHash) {
-	if s.rdb == nil {
-		return
-	}
 	raw, err := json.Marshal(c)
 	if err != nil {
 		return
 	}
-	key := s.rdb.Key(cacheKindSecretHash, id.String())
-	_, _ = s.rdb.Raw().Set(ctx, key, raw, s.secretHashCacheTTL).Result()
-}
-
-func (s *AgentService) invalidateSecretHashCache(ctx context.Context, id uuid.UUID) {
-	if s.rdb == nil {
-		return
-	}
-	key := s.rdb.Key(cacheKindSecretHash, id.String())
-	_, _ = s.rdb.Raw().Del(ctx, key).Result()
+	s.cache.fill(ctx, id, raw, func() bool {
+		fresh, err := s.agents.Get(ctx, id)
+		return err == nil && string(fresh.Status) == c.Status && bytes.Equal(fresh.SecretHash, c.Hash)
+	})
 }
 
 // List returns every agent, with last-seen pulled from Redis when
