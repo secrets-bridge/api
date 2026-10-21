@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"os"
 	"testing"
@@ -56,14 +57,10 @@ func TestLive_CredentialCacheUnconfirmedAnswers503(t *testing.T) {
 		{"revoke", http.MethodPost, revoke, map[string]any{"reason": "outage"}, "revoked_cache_unconfirmed"},
 	} {
 		code, body := f.l.callAs(t, c.method, c.path, f.admin, c.body)
-		if code != http.StatusServiceUnavailable || errCode(t, body) != c.want {
-			t.Errorf("gateway %s with Redis down = %d %s, want 503 %s", c.name, code, body, c.want)
-		}
+		checkUnconfirmed(t, "gateway "+c.name, code, body, c.want)
 	}
 	code, body = f.l.call(t, http.MethodPost, "/api/v1/admin/agents/"+minted.ID.String()+"/revoke", op, map[string]any{"reason": "outage"})
-	if code != http.StatusServiceUnavailable || errCode(t, body) != "revoked_cache_unconfirmed" {
-		t.Errorf("agent revoke with Redis down = %d %s, want 503 revoked_cache_unconfirmed", code, body)
-	}
+	checkUnconfirmed(t, "agent revoke", code, body, "revoked_cache_unconfirmed")
 
 	// Back up: the cache still holds both credentials until the background
 	// retry lands the tombstones, one retry tick later.
@@ -92,5 +89,20 @@ func TestLive_CredentialCacheUnconfirmedAnswers503(t *testing.T) {
 		if err := f.l.pool.QueryRow(t.Context(), `SELECT count(*) FROM audit_events WHERE action = $1`, action).Scan(&n); err != nil || n != 1 {
 			t.Errorf("%s audit rows = %d (%v), want 1", action, n, err)
 		}
+	}
+}
+
+// checkUnconfirmed: a 503 in the stableErr shape (error_code, message)
+// with the request's correlation id, like every other error body.
+func checkUnconfirmed(t *testing.T, name string, code int, body []byte, want string) {
+	t.Helper()
+	var e struct {
+		ErrorCode     string `json:"error_code"`
+		Message       string `json:"message"`
+		CorrelationID string `json:"correlation_id"`
+	}
+	_ = json.Unmarshal(body, &e)
+	if code != http.StatusServiceUnavailable || e.ErrorCode != want || e.Message == "" || e.CorrelationID == "" {
+		t.Errorf("%s with Redis down = %d %s, want 503 %s with a message and a correlation_id", name, code, body, want)
 	}
 }

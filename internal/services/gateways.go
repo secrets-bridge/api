@@ -272,7 +272,7 @@ func (s *GatewayService) Revoke(ctx context.Context, id uuid.UUID, by, reason st
 	if errors.Is(err, storage.ErrGatewayAlreadyRevoked) {
 		// A retry after ErrCredentialCacheUnconfirmed lands here: confirm
 		// the tombstone again before answering.
-		if cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked, nil); cacheErr != nil {
+		if cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked, finalState(tombstoneRevoked)); cacheErr != nil {
 			return nil, cacheErr
 		}
 		return nil, err
@@ -280,7 +280,7 @@ func (s *GatewayService) Revoke(ctx context.Context, id uuid.UUID, by, reason st
 	if err != nil {
 		return nil, err
 	}
-	cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked, nil)
+	cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked, finalState(tombstoneRevoked))
 	meta := map[string]any{
 		"gateway_id": id.String(), "enrollment_tokens_revoked": out.TokensRevoked,
 		"tasks_requeued": out.TasksRequeued,
@@ -326,9 +326,9 @@ func (s *GatewayService) SetEnabled(ctx context.Context, id uuid.UUID, enabled b
 	var cacheErr error
 	if enabled {
 		// Lifts only a "disabled" tombstone, so this never lifts a revoke.
-		cacheErr = s.cache.ensureCleared(ctx, id, s.blockedInDB(id))
+		cacheErr = s.cache.ensureCleared(ctx, id, s.cacheStateInDB(id))
 	} else {
-		cacheErr = s.cache.ensureRevoked(ctx, id, tombstoneDisabled, s.blockedInDB(id))
+		cacheErr = s.cache.ensureRevoked(ctx, id, tombstoneDisabled, s.cacheStateInDB(id))
 	}
 	if changed {
 		action := "gateway.enable"
@@ -353,13 +353,24 @@ func (s *GatewayService) SetEnabled(ctx context.Context, id uuid.UUID, enabled b
 	return s.store.Get(ctx, id)
 }
 
-// blockedInDB is the cache's re-read of the Gateway row: true while the
-// Gateway isn't live, and also when the row can't be read, so a doubt
-// keeps it out rather than letting it in.
-func (s *GatewayService) blockedInDB(id uuid.UUID) func(context.Context) bool {
-	return func(ctx context.Context) bool {
+// cacheStateInDB is the cache's read of the Gateway row: a "revoked" or
+// "disabled" tombstone for those two statuses, none for any other. A
+// pending Gateway gets none: it has no credential to cache yet, and a
+// tombstone left after it was enabled would refuse it right after it
+// enrolls (api#306).
+func (s *GatewayService) cacheStateInDB(id uuid.UUID) cacheState {
+	return func(ctx context.Context) (string, error) {
 		status, _, err := s.store.GetAuth(ctx, id)
-		return err != nil || !storage.GatewayStatus(status).Live()
+		if err != nil {
+			return "", err
+		}
+		switch storage.GatewayStatus(status) {
+		case storage.GatewayStatusRevoked:
+			return tombstoneRevoked, nil
+		case storage.GatewayStatusDisabled:
+			return tombstoneDisabled, nil
+		}
+		return "", nil
 	}
 }
 
@@ -578,6 +589,7 @@ func (s *GatewayService) claimRejectSlot(ctx context.Context, kind, subject, rea
 	cctx, cancel := withCacheDeadline(ctx)
 	defer cancel()
 	ok, err := s.rdb.Raw().SetNX(cctx, s.rdb.Key(kind, subject+":"+reason), "1", rejectAuditWindow).Result()
+	_ = countTimeout(err)
 	if err != nil {
 		return true
 	}

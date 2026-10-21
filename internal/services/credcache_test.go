@@ -18,7 +18,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 
+	"github.com/secrets-bridge/api/internal/observability"
 	"github.com/secrets-bridge/api/internal/services"
 	"github.com/secrets-bridge/api/internal/testutil/redisproxy"
 	"github.com/secrets-bridge/api/pkg/runtime"
@@ -443,6 +446,10 @@ func TestGatewayAuth_DisableRetryStopsAfterAnEnable(t *testing.T) {
 	services.SetGatewayCacheRetry(svc, time.Second)
 	ctx := t.Context()
 	id, secret := enrolledGateway(t, svc)
+	// Installed before any background work starts, so the seam is never
+	// written while the retry reads it.
+	var confirms atomic.Int32
+	services.SetGatewayCacheSeams(svc, services.CredCacheSeams{BeforeConfirm: func() { confirms.Add(1) }})
 	proxy.Set(redisproxy.Down)
 	if _, err := svc.SetEnabled(ctx, id, false, "test-admin"); !errors.Is(err, services.ErrCredentialCacheUnconfirmed) {
 		t.Fatalf("disable during the outage = %v, want ErrCredentialCacheUnconfirmed", err)
@@ -451,10 +458,9 @@ func TestGatewayAuth_DisableRetryStopsAfterAnEnable(t *testing.T) {
 	if _, err := svc.SetEnabled(ctx, id, true, "test-admin"); err != nil {
 		t.Fatalf("enable: %v", err)
 	}
-	var retried atomic.Int32
-	services.SetGatewayCacheSeams(svc, services.CredCacheSeams{BeforeConfirm: func() { retried.Add(1) }})
+	before := confirms.Load()
 	time.Sleep(2500 * time.Millisecond) // two ticks of the disable's retry
-	if n := retried.Load(); n != 0 {
+	if n := confirms.Load() - before; n != 0 {
 		t.Fatalf("the disable's retry tried to write a tombstone %d time(s) after the enable", n)
 	}
 	if v := services.GatewayTombstone(ctx, svc, id); v != "" {
@@ -557,7 +563,14 @@ func TestAuth_BlackholedRedisIsBounded(t *testing.T) {
 			t.Fatalf("prime the cache: %v", err)
 		}
 	}
+	timeouts := observability.RedisCallTimeouts.WithLabelValues(observability.RedisSiteAuthCache)
+	before := counterValue(t, timeouts)
 	proxy.Set(redisproxy.Blackhole)
+	t.Cleanup(func() {
+		if n := counterValue(t, timeouts) - before; n == 0 {
+			t.Error("redis_call_timeouts_total{site=auth_cache} did not move with Redis blackholed")
+		}
+	})
 	timed := func(name string, limit time.Duration, call func() error, check func(error) bool) {
 		t.Helper()
 		start := time.Now()
@@ -608,4 +621,229 @@ func TestGatewayAuth_EnableClearLosesToAConcurrentDisable(t *testing.T) {
 	if err := svc.Authenticate(ctx, id, secret); !errors.Is(err, storage.ErrUnauthorized) {
 		t.Fatalf("disabled Gateway = %v, want ErrUnauthorized", err)
 	}
+}
+
+// ---- api#306 ----------------------------------------------------------------
+
+// failingGateways is countingGateways whose GetAuth can be made to fail,
+// the way a Postgres blip looks to the cache's row check.
+type failingGateways struct {
+	countingGateways
+	fail atomic.Bool
+}
+
+func (f *failingGateways) GetAuth(ctx context.Context, id uuid.UUID) (storage.GatewayStatus, []byte, error) {
+	if f.fail.Load() {
+		f.gets.Add(1)
+		return "", nil, errors.New("test: database unavailable")
+	}
+	return f.countingGateways.GetAuth(ctx, id)
+}
+
+// proxiedGatewayService is a GatewayService with a failingGateways store
+// and its Redis behind a redisproxy.
+func proxiedGatewayService(t *testing.T) (*services.GatewayService, *failingGateways, *redisproxy.Proxy, *storage.Pool) {
+	t.Helper()
+	_, pool, _ := bootstrap(t)
+	p, proxied := redisproxy.Start(t, os.Getenv("TEST_REDIS_URL"))
+	rdb, err := runtime.Open(t.Context(), runtime.Config{URL: proxied, PoolSize: 4, Namespace: fmt.Sprintf("sb-test-%d", time.Now().UnixNano())})
+	if err != nil {
+		t.Fatalf("Open runtime through the proxy: %v", err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+	store := &failingGateways{countingGateways: countingGateways{GatewayStore: storage.NewGateways(pool)}}
+	svc := services.NewGatewayService(store, storage.NewAuditEvents(pool), rdb)
+	services.SetGatewayCacheRetry(svc, 50*time.Millisecond)
+	return svc, store, p, pool
+}
+
+// An enable whose row check fails can't tell whether a disable landed in
+// between, so it must not report success: 503, an audit row, and the
+// retry finishes the job once the database answers.
+func TestGatewayAuth_EnableWithADatabaseErrorIsUnconfirmed(t *testing.T) {
+	svc, store, _, pool := proxiedGatewayService(t)
+	ctx := t.Context()
+	id, secret := enrolledGateway(t, svc)
+	if _, err := svc.SetEnabled(ctx, id, false, "test-admin"); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	store.fail.Store(true)
+	if _, err := svc.SetEnabled(ctx, id, true, "test-admin"); !errors.Is(err, services.ErrCredentialCacheUnconfirmed) {
+		t.Fatalf("enable with the row check failing = %v, want ErrCredentialCacheUnconfirmed", err)
+	}
+	if n := countAudit(t, pool, "gateway.enable.cache_unconfirmed", "gateway:"+id.String()); n != 1 {
+		t.Fatalf("cache_unconfirmed audit rows = %d, want 1", n)
+	}
+	store.fail.Store(false)
+	if !eventually(func() bool { return svc.Authenticate(ctx, id, secret) == nil }) {
+		t.Fatalf("enabled Gateway still refused once the database answered (tombstone %q)", services.GatewayTombstone(ctx, svc, id))
+	}
+	if !eventually(func() bool { return services.GatewayCacheFixesRunning(svc) == 0 }) {
+		t.Fatal("the retry never finished")
+	}
+}
+
+// The same for a disable: with the row unreadable it can't rule out an
+// enable that landed in between, so it answers 503 and the retry settles
+// the cache once the database is back.
+func TestGatewayAuth_DisableWithADatabaseErrorIsUnconfirmed(t *testing.T) {
+	svc, store, _, pool := proxiedGatewayService(t)
+	ctx := t.Context()
+	id, secret := enrolledGateway(t, svc)
+	store.fail.Store(true)
+	if _, err := svc.SetEnabled(ctx, id, false, "test-admin"); !errors.Is(err, services.ErrCredentialCacheUnconfirmed) {
+		t.Fatalf("disable with the row check failing = %v, want ErrCredentialCacheUnconfirmed", err)
+	}
+	if n := countAudit(t, pool, "gateway.disable.cache_unconfirmed", "gateway:"+id.String()); n != 1 {
+		t.Fatalf("cache_unconfirmed audit rows = %d, want 1", n)
+	}
+	if err := svc.Authenticate(ctx, id, secret); !errors.Is(err, storage.ErrUnauthorized) {
+		t.Fatalf("disabled Gateway while the row check fails = %v, want ErrUnauthorized", err)
+	}
+	store.fail.Store(false)
+	if !eventually(func() bool { return services.GatewayCacheFixesRunning(svc) == 0 }) {
+		t.Fatal("the retry never finished")
+	}
+	if v := services.GatewayTombstone(ctx, svc, id); v != "disabled" {
+		t.Fatalf("tombstone = %q, want disabled", v)
+	}
+}
+
+// A disable that loses to a concurrent enable lifts its tombstone again;
+// if that clear fails, it must try again rather than report success with
+// "disabled" left on an enabled Gateway.
+func TestGatewayAuth_DisableRetriesAFailedCorrectiveClear(t *testing.T) {
+	svc, _ := gatewayService(t)
+	ctx := t.Context()
+	id, secret := enrolledGateway(t, svc)
+	var once sync.Once
+	var failNext atomic.Bool
+	services.SetGatewayCacheSeams(svc, services.CredCacheSeams{
+		BeforeConfirm: func() {
+			once.Do(func() {
+				if _, err := svc.SetEnabled(ctx, id, true, "test-admin"); err != nil {
+					t.Errorf("concurrent enable: %v", err)
+				}
+				failNext.Store(true)
+			})
+		},
+		FailClear: func() bool { return failNext.Swap(false) },
+	})
+	if _, err := svc.SetEnabled(ctx, id, false, "test-admin"); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if v := services.GatewayTombstone(ctx, svc, id); v != "" {
+		t.Fatalf("tombstone = %q on a Gateway the database has enabled, want none", v)
+	}
+	if err := svc.Authenticate(ctx, id, secret); err != nil {
+		t.Fatalf("enabled Gateway = %v, want nil", err)
+	}
+}
+
+// However many calls fail during an outage, one goroutine per id fixes the
+// cache afterwards, and it doesn't touch the database while Redis is down.
+func TestGatewayAuth_OneQuietRetryPerID(t *testing.T) {
+	svc, store, proxy, _ := proxiedGatewayService(t)
+	ctx := t.Context()
+	id, secret := enrolledGateway(t, svc)
+	proxy.Set(redisproxy.Down)
+	for _, enabled := range []bool{false, true, false} {
+		if _, err := svc.SetEnabled(ctx, id, enabled, "test-admin"); !errors.Is(err, services.ErrCredentialCacheUnconfirmed) {
+			t.Fatalf("SetEnabled(%v) during the outage = %v, want ErrCredentialCacheUnconfirmed", enabled, err)
+		}
+	}
+	// The pending fix follows a disable, so it has a row to check, but it
+	// must not check it while Redis is down.
+	before := store.gets.Load()
+	time.Sleep(time.Second) // 20 retry ticks
+	if n := store.gets.Load() - before; n != 0 {
+		t.Fatalf("the retry read the database %d times while Redis was down, want 0", n)
+	}
+	if _, err := svc.Revoke(ctx, id, "test-admin", "outage"); !errors.Is(err, services.ErrCredentialCacheUnconfirmed) {
+		t.Fatalf("Revoke during the outage = %v, want ErrCredentialCacheUnconfirmed", err)
+	}
+	if n := services.GatewayCacheFixesRunning(svc); n != 1 {
+		t.Fatalf("retry goroutines = %d after four failed calls on one id, want 1", n)
+	}
+	proxy.Set(redisproxy.Up)
+	if !eventually(func() bool { return services.GatewayTombstone(ctx, svc, id) == "revoked" }) {
+		t.Fatalf("tombstone = %q once Redis came back, want revoked (the last call won)", services.GatewayTombstone(ctx, svc, id))
+	}
+	if err := svc.Authenticate(ctx, id, secret); !errors.Is(err, storage.ErrUnauthorized) {
+		t.Fatalf("revoked Gateway = %v, want ErrUnauthorized", err)
+	}
+	if !eventually(func() bool { return services.GatewayCacheFixesRunning(svc) == 0 }) {
+		t.Fatal("the retry never finished")
+	}
+}
+
+// Enabling a Gateway that never enrolled leaves it pending, and pending
+// has no tombstone: it can enroll and authenticate straight away.
+func TestGatewayAuth_PendingGatewayEnrollsRightAfterAnEnable(t *testing.T) {
+	svc, _ := gatewayService(t)
+	ctx := t.Context()
+	g, err := svc.CreateGateway(ctx, services.CreateGatewayInput{Name: fmt.Sprintf("gw-%d", time.Now().UnixNano()), Boundary: "test", CreatedBy: "test-admin"})
+	if err != nil {
+		t.Fatalf("CreateGateway: %v", err)
+	}
+	if _, err := svc.SetEnabled(ctx, g.ID, false, "test-admin"); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if _, err := svc.SetEnabled(ctx, g.ID, true, "test-admin"); err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+	if v := services.GatewayTombstone(ctx, svc, g.ID); v != "" {
+		t.Fatalf("tombstone = %q on a pending Gateway, want none", v)
+	}
+	tok, err := svc.MintEnrollmentToken(ctx, services.MintGatewayTokenInput{GatewayID: g.ID, CreatedBy: "test-admin"})
+	if err != nil {
+		t.Fatalf("MintEnrollmentToken: %v", err)
+	}
+	en, err := svc.Enroll(ctx, services.GatewayEnrollInput{Token: tok.Token})
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	if err := svc.Authenticate(ctx, en.GatewayID, en.Secret); err != nil {
+		t.Fatalf("just-enrolled Gateway = %v, want nil", err)
+	}
+}
+
+// The admin list falls back to the last-seen time a heartbeat wrote to
+// Redis, under the same namespaced key.
+func TestAgentList_ReadsTheLastSeenTheHeartbeatWrote(t *testing.T) {
+	svc, pool, _ := bootstrap(t)
+	ctx := t.Context()
+	minted, err := svc.Mint(ctx, services.MintInput{Name: "lastseen"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Heartbeat(ctx, minted.ID, minted.AgentSecret); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	// Only the Redis copy is left to answer.
+	if _, err := pool.Exec(ctx, `UPDATE agents SET last_seen_at = NULL WHERE id = $1`, minted.ID); err != nil {
+		t.Fatal(err)
+	}
+	views, err := svc.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, v := range views {
+		if v.ID == minted.ID {
+			if v.LastSeenAt == nil {
+				t.Fatal("LastSeenAt = nil, want the heartbeat's time from Redis")
+			}
+			return
+		}
+	}
+	t.Fatal("minted agent not in the list")
+}
+
+func counterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	return m.GetCounter().GetValue()
 }

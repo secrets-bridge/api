@@ -33,6 +33,16 @@ on `main`.
   Redis calls now have a deadline (300ms for the auth cache, 500ms for
   the rate limiter), and the Redis client honours the caller's context
   deadline for every call.
+- A Gateway disable or enable that can't read the Gateway row afterwards
+  answers 503 instead of reporting success, and a failed corrective
+  clear is retried (api#306). One background goroutine per id brings
+  the cache in line with the row, and it reads the database only once
+  Redis answers again. Enabling a Gateway that never enrolled no longer
+  leaves a tombstone that refuses it right after it enrolls.
+- The `*_cache_unconfirmed` 503s use the `error_code` and `message`
+  shape with a `correlation_id`, so the console shows the message.
+- The agent list's last-seen fallback reads the Redis key that
+  heartbeats write; it used a different key and never matched.
 
 ### Removed
 - The control-plane Argo CD integration (secrets-bridge/gateway#13):
@@ -49,6 +59,9 @@ on `main`.
   token on the Argo CD side.
 
 ### Added
+- `redis_call_timeouts_total{site}` counts Redis calls on the auth paths
+  (`auth_cache`) and in the rate limiter (`rate_limit`) that hit their
+  deadline, so a slow Redis shows before limiters start failing open.
 - Parity tests: the Gateway evidence path shows every Argo CD fact the
   poller recorded (sync, health, operation phase, revision), per bound
   application, labelled operational state.

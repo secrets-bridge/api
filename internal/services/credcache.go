@@ -3,11 +3,14 @@ package services
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/secrets-bridge/api/internal/observability"
 	"github.com/secrets-bridge/api/pkg/runtime"
 )
 
@@ -55,11 +58,16 @@ type credCache struct {
 	hashTTL, revokedTTL, missingTTL time.Duration
 	retryEvery                      time.Duration
 
+	pendingMu sync.Mutex
+	pending   map[uuid.UUID]*pendingFix
+	running   atomic.Int32 // reconcile goroutines alive
+
 	// Test seams (export_test.go); nil in production.
 	beforeFill    func()
 	afterWrite    func()
 	beforeConfirm func()
 	beforeClear   func()
+	failClear     func() bool
 	del           func(ctx context.Context, key string) error
 }
 
@@ -106,6 +114,7 @@ func newCredCache(rdb *runtime.Client, hashKind string, hashTTL time.Duration) *
 		revokedTTL:  2 * hashTTL,
 		missingTTL:  30 * time.Second,
 		retryEvery:  100 * time.Millisecond,
+		pending:     map[uuid.UUID]*pendingFix{},
 	}
 }
 
@@ -118,6 +127,7 @@ func (c *credCache) read(ctx context.Context, id uuid.UUID) credCacheRead {
 	cctx, cancel := withCacheDeadline(ctx)
 	defer cancel()
 	vals, err := c.rdb.Raw().MGet(cctx, c.key(c.hashKind, id), c.key(c.revokedKind, id), c.key(c.missKind, id)).Result()
+	_ = countTimeout(err)
 	if err != nil || len(vals) != 3 {
 		return credCacheRead{}
 	}
@@ -149,6 +159,7 @@ func (c *credCache) fill(ctx context.Context, id uuid.UUID, entry []byte, unchan
 		[]string{c.key(c.hashKind, id), c.key(c.revokedKind, id)},
 		entry, c.hashTTL.Milliseconds()).Int()
 	cancel()
+	_ = countTimeout(err)
 	if err != nil || wrote != 1 {
 		return
 	}
@@ -171,48 +182,47 @@ func (c *credCache) markRevoked(ctx context.Context, id uuid.UUID, reason string
 	}
 	cctx, cancel := withCacheDeadline(ctx)
 	defer cancel()
-	return setTombstoneScript.Run(cctx, c.rdb.Raw(), []string{c.key(c.revokedKind, id)}, reason, c.revokedTTL.Milliseconds()).Err()
+	return countTimeout(setTombstoneScript.Run(cctx, c.rdb.Raw(), []string{c.key(c.revokedKind, id)}, reason, c.revokedTTL.Milliseconds()).Err())
+}
+
+// cacheState reads what the database says the cache should hold for an
+// id: tombstoneRevoked or tombstoneDisabled to keep it out, "" for any
+// other status. An error means the row couldn't be read.
+type cacheState func(ctx context.Context) (string, error)
+
+// finalState is the cacheState of a revoke. A revoke is final, so it
+// never needs the database.
+func finalState(reason string) cacheState {
+	return func(context.Context) (string, error) { return reason, nil }
 }
 
 // quickTries spaces the synchronous attempts of ensureRevoked and
 // ensureCleared.
 var quickTries = []time.Duration{0, 20 * time.Millisecond, 100 * time.Millisecond}
 
-// ensureRevoked runs after the database change. It writes the tombstone
-// (a few quick tries) and drops the entry. When Redis won't take the
-// tombstone, it keeps trying in the background for revokedTTL, the
-// longest a stale entry could still be served once Redis is back, and
+// ensureRevoked runs after a revoke or disable commits. It writes the
+// tombstone and drops the entry, a few quick tries. When it can't confirm
+// that the cache matches the row, it hands the id to reconcileLater and
 // returns ErrCredentialCacheUnconfirmed.
-//
-// blocked re-reads the database: true while the id should still be kept
-// out. A revoke is final and passes nil. A disable passes a check, so a
-// retry that outlives a later enable stops instead of shutting the
-// Gateway out again (api#304).
-func (c *credCache) ensureRevoked(ctx context.Context, id uuid.UUID, reason string, blocked func(context.Context) bool) error {
+func (c *credCache) ensureRevoked(ctx context.Context, id uuid.UUID, reason string, state cacheState) error {
 	if c.rdb == nil {
 		return nil
 	}
 	for _, wait := range quickTries {
 		time.Sleep(wait)
-		if c.confirmRevoked(ctx, id, reason, blocked) {
+		if c.confirmRevoked(ctx, id, reason, state) {
 			return nil
 		}
 	}
-	go c.retryInBackground(func(ctx context.Context) bool {
-		if blocked != nil && !blocked(ctx) {
-			return true // enabled again since: nothing left to confirm
-		}
-		return c.confirmRevoked(ctx, id, reason, blocked)
-	})
+	c.reconcileLater(id, state)
 	return ErrCredentialCacheUnconfirmed
 }
 
-// confirmRevoked writes the tombstone and drops the entry. If the
-// database stopped blocking the id while it wrote, it lifts the
-// tombstone again (an enable that committed and cleared just before this
-// write would otherwise be undone). Reports whether the tombstone write
-// went through.
-func (c *credCache) confirmRevoked(ctx context.Context, id uuid.UUID, reason string, blocked func(context.Context) bool) bool {
+// confirmRevoked writes the tombstone and drops the entry, then re-reads
+// the row: if an enable committed meanwhile, it lifts the tombstone again.
+// It reports true only when every Redis call went through and the row
+// could be read; anything else is left to the retry (api#306).
+func (c *credCache) confirmRevoked(ctx context.Context, id uuid.UUID, reason string, state cacheState) bool {
 	if c.beforeConfirm != nil {
 		c.beforeConfirm()
 	}
@@ -220,70 +230,136 @@ func (c *credCache) confirmRevoked(ctx context.Context, id uuid.UUID, reason str
 		return false
 	}
 	c.invalidate(ctx, id)
-	if blocked != nil && !blocked(ctx) {
-		_ = c.clearRevoked(ctx, id)
+	want, err := state(ctx)
+	if err != nil {
+		return false
+	}
+	if want == "" && c.clearRevoked(ctx, id) != nil {
+		return false
 	}
 	return true
 }
 
 // ensureCleared runs after a Gateway is enabled. It lifts a "disabled"
-// tombstone and drops the entry, which may still say "disabled". When
-// Redis won't take both, it keeps trying in the background while the
-// database still has the Gateway live, and returns
-// ErrCredentialCacheUnconfirmed: until then the Gateway may still be
-// refused, which is an availability cost only.
-func (c *credCache) ensureCleared(ctx context.Context, id uuid.UUID, blocked func(context.Context) bool) error {
+// tombstone and drops the entry, which may still say "disabled". When it
+// can't confirm, it hands the id to reconcileLater and returns
+// ErrCredentialCacheUnconfirmed: the Gateway may still be refused until
+// then, which costs availability only.
+func (c *credCache) ensureCleared(ctx context.Context, id uuid.UUID, state cacheState) error {
 	if c.rdb == nil {
 		return nil
 	}
 	for _, wait := range quickTries {
 		time.Sleep(wait)
-		if c.confirmCleared(ctx, id, blocked) {
+		if c.confirmCleared(ctx, id, state) {
 			return nil
 		}
 	}
-	go c.retryInBackground(func(ctx context.Context) bool {
-		if blocked(ctx) {
-			return true // disabled or revoked again since: leave it
-		}
-		return c.confirmCleared(ctx, id, blocked)
-	})
+	c.reconcileLater(id, state)
 	return ErrCredentialCacheUnconfirmed
 }
 
-// confirmCleared lifts the tombstone and drops the entry. If a disable
-// committed meanwhile, it puts a "disabled" tombstone back (never over a
-// "revoked" one). Reports whether both Redis calls went through.
-func (c *credCache) confirmCleared(ctx context.Context, id uuid.UUID, blocked func(context.Context) bool) bool {
+// confirmCleared lifts the tombstone and drops the entry, then re-reads
+// the row: if a disable committed meanwhile, it puts the tombstone back
+// (never over a "revoked" one). Same rule for true as confirmRevoked.
+func (c *credCache) confirmCleared(ctx context.Context, id uuid.UUID, state cacheState) bool {
 	if c.beforeClear != nil {
 		c.beforeClear()
 	}
 	if c.clearRevoked(ctx, id) != nil || c.delKey(ctx, c.key(c.hashKind, id)) != nil {
 		return false
 	}
-	if blocked(ctx) {
-		_ = c.markRevoked(ctx, id, tombstoneDisabled)
+	want, err := state(ctx)
+	if err != nil {
+		return false
+	}
+	if want != "" && c.markRevoked(ctx, id, want) != nil {
+		return false
 	}
 	return true
 }
 
-// retryInBackground calls attempt every retryEvery until it reports done
-// or revokedTTL passes; by then any key it was correcting has expired.
-func (c *credCache) retryInBackground(attempt func(context.Context) bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.revokedTTL)
-	defer cancel()
+// pendingFix is one id that reconcileLater is still bringing in line.
+type pendingFix struct {
+	state    cacheState
+	deadline time.Time
+	again    bool // a newer call came in while an attempt ran
+}
+
+// reconcileLater brings an id's cache keys in line with its row in the
+// background. There is one goroutine per id: a repeated call only swaps in
+// its state and extends the deadline, and every attempt reads the row, so
+// it ends up where the latest revoke, disable or enable left it. An
+// attempt reads the database only after Redis answers a PING, so an outage
+// costs no queries. It gives up revokedTTL after the last call, when every
+// key it could correct has expired.
+func (c *credCache) reconcileLater(id uuid.UUID, state cacheState) {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	if p, ok := c.pending[id]; ok {
+		p.state, p.deadline, p.again = state, time.Now().Add(c.revokedTTL), true
+		return
+	}
+	p := &pendingFix{state: state, deadline: time.Now().Add(c.revokedTTL)}
+	c.pending[id] = p
+	go c.reconcile(id, p)
+}
+
+func (c *credCache) reconcile(id uuid.UUID, p *pendingFix) {
+	c.running.Add(1)
+	defer c.running.Add(-1)
 	t := time.NewTicker(c.retryEvery)
 	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
+	for range t.C {
+		c.pendingMu.Lock()
+		if time.Now().After(p.deadline) {
+			delete(c.pending, id)
+			c.pendingMu.Unlock()
 			return
-		case <-t.C:
-			if attempt(ctx) {
-				return
-			}
 		}
+		state := p.state
+		p.again = false
+		c.pendingMu.Unlock()
+		if !c.reconcileOnce(id, state) {
+			continue
+		}
+		c.pendingMu.Lock()
+		if p.again {
+			c.pendingMu.Unlock()
+			continue
+		}
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
+		return
 	}
+}
+
+// reconcileOnce is one attempt: true once the keys match the row.
+func (c *credCache) reconcileOnce(id uuid.UUID, state cacheState) bool {
+	ctx := context.Background()
+	if c.ping(ctx) != nil {
+		return false
+	}
+	want, err := state(ctx)
+	if err != nil {
+		return false
+	}
+	if want != "" {
+		return c.confirmRevoked(ctx, id, want, state)
+	}
+	return c.confirmCleared(ctx, id, state)
+}
+
+func (c *credCache) ping(ctx context.Context) error {
+	cctx, cancel := withCacheDeadline(ctx)
+	defer cancel()
+	return countTimeout(c.rdb.Raw().Ping(cctx).Err())
+}
+
+// countTimeout records a Redis call on the auth paths that ran out of its
+// deadline (observability.RedisCallTimeouts) and returns err unchanged.
+func countTimeout(err error) error {
+	return observability.CountRedisTimeout(observability.RedisSiteAuthCache, err)
 }
 
 // clearRevoked drops a "disabled" tombstone. A "revoked" one stays.
@@ -291,9 +367,12 @@ func (c *credCache) clearRevoked(ctx context.Context, id uuid.UUID) error {
 	if c.rdb == nil {
 		return nil
 	}
+	if c.failClear != nil && c.failClear() {
+		return errors.New("credcache: clear failed (test seam)")
+	}
 	cctx, cancel := withCacheDeadline(ctx)
 	defer cancel()
-	return clearDisabledScript.Run(cctx, c.rdb.Raw(), []string{c.key(c.revokedKind, id)}).Err()
+	return countTimeout(clearDisabledScript.Run(cctx, c.rdb.Raw(), []string{c.key(c.revokedKind, id)}).Err())
 }
 
 func (c *credCache) markMissing(ctx context.Context, id uuid.UUID) {
@@ -302,7 +381,7 @@ func (c *credCache) markMissing(ctx context.Context, id uuid.UUID) {
 	}
 	cctx, cancel := withCacheDeadline(ctx)
 	defer cancel()
-	_, _ = c.rdb.Raw().Set(cctx, c.key(c.missKind, id), "1", c.missingTTL).Result()
+	_ = countTimeout(c.rdb.Raw().Set(cctx, c.key(c.missKind, id), "1", c.missingTTL).Err())
 }
 
 // invalidate drops the credential entry. A failure is tolerated: after a
@@ -320,7 +399,7 @@ func (c *credCache) delKey(ctx context.Context, key string) error {
 	}
 	cctx, cancel := withCacheDeadline(ctx)
 	defer cancel()
-	err := c.rdb.Raw().Del(cctx, key).Err()
+	err := countTimeout(c.rdb.Raw().Del(cctx, key).Err())
 	if errors.Is(err, redis.Nil) {
 		return nil
 	}

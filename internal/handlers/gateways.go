@@ -525,14 +525,22 @@ type revokeGatewayRequest struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// cacheUnconfirmedMessages are the console texts for the 503 codes.
+var cacheUnconfirmedMessages = map[string]string{
+	"revoked_cache_unconfirmed": "Saved, but the credential cache could not be updated yet, so the credential may still be accepted for a moment. Repeat the request to confirm.",
+	"enabled_cache_unconfirmed": "Saved, but the credential cache could not be updated yet, so the Gateway may still be refused for a moment. Repeat the request to confirm.",
+}
+
 // cacheUnconfirmed answers 503 for services.ErrCredentialCacheUnconfirmed:
 // the change is saved, the auth cache isn't in line with it yet, and
-// repeating the call is safe. It writes the body itself because the app's
-// error handler replaces every 5xx message with a generic one, and the
-// admin needs to know which way the cache may still be wrong.
+// repeating the call is safe. It writes the body itself, in the stableErr
+// shape plus the correlation id, because the app's error handler replaces
+// every 5xx message with a generic one and the admin needs to know which
+// way the cache may still be wrong.
 func cacheUnconfirmed(c fiber.Ctx, code string) error {
+	rid, _ := c.Locals(string(middleware.CtxKeyRequestID)).(string)
 	c.Set(fiber.HeaderRetryAfter, "1")
-	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": code})
+	return stableErr(c, fiber.StatusServiceUnavailable, code, cacheUnconfirmedMessages[code], map[string]any{"correlation_id": rid})
 }
 
 // AdminRevoke handles POST /admin/gateways/:id/revoke (gateway.revoke,

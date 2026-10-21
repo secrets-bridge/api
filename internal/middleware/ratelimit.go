@@ -36,6 +36,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/internal/observability"
 	"github.com/secrets-bridge/api/pkg/runtime"
 )
 
@@ -100,6 +101,7 @@ func RateLimit(rdb *runtime.Client, logger *slog.Logger, cfg RateLimitConfig) fi
 		callCtx, cancel := context.WithTimeout(c.Context(), rateLimitCallTimeout)
 		rl, err := rdb.AllowN(callCtx, fullBucket, cfg.Limit, cfg.Window)
 		cancel()
+		_ = observability.CountRedisTimeout(observability.RedisSiteRateLimit, err)
 		if err != nil {
 			if cfg.FailClosed {
 				if logger != nil {

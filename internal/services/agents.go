@@ -286,6 +286,7 @@ func (s *AgentService) claimRejectAuditSlot(ctx context.Context, kind, subject, 
 	cctx, cancel := withCacheDeadline(ctx)
 	defer cancel()
 	ok, err := s.rdb.Raw().SetNX(cctx, key, "1", rejectAuditWindow).Result()
+	_ = countTimeout(err)
 	if err != nil {
 		return true
 	}
@@ -307,7 +308,7 @@ func (s *AgentService) Heartbeat(ctx context.Context, id uuid.UUID, agentSecret 
 	if s.rdb != nil {
 		key := s.rdb.Key(cacheKindLastSeen, id.String())
 		cctx, cancel := withCacheDeadline(ctx)
-		_, _ = s.rdb.Raw().Set(cctx, key, now.Format(time.RFC3339Nano), s.heartbeatCacheTTL).Result()
+		_ = countTimeout(s.rdb.Raw().Set(cctx, key, now.Format(time.RFC3339Nano), s.heartbeatCacheTTL).Err())
 		cancel()
 	}
 	return nil
@@ -374,7 +375,7 @@ func (s *AgentService) Revoke(ctx context.Context, id uuid.UUID, revokedBy, reas
 	if err := s.agents.Revoke(ctx, id, revokedBy, s.now().UTC()); err != nil {
 		return err
 	}
-	cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked, nil)
+	cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked, finalState(tombstoneRevoked))
 
 	actor := auditActor(ctx, revokedBy)
 	meta := map[string]any{
@@ -437,8 +438,11 @@ func (s *AgentService) List(ctx context.Context) ([]*AgentView, error) {
 		}
 		if s.rdb != nil && a.LastSeenAt == nil {
 			cctx, cancel := withCacheDeadline(ctx)
-			cached, err := s.rdb.Raw().Get(cctx, "secrets-bridge:agent:lastseen:"+a.ID.String()).Result()
+			// The same key Heartbeat writes (the namespace and kind come
+			// from the runtime client, api#306).
+			cached, err := s.rdb.Raw().Get(cctx, s.rdb.Key(cacheKindLastSeen, a.ID.String())).Result()
 			cancel()
+			_ = countTimeout(err)
 			if err == nil && cached != "" {
 				if t, err := time.Parse(time.RFC3339Nano, cached); err == nil {
 					v.LastSeenAt = &t
