@@ -95,6 +95,11 @@ var (
 	// obsSecretRefRe is secretRef.name (observation-task schema); the
 	// "://" refusal is checked separately (RE2 has no lookahead).
 	obsSecretRefRe = regexp.MustCompile(`^[A-Za-z0-9/_+=.@-]+$`)
+	// obsIdentityDigestRe is resource.identity_digest: "d-" and 26
+	// lower-case base32 characters, a one-way digest of the connector id
+	// and the object's uid computed inside the customer boundary (ADR
+	// 0002 C3). The CP cannot recover the uid from it.
+	obsIdentityDigestRe = regexp.MustCompile(`^d-[a-z2-7]{26}$`)
 )
 
 var (
@@ -112,7 +117,7 @@ var (
 	obsAllErrorCodes = []string{
 		"connector_unreachable", "connector_timeout", "connector_unauthorized", "connector_forbidden",
 		"resource_not_found", "api_version_not_served", "response_too_large", "rate_limited",
-		"tls_verification_failed", "internal",
+		"tls_verification_failed", "internal", "target_identity_changed",
 	}
 	obsRefusalReasons = []string{
 		"unknown_connector", "unbound_target", "stage_not_supported_by_connector", "scope_mismatch",
@@ -131,6 +136,9 @@ type obsStageRules struct {
 	apiVersions       []string
 	observedNeedsLink bool
 	mustCaveat        string
+	// digestIdentity: the resource carries identity_digest and never the
+	// raw uid. Other stages may not carry identity_digest.
+	digestIdentity bool
 }
 
 var obsRulesByStage = map[string]obsStageRules{
@@ -147,7 +155,7 @@ var obsRulesByStage = map[string]obsStageRules{
 	StageArgoCDContext: {
 		api: "argocd", outcomes: []string{OutcomeObserved, OutcomeNotObserved, OutcomeUnverifiable, OutcomeError},
 		confidences: []string{"low", "none"}, linkages: []string{"none"}, kind: "Application", connectorKind: GatewayKindArgoCD,
-		apiVersions: []string{"argoproj.io/v1alpha1"}, mustCaveat: CaveatArgoCDHealthNotProof,
+		apiVersions: []string{"argoproj.io/v1alpha1"}, mustCaveat: CaveatArgoCDHealthNotProof, digestIdentity: true,
 	},
 }
 
@@ -210,11 +218,14 @@ type EvidenceSource struct {
 // name are the values the Gateway advertised for the target; they are
 // for admin display only and are not shown on the request page.
 type EvidenceResource struct {
-	APIVersion      string `json:"api_version"`
-	Kind            string `json:"kind"`
-	Namespace       string `json:"namespace"`
-	Name            string `json:"name"`
-	UID             string `json:"uid,omitempty"`
+	APIVersion string `json:"api_version"`
+	Kind       string `json:"kind"`
+	Namespace  string `json:"namespace"`
+	Name       string `json:"name"`
+	UID        string `json:"uid,omitempty"`
+	// IdentityDigest is the scoped identity digest an Argo CD stage
+	// carries instead of the raw uid.
+	IdentityDigest  string `json:"identity_digest,omitempty"`
 	ResourceVersion string `json:"resource_version,omitempty"`
 	Generation      *int64 `json:"generation,omitempty"`
 }
@@ -373,7 +384,7 @@ var (
 		)
 		stage := keys("stage", "observed_at", "outcome", "confidence", "caveats", "linkage", "error_code")
 		stage["source"] = &keySet{fields: keys("connector_id", "target_id", "api")}
-		stage["resource"] = &keySet{fields: keys("api_version", "kind", "namespace", "name", "uid", "resource_version", "generation")}
+		stage["resource"] = &keySet{fields: keys("api_version", "kind", "namespace", "name", "uid", "identity_digest", "resource_version", "generation")}
 		stage["facts"] = &keySet{fields: facts}
 		root := keys("schema_version", "task_id", "attempt_id", "gateway_id", "replica_id", "gateway_version",
 			"started_at", "finished_at", "attempt_status", "refusal_reason")
@@ -647,6 +658,12 @@ func (r *EvidenceResource) validate(rules obsStageRules) error {
 		return obsViolation("resource.name", "must be an object name")
 	case r.UID != "" && !obsUUIDRe.MatchString(r.UID):
 		return obsViolation("resource.uid", "must be a uuid")
+	case rules.digestIdentity && r.UID != "":
+		return obsViolation("resource.uid", "is not allowed for this stage; send identity_digest")
+	case !rules.digestIdentity && r.IdentityDigest != "":
+		return obsViolation("resource.identity_digest", "is not allowed for this stage")
+	case r.IdentityDigest != "" && !obsIdentityDigestRe.MatchString(r.IdentityDigest):
+		return obsViolation("resource.identity_digest", "does not match the pattern")
 	case r.ResourceVersion != "" && !obsK8sRVRe.MatchString(r.ResourceVersion):
 		return obsViolation("resource.resource_version", "does not match the pattern")
 	case !nonNeg(r.Generation):
