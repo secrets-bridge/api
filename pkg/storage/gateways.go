@@ -289,6 +289,9 @@ type GatewayHeartbeatOutcome struct {
 	MaxReplicas       int
 	// Discovery is set when the heartbeat is answered as contract 2.
 	Discovery *GatewayDiscoveryHeartbeat
+	// OverPrivileged lists the approved connectors this heartbeat latched
+	// back to advertised (api#308 review, ADR 0002 C2).
+	OverPrivileged []GatewayScopeEvent
 }
 
 // GatewayCatalogConnector is one connector of a validated catalog.
@@ -751,6 +754,9 @@ func (r *Gateways) RecordHeartbeat(ctx context.Context, hb GatewayHeartbeat, at,
 			status = CASE WHEN status = 'stale' THEN 'active' ELSE status END
 		WHERE id = $1`, hb.GatewayID, at, hb.Status, hb.GatewayVersion, contract); err != nil {
 		return nil, fmt.Errorf("storage: update gateway liveness: %w", err)
+	}
+	if out.OverPrivileged, err = latchOverPrivileged(ctx, tx, hb, at); err != nil {
+		return nil, err
 	}
 	if hb.AnswerContract2 {
 		if out.Discovery, err = recordDiscoveryHeartbeat(ctx, tx, hb, at, seenSince); err != nil {

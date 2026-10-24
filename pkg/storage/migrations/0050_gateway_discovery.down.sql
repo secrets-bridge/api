@@ -42,6 +42,7 @@ ALTER TABLE gateway_connectors
     DROP COLUMN IF EXISTS last_upload_response,
     DROP COLUMN IF EXISTS last_upload_sha256,
     DROP COLUMN IF EXISTS last_upload_lease_id,
+    DROP COLUMN IF EXISTS discovery_scope_digest,
     DROP COLUMN IF EXISTS discovery_allowed_projects,
     DROP COLUMN IF EXISTS last_discovery_at,
     DROP COLUMN IF EXISTS last_lease_granted_at,

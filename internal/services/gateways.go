@@ -673,6 +673,7 @@ func (s *GatewayService) Heartbeat(ctx context.Context, gatewayID uuid.UUID, in 
 	case err != nil:
 		return nil, err
 	}
+	s.auditOverPrivilegedLatch(ctx, gatewayID, replicaID, out.OverPrivileged)
 	if in.Status == "over_privileged" && out.PrevReplicaStatus != "over_privileged" {
 		s.appendAudit(ctx, &storage.AuditEvent{
 			Actor: gatewayActor(gatewayID), Action: "gateway.over_privileged", Resource: gatewayActor(gatewayID),
