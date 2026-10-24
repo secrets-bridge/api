@@ -382,7 +382,17 @@ func TestLive_Gateway_EnrollHeartbeatCatalogBind(t *testing.T) {
 	// Every change is audited with the session actor.
 	for _, action := range []string{"gateway.create", "gateway.enrollment_token.create", "gateway.connector.approved",
 		"gateway.binding.create", "gateway.binding.delete"} {
-		f.l.requireOneAudit(t, action, f.adminID.String())
+		f.l.requireOneSuccessAudit(t, action, f.adminID.String())
+	}
+	// And every refused bind as denied with its error kind (api#312).
+	var kinds []string
+	for _, r := range f.l.auditRowsWithStatus(t, "gateway.binding.create") {
+		if r.Status == "denied" {
+			kinds = append(kinds, r.Metadata["error_kind"].(string))
+		}
+	}
+	if got := strings.Join(kinds, ","); got != "connector_not_approved,target_not_advertised,invalid_request,binding_exists,target_stale" {
+		t.Errorf("denied bind error kinds = %s", got)
 	}
 	if got := f.l.actorOf(t, "gateway.enroll"); got != "gateway:"+gw.GatewayID {
 		t.Errorf("gateway.enroll actor = %q", got)

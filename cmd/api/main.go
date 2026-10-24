@@ -1376,19 +1376,34 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	gatewayRevoke := auth.Require(auth.PermGatewayRevoke, rbacResolver)
 	gatewayList := auth.Require(auth.PermGatewayList, rbacResolver)
 	gatewayBind := auth.Require(auth.PermGatewayBind, rbacResolver)
+	// api#312: a refused bind, approve, delete or re-confirm is audited
+	// as denied with an error kind and path ids only. It runs before the
+	// permission and step-up guards so it sees their refusals too.
+	denied := func(action string, ids handlers.GatewayDenyPathIDs) fiber.Handler {
+		return handlers.AuditGatewayDenied(auditRepo, action, ids)
+	}
 	v1.Post("/admin/gateways", gatewayMint, requireMFA, gatewaysH.AdminCreate)
 	v1.Get("/admin/gateways", gatewayList, gatewaysH.AdminList)
 	v1.Get("/admin/gateways/:id", gatewayList, gatewaysH.AdminGet)
 	v1.Post("/admin/gateways/:id/enrollment-token", gatewayMint, requireMFA, gatewaysH.AdminMintToken)
 	v1.Post("/admin/gateways/:id/revoke", gatewayRevoke, requireMFA, gatewaysH.AdminRevoke)
-	v1.Post("/admin/gateways/:id/connectors/:cid/approve", gatewayBind, requireMFA, gatewaysH.AdminApproveConnector)
+	v1.Post("/admin/gateways/:id/connectors/:cid/approve", denied("gateway.connector.approved", handlers.GatewayDenyApprove),
+		gatewayBind, requireMFA, gatewaysH.AdminApproveConnector)
+	// api#312: a platform admin accepts the identity the Gateway now
+	// advertises for an identity_changed target, which resumes its
+	// bindings.
+	v1.Post("/admin/gateways/:id/connectors/:cid/targets/:tid/confirm-identity",
+		denied("gateway.target.identity_confirmed", handlers.GatewayDenyConfirm),
+		gatewayBind, requireMFA, gatewaysH.AdminConfirmTargetIdentity)
 	v1.Post("/admin/gateway-enrollment-tokens/:id/revoke", gatewayMint, requireMFA, gatewaysH.AdminRevokeToken)
-	v1.Post("/admin/gateway-bindings", gatewayBind, requireMFA, gatewaysH.AdminCreateBinding)
+	v1.Post("/admin/gateway-bindings", denied("gateway.binding.create", handlers.GatewayDenyBind),
+		gatewayBind, requireMFA, gatewaysH.AdminCreateBinding)
 	// api#298: the binding list and the observation source are metadata
 	// (no credential), so gateway.list reads them; every write stays on
 	// gateway.bind with a fresh second factor.
 	v1.Get("/admin/gateway-bindings", gatewayList, gatewaysH.AdminListBindings)
-	v1.Delete("/admin/gateway-bindings/:id", gatewayBind, requireMFA, gatewaysH.AdminDeleteBinding)
+	v1.Delete("/admin/gateway-bindings/:id", denied("gateway.binding.delete", handlers.GatewayDenyDelete),
+		gatewayBind, requireMFA, gatewaysH.AdminDeleteBinding)
 	// api#294: disable or re-enable, a Gateway's tasks, and an
 	// environment's observation source (design section 9 permissions).
 	v1.Put("/admin/gateways/:id/enabled", gatewayRevoke, requireMFA, gatewaysH.AdminSetEnabled)

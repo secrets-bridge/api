@@ -144,6 +144,9 @@ var auditMetaKeys = map[string]auditMetaKind{
 	"connector_count": metaNumber, "target_count": metaNumber, "targets_stale": metaNumber,
 	"connectors_missing": metaNumber, "max_replicas": metaNumber, "max_inflight_tasks": metaNumber,
 	"enrollment_tokens_revoked": metaNumber, "observation_timeout_seconds": metaNumber,
+	// target identity pin (api#312): scoped one-way digests, never a uid
+	"identity_digest_before": metaDigest, "identity_digest_after": metaDigest,
+	"bindings_suspended": metaNumber, "bindings_resumed": metaNumber,
 
 	// gateway observation queue (api#294): ids, enums, digests and counts only
 	"task_id": metaID, "attempt_id": metaID, "previous_attempt_id": metaID, "superseding_task_id": metaID,

@@ -153,6 +153,39 @@ type GatewayTarget struct {
 	RefreshIntervalSeconds  *int   `json:"refresh_interval_seconds,omitempty"`
 	ProgressDeadlineSeconds *int   `json:"progress_deadline_seconds,omitempty"`
 	Stale                   bool   `json:"stale"`
+	// IdentityDigest is the pinned scoped identity digest (api#312, ADR
+	// 0002 C3): the first non-empty identity the Gateway advertised for
+	// this target. Argo CD targets only. Never shown in an admin view.
+	IdentityDigest string `json:"identity_digest,omitempty"`
+	// IdentityStatus is "" (no pin yet), pinned or identity_changed.
+	IdentityStatus string `json:"identity_status,omitempty"`
+	// IdentityAdvertised is the last non-empty identity the Gateway
+	// advertised. It differs from IdentityDigest only while the target is
+	// identity_changed; a re-confirm makes it the new pin. On an incoming
+	// catalog target it is the identity of that upload ("" when absent).
+	IdentityAdvertised string `json:"identity_advertised,omitempty"`
+}
+
+// Target identity statuses (api#312).
+const (
+	GatewayTargetIdentityPinned  = "pinned"
+	GatewayTargetIdentityChanged = "identity_changed"
+)
+
+// Suspended reports whether the target's bindings are suspended: no
+// dispatch and no evidence until a platform admin re-confirms.
+func (t GatewayTarget) Suspended() bool { return t.IdentityStatus == GatewayTargetIdentityChanged }
+
+// GatewayTargetIdentityChange is a target whose advertised identity no
+// longer matches its pin (from ReplaceCatalog), or one an admin
+// re-confirmed (from ConfirmTargetIdentity). Old is the pin before, New
+// the advertised identity. Bindings counts the live bindings on the
+// target.
+type GatewayTargetIdentityChange struct {
+	ConnectorID uuid.UUID
+	TargetID    string
+	Old, New    string
+	Bindings    int
 }
 
 // GatewayConnector mirrors a gateway_connectors row.
@@ -200,9 +233,13 @@ type GatewayBinding struct {
 	Enabled              bool
 	CreatedBy            string
 	CreatedAt            time.Time
+	// SuspendedReason is identity_changed while the binding's Argo CD
+	// target is identity_changed (api#312), else "". Derived, not a
+	// column.
+	SuspendedReason string
 }
 
-// GatewayHeartbeat is what one replica reported, already validated.
+// GatewayHeartbeatis what one replica reported, already validated.
 type GatewayHeartbeat struct {
 	GatewayID        uuid.UUID
 	ReplicaID        uuid.UUID
@@ -237,6 +274,9 @@ type GatewayCatalogOutcome struct {
 	TargetsStale int
 	Missing      []*GatewayConnector // connectors that left the catalog now
 	Reset        []*GatewayConnector // approved connectors that went back to advertised
+	// IdentityChanged lists the targets that moved to identity_changed, or
+	// that advertised yet another identity while identity_changed.
+	IdentityChanged []GatewayTargetIdentityChange
 }
 
 // Gateways is the Postgres repository for the gateway registry.
@@ -785,12 +825,44 @@ func (r *Gateways) GetConnector(ctx context.Context, id uuid.UUID) (*GatewayConn
 
 // mergeTargets returns the incoming targets (not stale) plus every
 // previously advertised target that is no longer advertised (stale),
-// sorted by target id.
-func mergeTargets(prev, incoming []GatewayTarget) []GatewayTarget {
+// sorted by target id. An incoming target keeps the identity pin of the
+// previous target with the same id (api#312):
+//
+//   - an absent identity never sets, clears or changes anything;
+//   - the first non-empty identity becomes the pin (pinned);
+//   - the pinned identity again is a no-op;
+//   - a different identity marks the target identity_changed and is
+//     returned as a change, unless that identity was already the
+//     recorded advertised one while identity_changed.
+//
+// identity_changed is sticky: advertising the pinned identity again does
+// not clear it. Only an admin re-confirm does.
+func mergeTargets(prev, incoming []GatewayTarget) ([]GatewayTarget, []GatewayTargetIdentityChange) {
 	out := make([]GatewayTarget, 0, len(prev)+len(incoming))
 	seen := make(map[string]bool, len(incoming))
+	byID := make(map[string]GatewayTarget, len(prev))
+	for _, t := range prev {
+		byID[t.TargetID] = t
+	}
+	var changes []GatewayTargetIdentityChange
 	for _, t := range incoming {
+		adv := t.IdentityAdvertised
+		p := byID[t.TargetID]
 		t.Stale = false
+		t.IdentityDigest, t.IdentityStatus, t.IdentityAdvertised = p.IdentityDigest, p.IdentityStatus, p.IdentityAdvertised
+		switch {
+		case adv == "":
+			// Absent: the pin and the status stay as they were.
+		case t.IdentityDigest == "":
+			t.IdentityDigest, t.IdentityStatus, t.IdentityAdvertised = adv, GatewayTargetIdentityPinned, adv
+		case adv == t.IdentityDigest:
+			t.IdentityAdvertised = adv
+		default:
+			if t.IdentityStatus != GatewayTargetIdentityChanged || t.IdentityAdvertised != adv {
+				changes = append(changes, GatewayTargetIdentityChange{TargetID: t.TargetID, Old: t.IdentityDigest, New: adv})
+			}
+			t.IdentityStatus, t.IdentityAdvertised = GatewayTargetIdentityChanged, adv
+		}
 		out = append(out, t)
 		seen[t.TargetID] = true
 	}
@@ -801,7 +873,17 @@ func mergeTargets(prev, incoming []GatewayTarget) []GatewayTarget {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].TargetID < out[j].TargetID })
-	return out
+	return out, changes
+}
+
+// countTargetBindings counts the live bindings on an Argo CD target.
+func countTargetBindings(ctx context.Context, q querier, connectorID uuid.UUID, targetID string) (int, error) {
+	var n int
+	if err := q.QueryRow(ctx, `SELECT count(*) FROM gateway_connector_bindings
+		WHERE argocd_connector_id = $1 AND argocd_target_id = $2 AND deleted_at IS NULL`, connectorID, targetID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("storage: count target bindings: %w", err)
+	}
+	return n, nil
 }
 
 // ReplaceCatalog records a full catalog for a live Gateway in one
@@ -850,7 +932,7 @@ func (r *Gateways) ReplaceCatalog(ctx context.Context, gatewayID uuid.UUID, conn
 		advertised[in.ConnectorID] = true
 		prev := byName[in.ConnectorID]
 		if prev == nil {
-			targets := mergeTargets(nil, in.Targets)
+			targets, _ := mergeTargets(nil, in.Targets) // first sight: an identity is a first pin
 			raw, err := json.Marshal(targets)
 			if err != nil {
 				return nil, fmt.Errorf("storage: marshal targets: %w", err)
@@ -865,10 +947,18 @@ func (r *Gateways) ReplaceCatalog(ctx context.Context, gatewayID uuid.UUID, conn
 		}
 		reset := prev.Kind != in.Kind || prev.Status == GatewayConnectorMissing
 		var targets []GatewayTarget
+		var changes []GatewayTargetIdentityChange
 		if prev.Kind != in.Kind {
-			targets = mergeTargets(nil, in.Targets) // another kind's targets mean nothing here
+			targets, _ = mergeTargets(nil, in.Targets) // another kind's targets mean nothing here
 		} else {
-			targets = mergeTargets(prev.Targets, in.Targets)
+			targets, changes = mergeTargets(prev.Targets, in.Targets)
+		}
+		for _, ch := range changes {
+			ch.ConnectorID = prev.ID
+			if ch.Bindings, err = countTargetBindings(ctx, tx, prev.ID, ch.TargetID); err != nil {
+				return nil, err
+			}
+			out.IdentityChanged = append(out.IdentityChanged, ch)
 		}
 		raw, err := json.Marshal(targets)
 		if err != nil {
@@ -899,7 +989,7 @@ func (r *Gateways) ReplaceCatalog(ctx context.Context, gatewayID uuid.UUID, conn
 		if advertised[c.Name] || c.Status == GatewayConnectorMissing {
 			continue
 		}
-		targets := mergeTargets(c.Targets, nil)
+		targets, _ := mergeTargets(c.Targets, nil)
 		raw, err := json.Marshal(targets)
 		if err != nil {
 			return nil, fmt.Errorf("storage: marshal targets: %w", err)
@@ -937,6 +1027,71 @@ func (r *Gateways) ApproveConnector(ctx context.Context, gatewayID, connectorID 
 	return nil, ErrGatewayConnectorNotApprovable
 }
 
+// Target re-confirm errors (api#312).
+var (
+	ErrGatewayTargetNotFound           = errors.New("storage: gateway target not found")
+	ErrGatewayTargetIdentityNotChanged = errors.New("storage: gateway target identity is not identity_changed")
+	ErrGatewayTargetStale              = errors.New("storage: gateway target is no longer advertised")
+)
+
+// ConfirmTargetIdentity makes the identity the Gateway now advertises
+// for an identity_changed target its new pin, which resumes the target's
+// bindings. It locks the Gateway row first, like ReplaceCatalog, so a
+// catalog upload and a confirm serialise and the confirm never accepts
+// an identity the Gateway stopped advertising. A connector of another
+// Gateway is ErrNotFound.
+func (r *Gateways) ConfirmTargetIdentity(ctx context.Context, gatewayID, connectorID uuid.UUID, targetID string) (*GatewayTargetIdentityChange, *GatewayConnector, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("storage: begin identity confirm: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := tx.QueryRow(ctx, `SELECT id FROM gateways WHERE id = $1 FOR UPDATE`, gatewayID).Scan(new(uuid.UUID)); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, ErrNotFound
+		}
+		return nil, nil, fmt.Errorf("storage: lock gateway: %w", err)
+	}
+	c, err := scanGatewayConnector(tx.QueryRow(ctx, `SELECT `+gatewayConnectorColumns+`
+		FROM gateway_connectors WHERE id = $1 AND gateway_id = $2`, connectorID, gatewayID))
+	if err != nil {
+		return nil, nil, err
+	}
+	idx := -1
+	for i, t := range c.Targets {
+		if t.TargetID == targetID {
+			idx = i
+		}
+	}
+	if idx < 0 {
+		return nil, nil, ErrGatewayTargetNotFound
+	}
+	t := c.Targets[idx]
+	switch {
+	case t.IdentityStatus != GatewayTargetIdentityChanged || t.IdentityAdvertised == "":
+		return nil, nil, ErrGatewayTargetIdentityNotChanged
+	case t.Stale:
+		return nil, nil, ErrGatewayTargetStale
+	}
+	ch := &GatewayTargetIdentityChange{ConnectorID: c.ID, TargetID: targetID, Old: t.IdentityDigest, New: t.IdentityAdvertised}
+	t.IdentityDigest, t.IdentityStatus = t.IdentityAdvertised, GatewayTargetIdentityPinned
+	c.Targets[idx] = t
+	raw, err := json.Marshal(c.Targets)
+	if err != nil {
+		return nil, nil, fmt.Errorf("storage: marshal targets: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE gateway_connectors SET advertised_targets = $2 WHERE id = $1`, c.ID, raw); err != nil {
+		return nil, nil, fmt.Errorf("storage: confirm target identity: %w", err)
+	}
+	if ch.Bindings, err = countTargetBindings(ctx, tx, c.ID, targetID); err != nil {
+		return nil, nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, fmt.Errorf("storage: commit identity confirm: %w", err)
+	}
+	return ch, c, nil
+}
+
 // --- bindings ----------------------------------------------------------
 
 const gatewayBindingColumns = `
@@ -945,7 +1100,17 @@ const gatewayBindingColumns = `
 	b.eso_connector_id, COALESCE(b.eso_target_id, ''),
 	b.rollout_connector_id, COALESCE(b.rollout_target_id, ''),
 	b.argocd_connector_id, COALESCE(b.argocd_target_id, ''),
-	b.observation_timeout_s, b.enabled, b.created_by, b.created_at`
+	b.observation_timeout_s, b.enabled, b.created_by, b.created_at,
+	CASE WHEN ` + bindingTargetIdentityChangedSQL + ` THEN 'identity_changed' ELSE '' END`
+
+// bindingTargetIdentityChangedSQL is true when binding b's Argo CD
+// target is identity_changed (api#312). The claim query and the binding
+// read use the same expression, so the console shows exactly what
+// dispatch skips.
+const bindingTargetIdentityChangedSQL = `EXISTS (
+		SELECT 1 FROM gateway_connectors ic, jsonb_array_elements(ic.advertised_targets) it
+		WHERE ic.id = b.argocd_connector_id AND it->>'target_id' = b.argocd_target_id
+		  AND it->>'identity_status' = 'identity_changed')`
 
 func scanGatewayBinding(row pgx.Row) (*GatewayBinding, error) {
 	var b GatewayBinding
@@ -955,7 +1120,7 @@ func scanGatewayBinding(row pgx.Row) (*GatewayBinding, error) {
 		&b.ESOConnectorID, &b.ESOTargetID,
 		&b.RolloutConnectorID, &b.RolloutTargetID,
 		&b.ArgoCDConnectorID, &b.ArgoCDTargetID,
-		&b.ObservationTimeoutS, &b.Enabled, &b.CreatedBy, &b.CreatedAt)
+		&b.ObservationTimeoutS, &b.Enabled, &b.CreatedBy, &b.CreatedAt, &b.SuspendedReason)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}

@@ -227,11 +227,12 @@ type gatewayCatalogRequest struct {
 		ConnectorID string `json:"connector_id"`
 		Kind        string `json:"kind"`
 		Targets     []struct {
-			TargetID                string `json:"target_id"`
-			Namespace               string `json:"namespace,omitempty"`
-			Name                    string `json:"name,omitempty"`
-			RefreshIntervalSeconds  *int   `json:"refresh_interval_seconds,omitempty"`
-			ProgressDeadlineSeconds *int   `json:"progress_deadline_seconds,omitempty"`
+			TargetID                string  `json:"target_id"`
+			Namespace               string  `json:"namespace,omitempty"`
+			Name                    string  `json:"name,omitempty"`
+			RefreshIntervalSeconds  *int    `json:"refresh_interval_seconds,omitempty"`
+			ProgressDeadlineSeconds *int    `json:"progress_deadline_seconds,omitempty"`
+			Identity                *string `json:"identity,omitempty"`
 		} `json:"targets"`
 	} `json:"connectors"`
 }
@@ -260,6 +261,7 @@ func (h *Gateways) Catalog(c fiber.Ctx) error {
 			cc.Targets = append(cc.Targets, services.GatewayCatalogTarget{
 				TargetID: t.TargetID, Namespace: t.Namespace, Name: t.Name,
 				RefreshIntervalSeconds: t.RefreshIntervalSeconds, ProgressDeadlineSeconds: t.ProgressDeadlineSeconds,
+				Identity: t.Identity,
 			})
 		}
 		conns = append(conns, cc)
@@ -347,19 +349,49 @@ type gatewayReplicaView struct {
 }
 
 type gatewayConnectorView struct {
-	ID               string                  `json:"id"`
-	ConnectorID      string                  `json:"connector_id"`
-	Kind             string                  `json:"kind"`
-	Status           string                  `json:"status"`
-	Targets          []storage.GatewayTarget `json:"targets"`
-	ApprovedBy       string                  `json:"approved_by,omitempty"`
-	ApprovedAt       *string                 `json:"approved_at,omitempty"`
-	LastAdvertisedAt *string                 `json:"last_advertised_at,omitempty"`
+	ID               string              `json:"id"`
+	ConnectorID      string              `json:"connector_id"`
+	Kind             string              `json:"kind"`
+	Status           string              `json:"status"`
+	Targets          []gatewayTargetView `json:"targets"`
+	ApprovedBy       string              `json:"approved_by,omitempty"`
+	ApprovedAt       *string             `json:"approved_at,omitempty"`
+	LastAdvertisedAt *string             `json:"last_advertised_at,omitempty"`
 }
 
+// gatewayTargetView is an advertised target in the admin read. It
+// carries identity_status (api#312) and never the identity digest
+// itself: the console needs the state, not the value.
+type gatewayTargetView struct {
+	TargetID                string `json:"target_id"`
+	Namespace               string `json:"namespace,omitempty"`
+	Name                    string `json:"name,omitempty"`
+	RefreshIntervalSeconds  *int   `json:"refresh_interval_seconds,omitempty"`
+	ProgressDeadlineSeconds *int   `json:"progress_deadline_seconds,omitempty"`
+	Stale                   bool   `json:"stale"`
+	// IdentityStatus is unpinned (no identity advertised yet), pinned or
+	// identity_changed (bindings suspended until re-confirmed).
+	IdentityStatus string `json:"identity_status"`
+}
+
+// Identity status of a target with no pin, as the admin read shows it.
+const gatewayTargetUnpinned = "unpinned"
+
 func toConnectorView(c *storage.GatewayConnector) gatewayConnectorView {
+	targets := make([]gatewayTargetView, 0, len(c.Targets))
+	for _, t := range c.Targets {
+		status := t.IdentityStatus
+		if status == "" {
+			status = gatewayTargetUnpinned
+		}
+		targets = append(targets, gatewayTargetView{
+			TargetID: t.TargetID, Namespace: t.Namespace, Name: t.Name,
+			RefreshIntervalSeconds: t.RefreshIntervalSeconds, ProgressDeadlineSeconds: t.ProgressDeadlineSeconds,
+			Stale: t.Stale, IdentityStatus: status,
+		})
+	}
 	return gatewayConnectorView{
-		ID: c.ID.String(), ConnectorID: c.Name, Kind: c.Kind, Status: c.Status, Targets: c.Targets,
+		ID: c.ID.String(), ConnectorID: c.Name, Kind: c.Kind, Status: c.Status, Targets: targets,
 		ApprovedBy: c.ApprovedBy, ApprovedAt: timePtr(c.ApprovedAt), LastAdvertisedAt: timePtr(c.LastAdvertisedAt),
 	}
 }
@@ -377,8 +409,11 @@ type gatewayBindingView struct {
 	ArgoCDTargetID       string   `json:"argocd_target_id,omitempty"`
 	ObservationTimeoutS  int      `json:"observation_timeout_seconds"`
 	Enabled              bool     `json:"enabled"`
-	CreatedBy            string   `json:"created_by"`
-	CreatedAt            string   `json:"created_at"`
+	// SuspendedReason is identity_changed while the binding's target is
+	// identity_changed: no dispatch and no evidence (api#312).
+	SuspendedReason string `json:"suspended_reason,omitempty"`
+	CreatedBy       string `json:"created_by"`
+	CreatedAt       string `json:"created_at"`
 }
 
 func toBindingView(b *storage.GatewayBinding) gatewayBindingView {
@@ -388,7 +423,7 @@ func toBindingView(b *storage.GatewayBinding) gatewayBindingView {
 		ProviderConnectionID: uuidPtr(b.ProviderConnectionID), SecretRef: b.SecretRef,
 		ExpectedStages: b.ExpectedStages, ArgoCDConnectorID: uuidPtr(b.ArgoCDConnectorID),
 		ArgoCDTargetID: b.ArgoCDTargetID, ObservationTimeoutS: b.ObservationTimeoutS, Enabled: b.Enabled,
-		CreatedBy: b.CreatedBy, CreatedAt: b.CreatedAt.UTC().Format(time.RFC3339),
+		SuspendedReason: b.SuspendedReason, CreatedBy: b.CreatedBy, CreatedAt: b.CreatedAt.UTC().Format(time.RFC3339),
 	}
 }
 
@@ -685,6 +720,46 @@ func (h *Gateways) AdminApproveConnector(c fiber.Ctx) error {
 	return c.JSON(toConnectorView(cn))
 }
 
+// AdminConfirmTargetIdentity handles POST
+// /admin/gateways/:id/connectors/:cid/targets/:tid/confirm-identity
+// (gateway.bind, fresh MFA; api#312). It takes no body: the identity the
+// Gateway now advertises becomes the pin, and the target's bindings
+// resume. Answers the connector view.
+func (h *Gateways) AdminConfirmTargetIdentity(c fiber.Ctx) error {
+	actor, err := adminActor(c)
+	if err != nil {
+		return err
+	}
+	id, err := pathUUID(c, "id")
+	if err != nil {
+		return err
+	}
+	cid, err := pathUUID(c, "cid")
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(c.Body())) > 0 {
+		var empty struct{}
+		if err := decodeStrict(c.Body(), &empty); err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, "invalid_request")
+		}
+	}
+	cn, err := h.svc.ConfirmTargetIdentity(c.Context(), id, cid, c.Params("tid"), actor)
+	switch {
+	case errors.Is(err, storage.ErrNotFound):
+		return fiber.NewError(fiber.StatusNotFound, "connector_not_found")
+	case errors.Is(err, storage.ErrGatewayTargetNotFound):
+		return fiber.NewError(fiber.StatusNotFound, "target_not_found")
+	case errors.Is(err, storage.ErrGatewayTargetIdentityNotChanged):
+		return fiber.NewError(fiber.StatusConflict, "target_identity_not_changed")
+	case errors.Is(err, storage.ErrGatewayTargetStale):
+		return fiber.NewError(fiber.StatusConflict, "target_stale")
+	case err != nil:
+		return err
+	}
+	return c.JSON(toConnectorView(cn))
+}
+
 type createBindingRequest struct {
 	GatewayID            uuid.UUID  `json:"gateway_id"`
 	ProjectID            *uuid.UUID `json:"project_id,omitempty"`
@@ -725,7 +800,7 @@ func (h *Gateways) AdminCreateBinding(c fiber.Ctx) error {
 			status = fiber.StatusConflict
 		case "gateway_not_found", "environment_not_found", "connector_not_found", "provider_connection_not_found", "reference_not_found":
 			status = fiber.StatusNotFound
-		case "connector_not_approved", "target_stale", "gateway_revoked":
+		case "connector_not_approved", "target_stale", "target_identity_changed", "gateway_revoked":
 			status = fiber.StatusConflict
 		}
 		return fiber.NewError(status, code)

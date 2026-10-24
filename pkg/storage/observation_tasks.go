@@ -582,7 +582,9 @@ type ObservationClaim struct {
 // or disable that commits first is seen. The task row is taken with
 // FOR UPDATE SKIP LOCKED, so two claims never lease the same task. An
 // expired lease re-enters inline with a new attempt_id; the old attempt
-// is closed as lease_expired and its late result is refused.
+// is closed as lease_expired and its late result is refused. A task is
+// skipped while its binding is suspended (target identity_changed),
+// decided in this query so every api replica agrees (api#312).
 func (r *ObservationTasks) Claim(ctx context.Context, gatewayID, replicaID uuid.UUID, lease time.Duration, perReplica int, contractVersion string) (*ObservationClaim, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -648,7 +650,8 @@ func (r *ObservationTasks) Claim(ctx context.Context, gatewayID, replicaID uuid.
 			SELECT 1 FROM gateway_connector_bindings b
 			JOIN gateway_connectors c ON c.id = b.argocd_connector_id
 			WHERE b.id = t.binding_id AND b.deleted_at IS NULL AND b.enabled
-			  AND c.gateway_id = t.gateway_id AND c.status = 'approved')
+			  AND c.gateway_id = t.gateway_id AND c.status = 'approved'
+			  AND NOT `+bindingTargetIdentityChangedSQL+`)
 		ORDER BY t.not_before, t.created_at
 		LIMIT 1
 		FOR UPDATE OF t SKIP LOCKED`, gatewayID).Scan(&taskID, &prevAttempt)

@@ -67,6 +67,11 @@ func observationError(c fiber.Ctx, err error) error {
 		return gwError(c, fiber.StatusConflict, "result_conflict")
 	case errors.Is(err, services.ErrObservationContractUnsupported):
 		return gwError(c, fiber.StatusConflict, "contract_version_unsupported")
+	case errors.Is(err, services.ErrObservationIdentityRefused):
+		// target_identity_changed, identity_digest_missing or
+		// identity_digest_mismatch (api#312). A Gateway that does not
+		// know the code still sees a 422 and drops the result.
+		return gwError(c, fiber.StatusUnprocessableEntity, services.IdentityRefusalCode(err))
 	case errors.Is(err, services.ErrObservationSchema):
 		return gwError(c, fiber.StatusUnprocessableEntity, "schema_violation")
 	case errors.Is(err, services.ErrObservationOutOfWindow):

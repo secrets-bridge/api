@@ -83,6 +83,7 @@ type GatewayStore interface {
 	GetConnector(ctx context.Context, id uuid.UUID) (*storage.GatewayConnector, error)
 	ReplaceCatalog(ctx context.Context, gatewayID uuid.UUID, conns []storage.GatewayCatalogConnector, digest string, at time.Time) (*storage.GatewayCatalogOutcome, error)
 	ApproveConnector(ctx context.Context, gatewayID, connectorID uuid.UUID, by string, at time.Time) (*storage.GatewayConnector, error)
+	ConfirmTargetIdentity(ctx context.Context, gatewayID, connectorID uuid.UUID, targetID string) (*storage.GatewayTargetIdentityChange, *storage.GatewayConnector, error)
 	CreateBinding(ctx context.Context, b *storage.GatewayBinding) error
 	GetBinding(ctx context.Context, id uuid.UUID) (*storage.GatewayBinding, error)
 	ListBindings(ctx context.Context, gatewayID *uuid.UUID) ([]*storage.GatewayBinding, error)
@@ -724,6 +725,19 @@ func (s *GatewayService) PutCatalog(ctx context.Context, gatewayID uuid.UUID, co
 			Metadata: map[string]any{"gateway_id": gatewayID.String(), "connector_id": c.ID.String(), "kind": c.Kind},
 		})
 	}
+	// A recreated Application under a pinned static target (api#312):
+	// the target's bindings are suspended from this commit on. Ids and
+	// the two digests only; the digest is one-way and scoped to the
+	// connector, so it names no Application.
+	for _, ch := range out.IdentityChanged {
+		s.appendAudit(ctx, &storage.AuditEvent{
+			Actor: actor, Action: "gateway.target.identity_changed", Resource: actor, Status: storage.AuditStatusFailure,
+			Metadata: map[string]any{
+				"gateway_id": gatewayID.String(), "connector_id": ch.ConnectorID.String(), "argocd_target_id": ch.TargetID,
+				"identity_digest_before": ch.Old, "identity_digest_after": ch.New, "bindings_suspended": ch.Bindings,
+			},
+		})
+	}
 	return &GatewayCatalogResult{Accepted: out.Accepted, TargetsStale: out.TargetsStale, CatalogVersion: digest}, nil
 }
 
@@ -793,6 +807,30 @@ func (s *GatewayService) ApproveConnector(ctx context.Context, gatewayID, connec
 		Actor: auditActor(ctx, by), Action: "gateway.connector.approved", Resource: gatewayActor(gatewayID),
 		Status:   storage.AuditStatusSuccess,
 		Metadata: map[string]any{"gateway_id": gatewayID.String(), "connector_id": c.ID.String(), "kind": c.Kind},
+	})
+	return c, nil
+}
+
+// ConfirmTargetIdentity is the platform-admin re-confirm (api#312): the
+// identity the Gateway now advertises for an identity_changed Argo CD
+// target becomes its pin, and every binding on the target resumes. The
+// integrator confirms the new object on their side first (a settings
+// uid or a new target id); this is the control-plane half.
+func (s *GatewayService) ConfirmTargetIdentity(ctx context.Context, gatewayID, connectorID uuid.UUID, targetID, by string) (*storage.GatewayConnector, error) {
+	if !ValidGatewayLocalID(targetID) {
+		return nil, storage.ErrGatewayTargetNotFound
+	}
+	ch, c, err := s.store.ConfirmTargetIdentity(ctx, gatewayID, connectorID, targetID)
+	if err != nil {
+		return nil, err
+	}
+	s.appendAudit(ctx, &storage.AuditEvent{
+		Actor: auditActor(ctx, by), Action: "gateway.target.identity_confirmed", Resource: gatewayActor(gatewayID),
+		Status: storage.AuditStatusSuccess,
+		Metadata: map[string]any{
+			"gateway_id": gatewayID.String(), "connector_id": ch.ConnectorID.String(), "argocd_target_id": ch.TargetID,
+			"identity_digest_before": ch.Old, "identity_digest_after": ch.New, "bindings_resumed": ch.Bindings,
+		},
 	})
 	return c, nil
 }
@@ -912,6 +950,9 @@ func (s *GatewayService) CreateBinding(ctx context.Context, in CreateBindingInpu
 	}
 	if t.Stale {
 		return nil, bindingInvalid("target_stale")
+	}
+	if t.Suspended() {
+		return nil, bindingInvalid("target_identity_changed")
 	}
 
 	connID := conn.ID

@@ -148,6 +148,10 @@ type GatewayCatalogTarget struct {
 	Name                    string
 	RefreshIntervalSeconds  *int
 	ProgressDeadlineSeconds *int
+	// Identity is the optional scoped identity digest of an Argo CD
+	// target (api#312), the same value as evidence
+	// resource.identity_digest. Nil when the Gateway sent none.
+	Identity *string
 }
 
 // GatewayCatalogConnector is one connector in an E3 body.
@@ -202,9 +206,19 @@ func normalizeCatalog(conns []GatewayCatalogConnector) ([]storage.GatewayCatalog
 			if !validInterval(t.ProgressDeadlineSeconds) {
 				return nil, gatewayInvalid("connectors.targets.progress_deadline_seconds")
 			}
+			identity := ""
+			if t.Identity != nil {
+				// Argo CD targets only; a Kubernetes connector never
+				// carries one. Present means well formed: "" is refused.
+				if c.Kind != GatewayKindArgoCD || !obsIdentityDigestRe.MatchString(*t.Identity) {
+					return nil, gatewayInvalid("connectors.targets.identity")
+				}
+				identity = *t.Identity
+			}
 			targets = append(targets, storage.GatewayTarget{
 				TargetID: t.TargetID, Namespace: t.Namespace, Name: t.Name,
 				RefreshIntervalSeconds: t.RefreshIntervalSeconds, ProgressDeadlineSeconds: t.ProgressDeadlineSeconds,
+				IdentityAdvertised: identity,
 			})
 		}
 		sort.Slice(targets, func(i, j int) bool { return targets[i].TargetID < targets[j].TargetID })
@@ -223,6 +237,7 @@ func catalogDigest(conns []storage.GatewayCatalogConnector) (string, error) {
 		Name     string `json:"name,omitempty"`
 		Refresh  *int   `json:"refresh_interval_seconds,omitempty"`
 		Deadline *int   `json:"progress_deadline_seconds,omitempty"`
+		Identity string `json:"identity,omitempty"`
 	}
 	type c struct {
 		ID      string `json:"connector_id"`
@@ -233,7 +248,7 @@ func catalogDigest(conns []storage.GatewayCatalogConnector) (string, error) {
 	for _, in := range conns {
 		cc := c{ID: in.ConnectorID, Kind: in.Kind, Targets: make([]t, 0, len(in.Targets))}
 		for _, tt := range in.Targets {
-			cc.Targets = append(cc.Targets, t{tt.TargetID, tt.Namespace, tt.Name, tt.RefreshIntervalSeconds, tt.ProgressDeadlineSeconds})
+			cc.Targets = append(cc.Targets, t{tt.TargetID, tt.Namespace, tt.Name, tt.RefreshIntervalSeconds, tt.ProgressDeadlineSeconds, tt.IdentityAdvertised})
 		}
 		doc = append(doc, cc)
 	}
