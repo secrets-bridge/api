@@ -48,7 +48,11 @@ var (
 	ErrObservationResultConflict      = errors.New("services: observation result conflict")
 	ErrObservationOutOfWindow         = errors.New("services: evidence out of window")
 	ErrObservationGatewayNotLive      = errors.New("services: gateway not live")
-	ErrObservationInvalidSource       = errors.New("services: invalid observation source")
+	// ErrObservationIdentityRefused: the evidence does not match the
+	// target's identity pin, or the target is identity_changed (api#312).
+	// IdentityRefusalCode names which.
+	ErrObservationIdentityRefused = errors.New("services: evidence refused by the target identity pin")
+	ErrObservationInvalidSource   = errors.New("services: invalid observation source")
 	// ErrObservationSourceRetired: control_plane selected the removed
 	// control-plane Argo CD poller (secrets-bridge/gateway#13).
 	ErrObservationSourceRetired = errors.New("services: observation source control_plane is retired")
@@ -784,9 +788,12 @@ func (s *GatewayObservationService) SubmitResult(ctx context.Context, gatewayID,
 			return reject(rejectSchema, obsViolation("stages", "names a stage the task does not expect"))
 		}
 	}
-	// 8. Scope: the evidence binding.
+	// 8. Scope: the evidence binding, then the target identity pin.
 	connectors, err := s.checkEvidenceBinding(ctx, rt, res, refs)
 	if err != nil {
+		if code := IdentityRefusalCode(err); code != "" {
+			return reject(code, err)
+		}
 		if errors.Is(err, ErrObservationSchema) {
 			return reject(rejectScope, err)
 		}
@@ -876,6 +883,9 @@ func (s *GatewayObservationService) checkEvidenceBinding(ctx context.Context, rt
 		if err := resourceMatchesTarget(conn, st); err != nil {
 			return nil, err
 		}
+		if err := identityMatchesPin(conn, st); err != nil {
+			return nil, err
+		}
 		out[st.Stage] = conn
 	}
 	return out, nil
@@ -902,6 +912,55 @@ func resourceMatchesTarget(conn *storage.GatewayConnector, st StageEvidence) err
 		return obsViolation("resource.name", "is not the object the target advertises")
 	case target.Namespace != "" && st.Resource.Namespace != target.Namespace:
 		return obsViolation("resource.namespace", "is not the namespace the target advertises")
+	}
+	return nil
+}
+
+// Identity refusal codes (api#312), the 422 error code and the
+// observation.evidence.rejected reason.
+const (
+	RefusalTargetIdentityChanged = "target_identity_changed"
+	RefusalIdentityDigestMissing = "identity_digest_missing"
+	RefusalIdentityDigestMatch   = "identity_digest_mismatch"
+)
+
+type identityRefusal struct{ code string }
+
+func (e *identityRefusal) Error() string {
+	return ErrObservationIdentityRefused.Error() + ": " + e.code
+}
+func (e *identityRefusal) Is(target error) bool { return target == ErrObservationIdentityRefused }
+
+// IdentityRefusalCode returns the closed code of an identity refusal, or
+// "" for any other error.
+func IdentityRefusalCode(err error) string {
+	var r *identityRefusal
+	if errors.As(err, &r) {
+		return r.code
+	}
+	return ""
+}
+
+// identityMatchesPin is the control-plane identity pin (api#312, ADR
+// 0002 C3). A target that is identity_changed takes no evidence at all,
+// an error stage included, until a platform admin re-confirms. A pinned
+// target takes a stage that describes an object only when its
+// resource.identity_digest is the pin; a missing digest is refused too.
+// A target with no pin (a Gateway that predates the identity, or one
+// that has not learned the uid yet) is checked by name as before.
+func identityMatchesPin(conn *storage.GatewayConnector, st StageEvidence) error {
+	target, ok := conn.Target(st.Source.TargetID)
+	switch {
+	case !ok:
+		return nil // resourceMatchesTarget refuses a stage with a resource
+	case target.Suspended():
+		return &identityRefusal{RefusalTargetIdentityChanged}
+	case target.IdentityDigest == "" || st.Resource == nil:
+		return nil
+	case st.Resource.IdentityDigest == "":
+		return &identityRefusal{RefusalIdentityDigestMissing}
+	case st.Resource.IdentityDigest != target.IdentityDigest:
+		return &identityRefusal{RefusalIdentityDigestMatch}
 	}
 	return nil
 }
