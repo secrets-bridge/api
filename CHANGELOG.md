@@ -20,6 +20,22 @@ on `main`.
   that is logged as a warning at boot.
 
 ### Fixed
+- A Gateway that refuses a recreated Application now suspends the
+  target (api#314, gateway#25). When the integrator pins
+  `applications[].uid` in the Gateway settings, the catalog identity
+  follows that uid and never changes, so the pin never saw the new
+  object. An accepted Argo CD error stage with `error_code:
+  target_identity_changed` for a pinned target now marks it
+  `identity_changed` like a catalog change: bindings suspended, dispatch
+  skipped, new binds answer 409. One `gateway.target.identity_changed`
+  audit row carries `trigger: gateway_reported` (catalog changes now
+  carry `trigger: catalog`). The confirm-identity endpoint clears it
+  even though the advertised identity is still the pin. That exception
+  holds for a gateway-reported change only: after a catalog change the
+  old pin again is still not confirmable. Re-confirming before the
+  integrator fixes the settings uid lifts the suspension until the next
+  such error stage marks the target again. An unpinned target is not
+  marked, since there is no pin to re-confirm.
 - A revoked agent or Gateway can no longer get in through the
   credential cache (api#303). A revoke or disable writes a tombstone the
   cache can't fill past. If Redis won't take it, the call answers 503

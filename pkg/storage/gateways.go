@@ -169,12 +169,28 @@ type GatewayTarget struct {
 	// identity_changed; a re-confirm makes it the new pin. On an incoming
 	// catalog target it is the identity of that upload ("" when absent).
 	IdentityAdvertised string `json:"identity_advertised,omitempty"`
+	// IdentityChangeTrigger is gateway_reported while the target is
+	// identity_changed because the Gateway posted an error stage with
+	// error_code target_identity_changed (api#314), else "". Then the
+	// advertised identity may still be the pin: the Gateway computes it
+	// from its settings uid, which is what the integrator changes.
+	IdentityChangeTrigger string `json:"identity_change_trigger,omitempty"`
 }
 
 // Target identity statuses (api#312).
 const (
 	GatewayTargetIdentityPinned  = "pinned"
 	GatewayTargetIdentityChanged = "identity_changed"
+)
+
+// Identity change triggers (api#314), the trigger audit metadata value.
+const (
+	// GatewayIdentityTriggerCatalog: the E3 catalog advertised another
+	// identity.
+	GatewayIdentityTriggerCatalog = "catalog"
+	// GatewayIdentityTriggerReported: the Gateway refused the object and
+	// posted an error stage with error_code target_identity_changed.
+	GatewayIdentityTriggerReported = "gateway_reported"
 )
 
 // Suspended reports whether the target's bindings are suspended: no
@@ -855,6 +871,7 @@ func mergeTargets(prev, incoming []GatewayTarget) ([]GatewayTarget, []GatewayTar
 		p := byID[t.TargetID]
 		t.Stale = false
 		t.IdentityDigest, t.IdentityStatus, t.IdentityAdvertised = p.IdentityDigest, p.IdentityStatus, p.IdentityAdvertised
+		t.IdentityChangeTrigger = p.IdentityChangeTrigger
 		switch {
 		case adv == "":
 			// Absent: the pin and the status stay as they were.
@@ -866,7 +883,9 @@ func mergeTargets(prev, incoming []GatewayTarget) ([]GatewayTarget, []GatewayTar
 			if t.IdentityStatus != GatewayTargetIdentityChanged || t.IdentityAdvertised != adv {
 				changes = append(changes, GatewayTargetIdentityChange{TargetID: t.TargetID, Old: t.IdentityDigest, New: adv})
 			}
-			t.IdentityStatus, t.IdentityAdvertised = GatewayTargetIdentityChanged, adv
+			// Another identity is a catalog change, also over a
+			// gateway_reported one: re-confirm now pins adv.
+			t.IdentityStatus, t.IdentityAdvertised, t.IdentityChangeTrigger = GatewayTargetIdentityChanged, adv, ""
 		}
 		out = append(out, t)
 		seen[t.TargetID] = true
@@ -1039,6 +1058,78 @@ var (
 	ErrGatewayTargetStale              = errors.New("storage: gateway target is no longer advertised")
 )
 
+// confirmable reports whether a re-confirm may pin t's advertised
+// identity. A catalog change needs a different advertised identity: the
+// old pin again confirms nothing. A gateway_reported change (api#314)
+// may keep the pin, because the Gateway's settings uid is what changed
+// and its catalog identity follows that uid. Re-confirming it before the
+// integrator fixes the settings uid lifts the suspension until the next
+// such error stage marks the target again. Only an advertised digest is
+// ever pinned, never a raw uid.
+func confirmable(t GatewayTarget) error {
+	switch {
+	case t.IdentityStatus != GatewayTargetIdentityChanged || t.IdentityAdvertised == "":
+		return ErrGatewayTargetIdentityNotChanged
+	case t.IdentityAdvertised == t.IdentityDigest && t.IdentityChangeTrigger != GatewayIdentityTriggerReported:
+		return ErrGatewayTargetIdentityNotChanged
+	case t.Stale:
+		return ErrGatewayTargetStale
+	}
+	return nil
+}
+
+// reportIdentityChanged marks a pinned, advertised target
+// identity_changed with trigger gateway_reported (api#314) and returns
+// the change, Old and New both the pin. It returns false, and changes
+// nothing, for an unknown or stale target, a target with no pin (there
+// is no pin to re-confirm) and one already identity_changed, so one
+// change is reported once however many error stages carry it.
+func reportIdentityChanged(targets []GatewayTarget, targetID string) (GatewayTargetIdentityChange, bool) {
+	for i, t := range targets {
+		if t.TargetID != targetID {
+			continue
+		}
+		if t.Stale || t.IdentityDigest == "" || t.Suspended() {
+			return GatewayTargetIdentityChange{}, false
+		}
+		targets[i].IdentityStatus, targets[i].IdentityChangeTrigger = GatewayTargetIdentityChanged, GatewayIdentityTriggerReported
+		if targets[i].IdentityAdvertised == "" {
+			targets[i].IdentityAdvertised = t.IdentityDigest
+		}
+		return GatewayTargetIdentityChange{TargetID: targetID, Old: t.IdentityDigest, New: targets[i].IdentityAdvertised}, true
+	}
+	return GatewayTargetIdentityChange{}, false
+}
+
+// ReportTargetIdentityChanged is reportIdentityChanged inside the result
+// transaction, for an accepted error stage with error_code
+// target_identity_changed (api#314). The connector row is locked FOR
+// UPDATE and read again, so two results racing on the same target
+// report the change once. Nil when nothing changed.
+func (rt *ObservationResultTx) ReportTargetIdentityChanged(ctx context.Context, connectorID uuid.UUID, targetID string) (*GatewayTargetIdentityChange, error) {
+	c, err := scanGatewayConnector(rt.tx.QueryRow(ctx, `SELECT `+gatewayConnectorColumns+`
+		FROM gateway_connectors WHERE id = $1 FOR UPDATE`, connectorID))
+	if err != nil {
+		return nil, err
+	}
+	ch, ok := reportIdentityChanged(c.Targets, targetID)
+	if !ok {
+		return nil, nil
+	}
+	raw, err := json.Marshal(c.Targets)
+	if err != nil {
+		return nil, fmt.Errorf("storage: marshal targets: %w", err)
+	}
+	if _, err := rt.tx.Exec(ctx, `UPDATE gateway_connectors SET advertised_targets = $2 WHERE id = $1`, c.ID, raw); err != nil {
+		return nil, fmt.Errorf("storage: report target identity change: %w", err)
+	}
+	ch.ConnectorID = c.ID
+	if ch.Bindings, err = countTargetBindings(ctx, rt.tx, c.ID, targetID); err != nil {
+		return nil, err
+	}
+	return &ch, nil
+}
+
 // ConfirmTargetIdentity makes the identity the Gateway now advertises
 // for an identity_changed target its new pin, which resumes the target's
 // bindings. It locks the Gateway row first, like ReplaceCatalog, so a
@@ -1072,14 +1163,11 @@ func (r *Gateways) ConfirmTargetIdentity(ctx context.Context, gatewayID, connect
 		return nil, nil, ErrGatewayTargetNotFound
 	}
 	t := c.Targets[idx]
-	switch {
-	case t.IdentityStatus != GatewayTargetIdentityChanged || t.IdentityAdvertised == "":
-		return nil, nil, ErrGatewayTargetIdentityNotChanged
-	case t.Stale:
-		return nil, nil, ErrGatewayTargetStale
+	if err := confirmable(t); err != nil {
+		return nil, nil, err
 	}
 	ch := &GatewayTargetIdentityChange{ConnectorID: c.ID, TargetID: targetID, Old: t.IdentityDigest, New: t.IdentityAdvertised}
-	t.IdentityDigest, t.IdentityStatus = t.IdentityAdvertised, GatewayTargetIdentityPinned
+	t.IdentityDigest, t.IdentityStatus, t.IdentityChangeTrigger = t.IdentityAdvertised, GatewayTargetIdentityPinned, ""
 	c.Targets[idx] = t
 	raw, err := json.Marshal(c.Targets)
 	if err != nil {

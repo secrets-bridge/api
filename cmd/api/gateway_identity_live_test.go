@@ -214,6 +214,7 @@ func TestLive_GatewayIdentity_ChangeSuspendsUntilReconfirmed(t *testing.T) {
 	want := map[string]any{
 		"gateway_id": f.gw.GatewayID, "connector_id": f.connID, "argocd_target_id": "payments-api",
 		"identity_digest_before": identityA, "identity_digest_after": identityB, "bindings_suspended": float64(1),
+		"trigger": "catalog",
 	}
 	if len(m) != len(want) {
 		t.Fatalf("identity_changed metadata = %v; want exactly %v", m, want)

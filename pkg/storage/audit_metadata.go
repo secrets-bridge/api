@@ -147,6 +147,8 @@ var auditMetaKeys = map[string]auditMetaKind{
 	// target identity pin (api#312): scoped one-way digests, never a uid
 	"identity_digest_before": metaDigest, "identity_digest_after": metaDigest,
 	"bindings_suspended": metaNumber, "bindings_resumed": metaNumber,
+	// what marked the target identity_changed (api#314): catalog or gateway_reported
+	"trigger": metaToken,
 
 	// gateway observation queue (api#294): ids, enums, digests and counts only
 	"task_id": metaID, "attempt_id": metaID, "previous_attempt_id": metaID, "superseding_task_id": metaID,
