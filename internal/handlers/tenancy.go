@@ -212,6 +212,9 @@ func (h *Tenancy) SetProjectTeam(c fiber.Ctx) error {
 	if current, err := h.projects.Get(c.Context(), id); err == nil {
 		before = current.TeamID
 	}
+	if err := structureCheck(c, h.resolver, h.teamScope, nil, before, teamID); err != nil {
+		return err
+	}
 	if err := h.projects.SetTeam(c.Context(), id, teamID); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "not found")

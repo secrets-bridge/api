@@ -922,6 +922,9 @@ type ObservationBindingScope struct {
 	ArgoCDTargetID       string
 	RequestEnvironmentID *uuid.UUID
 	RequestProjectID     string
+	// api#308: static or discovered, and the stored suspension.
+	TargetSource    string
+	SuspendedReason string
 }
 
 // BindingScope reads the task's binding (deleted or not) and request.
@@ -931,13 +934,14 @@ func (rt *ObservationResultTx) BindingScope(ctx context.Context) (*ObservationBi
 	var scope []byte
 	err := rt.tx.QueryRow(ctx, `
 		SELECT b.gateway_id, b.environment_id, e.project_id, b.deleted_at, b.enabled,
-		       b.argocd_connector_id, COALESCE(b.argocd_target_id, ''), ar.environment_id, ar.target_scope
+		       b.argocd_connector_id, COALESCE(b.argocd_target_id, ''), ar.environment_id, ar.target_scope,
+		       b.target_source, COALESCE(b.suspended_reason, '')
 		FROM gateway_connector_bindings b
 		JOIN environments e ON e.id = b.environment_id
 		JOIN access_requests ar ON ar.id = $2
 		WHERE b.id = $1`, rt.Task.BindingID, rt.Task.RequestID).
 		Scan(&s.BindingGatewayID, &s.BindingEnvironmentID, &s.BindingProjectID, &deletedAt, &s.BindingEnabled,
-			&s.ArgoCDConnectorID, &s.ArgoCDTargetID, &s.RequestEnvironmentID, &scope)
+			&s.ArgoCDConnectorID, &s.ArgoCDTargetID, &s.RequestEnvironmentID, &scope, &s.TargetSource, &s.SuspendedReason)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -956,6 +960,21 @@ func (rt *ObservationResultTx) BindingScope(ctx context.Context) (*ObservationBi
 func (rt *ObservationResultTx) ConnectorByName(ctx context.Context, gatewayID uuid.UUID, name string) (*GatewayConnector, error) {
 	return scanGatewayConnector(rt.tx.QueryRow(ctx, `SELECT `+gatewayConnectorColumns+`
 		FROM gateway_connectors WHERE gateway_id = $1 AND name = $2`, gatewayID, name))
+}
+
+// DiscoveredTargetView returns a connector's discovered target as an
+// advertised target for the evidence checks (api#308): its identity pin
+// is the target id itself (the scoped identity digest), and a missing
+// target is stale. ErrNotFound when there is none.
+func (rt *ObservationResultTx) DiscoveredTargetView(ctx context.Context, connectorID uuid.UUID, targetID string) (GatewayTarget, error) {
+	d, err := getDiscoveredTarget(ctx, rt.tx, connectorID, targetID)
+	if err != nil {
+		return GatewayTarget{}, err
+	}
+	return GatewayTarget{
+		TargetID: d.TargetID, Namespace: d.Namespace, Name: d.Name, Stale: d.Status != "present",
+		IdentityDigest: d.TargetID, IdentityStatus: GatewayTargetIdentityPinned, IdentityAdvertised: d.TargetID,
+	}, nil
 }
 
 // InsertEvidence appends one accepted stage observation.

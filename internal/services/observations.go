@@ -857,6 +857,9 @@ func (s *GatewayObservationService) checkEvidenceBinding(ctx context.Context, rt
 		return nil, obsViolation("binding", "is not in the request's project")
 	case scope.BindingDeleted || !scope.BindingEnabled:
 		return nil, obsViolation("binding", "is no longer live")
+	case scope.SuspendedReason != "":
+		// api#308: target_missing, mapping_removed or scope_changed.
+		return nil, obsViolation("binding", "is suspended")
 	}
 	out := map[string]*storage.GatewayConnector{}
 	for _, st := range *res.Stages {
@@ -870,6 +873,23 @@ func (s *GatewayObservationService) checkEvidenceBinding(ctx context.Context, rt
 		}
 		if err != nil {
 			return nil, err
+		}
+		if scope.TargetSource == storage.GatewayTargetSourceDiscovered && st.Source.TargetID == scope.ArgoCDTargetID {
+			// A discovered target is checked like a pinned static one:
+			// resource.name and namespace from the catalog, and
+			// resource.identity_digest equal to the target id (C3, C7).
+			t, err := rt.DiscoveredTargetView(ctx, conn.ID, st.Source.TargetID)
+			switch {
+			case errors.Is(err, storage.ErrNotFound):
+				return nil, obsViolation("source.target_id", "is not a discovered target of the connector")
+			case err != nil:
+				return nil, err
+			case t.Stale:
+				return nil, obsViolation("source.target_id", "is missing from the catalog")
+			}
+			c := *conn
+			c.Targets = append(slices.Clone(conn.Targets), t)
+			conn = &c
 		}
 		rules := obsRulesByStage[st.Stage]
 		switch {

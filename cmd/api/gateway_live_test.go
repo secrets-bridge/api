@@ -801,13 +801,25 @@ func TestLive_Gateway_AdminRoutesNeedPermissionAndFreshMFA(t *testing.T) {
 			t.Errorf("%s %s without %s = %d %s; want 403", r.method, r.path, r.perm, code, raw)
 		}
 	}
-	// The permission at team scope is not enough (global only).
+	// The permission at team scope is not enough (global only), except
+	// on the bind and unbind routes, which take a team-scoped
+	// gateway.bind since api#308 (ADR 0002 C4): there the gate passes and
+	// the service's rules answer (here: a body the decoder refuses, and
+	// a binding the caller cannot see).
 	scoped := uuid.New()
 	scopedHdr := map[string]string{"Cookie": f.l.sessionFor(t, scoped, "gw-scoped@example.com")}
 	f.l.addGrant(t, scoped.String(), gatewayAdminPerms, `{"team_id":"`+uuid.NewString()+`"}`)
+	teamScoped := map[string]int{
+		http.MethodPost + " /api/v1/admin/gateway-bindings":            http.StatusBadRequest,
+		http.MethodDelete + " /api/v1/admin/gateway-bindings/" + anyID: http.StatusNotFound,
+	}
 	for _, r := range routes {
-		if code, raw := f.l.callAs(t, r.method, r.path, scopedHdr, body); code != http.StatusForbidden {
-			t.Errorf("%s %s with a team-scoped grant = %d %s; want 403", r.method, r.path, code, raw)
+		want, ok := teamScoped[r.method+" "+r.path]
+		if !ok {
+			want = http.StatusForbidden
+		}
+		if code, raw := f.l.callAs(t, r.method, r.path, scopedHdr, body); code != want {
+			t.Errorf("%s %s with a team-scoped grant = %d %s; want %d", r.method, r.path, code, raw, want)
 		}
 	}
 	// The permission with a stale second factor: writes 401 step-up,

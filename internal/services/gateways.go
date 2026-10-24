@@ -95,6 +95,15 @@ type GatewayStore interface {
 	EnvironmentProject(ctx context.Context, envID uuid.UUID) (uuid.UUID, error)
 	SecretBoundToProject(ctx context.Context, secretID, projectID uuid.UUID) (bool, error)
 	ProviderConnectionExists(ctx context.Context, id uuid.UUID) (bool, error)
+	// Discovery catalog and bind rules (api#308).
+	ListCatalog(ctx context.Context, f storage.CatalogFilter) ([]storage.CatalogItem, error)
+	GetDiscoveredTarget(ctx context.Context, connectorID uuid.UUID, targetID string) (*storage.DiscoveredTarget, error)
+	EnvironmentBindInfo(ctx context.Context, envID uuid.UUID) (*storage.EnvironmentBindInfo, error)
+	TeamCoveredByAny(ctx context.Context, roots []uuid.UUID, team uuid.UUID) (bool, error)
+	CountBoundTargets(ctx context.Context, gatewayID uuid.UUID) (int, error)
+	TargetBound(ctx context.Context, connectorID uuid.UUID, targetID string) (bool, error)
+	GetProjectTeams(ctx context.Context, gatewayID, connectorID uuid.UUID) (*storage.GatewayProjectTeams, error)
+	PutProjectTeams(ctx context.Context, gatewayID, connectorID uuid.UUID, mappings map[string][]uuid.UUID, by string, at time.Time) (*storage.GatewayMappingOutcome, error)
 }
 
 // GatewayService is the Gateway registry service.
@@ -859,6 +868,8 @@ type CreateBindingInput struct {
 	ArgoCDTargetID       string
 	ObservationTimeoutS  int
 	CreatedBy            string
+	// Caller is the caller's gateway.bind scope (api#308).
+	Caller BindCaller
 }
 
 // bindingInvalid names the rule a bind broke, as a closed code.
@@ -877,10 +888,32 @@ func BindingErrorCode(err error) string {
 	return "invalid_binding"
 }
 
-// CreateBinding binds an advertised Argo CD target of a Gateway to a
-// secret scope in an environment. The service checks what foreign keys
-// cannot: same Gateway, approved, right kind, target advertised and not
-// stale, environment in the project and in the Gateway's environment.
+// gatewayMaxBoundTargets is the bound target cap per Gateway (E-4).
+const gatewayMaxBoundTargets = 4096
+
+// CreateBinding binds an Argo CD target of a Gateway, static or
+// discovered, to a secret scope in an environment (discovery-contract.md
+// section 8.4). The rules, in order; the first failure answers:
+//
+//  1. the target exists and the caller can see it (a team-scoped caller
+//     sees discovered targets on approved connectors whose AppProject
+//     maps to one of its teams, nothing else): 404 target_not_found;
+//  2. a discovered target is present: 409 target_missing (static
+//     targets keep target_stale and target_identity_changed);
+//  3. the environment's project belongs to one of a team-scoped
+//     caller's teams: 404 environment_not_found;
+//  4. a caller without global gateway.bind binds only into type dev,
+//     staging or uat with kind non_prod: 403
+//     production_binding_platform_only (D1, S-9);
+//  5. a discovered target's AppProject maps to a team covering the
+//     binding project's team, for every caller (S-8): 403
+//     target_team_mismatch;
+//  6. the connector is approved for the digest the replicas report:
+//     409 connector_not_approved;
+//  7. fewer than 4096 bound targets on the Gateway: 409
+//     gateway_bound_target_limit;
+//  8. the Release 1 checks (environment in the Gateway's environment,
+//     secret in the project, binding_exists).
 func (s *GatewayService) CreateBinding(ctx context.Context, in CreateBindingInput) (*storage.GatewayBinding, error) {
 	if in.ObservationTimeoutS == 0 {
 		in.ObservationTimeoutS = 1800
@@ -899,7 +932,7 @@ func (s *GatewayService) CreateBinding(ctx context.Context, in CreateBindingInpu
 	if scopeConn && (in.ProviderConnectionID == nil || !validSecretRef(in.SecretRef)) {
 		return nil, bindingInvalid("secret_scope_required")
 	}
-
+	caller := in.Caller
 	g, err := s.store.Get(ctx, in.GatewayID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
@@ -910,16 +943,100 @@ func (s *GatewayService) CreateBinding(ctx context.Context, in CreateBindingInpu
 	if g.Status == storage.GatewayStatusRevoked {
 		return nil, bindingInvalid("gateway_revoked")
 	}
-	projectID, err := s.store.EnvironmentProject(ctx, in.EnvironmentID)
+	conn, err := s.store.GetConnector(ctx, in.ArgoCDConnectorID)
+	switch {
+	case errors.Is(err, storage.ErrNotFound) || (err == nil && conn.GatewayID != in.GatewayID):
+		if !caller.Global {
+			return nil, bindingInvalid("target_not_found")
+		}
+		return nil, bindingInvalid("connector_not_found")
+	case err != nil:
+		return nil, err
+	}
+	disc, err := s.store.GetDiscoveredTarget(ctx, conn.ID, in.ArgoCDTargetID)
+	if errors.Is(err, storage.ErrNotFound) {
+		disc = nil
+	} else if err != nil {
+		return nil, err
+	}
+	// Rule 1: visibility.
+	if !caller.Global && (disc == nil || conn.Status != storage.GatewayConnectorApproved || !caller.seesAnyOf(disc.Teams)) {
+		return nil, bindingInvalid("target_not_found")
+	}
+	if conn.Kind != GatewayKindArgoCD {
+		return nil, bindingInvalid("connector_kind_not_supported")
+	}
+	// Rule 2.
+	if disc != nil {
+		if disc.Status != "present" {
+			return nil, bindingInvalid("target_missing")
+		}
+	} else {
+		t, ok := conn.Target(in.ArgoCDTargetID)
+		switch {
+		case !ok:
+			return nil, bindingInvalid("target_not_advertised")
+		case t.Stale:
+			return nil, bindingInvalid("target_stale")
+		case t.Suspended():
+			return nil, bindingInvalid("target_identity_changed")
+		}
+	}
+	// Rule 3.
+	env, err := s.store.EnvironmentBindInfo(ctx, in.EnvironmentID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil, bindingInvalid("environment_not_found")
 		}
 		return nil, err
 	}
+	if !caller.Global && (env.ProjectTeamID == nil || !caller.hasTeam(*env.ProjectTeamID)) {
+		return nil, bindingInvalid("environment_not_found")
+	}
+	projectID := env.ProjectID
 	if in.ProjectID != nil && *in.ProjectID != projectID {
 		return nil, bindingInvalid("environment_not_in_project")
 	}
+	// Rule 4: production is platform-only.
+	if !caller.Global && (env.Type == "prod" || env.Type == "other" || env.Kind == "prod") {
+		return nil, bindingInvalid("production_binding_platform_only")
+	}
+	// Rule 5: the team relation, for platform admins too.
+	if disc != nil {
+		covered := false
+		if env.ProjectTeamID != nil && len(disc.Teams) > 0 {
+			if covered, err = s.store.TeamCoveredByAny(ctx, disc.Teams, *env.ProjectTeamID); err != nil {
+				return nil, err
+			}
+		}
+		if !covered {
+			return nil, bindingInvalid("target_team_mismatch")
+		}
+	}
+	// Rule 6: approved for the scope the replicas report now.
+	if conn.Status != storage.GatewayConnectorApproved {
+		return nil, bindingInvalid("connector_not_approved")
+	}
+	scope, err := s.store.ConnectorScope(ctx, in.GatewayID, conn.Name, s.now().UTC().Add(-GatewayReplicaWindow))
+	if err != nil {
+		return nil, err
+	}
+	if scope.Mismatch || (scope.ReportedDigest != "" && scope.ReportedDigest != conn.ApprovedScopeDigest) {
+		return nil, bindingInvalid("connector_not_approved")
+	}
+	// Rule 7.
+	if n, err := s.store.CountBoundTargets(ctx, in.GatewayID); err != nil {
+		return nil, err
+	} else if n >= gatewayMaxBoundTargets {
+		bound, err := s.store.TargetBound(ctx, conn.ID, in.ArgoCDTargetID)
+		if err != nil {
+			return nil, err
+		}
+		if !bound {
+			return nil, bindingInvalid("gateway_bound_target_limit")
+		}
+	}
+	// Rule 8: Release 1 checks.
 	if g.EnvironmentID != nil && *g.EnvironmentID != in.EnvironmentID {
 		return nil, bindingInvalid("environment_outside_gateway")
 	}
@@ -940,39 +1057,18 @@ func (s *GatewayService) CreateBinding(ctx context.Context, in CreateBindingInpu
 			return nil, bindingInvalid("provider_connection_not_found")
 		}
 	}
-	conn, err := s.store.GetConnector(ctx, in.ArgoCDConnectorID)
-	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			return nil, bindingInvalid("connector_not_found")
-		}
-		return nil, err
-	}
-	switch {
-	case conn.GatewayID != in.GatewayID:
-		return nil, bindingInvalid("connector_not_found")
-	case conn.Kind != GatewayKindArgoCD:
-		return nil, bindingInvalid("connector_kind_not_supported")
-	case conn.Status != storage.GatewayConnectorApproved:
-		return nil, bindingInvalid("connector_not_approved")
-	}
-	t, ok := conn.Target(in.ArgoCDTargetID)
-	if !ok {
-		return nil, bindingInvalid("target_not_advertised")
-	}
-	if t.Stale {
-		return nil, bindingInvalid("target_stale")
-	}
-	if t.Suspended() {
-		return nil, bindingInvalid("target_identity_changed")
-	}
 
 	connID := conn.ID
+	source := storage.GatewayTargetSourceStatic
+	if disc != nil {
+		source = storage.GatewayTargetSourceDiscovered
+	}
 	b := &storage.GatewayBinding{
 		GatewayID: in.GatewayID, EnvironmentID: in.EnvironmentID, ProjectID: projectID,
 		SecretID: in.SecretID, ProviderConnectionID: in.ProviderConnectionID, SecretRef: in.SecretRef,
 		ExpectedStages:    []string{"argocd_context"},
 		ArgoCDConnectorID: &connID, ArgoCDTargetID: in.ArgoCDTargetID,
-		ObservationTimeoutS: in.ObservationTimeoutS, CreatedBy: in.CreatedBy,
+		ObservationTimeoutS: in.ObservationTimeoutS, CreatedBy: in.CreatedBy, TargetSource: source,
 	}
 	if err := s.store.CreateBinding(ctx, b); err != nil {
 		switch {
@@ -984,11 +1080,16 @@ func (s *GatewayService) CreateBinding(ctx context.Context, in CreateBindingInpu
 		return nil, err
 	}
 	b.Enabled = true
+	permScope := "global"
+	if !caller.Global {
+		permScope = "team"
+	}
 	meta := map[string]any{
 		"binding_id": b.ID.String(), "gateway_id": b.GatewayID.String(),
 		"environment_id": b.EnvironmentID.String(), "project_id": projectID.String(),
 		"argocd_connector_id": connID.String(), "argocd_target_id": b.ArgoCDTargetID,
 		"expected_stages": b.ExpectedStages, "observation_timeout_seconds": b.ObservationTimeoutS,
+		"target_source": source, "permission_scope": permScope,
 	}
 	if b.SecretID != nil {
 		meta["secret_id"] = b.SecretID.String()
@@ -1002,6 +1103,31 @@ func (s *GatewayService) CreateBinding(ctx context.Context, in CreateBindingInpu
 	return b, nil
 }
 
+// teamMayUnbind reports whether a team-scoped caller can see a binding:
+// a discovered target it can see, in a project of one of its teams.
+func (s *GatewayService) teamMayUnbind(ctx context.Context, b *storage.GatewayBinding, caller BindCaller) (bool, error) {
+	if b.TargetSource != storage.GatewayTargetSourceDiscovered || b.ArgoCDConnectorID == nil {
+		return false, nil
+	}
+	conn, err := s.store.GetConnector(ctx, *b.ArgoCDConnectorID)
+	if err != nil {
+		return false, err
+	}
+	disc, err := s.store.GetDiscoveredTarget(ctx, conn.ID, b.ArgoCDTargetID)
+	if errors.Is(err, storage.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	env, err := s.store.EnvironmentBindInfo(ctx, b.EnvironmentID)
+	if err != nil {
+		return false, err
+	}
+	return conn.Status == storage.GatewayConnectorApproved && caller.seesAnyOf(disc.Teams) &&
+		env.ProjectTeamID != nil && caller.hasTeam(*env.ProjectTeamID), nil
+}
+
 // ListBindings returns live bindings, for one Gateway when set.
 func (s *GatewayService) ListBindings(ctx context.Context, gatewayID *uuid.UUID) ([]*storage.GatewayBinding, error) {
 	return s.store.ListBindings(ctx, gatewayID)
@@ -1009,10 +1135,19 @@ func (s *GatewayService) ListBindings(ctx context.Context, gatewayID *uuid.UUID)
 
 // DeleteBinding soft-deletes a binding and cancels its open
 // observation tasks (reason binding_removed).
-func (s *GatewayService) DeleteBinding(ctx context.Context, id uuid.UUID, by string) error {
+func (s *GatewayService) DeleteBinding(ctx context.Context, id uuid.UUID, by string, caller BindCaller) error {
 	b, err := s.store.GetBinding(ctx, id)
 	if err != nil {
 		return err
+	}
+	if !caller.Global {
+		// Rules 1 and 3 for a team-scoped caller; anything else is the
+		// same 404 as an unknown binding.
+		if ok, err := s.teamMayUnbind(ctx, b, caller); err != nil {
+			return err
+		} else if !ok {
+			return storage.ErrNotFound
+		}
 	}
 	cancelled, err := s.store.DeleteBinding(ctx, id, s.now().UTC())
 	if err != nil {

@@ -78,10 +78,12 @@ func AuditGatewayDenied(repo storage.AuditEventRepository, action string, ids Ga
 // to permission_denied.
 func gatewayDenyErrorKind(status int, msg string) string {
 	switch {
+	case gatewayDenyErrorKindRe.MatchString(msg):
+		// A closed code, including the 403 bind rules (api#308:
+		// production_binding_platform_only, target_team_mismatch).
+		return msg
 	case status == fiber.StatusForbidden:
 		return "permission_denied"
-	case gatewayDenyErrorKindRe.MatchString(msg):
-		return msg
 	case status == fiber.StatusUnauthorized:
 		return "unauthenticated"
 	case status == fiber.StatusNotFound:
@@ -98,4 +100,6 @@ var (
 	GatewayDenyConfirm = GatewayDenyPathIDs{"id": "gateway_id", "cid": "connector_id"}
 	GatewayDenyBind    = GatewayDenyPathIDs{}
 	GatewayDenyDelete  = GatewayDenyPathIDs{"id": "binding_id"}
+	// api#308: the AppProject to team mapping write.
+	GatewayDenyMapping = GatewayDenyPathIDs{"id": "gateway_id", "cid": "connector_id"}
 )

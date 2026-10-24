@@ -1186,12 +1186,12 @@ func (r *Gateways) CreateBinding(ctx context.Context, b *GatewayBinding) error {
 		INSERT INTO gateway_connector_bindings (
 			gateway_id, environment_id, secret_id, provider_connection_id, secret_ref, expected_stages,
 			eso_connector_id, eso_target_id, rollout_connector_id, rollout_target_id,
-			argocd_connector_id, argocd_target_id, observation_timeout_s, created_by)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			argocd_connector_id, argocd_target_id, observation_timeout_s, created_by, target_source)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, COALESCE(NULLIF($15, ''), 'static'))
 		RETURNING id, enabled, created_at`,
 		b.GatewayID, b.EnvironmentID, b.SecretID, b.ProviderConnectionID, nullable(b.SecretRef), stages,
 		b.ESOConnectorID, nullable(b.ESOTargetID), b.RolloutConnectorID, nullable(b.RolloutTargetID),
-		b.ArgoCDConnectorID, nullable(b.ArgoCDTargetID), b.ObservationTimeoutS, b.CreatedBy).
+		b.ArgoCDConnectorID, nullable(b.ArgoCDTargetID), b.ObservationTimeoutS, b.CreatedBy, b.TargetSource).
 		Scan(&b.ID, &b.Enabled, &b.CreatedAt)
 	switch {
 	case isUniqueViolation(err):
