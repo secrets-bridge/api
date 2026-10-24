@@ -30,12 +30,14 @@ on `main`.
   skipped, new binds answer 409. One `gateway.target.identity_changed`
   audit row carries `trigger: gateway_reported` (catalog changes now
   carry `trigger: catalog`). The confirm-identity endpoint clears it
-  even though the advertised identity is still the pin. That exception
-  holds for a gateway-reported change only: after a catalog change the
-  old pin again is still not confirmable. Re-confirming before the
+  even though the advertised identity is still the pin, which keeps the
+  original pin. A catalog change back to the pin (A, B, A) is
+  re-confirmable the same way. Re-confirming before the
   integrator fixes the settings uid lifts the suspension until the next
-  such error stage marks the target again. An unpinned target is not
-  marked, since there is no pin to re-confirm.
+  such error stage marks the target again. The admin gateway read shows
+  `identity_change_trigger` (`catalog` or `gateway_reported`) on an
+  `identity_changed` target, so an admin can tell the two apart. An
+  unpinned target is not marked, since there is no pin to re-confirm.
 - A revoked agent or Gateway can no longer get in through the
   credential cache (api#303). A revoke or disable writes a tombstone the
   cache can't fill past. If Redis won't take it, the call answers 503

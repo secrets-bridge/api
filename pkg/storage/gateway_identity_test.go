@@ -106,7 +106,7 @@ func TestReportIdentityChanged_NeedsALivePin(t *testing.T) {
 		t.Fatalf("stale target was marked: %+v", stale[0])
 	}
 	changed, _ := mergeTargets(pinned, advertise(pinB))
-	if _, ok := reportIdentityChanged(changed, "payments-api"); ok || changed[0].IdentityChangeTrigger != "" {
+	if _, ok := reportIdentityChanged(changed, "payments-api"); ok || changed[0].IdentityChangeTrigger != GatewayIdentityTriggerCatalog {
 		t.Fatalf("catalog change was re-reported: %+v", changed[0])
 	}
 }
@@ -119,20 +119,20 @@ func TestMergeTargets_CatalogChangeClearsReportedTrigger(t *testing.T) {
 		t.Fatalf("pin again: changes %+v target %+v; want no change, trigger kept", changes, same[0])
 	}
 	got, changes := mergeTargets(same, advertise(pinB))
-	if len(changes) != 1 || got[0].IdentityChangeTrigger != "" || got[0].IdentityAdvertised != pinB || !got[0].Suspended() {
-		t.Fatalf("new identity: changes %+v target %+v; want a catalog change, no trigger", changes, got[0])
+	if len(changes) != 1 || got[0].IdentityChangeTrigger != GatewayIdentityTriggerCatalog || got[0].IdentityAdvertised != pinB || !got[0].Suspended() {
+		t.Fatalf("new identity: changes %+v target %+v; want a catalog change", changes, got[0])
 	}
 }
 
-func TestConfirmable_PinAgainOnlyForReported(t *testing.T) {
+func TestConfirmable_PinAgainIsConfirmable(t *testing.T) {
 	pinned, _ := mergeTargets(nil, advertise(pinA))
 	if err := confirmable(pinned[0]); err != ErrGatewayTargetIdentityNotChanged {
 		t.Fatalf("pinned target: %v; want not changed", err)
 	}
 	reverted, _ := mergeTargets(pinned, advertise(pinB))
 	reverted, _ = mergeTargets(reverted, advertise(pinA))
-	if err := confirmable(reverted[0]); err != ErrGatewayTargetIdentityNotChanged {
-		t.Fatalf("catalog change back to the pin: %v; want not changed", err)
+	if err := confirmable(reverted[0]); err != nil {
+		t.Fatalf("catalog change back to the pin: %v; want confirmable", err)
 	}
 	reported, _ := mergeTargets(nil, advertise(pinA))
 	reportIdentityChanged(reported, "payments-api")
@@ -142,5 +142,30 @@ func TestConfirmable_PinAgainOnlyForReported(t *testing.T) {
 	changed, _ := mergeTargets(pinned, advertise(pinB))
 	if err := confirmable(changed[0]); err != nil {
 		t.Fatalf("catalog change: %v; want confirmable", err)
+	}
+	stale, _ := mergeTargets(changed, nil)
+	if err := confirmable(stale[0]); err != ErrGatewayTargetStale {
+		t.Fatalf("stale target: %v; want stale", err)
+	}
+}
+
+func TestGatewayTarget_ChangeTrigger(t *testing.T) {
+	pinned, _ := mergeTargets(nil, advertise(pinA))
+	if got := pinned[0].ChangeTrigger(); got != "" {
+		t.Fatalf("pinned target trigger = %q; want none", got)
+	}
+	changed, _ := mergeTargets(pinned, advertise(pinB))
+	if got := changed[0].ChangeTrigger(); got != GatewayIdentityTriggerCatalog {
+		t.Fatalf("catalog change trigger = %q; want catalog", got)
+	}
+	// A target that went identity_changed before the field existed.
+	legacy := changed[0]
+	legacy.IdentityChangeTrigger = ""
+	if got := legacy.ChangeTrigger(); got != GatewayIdentityTriggerCatalog {
+		t.Fatalf("legacy identity_changed trigger = %q; want catalog", got)
+	}
+	reportIdentityChanged(pinned, "payments-api")
+	if got := pinned[0].ChangeTrigger(); got != GatewayIdentityTriggerReported {
+		t.Fatalf("reported change trigger = %q; want gateway_reported", got)
 	}
 }

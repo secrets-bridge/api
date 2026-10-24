@@ -12,8 +12,11 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/secrets-bridge/api/pkg/storage"
 )
 
 // identityErrorResult is the error stage a Gateway posts when the
@@ -38,6 +41,32 @@ func (f *obsFixture) storedTrigger(t *testing.T) string {
 		t.Fatalf("stored trigger: %v", err)
 	}
 	return trigger
+}
+
+// adminTargetTrigger reads payments-api's identity_change_trigger from
+// GET /admin/gateways/:id.
+func (f *obsFixture) adminTargetTrigger(t *testing.T) string {
+	t.Helper()
+	code, body := f.l.callAs(t, http.MethodGet, "/api/v1/admin/gateways/"+f.gw.GatewayID, f.admin, nil)
+	if code != http.StatusOK {
+		t.Fatalf("detail = %d %s", code, body)
+	}
+	var d struct {
+		Connectors []struct {
+			Targets []struct {
+				TargetID string `json:"target_id"`
+				Trigger  string `json:"identity_change_trigger"`
+			} `json:"targets"`
+		} `json:"connectors"`
+	}
+	mustJSON(t, body, &d)
+	for _, tg := range d.Connectors[0].Targets {
+		if tg.TargetID == "payments-api" {
+			return tg.Trigger
+		}
+	}
+	t.Fatalf("payments-api not in the admin read: %s", body)
+	return ""
 }
 
 // TestLive_GatewayIdentity_ReportedChangeSuspendsUntilReconfirmed: an
@@ -83,6 +112,9 @@ func TestLive_GatewayIdentity_ReportedChangeSuspendsUntilReconfirmed(t *testing.
 	}
 	if status, suspended := f.adminTargetStatus(t); status != "identity_changed" || suspended != "identity_changed" {
 		t.Fatalf("admin read = %q suspended %q; want identity_changed on both", status, suspended)
+	}
+	if got := f.adminTargetTrigger(t); got != "gateway_reported" {
+		t.Fatalf("admin identity_change_trigger = %q; want gateway_reported", got)
 	}
 
 	// The second leased task's error stage is refused: the target takes
@@ -145,6 +177,9 @@ func TestLive_GatewayIdentity_ReportedChangeSuspendsUntilReconfirmed(t *testing.
 	if d, s, _ := f.storedTarget(t); d != identityA || s != "pinned" || f.storedTrigger(t) != "" {
 		t.Fatalf("after re-confirm: pin %q status %q trigger %q; want %q pinned, no trigger", d, s, f.storedTrigger(t), identityA)
 	}
+	if got := f.adminTargetTrigger(t); got != "" {
+		t.Fatalf("admin identity_change_trigger after re-confirm = %q; want none", got)
+	}
 	confirmed := f.l.auditRowsWithStatus(t, "gateway.target.identity_confirmed")
 	if len(confirmed) != 1 || confirmed[0].Status != "success" ||
 		confirmed[0].Metadata["identity_digest_before"] != identityA || confirmed[0].Metadata["identity_digest_after"] != identityA ||
@@ -190,9 +225,12 @@ func TestLive_GatewayIdentity_ReportedThenCatalogChange(t *testing.T) {
 		t.Fatalf("error stage = %d %s; want 200", code, body)
 	}
 	f.putCatalog(t, identityCatalog(identityB))
-	if d, s, a := f.storedTarget(t); d != identityA || s != "identity_changed" || a != identityB || f.storedTrigger(t) != "" {
-		t.Fatalf("after the fixed settings uid: pin %q status %q advertised %q trigger %q; want %q identity_changed %q, no trigger",
+	if d, s, a := f.storedTarget(t); d != identityA || s != "identity_changed" || a != identityB || f.storedTrigger(t) != "catalog" {
+		t.Fatalf("after the fixed settings uid: pin %q status %q advertised %q trigger %q; want %q identity_changed %q, trigger catalog",
 			d, s, a, f.storedTrigger(t), identityA, identityB)
+	}
+	if got := f.adminTargetTrigger(t); got != "catalog" {
+		t.Fatalf("admin identity_change_trigger = %q; want catalog", got)
 	}
 	rows := f.l.auditRows(t, "gateway.target.identity_changed")
 	if len(rows) != 2 || rows[0].Metadata["trigger"] != "gateway_reported" || rows[1].Metadata["trigger"] != "catalog" ||
@@ -207,10 +245,11 @@ func TestLive_GatewayIdentity_ReportedThenCatalogChange(t *testing.T) {
 	}
 }
 
-// TestLive_GatewayIdentity_CatalogRevertNotReconfirmable: for a catalog
-// change, re-confirm needs an advertised identity other than the pin.
-// The Gateway advertising the old pin again leaves nothing to confirm.
-func TestLive_GatewayIdentity_CatalogRevertNotReconfirmable(t *testing.T) {
+// TestLive_GatewayIdentity_CatalogRevertReconfirmsTheOriginalPin: the
+// Gateway advertising the old pin again after a catalog change (A, B,
+// A) can be re-confirmed. The original pin stays, the binding resumes,
+// and evidence is still checked against the pin.
+func TestLive_GatewayIdentity_CatalogRevertReconfirmsTheOriginalPin(t *testing.T) {
 	f := newObsFixture(t)
 	f.putCatalog(t, identityCatalog(identityA))
 	f.putCatalog(t, identityCatalog(identityB))
@@ -218,12 +257,27 @@ func TestLive_GatewayIdentity_CatalogRevertNotReconfirmable(t *testing.T) {
 	if d, s, a := f.storedTarget(t); d != identityA || s != "identity_changed" || a != identityA {
 		t.Fatalf("after A, B, A: pin %q status %q advertised %q; want %q identity_changed %q", d, s, a, identityA, identityA)
 	}
-	if code, body := f.l.callAs(t, http.MethodPost, f.confirmPath(), f.admin, nil); code != http.StatusConflict ||
-		!strings.Contains(string(body), "target_identity_not_changed") {
-		t.Fatalf("re-confirm of a catalog change back to the pin = %d %s; want 409 target_identity_not_changed", code, body)
+	if code, body := f.l.callAs(t, http.MethodPost, f.confirmPath(), f.admin, nil); code != http.StatusOK {
+		t.Fatalf("re-confirm of a catalog change back to the pin = %d %s; want 200", code, body)
 	}
-	if _, s, _ := f.storedTarget(t); s != "identity_changed" {
-		t.Fatalf("status after a refused re-confirm = %q; want identity_changed", s)
+	if d, s, _ := f.storedTarget(t); d != identityA || s != "pinned" {
+		t.Fatalf("after re-confirm: pin %q status %q; want the original pin %q pinned", d, s, identityA)
+	}
+	confirmed := f.l.auditRowsWithStatus(t, "gateway.target.identity_confirmed")
+	if len(confirmed) != 1 || confirmed[0].Status != "success" ||
+		confirmed[0].Metadata["identity_digest_before"] != identityA || confirmed[0].Metadata["identity_digest_after"] != identityA {
+		t.Fatalf("identity_confirmed audits = %+v; want one success row from the pin to the pin", confirmed)
+	}
+	code, task := f.claimTask(t)
+	if code != http.StatusOK {
+		t.Fatalf("claim after re-confirm = %d; want 200", code)
+	}
+	if code, body := f.post(t, task.TaskID, withIdentity(argoResult(task, f.gw.GatewayID, f.replica), identityB)); code != http.StatusUnprocessableEntity ||
+		errCode(t, body) != "identity_digest_mismatch" {
+		t.Fatalf("evidence with the other digest = %d %s; want 422 identity_digest_mismatch", code, body)
+	}
+	if code, body := f.post(t, task.TaskID, withIdentity(argoResult(task, f.gw.GatewayID, f.replica), identityA)); code != http.StatusOK {
+		t.Fatalf("evidence with the original pin = %d %s; want 200", code, body)
 	}
 }
 
@@ -262,5 +316,114 @@ func TestLive_GatewayIdentity_OtherErrorCodeDoesNotSuspend(t *testing.T) {
 	}
 	if rows := f.l.auditRows(t, "gateway.target.identity_changed"); len(rows) != 0 {
 		t.Fatalf("identity_changed audits = %+v; want none", rows)
+	}
+}
+
+// leaseTwoOnTarget adds a second binding on payments-api and leases one
+// task on each binding.
+func (f *obsFixture) leaseTwoOnTarget(t *testing.T) (*wireTask, *wireTask) {
+	t.Helper()
+	secret2 := f.addSecret(t, f.proj)
+	f.bind(t, f.gw.GatewayID, f.connID, f.env, secret2, "payments-api")
+	code, first := f.claimTask(t)
+	if code != http.StatusOK {
+		t.Fatalf("first claim = %d; want 200", code)
+	}
+	req2, _ := f.executeOn(t, f.env, secret2)
+	f.makeClaimable(t, req2)
+	code, _, second, raw := f.claimAs(t, f.gw.GatewayID, f.gw.GatewaySecret, uuid.NewString())
+	if code != http.StatusOK {
+		t.Fatalf("second claim = %d %s; want 200", code, raw)
+	}
+	return first, second
+}
+
+// TestLive_GatewayIdentity_ConcurrentReportsAuditOnce: two error stages
+// accepted at the same time for the same target. A third transaction
+// holds the connector row while both results pass the evidence checks,
+// so both read the target as pinned before either commits. The re-read
+// under the row lock in the result transaction reports the change once:
+// both results are accepted and there is exactly one audit row.
+func TestLive_GatewayIdentity_ConcurrentReportsAuditOnce(t *testing.T) {
+	f := newObsFixture(t)
+	ctx := t.Context()
+	f.putCatalog(t, identityCatalog(identityA))
+	first, second := f.leaseTwoOnTarget(t)
+
+	// NO KEY UPDATE: the evidence rows' foreign key share lock on the
+	// connector still goes through, so both results reach the re-read.
+	blocker, err := f.l.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback(ctx) }()
+	if _, err := blocker.Exec(ctx, `SELECT 1 FROM gateway_connectors WHERE id = $1 FOR NO KEY UPDATE`, f.connID); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		code int
+		body []byte
+	}
+	results := make(chan result, 2)
+	for _, task := range []*wireTask{first, second} {
+		res := identityErrorResult(task, f.gw.GatewayID, f.replica)
+		go func() {
+			code, body := f.post(t, task.TaskID, res)
+			results <- result{code, body}
+		}()
+	}
+	// Both result transactions wait on the connector row.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var waiting int
+		if err := f.l.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock' AND query LIKE '%gateway_connectors%'`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("result transactions waiting on the connector row = %d; want 2", waiting)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		r := <-results
+		if r.code != http.StatusOK {
+			t.Fatalf("concurrent error stage = %d %s; want 200", r.code, r.body)
+		}
+	}
+	if _, s, _ := f.storedTarget(t); s != "identity_changed" {
+		t.Fatalf("status = %q; want identity_changed", s)
+	}
+	if rows := f.l.auditRows(t, "gateway.target.identity_changed"); len(rows) != 1 {
+		t.Fatalf("identity_changed audits for two concurrent reports = %d; want exactly 1", len(rows))
+	}
+}
+
+// TestLive_GatewayIdentity_ReportReadsOnlyTheTaskGateway: the re-read in
+// the result transaction is scoped to the task's Gateway, so a
+// connector of another Gateway is never marked.
+func TestLive_GatewayIdentity_ReportReadsOnlyTheTaskGateway(t *testing.T) {
+	f := newObsFixture(t)
+	ctx := t.Context()
+	gw2, conn2 := f.gatewayReady(t, "obs-gw2")
+	if code, raw := f.catalog(t, gw2.GatewayID, gw2.GatewaySecret, identityCatalog(identityA)); code != http.StatusOK {
+		t.Fatalf("catalog = %d %s", code, raw)
+	}
+	_, task := f.claimTask(t)
+	rt, err := storage.NewObservationTasks(f.l.pool).BeginResult(ctx, uuid.MustParse(f.gw.GatewayID), uuid.MustParse(task.TaskID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Rollback(ctx)
+	ch, err := rt.ReportTargetIdentityChanged(ctx, uuid.MustParse(conn2), "payments-api")
+	if err != nil || ch != nil {
+		t.Fatalf("report on another Gateway's connector = %+v, %v; want nothing", ch, err)
 	}
 }

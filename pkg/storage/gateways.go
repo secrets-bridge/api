@@ -169,11 +169,14 @@ type GatewayTarget struct {
 	// identity_changed; a re-confirm makes it the new pin. On an incoming
 	// catalog target it is the identity of that upload ("" when absent).
 	IdentityAdvertised string `json:"identity_advertised,omitempty"`
-	// IdentityChangeTrigger is gateway_reported while the target is
-	// identity_changed because the Gateway posted an error stage with
-	// error_code target_identity_changed (api#314), else "". Then the
-	// advertised identity may still be the pin: the Gateway computes it
-	// from its settings uid, which is what the integrator changes.
+	// IdentityChangeTrigger is what made the target identity_changed:
+	// catalog (another advertised identity) or gateway_reported (an
+	// error stage with error_code target_identity_changed, api#314). ""
+	// otherwise, and on a target that went identity_changed before the
+	// field existed; ChangeTrigger reads that as catalog. With
+	// gateway_reported the advertised identity may still be the pin: the
+	// Gateway computes it from its settings uid, which is what the
+	// integrator changes.
 	IdentityChangeTrigger string `json:"identity_change_trigger,omitempty"`
 }
 
@@ -196,6 +199,18 @@ const (
 // Suspended reports whether the target's bindings are suspended: no
 // dispatch and no evidence until a platform admin re-confirms.
 func (t GatewayTarget) Suspended() bool { return t.IdentityStatus == GatewayTargetIdentityChanged }
+
+// ChangeTrigger is the trigger of an identity_changed target (catalog or
+// gateway_reported), or "" when the target is not identity_changed.
+func (t GatewayTarget) ChangeTrigger() string {
+	switch {
+	case !t.Suspended():
+		return ""
+	case t.IdentityChangeTrigger == "":
+		return GatewayIdentityTriggerCatalog
+	}
+	return t.IdentityChangeTrigger
+}
 
 // GatewayTargetIdentityChange is a target whose advertised identity no
 // longer matches its pin (from ReplaceCatalog), or one an admin
@@ -885,7 +900,7 @@ func mergeTargets(prev, incoming []GatewayTarget) ([]GatewayTarget, []GatewayTar
 			}
 			// Another identity is a catalog change, also over a
 			// gateway_reported one: re-confirm now pins adv.
-			t.IdentityStatus, t.IdentityAdvertised, t.IdentityChangeTrigger = GatewayTargetIdentityChanged, adv, ""
+			t.IdentityStatus, t.IdentityAdvertised, t.IdentityChangeTrigger = GatewayTargetIdentityChanged, adv, GatewayIdentityTriggerCatalog
 		}
 		out = append(out, t)
 		seen[t.TargetID] = true
@@ -1059,18 +1074,18 @@ var (
 )
 
 // confirmable reports whether a re-confirm may pin t's advertised
-// identity. A catalog change needs a different advertised identity: the
-// old pin again confirms nothing. A gateway_reported change (api#314)
-// may keep the pin, because the Gateway's settings uid is what changed
-// and its catalog identity follows that uid. Re-confirming it before the
-// integrator fixes the settings uid lifts the suspension until the next
-// such error stage marks the target again. Only an advertised digest is
-// ever pinned, never a raw uid.
+// identity. The advertised identity may be the pin itself: after a
+// gateway_reported change (api#314), because the Gateway's settings uid
+// is what changed and its catalog identity follows that uid, and after
+// a catalog change back to the pin (A, B, A). Confirming then keeps the
+// original pin, and evidence is still checked against it. Re-confirming
+// a gateway_reported change before the integrator fixes the settings
+// uid lifts the suspension until the next such error stage marks the
+// target again. Only an advertised digest is ever pinned, never a raw
+// uid.
 func confirmable(t GatewayTarget) error {
 	switch {
 	case t.IdentityStatus != GatewayTargetIdentityChanged || t.IdentityAdvertised == "":
-		return ErrGatewayTargetIdentityNotChanged
-	case t.IdentityAdvertised == t.IdentityDigest && t.IdentityChangeTrigger != GatewayIdentityTriggerReported:
 		return ErrGatewayTargetIdentityNotChanged
 	case t.Stale:
 		return ErrGatewayTargetStale
@@ -1104,11 +1119,18 @@ func reportIdentityChanged(targets []GatewayTarget, targetID string) (GatewayTar
 // ReportTargetIdentityChanged is reportIdentityChanged inside the result
 // transaction, for an accepted error stage with error_code
 // target_identity_changed (api#314). The connector row is locked FOR
-// UPDATE and read again, so two results racing on the same target
-// report the change once. Nil when nothing changed.
+// NO KEY UPDATE and read again, so two results racing on the same
+// target report the change once. Not FOR UPDATE: each result already
+// holds the key share lock of its evidence row's foreign key on the
+// connector, and two FOR UPDATE waits on those would deadlock. Only a connector of the task's Gateway is
+// read, which the evidence-binding check already ensures. Nil when
+// nothing changed.
 func (rt *ObservationResultTx) ReportTargetIdentityChanged(ctx context.Context, connectorID uuid.UUID, targetID string) (*GatewayTargetIdentityChange, error) {
 	c, err := scanGatewayConnector(rt.tx.QueryRow(ctx, `SELECT `+gatewayConnectorColumns+`
-		FROM gateway_connectors WHERE id = $1 FOR UPDATE`, connectorID))
+		FROM gateway_connectors WHERE id = $1 AND gateway_id = $2 FOR NO KEY UPDATE`, connectorID, rt.Task.GatewayID))
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
