@@ -42,6 +42,11 @@ const (
 	GatewayConnectorReasonScopeChanged  = "scope_changed"
 	GatewayConnectorReasonScopeMismatch = "scope_mismatch_between_replicas"
 	GatewayConnectorReasonSnapshotStale = "snapshot_stale"
+	// GatewayConnectorReasonOverPrivileged latches a connector a replica
+	// reported over_privileged (or that a replica reporting itself
+	// over_privileged serves) until a platform admin re-approves it after
+	// a passing probe (ADR 0002 C2 and section 6).
+	GatewayConnectorReasonOverPrivileged = "over_privileged"
 )
 
 // Binding suspended reasons (gateway_connector_bindings.suspended_reason).
@@ -77,6 +82,10 @@ var (
 	// ErrGatewayProjectMappingIncomplete: an allowed AppProject has no
 	// team (A2, A3, 409 project_mapping_incomplete).
 	ErrGatewayProjectMappingIncomplete = errors.New("storage: an allowed AppProject has no team")
+	// ErrGatewayConnectorOverPrivileged: a live replica still reports the
+	// connector, or itself, over_privileged (A3, 409
+	// connector_over_privileged).
+	ErrGatewayConnectorOverPrivileged = errors.New("storage: a live replica reports the connector over_privileged")
 )
 
 // GatewayDiscoveryLease is one lease granted by a heartbeat.
@@ -93,6 +102,9 @@ const (
 	GatewayScopeEventChanged  = "changed"
 	GatewayScopeEventAdopted  = "adopted"
 	GatewayScopeEventMismatch = "mismatch"
+	// GatewayScopeEventOverPrivileged: an approved connector latched back
+	// to advertised with status_reason over_privileged.
+	GatewayScopeEventOverPrivileged = "over_privileged"
 )
 
 // GatewayScopeEvent is a scope state change one heartbeat caused. Old is
@@ -130,22 +142,39 @@ type GatewayDiscoveryHeartbeat struct {
 	BoundTargetsVersion string
 }
 
-// gatewayReplicaScopeSQL selects (digest, discovery_enabled) of every
-// live replica of Gateway $1 seen after $2 that reports connector $3
-// with a digest.
+// gatewayReplicaScopeSQL selects, for every live replica of Gateway $1
+// seen after $2 that reports connector $3: its digest ("" when it sends
+// none), discovery_enabled, and whether the replica or the connector on
+// it is over_privileged.
 const gatewayReplicaScopeSQL = `
-	SELECT ch->>'scope_digest', COALESCE((ch->>'discovery_enabled')::boolean, false)
+	SELECT COALESCE(ch->>'scope_digest', ''), COALESCE((ch->>'discovery_enabled')::boolean, false),
+	       rp.status = 'over_privileged' OR ch->>'status' = 'over_privileged'
 	FROM gateway_replicas rp, jsonb_array_elements(rp.connector_health) ch
-	WHERE rp.gateway_id = $1 AND rp.last_seen_at > $2
-	  AND ch->>'connector_id' = $3 AND ch ? 'scope_digest'`
+	WHERE rp.gateway_id = $1 AND rp.last_seen_at > $2 AND ch->>'connector_id' = $3`
 
 // liveScope is what the live replicas report for one connector.
 type liveScope struct {
-	digests          []string // distinct, sorted
+	digests          []string // distinct, sorted, non-empty
+	missing          int      // live replicas that report the connector with no digest
 	discoveryEnabled bool     // any replica reports discovery on
+	overPrivileged   bool     // any replica reports it, or itself, over_privileged
 }
 
+// agreed is the digest every live replica reports. A live replica that
+// reports the connector without a digest (a contract 1 shaped
+// heartbeat) is not in agreement (review on #317, item 1).
 func (l liveScope) agreed() (string, bool) {
+	if len(l.digests) == 1 && l.missing == 0 {
+		return l.digests[0], true
+	}
+	return "", false
+}
+
+// single is the one digest the replicas that send one report, ignoring
+// replicas that send none yet. Scope change detection and adoption use
+// it: a replica restarting sends one contract 1 shaped heartbeat, and
+// that must not flap the connector. Leases and approvals use agreed.
+func (l liveScope) single() (string, bool) {
 	if len(l.digests) == 1 {
 		return l.digests[0], true
 	}
@@ -162,17 +191,80 @@ func readLiveScope(ctx context.Context, q querier, gatewayID uuid.UUID, connecto
 	seen := map[string]bool{}
 	for rows.Next() {
 		var d string
-		var on bool
-		if err := rows.Scan(&d, &on); err != nil {
+		var on, op bool
+		if err := rows.Scan(&d, &on, &op); err != nil {
 			return liveScope{}, fmt.Errorf("storage: scan replica scope digest: %w", err)
 		}
 		out.discoveryEnabled = out.discoveryEnabled || on
-		if !seen[d] {
+		out.overPrivileged = out.overPrivileged || op
+		switch {
+		case d == "":
+			out.missing++
+		case !seen[d]:
 			seen[d] = true
 			out.digests = append(out.digests, d)
 		}
 	}
 	sort.Strings(out.digests)
+	return out, rows.Err()
+}
+
+// latchOverPrivileged takes every approved Argo CD connector a heartbeat
+// reports over_privileged (all of them when the replica itself is
+// over_privileged) back to advertised with status_reason
+// over_privileged, and moves its leased tasks back to queued. It runs
+// for every heartbeat, contract 1 or 2. The pause no longer lifts on the
+// replica's next healthy heartbeat: a platform admin re-approves.
+func latchOverPrivileged(ctx context.Context, tx pgx.Tx, hb GatewayHeartbeat, at time.Time) ([]GatewayScopeEvent, error) {
+	// names nil with a replica-level over_privileged means every Argo CD
+	// connector of the Gateway.
+	var names []string
+	if hb.Status != "over_privileged" {
+		for _, ch := range hb.Connectors {
+			if ch.Kind == "argocd" && ch.Status == "over_privileged" {
+				names = append(names, ch.ConnectorID)
+			}
+		}
+		if len(names) == 0 {
+			return nil, nil
+		}
+	}
+	rows, err := tx.Query(ctx, `
+		UPDATE gateway_connectors SET status = 'advertised', status_reason = 'over_privileged',
+			approved_by = NULL, approved_at = NULL,
+			discovery_lease_id = NULL, discovery_lease_replica_id = NULL, discovery_lease_generation = NULL,
+			discovery_lease_expires_at = NULL
+		WHERE gateway_id = $1 AND kind = 'argocd' AND status = 'approved'
+		  AND ($2::text[] IS NULL OR name = ANY($2::text[]))
+		RETURNING id`, hb.GatewayID, names)
+	if err != nil {
+		return nil, fmt.Errorf("storage: latch over_privileged: %w", err)
+	}
+	ids, err := collectIDs(rows)
+	if err != nil {
+		return nil, err
+	}
+	var out []GatewayScopeEvent
+	for _, id := range ids {
+		n, err := requeueLeasedForConnector(ctx, tx, id, at)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, GatewayScopeEvent{ConnectorID: id, Event: GatewayScopeEventOverPrivileged, TasksRequeued: n})
+	}
+	return out, nil
+}
+
+func collectIDs(rows pgx.Rows) ([]uuid.UUID, error) {
+	defer rows.Close()
+	out := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("storage: scan id: %w", err)
+		}
+		out = append(out, id)
+	}
 	return out, rows.Err()
 }
 
@@ -224,7 +316,11 @@ type discoveryConnectorRow struct {
 // connectorScopeHeartbeat applies one reported Argo CD connector of a
 // contract 2 heartbeat. The connector row is locked FOR UPDATE. A
 // connector the Gateway has not advertised through E3 yet is skipped.
-func connectorScopeHeartbeat(ctx context.Context, tx pgx.Tx, hb GatewayHeartbeat, ch GatewayConnectorHealth, at, seenSince time.Time, out *GatewayDiscoveryHeartbeat) error {
+//
+// at is the api clock (suspension stamps); dbNow is the database clock,
+// which every lease time uses, so api replicas with skewed clocks agree
+// on expiry and on the interval floor.
+func connectorScopeHeartbeat(ctx context.Context, tx pgx.Tx, hb GatewayHeartbeat, ch GatewayConnectorHealth, at, dbNow, seenSince time.Time, out *GatewayDiscoveryHeartbeat) error {
 	var c discoveryConnectorRow
 	err := tx.QueryRow(ctx, `
 		SELECT id, status, approved_scope_digest, status_reason, discovery_lease_expires_at,
@@ -242,7 +338,8 @@ func connectorScopeHeartbeat(ctx context.Context, tx pgx.Tx, hb GatewayHeartbeat
 	if err != nil {
 		return err
 	}
-	digest, agreed := live.agreed()
+	digest, settled := live.single()
+	_, agreed := live.agreed()
 	reason := ""
 	if c.reason != nil {
 		reason = *c.reason
@@ -250,10 +347,13 @@ func connectorScopeHeartbeat(ctx context.Context, tx pgx.Tx, hb GatewayHeartbeat
 	inactive := c.status == GatewayConnectorMissing || c.status == GatewayConnectorDisabled
 
 	switch {
-	case inactive:
-		// A missing or disabled connector takes no scope decision.
-	case !agreed:
-		if reason == "" {
+	case inactive || reason == GatewayConnectorReasonOverPrivileged:
+		// A missing, disabled or over_privileged connector takes no scope
+		// decision; the latter waits for a platform admin.
+	case !settled:
+		// Recorded unless a stronger reason holds the connector already
+		// (scope_changed and over_privileged both need a re-approval).
+		if reason == "" || reason == GatewayConnectorReasonSnapshotStale {
 			if _, err := tx.Exec(ctx, `UPDATE gateway_connectors SET status_reason = $2 WHERE id = $1`,
 				c.id, GatewayConnectorReasonScopeMismatch); err != nil {
 				return fmt.Errorf("storage: mark scope mismatch: %w", err)
@@ -309,26 +409,27 @@ func connectorScopeHeartbeat(ctx context.Context, tx pgx.Tx, hb GatewayHeartbeat
 	// Lease grant (contract section 2.5). Approval is not a condition:
 	// the first upload must arrive before approval.
 	healthy := func(s string) bool { return s == "ok" || s == "degraded" }
-	if inactive || !agreed || ch.DiscoveryEnabled == nil || !*ch.DiscoveryEnabled ||
+	if inactive || !agreed || live.overPrivileged || reason == GatewayConnectorReasonOverPrivileged ||
+		ch.DiscoveryEnabled == nil || !*ch.DiscoveryEnabled ||
 		!healthy(hb.Status) || !healthy(ch.Status) || hb.LeaseTTL <= 0 {
 		return nil
 	}
-	if c.leaseExpires != nil && c.leaseExpires.After(at) {
+	if c.leaseExpires != nil && c.leaseExpires.After(dbNow) {
 		return nil
 	}
 	floor := max(GatewayDiscoveryIntervalFloor, time.Duration(ch.DiscoveryIntervalSeconds)*time.Second)
-	if c.lastGrant != nil && at.Sub(*c.lastGrant) < floor {
+	if c.lastGrant != nil && dbNow.Sub(*c.lastGrant) < floor {
 		return nil
 	}
 	lease := GatewayDiscoveryLease{
 		ConnectorID: c.id, ConnectorName: ch.ConnectorID, LeaseID: uuid.New(),
-		Generation: c.granted + 1, ExpiresAt: at.Add(hb.LeaseTTL),
+		Generation: c.granted + 1, ExpiresAt: dbNow.Add(hb.LeaseTTL),
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE gateway_connectors SET discovery_lease_id = $2, discovery_lease_replica_id = $3,
 			discovery_lease_generation = $4, discovery_lease_expires_at = $5,
 			discovery_generation_granted = $4, last_lease_granted_at = $6
-		WHERE id = $1`, c.id, lease.LeaseID, hb.ReplicaID, lease.Generation, lease.ExpiresAt, at); err != nil {
+		WHERE id = $1`, c.id, lease.LeaseID, hb.ReplicaID, lease.Generation, lease.ExpiresAt, dbNow); err != nil {
 		return fmt.Errorf("storage: grant discovery lease: %w", err)
 	}
 	out.Leases = append(out.Leases, lease)
@@ -340,11 +441,15 @@ func connectorScopeHeartbeat(ctx context.Context, tx pgx.Tx, hb GatewayHeartbeat
 func recordDiscoveryHeartbeat(ctx context.Context, tx pgx.Tx, hb GatewayHeartbeat, at, seenSince time.Time) (*GatewayDiscoveryHeartbeat, error) {
 	out := &GatewayDiscoveryHeartbeat{}
 	if hb.Contract2 {
+		var dbNow time.Time
+		if err := tx.QueryRow(ctx, `SELECT now()`).Scan(&dbNow); err != nil {
+			return nil, fmt.Errorf("storage: database clock: %w", err)
+		}
 		for _, ch := range hb.Connectors {
 			if ch.Kind != "argocd" || ch.ScopeDigest == "" {
 				continue
 			}
-			if err := connectorScopeHeartbeat(ctx, tx, hb, ch, at, seenSince, out); err != nil {
+			if err := connectorScopeHeartbeat(ctx, tx, hb, ch, at, dbNow, seenSince, out); err != nil {
 				return nil, err
 			}
 		}
@@ -434,9 +539,12 @@ func (r *Gateways) CountBoundTargets(ctx context.Context, gatewayID uuid.UUID) (
 type GatewayConnectorScope struct {
 	// ReportedDigest is the digest every live replica reports, "" when
 	// none reports one or they disagree (Mismatch).
-	ReportedDigest   string
+	ReportedDigest string
+	// Mismatch is true while live replicas report different digests, or
+	// some report one and some none.
 	Mismatch         bool
 	DiscoveryEnabled bool
+	OverPrivileged   bool
 }
 
 // ConnectorScope returns what the live replicas report for a connector.
@@ -446,7 +554,10 @@ func (r *Gateways) ConnectorScope(ctx context.Context, gatewayID uuid.UUID, conn
 		return GatewayConnectorScope{}, err
 	}
 	d, ok := live.agreed()
-	return GatewayConnectorScope{ReportedDigest: d, Mismatch: len(live.digests) > 1 && !ok, DiscoveryEnabled: live.discoveryEnabled}, nil
+	return GatewayConnectorScope{
+		ReportedDigest: d, Mismatch: len(live.digests) > 0 && !ok, DiscoveryEnabled: live.discoveryEnabled,
+		OverPrivileged: live.overPrivileged,
+	}, nil
 }
 
 // GatewayApproveOutcome is what ApproveConnectorScope changed.
@@ -492,9 +603,16 @@ func (r *Gateways) ApproveConnectorScope(ctx context.Context, gatewayID, connect
 	}
 	reported, agreed := live.agreed()
 	switch {
+	case live.overPrivileged:
+		// A passing probe first: no live replica may still report it.
+		return nil, ErrGatewayConnectorOverPrivileged
 	case len(live.digests) == 0 && digest != "":
 		return nil, ErrGatewayScopeDigestChanged
 	case len(live.digests) > 0 && (!agreed || digest != reported):
+		return nil, ErrGatewayScopeDigestChanged
+	case c.ApprovedScopeDigest != "" && digest == "":
+		// Once a digest was approved, an approval must name one: an empty
+		// body never writes NULL over it (review on #317, item 2).
 		return nil, ErrGatewayScopeDigestChanged
 	}
 	if live.discoveryEnabled {
@@ -505,6 +623,15 @@ func (r *Gateways) ApproveConnectorScope(ctx context.Context, gatewayID, connect
 		if !complete {
 			return nil, ErrGatewayProjectMappingIncomplete
 		}
+		// The AppProjects the console shows come from the latest upload:
+		// it must be of the approved scope (review on #317, item 4).
+		var uploaded string
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(discovery_scope_digest, '') FROM gateway_connectors WHERE id = $1`, connectorID).Scan(&uploaded); err != nil {
+			return nil, fmt.Errorf("storage: upload scope digest: %w", err)
+		}
+		if uploaded != digest {
+			return nil, ErrGatewayScopeDigestChanged
+		}
 	}
 	var stored any
 	if digest != "" {
@@ -512,7 +639,7 @@ func (r *Gateways) ApproveConnectorScope(ctx context.Context, gatewayID, connect
 	}
 	c, err = scanGatewayConnector(tx.QueryRow(ctx, `
 		UPDATE gateway_connectors SET status = 'approved', approved_by = $2, approved_at = $3,
-			approved_scope_digest = $4, status_reason = NULL
+			approved_scope_digest = COALESCE($4, approved_scope_digest), status_reason = NULL
 		WHERE id = $1
 		RETURNING `+gatewayConnectorColumns, connectorID, by, at, stored))
 	if err != nil {

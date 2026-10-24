@@ -95,7 +95,14 @@ on `main`.
   that disagree pause dispatch too. One discovery lease per connector is
   granted across api replicas, no sooner than the 60 second floor, with
   a TTL from `SB_GATEWAY_DISCOVERY_LEASE_TTL` (default 5m). Approve
-  takes the scope digest the admin was shown.
+  takes the scope digest the admin was shown; once a digest was
+  approved it is never cleared, and with discovery on it must be the
+  digest of the latest upload. Only a replica whose own heartbeat
+  reports the approved digest can claim. A connector reported
+  `over_privileged` latches back to pending (`status_reason:
+  over_privileged`) until a platform admin re-approves it after a
+  passing probe; the pause no longer lifts on the next healthy
+  heartbeat. E3 refuses static target ids in the discovered `d-` shape.
 - `redis_call_timeouts_total{site}` counts Redis calls on the auth paths
   (`auth_cache`) and in the rate limiter (`rate_limit`) that hit their
   deadline, so a slow Redis shows before limiters start failing open.

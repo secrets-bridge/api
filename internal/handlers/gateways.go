@@ -864,6 +864,8 @@ func (h *Gateways) AdminApproveConnector(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusConflict, "scope_digest_changed")
 	case errors.Is(err, storage.ErrGatewayProjectMappingIncomplete):
 		return fiber.NewError(fiber.StatusConflict, "project_mapping_incomplete")
+	case errors.Is(err, storage.ErrGatewayConnectorOverPrivileged):
+		return fiber.NewError(fiber.StatusConflict, "connector_over_privileged")
 	case err != nil:
 		return err
 	}

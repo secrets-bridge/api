@@ -86,6 +86,21 @@ type connRow struct {
 	Status, Reason, Approved string
 }
 
+// retireReplicas moves every replica of a Gateway out of the live
+// window except keep: the fixture's first heartbeat comes from a replica
+// that never sends a digest, and a live replica without one blocks a
+// lease and an approval.
+func (f *gwFixture) retireReplicas(t *testing.T, gatewayID string, keep ...string) {
+	t.Helper()
+	if keep == nil {
+		keep = []string{}
+	}
+	if _, err := f.l.pool.Exec(t.Context(), `UPDATE gateway_replicas SET last_seen_at = now() - interval '11 minutes'
+		WHERE gateway_id = $1 AND NOT (replica_id::text = ANY($2::text[]))`, gatewayID, keep); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (f *gwFixture) connRow(t *testing.T, connID string) connRow {
 	t.Helper()
 	var c connRow
@@ -163,6 +178,7 @@ func TestLive_GatewayDiscovery_Contract1HeartbeatUnchanged(t *testing.T) {
 // re-approving the new one resumes the binding and dispatch.
 func TestLive_GatewayDiscovery_ScopeChangePausesDispatch(t *testing.T) {
 	f := newObsFixture(t)
+	f.retireReplicas(t, f.gw.GatewayID)
 	reqID, _ := f.executeOn(t, f.env, f.secret)
 	f.makeClaimable(t, reqID)
 
@@ -252,6 +268,7 @@ func reflectEqualSanitized(action string, meta map[string]any) bool {
 // granted and approve is refused. Once they agree, all three lift.
 func TestLive_GatewayDiscovery_ReplicasDisagree(t *testing.T) {
 	f := newObsFixture(t)
+	f.retireReplicas(t, f.gw.GatewayID)
 	reqID, _ := f.executeOn(t, f.env, f.secret)
 	f.makeClaimable(t, reqID)
 	r1, r2 := f.replica, uuid.NewString()

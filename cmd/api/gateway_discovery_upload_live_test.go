@@ -354,6 +354,9 @@ func TestLive_GatewayDiscoveryUpload_Refusals(t *testing.T) {
 func TestLive_GatewayDiscoveryUpload_MissingTargetSuspendsBinding(t *testing.T) {
 	f := newObsFixture(t)
 	d := &discFixture{gwFixture: f.gwFixture, gw: f.gw, hdr: f.gwHdr, connID: f.connID}
+	// The fixture's first replica never sends a digest; while it is live
+	// no lease is granted.
+	f.retireReplicas(t, f.gw.GatewayID)
 	l := d.lease(t)
 	entries := discEntries(3)
 	d.mustUpload(t, uploadBody(l, entries))
@@ -455,5 +458,17 @@ func TestLive_GatewayDiscovery_SnapshotStaleRefusalIsNotAFailure(t *testing.T) {
 		if len(ts) != 1 || ts[0].FailureCount != c.failures {
 			t.Fatalf("after a %s refusal: failure_count = %d; want %d", c.reason, ts[0].FailureCount, c.failures)
 		}
+	}
+}
+
+// TestLive_GatewayDiscoveryUpload_StoresUploadScope: an accepted upload
+// records its scope digest, which approve must then carry (review on
+// #317, item 4).
+func TestLive_GatewayDiscoveryUpload_StoresUploadScope(t *testing.T) {
+	d := newDiscFixture(t, newGatewayFixture(t), "disc-scope-gw")
+	d.mustUpload(t, uploadBody(d.lease(t), discEntries(1)))
+	var got string
+	if err := d.l.pool.QueryRow(t.Context(), `SELECT COALESCE(discovery_scope_digest, '') FROM gateway_connectors WHERE id = $1`, d.connID).Scan(&got); err != nil || got != testScope() {
+		t.Fatalf("stored upload scope = %q, %v; want %s", got, err, testScope())
 	}
 }

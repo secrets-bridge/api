@@ -38,6 +38,14 @@ func (s *GatewayService) auditDiscoveryHeartbeat(ctx context.Context, gatewayID,
 	actor := gatewayActor(gatewayID)
 	for _, ev := range d.ScopeEvents {
 		if ev.Event == storage.GatewayScopeEventMismatch {
+			// Replicas disagree: dispatch paused and leased tasks requeued.
+			s.appendAudit(ctx, &storage.AuditEvent{
+				Actor: actor, Action: "gateway.connector.scope_mismatch", Resource: actor, Status: storage.AuditStatusFailure,
+				Metadata: map[string]any{
+					"gateway_id": gatewayID.String(), "connector_id": ev.ConnectorID.String(), "replica_id": replicaID.String(),
+					"tasks_requeued": ev.TasksRequeued,
+				},
+			})
 			continue
 		}
 		meta := map[string]any{
@@ -58,6 +66,21 @@ func (s *GatewayService) auditDiscoveryHeartbeat(ctx context.Context, gatewayID,
 		}
 		s.appendAudit(ctx, &storage.AuditEvent{
 			Actor: actor, Action: "gateway.connector.scope_changed", Resource: actor, Status: status, Metadata: meta,
+		})
+	}
+}
+
+// auditOverPrivilegedLatch records each connector a heartbeat latched
+// back to advertised for over_privileged.
+func (s *GatewayService) auditOverPrivilegedLatch(ctx context.Context, gatewayID, replicaID uuid.UUID, evs []storage.GatewayScopeEvent) {
+	actor := gatewayActor(gatewayID)
+	for _, ev := range evs {
+		s.appendAudit(ctx, &storage.AuditEvent{
+			Actor: actor, Action: "gateway.connector.approval_reset", Resource: actor, Status: storage.AuditStatusFailure,
+			Metadata: map[string]any{
+				"gateway_id": gatewayID.String(), "connector_id": ev.ConnectorID.String(), "replica_id": replicaID.String(),
+				"reason": storage.GatewayConnectorReasonOverPrivileged, "tasks_requeued": ev.TasksRequeued,
+			},
 		})
 	}
 }

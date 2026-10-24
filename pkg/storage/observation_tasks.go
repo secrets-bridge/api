@@ -616,6 +616,17 @@ const bindingDiscoveredDispatchableSQL = `(b.target_source = 'static' OR (
 			WHERE pdt.connector_id = b.argocd_connector_id AND pdt.target_id = b.argocd_target_id AND pdt.status = 'present')
 		AND ` + bindingTeamCoveredSQL + `))`
 
+// claimerScopeApprovedSQL is true when connector c has no approved
+// digest (a contract 1 Gateway), or the claiming replica ($3), live in
+// the window ($2), last reported exactly the approved digest for c. A
+// replica that sent no digest yet (its first, contract 1 shaped
+// heartbeat), one that never heartbeated, and one at another digest
+// cannot claim (review on #317, item 1).
+const claimerScopeApprovedSQL = `(c.approved_scope_digest IS NULL OR EXISTS (
+		SELECT 1 FROM gateway_replicas ro, jsonb_array_elements(ro.connector_health) oh
+		WHERE ro.gateway_id = t.gateway_id AND ro.replica_id = $3 AND ro.last_seen_at > now() - $2::interval
+		  AND oh->>'connector_id' = c.name AND oh->>'scope_digest' = c.approved_scope_digest))`
+
 // gatewayReplicaWindowSQL is GatewayReplicaLiveWindow as a Postgres
 // interval.
 var gatewayReplicaWindowSQL = fmt.Sprintf("%d seconds", int(GatewayReplicaLiveWindow/time.Second))
@@ -708,10 +719,11 @@ func (r *ObservationTasks) Claim(ctx context.Context, gatewayID, replicaID uuid.
 			  AND NOT `+bindingTargetIdentityChangedSQL+`
 			  AND NOT `+connectorOverPrivilegedSQL+`
 			  AND NOT `+connectorScopeUnsettledSQL+`
-			  AND `+bindingDiscoveredDispatchableSQL+`)
+			  AND `+bindingDiscoveredDispatchableSQL+`
+			  AND `+claimerScopeApprovedSQL+`)
 		ORDER BY t.not_before, t.created_at
 		LIMIT 1
-		FOR UPDATE OF t SKIP LOCKED`, gatewayID, gatewayReplicaWindowSQL).Scan(&taskID, &prevAttempt)
+		FOR UPDATE OF t SKIP LOCKED`, gatewayID, gatewayReplicaWindowSQL, replicaID).Scan(&taskID, &prevAttempt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNoObservationTask
 	}
