@@ -1328,7 +1328,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// authenticated Gateway id. Admin routes under /admin/gateways stay
 	// behind the session gate, each with a gateway.* permission and a
 	// fresh second factor on every write.
-	gatewaySvc := services.NewGatewayService(storage.NewGateways(pool), auditRepo, rdb)
+	gatewaySvc := services.NewGatewayService(storage.NewGateways(pool), auditRepo, rdb).
+		WithDiscoveryLeaseTTL(cfg.GatewayDiscoveryLeaseTTL)
 	gatewaysH := handlers.NewGateways(gatewaySvc, cfg.Env != ModeDev).WithObservations(observationSvc)
 	// E4 to E7 fail closed: without Redis the limiter answers 503,
 	// which the Gateway client treats as transient and backs off on,

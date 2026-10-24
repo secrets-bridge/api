@@ -147,6 +147,10 @@ var auditMetaKeys = map[string]auditMetaKind{
 	// target identity pin (api#312): scoped one-way digests, never a uid
 	"identity_digest_before": metaDigest, "identity_digest_after": metaDigest,
 	"bindings_suspended": metaNumber, "bindings_resumed": metaNumber,
+	// Argo CD discovery (api#308): one-way scope digests, ids and counts
+	// only, never an AppProject, namespace or Application name
+	"scope_digest": metaDigest, "scope_digest_before": metaDigest, "scope_digest_after": metaDigest,
+	"adopted": metaBool, "app_project_count_before": metaNumber,
 
 	// gateway observation queue (api#294): ids, enums, digests and counts only
 	"task_id": metaID, "attempt_id": metaID, "previous_attempt_id": metaID, "superseding_task_id": metaID,

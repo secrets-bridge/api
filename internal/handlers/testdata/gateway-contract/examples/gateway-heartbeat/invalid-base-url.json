@@ -1,0 +1,35 @@
+{
+  "replica_id": "7f3c9e2a-1b2c-4d5e-8f90-123456789abc",
+  "gateway_version": "0.4.0",
+  "contract_versions": [
+    "1",
+    "2"
+  ],
+  "status": "ok",
+  "in_flight": 1,
+  "catalog_version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "bound_targets_version": "",
+  "connectors": [
+    {
+      "connector_id": "argocd-main",
+      "kind": "argocd",
+      "status": "ok",
+      "scope_digest": "sha256:bf4357a6ba9936070285b4ac00d9d32ba1ad29922757fbd7556dc9f08c2784a7",
+      "discovery_enabled": true,
+      "discovery_interval_seconds": 300,
+      "base_url": "https://argocd.example.com"
+    },
+    {
+      "connector_id": "argocd-static",
+      "kind": "argocd",
+      "status": "ok",
+      "scope_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "discovery_enabled": false
+    },
+    {
+      "connector_id": "eso-main",
+      "kind": "eso",
+      "status": "ok"
+    }
+  ]
+}

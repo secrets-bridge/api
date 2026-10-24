@@ -160,10 +160,17 @@ type gatewayHeartbeatRequest struct {
 	Status           string   `json:"status"`
 	InFlight         int      `json:"in_flight"`
 	CatalogVersion   string   `json:"catalog_version,omitempty"`
-	Connectors       []struct {
+	// Contract 2 (api#308). The service refuses it unless the request
+	// lists "2".
+	BoundTargetsVersion *string `json:"bound_targets_version,omitempty"`
+	Connectors          []struct {
 		ConnectorID string `json:"connector_id"`
 		Kind        string `json:"kind"`
 		Status      string `json:"status"`
+		// Contract 2, Argo CD only.
+		ScopeDigest              *string `json:"scope_digest,omitempty"`
+		DiscoveryEnabled         *bool   `json:"discovery_enabled,omitempty"`
+		DiscoveryIntervalSeconds *int    `json:"discovery_interval_seconds,omitempty"`
 	} `json:"connectors,omitempty"`
 }
 
@@ -174,6 +181,58 @@ type gatewayHeartbeatResponse struct {
 	ClaimPollSeconds     int    `json:"claim_poll_seconds"`
 	ContractVersion      string `json:"contract_version"`
 	CatalogVersion       string `json:"catalog_version"`
+	// Contract 2 only (api#308, discovery-contract.md section 2.4). A
+	// contract 1 answer never carries them.
+	DiscoveryLeases     []gatewayDiscoveryLeaseView     `json:"discovery_leases,omitempty"`
+	SnapshotGenerations []gatewaySnapshotGenerationView `json:"snapshot_generations,omitempty"`
+	BoundTargetsVersion *string                         `json:"bound_targets_version,omitempty"`
+	// BoundTargets is a pointer so an empty full replace is sent as [].
+	BoundTargets *[]storage.GatewayBoundTargets `json:"bound_targets,omitempty"`
+}
+
+type gatewayDiscoveryLeaseView struct {
+	ConnectorID string `json:"connector_id"`
+	LeaseID     string `json:"lease_id"`
+	Generation  int64  `json:"generation"`
+	ExpiresAt   string `json:"expires_at"`
+}
+
+type gatewaySnapshotGenerationView struct {
+	ConnectorID string `json:"connector_id"`
+	Generation  int64  `json:"generation"`
+}
+
+// heartbeatResponse renders an E2 200 body. The contract 2 fields are
+// set only when the service answered contract 2.
+func heartbeatResponse(res *services.GatewayHeartbeatResult) gatewayHeartbeatResponse {
+	out := gatewayHeartbeatResponse{
+		Status: "ok", ServerTime: res.ServerTime.UTC().Format(time.RFC3339Nano),
+		NextHeartbeatSeconds: res.NextHeartbeatSeconds, ClaimPollSeconds: res.ClaimPollSeconds,
+		ContractVersion: res.ContractVersion, CatalogVersion: res.CatalogVersion,
+	}
+	d := res.Discovery
+	if d == nil {
+		return out
+	}
+	for _, l := range d.Leases {
+		out.DiscoveryLeases = append(out.DiscoveryLeases, gatewayDiscoveryLeaseView{
+			ConnectorID: l.ConnectorName, LeaseID: l.LeaseID.String(), Generation: l.Generation,
+			ExpiresAt: l.ExpiresAt.UTC().Format(time.RFC3339),
+		})
+	}
+	for _, g := range d.SnapshotGenerations {
+		out.SnapshotGenerations = append(out.SnapshotGenerations, gatewaySnapshotGenerationView{ConnectorID: g.ConnectorName, Generation: g.Generation})
+	}
+	version := d.BoundTargetsVersion
+	out.BoundTargetsVersion = &version
+	if res.SendBoundTargets {
+		list := d.BoundTargets
+		if list == nil {
+			list = []storage.GatewayBoundTargets{}
+		}
+		out.BoundTargets = &list
+	}
+	return out
 }
 
 func authenticatedGateway(c fiber.Ctx) (uuid.UUID, error) {
@@ -197,9 +256,13 @@ func (h *Gateways) Heartbeat(c fiber.Ctx) error {
 	in := services.GatewayHeartbeatInput{
 		ReplicaID: req.ReplicaID, GatewayVersion: req.GatewayVersion, ContractVersions: req.ContractVersions,
 		Status: req.Status, InFlight: req.InFlight, CatalogVersion: req.CatalogVersion,
+		BoundTargetsVersion: req.BoundTargetsVersion,
 	}
 	for _, ch := range req.Connectors {
-		in.Connectors = append(in.Connectors, storage.GatewayConnectorHealth{ConnectorID: ch.ConnectorID, Kind: ch.Kind, Status: ch.Status})
+		in.Connectors = append(in.Connectors, services.GatewayHeartbeatConnector{
+			ConnectorID: ch.ConnectorID, Kind: ch.Kind, Status: ch.Status,
+			ScopeDigest: ch.ScopeDigest, DiscoveryEnabled: ch.DiscoveryEnabled, DiscoveryIntervalSeconds: ch.DiscoveryIntervalSeconds,
+		})
 	}
 	res, err := h.svc.Heartbeat(c.Context(), id, in)
 	switch {
@@ -213,11 +276,7 @@ func (h *Gateways) Heartbeat(c fiber.Ctx) error {
 	case err != nil:
 		return err
 	}
-	return c.JSON(gatewayHeartbeatResponse{
-		Status: "ok", ServerTime: res.ServerTime.UTC().Format(time.RFC3339Nano),
-		NextHeartbeatSeconds: res.NextHeartbeatSeconds, ClaimPollSeconds: res.ClaimPollSeconds,
-		ContractVersion: res.ContractVersion, CatalogVersion: res.CatalogVersion,
-	})
+	return c.JSON(heartbeatResponse(res))
 }
 
 // ---- E3 catalog --------------------------------------------------------
@@ -338,14 +397,23 @@ func toGatewayView(g *storage.Gateway) gatewayView {
 }
 
 type gatewayReplicaView struct {
-	ReplicaID      string                           `json:"replica_id"`
-	GatewayVersion string                           `json:"gateway_version,omitempty"`
-	Status         string                           `json:"status"`
-	InFlight       int                              `json:"in_flight"`
-	CatalogVersion string                           `json:"catalog_version,omitempty"`
-	Connectors     []storage.GatewayConnectorHealth `json:"connectors"`
-	FirstSeenAt    string                           `json:"first_seen_at"`
-	LastSeenAt     string                           `json:"last_seen_at"`
+	ReplicaID      string                        `json:"replica_id"`
+	GatewayVersion string                        `json:"gateway_version,omitempty"`
+	Status         string                        `json:"status"`
+	InFlight       int                           `json:"in_flight"`
+	CatalogVersion string                        `json:"catalog_version,omitempty"`
+	Connectors     []gatewayReplicaConnectorView `json:"connectors"`
+	FirstSeenAt    string                        `json:"first_seen_at"`
+	LastSeenAt     string                        `json:"last_seen_at"`
+}
+
+// gatewayReplicaConnectorView is a connector line of a replica: enums
+// only, as before api#308. The scope digest is shown once per connector
+// (gatewayConnectorView), not per replica.
+type gatewayReplicaConnectorView struct {
+	ConnectorID string `json:"connector_id"`
+	Kind        string `json:"kind"`
+	Status      string `json:"status"`
 }
 
 type gatewayConnectorView struct {
@@ -357,6 +425,33 @@ type gatewayConnectorView struct {
 	ApprovedBy       string              `json:"approved_by,omitempty"`
 	ApprovedAt       *string             `json:"approved_at,omitempty"`
 	LastAdvertisedAt *string             `json:"last_advertised_at,omitempty"`
+	// Discovery (api#308). StatusReason is scope_changed,
+	// scope_mismatch_between_replicas or snapshot_stale. ScopeDigest is
+	// the digest every live replica reports now, the one an approve body
+	// carries; ScopeMismatch is true while they disagree. Platform
+	// admins only (gateway.list): the catalog read never carries them.
+	StatusReason        string   `json:"status_reason,omitempty"`
+	ScopeDigest         string   `json:"scope_digest,omitempty"`
+	ScopeMismatch       bool     `json:"scope_mismatch,omitempty"`
+	ApprovedScopeDigest string   `json:"approved_scope_digest,omitempty"`
+	DiscoveryEnabled    bool     `json:"discovery_enabled,omitempty"`
+	DiscoveryGeneration int64    `json:"discovery_generation,omitempty"`
+	LastDiscoveryAt     *string  `json:"last_discovery_at,omitempty"`
+	AllowedProjects     []string `json:"allowed_projects,omitempty"`
+}
+
+func replicaConnectors(hs []storage.GatewayConnectorHealth) []gatewayReplicaConnectorView {
+	out := make([]gatewayReplicaConnectorView, 0, len(hs))
+	for _, h := range hs {
+		out = append(out, gatewayReplicaConnectorView{ConnectorID: h.ConnectorID, Kind: h.Kind, Status: h.Status})
+	}
+	return out
+}
+
+// withScope adds what the live replicas report to a connector view.
+func (v gatewayConnectorView) withScope(sc storage.GatewayConnectorScope) gatewayConnectorView {
+	v.ScopeDigest, v.ScopeMismatch, v.DiscoveryEnabled = sc.ReportedDigest, sc.Mismatch, sc.DiscoveryEnabled
+	return v
 }
 
 // gatewayTargetView is an advertised target in the admin read. It
@@ -393,6 +488,9 @@ func toConnectorView(c *storage.GatewayConnector) gatewayConnectorView {
 	return gatewayConnectorView{
 		ID: c.ID.String(), ConnectorID: c.Name, Kind: c.Kind, Status: c.Status, Targets: targets,
 		ApprovedBy: c.ApprovedBy, ApprovedAt: timePtr(c.ApprovedAt), LastAdvertisedAt: timePtr(c.LastAdvertisedAt),
+		StatusReason: c.StatusReason, ApprovedScopeDigest: c.ApprovedScopeDigest,
+		DiscoveryGeneration: c.DiscoveryGeneration, LastDiscoveryAt: timePtr(c.LastDiscoveryAt),
+		AllowedProjects: c.AllowedProjects,
 	}
 }
 
@@ -667,13 +765,17 @@ func (h *Gateways) AdminGet(c fiber.Ctx) error {
 	for _, r := range d.Replicas {
 		replicas = append(replicas, gatewayReplicaView{
 			ReplicaID: r.ReplicaID.String(), GatewayVersion: r.GatewayVersion, Status: r.Status, InFlight: r.InFlight,
-			CatalogVersion: r.CatalogVersion, Connectors: r.ConnectorHealth,
+			CatalogVersion: r.CatalogVersion, Connectors: replicaConnectors(r.ConnectorHealth),
 			FirstSeenAt: r.FirstSeenAt.UTC().Format(time.RFC3339), LastSeenAt: r.LastSeenAt.UTC().Format(time.RFC3339),
 		})
 	}
+	scopes, err := h.svc.ConnectorScopes(c.Context(), id, d.Connectors)
+	if err != nil {
+		return err
+	}
 	conns := make([]gatewayConnectorView, 0, len(d.Connectors))
 	for _, cn := range d.Connectors {
-		conns = append(conns, toConnectorView(cn))
+		conns = append(conns, toConnectorView(cn).withScope(scopes[cn.ID]))
 	}
 	bindings := make([]gatewayBindingView, 0, len(d.Bindings))
 	for _, b := range d.Bindings {
@@ -708,12 +810,28 @@ func (h *Gateways) AdminApproveConnector(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	cn, err := h.svc.ApproveConnector(c.Context(), id, cid, actor)
+	// api#308 (A3): the approved scope digest. An empty body stays valid
+	// for a contract 1 Gateway.
+	var req struct {
+		ScopeDigest string `json:"scope_digest"`
+	}
+	if len(bytes.TrimSpace(c.Body())) > 0 {
+		if err := decodeStrict(c.Body(), &req); err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, "invalid_request")
+		}
+	}
+	cn, err := h.svc.ApproveConnector(c.Context(), id, cid, req.ScopeDigest, actor)
 	switch {
+	case errors.Is(err, services.ErrGatewayDiscoveryInvalid):
+		return fiber.NewError(fiber.StatusBadRequest, "invalid_request")
 	case errors.Is(err, storage.ErrNotFound):
 		return fiber.NewError(fiber.StatusNotFound, "connector_not_found")
 	case errors.Is(err, storage.ErrGatewayConnectorNotApprovable):
 		return fiber.NewError(fiber.StatusConflict, "connector_not_advertised")
+	case errors.Is(err, storage.ErrGatewayScopeDigestChanged):
+		return fiber.NewError(fiber.StatusConflict, "scope_digest_changed")
+	case errors.Is(err, storage.ErrGatewayProjectMappingIncomplete):
+		return fiber.NewError(fiber.StatusConflict, "project_mapping_incomplete")
 	case err != nil:
 		return err
 	}

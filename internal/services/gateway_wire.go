@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
@@ -45,6 +46,7 @@ var (
 	gatewayUUIDRe         = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 	gatewayNameRe         = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 	gatewayClusterNameRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	gatewaySHA256Re       = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 )
 
 // Bounds. The 64 KiB body cap is the outer limit; these keep the stored
@@ -61,6 +63,13 @@ const (
 	gatewayMaxSecretRefLen      = 512
 	gatewayContractVersion      = "1"
 	gatewayHeartbeatIntervalSec = 30
+	// gatewayContractV2 is the discovery contract (api#308, gateway
+	// docs/design/discovery-contract.md section 2.1). It is answered only
+	// to a request that lists it; "1" keeps working unchanged.
+	gatewayContractV2 = "2"
+	// Discovery interval bounds a replica may report (section 2.3).
+	gatewayDiscoveryIntervalMin = 60
+	gatewayDiscoveryIntervalMax = 1800
 	gatewayClaimPollSec         = 5
 )
 
@@ -89,7 +98,87 @@ type GatewayHeartbeatInput struct {
 	Status           string
 	InFlight         int
 	CatalogVersion   string
-	Connectors       []storage.GatewayConnectorHealth
+	Connectors       []GatewayHeartbeatConnector
+	// BoundTargetsVersion is contract 2 (api#308). Nil when absent; its
+	// presence makes the heartbeat contract 2 shaped.
+	BoundTargetsVersion *string
+}
+
+// GatewayHeartbeatConnector is one connector of an E2 body. The pointer
+// fields are contract 2, Argo CD only, and nil when absent.
+type GatewayHeartbeatConnector struct {
+	ConnectorID              string
+	Kind                     string
+	Status                   string
+	ScopeDigest              *string
+	DiscoveryEnabled         *bool
+	DiscoveryIntervalSeconds *int
+}
+
+// listsContract reports whether the request lists contract version v.
+func (in GatewayHeartbeatInput) listsContract(v string) bool {
+	return slices.Contains(in.ContractVersions, v)
+}
+
+// contract2Shaped reports whether the heartbeat carries the contract 2
+// fields (rule 4: a contract 2 shaped heartbeat always carries
+// bound_targets_version).
+func (in GatewayHeartbeatInput) contract2Shaped() bool { return in.BoundTargetsVersion != nil }
+
+// validateContract2 checks the contract 2 fields (section 2.3). They are
+// refused unless the request lists "2" and is contract 2 shaped; in a
+// contract 2 shaped heartbeat every Argo CD connector carries
+// scope_digest and discovery_enabled, eso and rollout never do, and the
+// interval is there exactly when discovery is on.
+func (in GatewayHeartbeatInput) validateContract2() error {
+	shaped := in.contract2Shaped()
+	if shaped && !in.listsContract(gatewayContractV2) {
+		return gatewayInvalid("bound_targets_version")
+	}
+	if shaped && !gatewayCatalogVerRe.MatchString(*in.BoundTargetsVersion) {
+		return gatewayInvalid("bound_targets_version")
+	}
+	for _, c := range in.Connectors {
+		v2 := c.ScopeDigest != nil || c.DiscoveryEnabled != nil || c.DiscoveryIntervalSeconds != nil
+		switch {
+		case v2 && !shaped:
+			return gatewayInvalid("connectors.scope_digest")
+		case !shaped:
+			continue
+		case c.Kind != GatewayKindArgoCD:
+			if v2 {
+				return gatewayInvalid("connectors.scope_digest")
+			}
+			continue
+		case c.ScopeDigest == nil || c.DiscoveryEnabled == nil || !gatewaySHA256Re.MatchString(*c.ScopeDigest):
+			return gatewayInvalid("connectors.scope_digest")
+		}
+		if *c.DiscoveryEnabled != (c.DiscoveryIntervalSeconds != nil) {
+			return gatewayInvalid("connectors.discovery_interval_seconds")
+		}
+		if p := c.DiscoveryIntervalSeconds; p != nil && (*p < gatewayDiscoveryIntervalMin || *p > gatewayDiscoveryIntervalMax) {
+			return gatewayInvalid("connectors.discovery_interval_seconds")
+		}
+	}
+	return nil
+}
+
+// health is the stored form of the reported connectors.
+func (in GatewayHeartbeatInput) health() []storage.GatewayConnectorHealth {
+	out := make([]storage.GatewayConnectorHealth, 0, len(in.Connectors))
+	for _, c := range in.Connectors {
+		h := storage.GatewayConnectorHealth{ConnectorID: c.ConnectorID, Kind: c.Kind, Status: c.Status}
+		if c.ScopeDigest != nil {
+			h.ScopeDigest = *c.ScopeDigest
+			on := c.DiscoveryEnabled != nil && *c.DiscoveryEnabled
+			h.DiscoveryEnabled = &on
+			if c.DiscoveryIntervalSeconds != nil {
+				h.DiscoveryIntervalSeconds = *c.DiscoveryIntervalSeconds
+			}
+		}
+		out = append(out, h)
+	}
+	return out
 }
 
 func (in GatewayHeartbeatInput) validate() (uuid.UUID, error) {
@@ -137,6 +226,9 @@ func (in GatewayHeartbeatInput) validate() (uuid.UUID, error) {
 		if !gatewayConnectorState[c.Status] {
 			return uuid.Nil, gatewayInvalid("connectors.status")
 		}
+	}
+	if err := in.validateContract2(); err != nil {
+		return uuid.Nil, err
 	}
 	return replica, nil
 }

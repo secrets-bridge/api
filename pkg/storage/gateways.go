@@ -134,6 +134,11 @@ type GatewayConnectorHealth struct {
 	ConnectorID string `json:"connector_id"`
 	Kind        string `json:"kind"`
 	Status      string `json:"status"`
+	// Contract 2, Argo CD only (api#308): the scope digest, the local
+	// discovery switch and interval. One-way digest, no URL or name.
+	ScopeDigest              string `json:"scope_digest,omitempty"`
+	DiscoveryEnabled         *bool  `json:"discovery_enabled,omitempty"`
+	DiscoveryIntervalSeconds int    `json:"discovery_interval_seconds,omitempty"`
 }
 
 // GatewayReplica mirrors a gateway_replicas row.
@@ -206,6 +211,14 @@ type GatewayConnector struct {
 	LastAdvertisedAt *time.Time
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
+	// Discovery (api#308, migration 0050).
+	ApprovedScopeDigest string
+	StatusReason        string
+	DiscoveryGeneration int64
+	LastDiscoveryAt     *time.Time
+	// AllowedProjects is the allowed AppProject list of the latest
+	// accepted discovery upload, nil when there is none.
+	AllowedProjects []string
 }
 
 // Target returns the advertised target with id, if any.
@@ -238,13 +251,16 @@ type GatewayBinding struct {
 	Enabled              bool
 	CreatedBy            string
 	CreatedAt            time.Time
-	// SuspendedReason is identity_changed while the binding's Argo CD
-	// target is identity_changed (api#312), else "". Derived, not a
-	// column.
+	// SuspendedReason is the stored suspended_reason (api#308:
+	// target_missing, mapping_removed, scope_changed), else
+	// identity_changed while the binding's static Argo CD target is
+	// identity_changed (api#312, derived), else "".
 	SuspendedReason string
+	// TargetSource is static or discovered (api#308).
+	TargetSource string
 }
 
-// GatewayHeartbeatis what one replica reported, already validated.
+// GatewayHeartbeat is what one replica reported, already validated.
 type GatewayHeartbeat struct {
 	GatewayID        uuid.UUID
 	ReplicaID        uuid.UUID
@@ -254,6 +270,15 @@ type GatewayHeartbeat struct {
 	InFlight         int
 	CatalogVersion   string
 	Connectors       []GatewayConnectorHealth
+	// AnswerContract2 is true when the request lists contract "2": the
+	// outcome then carries the contract 2 response data (api#308).
+	AnswerContract2 bool
+	// Contract2 is true for a contract 2 shaped heartbeat (it carries
+	// bound_targets_version and the per-connector scope fields): scope
+	// digests are applied and leases granted.
+	Contract2 bool
+	// LeaseTTL is the discovery lease TTL setting.
+	LeaseTTL time.Duration
 }
 
 // GatewayHeartbeatOutcome is what RecordHeartbeat found.
@@ -262,6 +287,8 @@ type GatewayHeartbeatOutcome struct {
 	PrevReplicaStatus string
 	CatalogVersion    string
 	MaxReplicas       int
+	// Discovery is set when the heartbeat is answered as contract 2.
+	Discovery *GatewayDiscoveryHeartbeat
 }
 
 // GatewayCatalogConnector is one connector of a validated catalog.
@@ -725,6 +752,11 @@ func (r *Gateways) RecordHeartbeat(ctx context.Context, hb GatewayHeartbeat, at,
 		WHERE id = $1`, hb.GatewayID, at, hb.Status, hb.GatewayVersion, contract); err != nil {
 		return nil, fmt.Errorf("storage: update gateway liveness: %w", err)
 	}
+	if hb.AnswerContract2 {
+		if out.Discovery, err = recordDiscoveryHeartbeat(ctx, tx, hb, at, seenSince); err != nil {
+			return nil, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("storage: commit heartbeat: %w", err)
 	}
@@ -761,13 +793,16 @@ func (r *Gateways) ListReplicas(ctx context.Context, gatewayID uuid.UUID) ([]*Ga
 
 const gatewayConnectorColumns = `
 	id, gateway_id, name, kind, advertised_targets, status,
-	COALESCE(approved_by, ''), approved_at, last_advertised_at, created_at, updated_at`
+	COALESCE(approved_by, ''), approved_at, last_advertised_at, created_at, updated_at,
+	COALESCE(approved_scope_digest, ''), COALESCE(status_reason, ''), discovery_generation,
+	last_discovery_at, discovery_allowed_projects`
 
 func scanGatewayConnector(row pgx.Row) (*GatewayConnector, error) {
 	var c GatewayConnector
-	var targets []byte
+	var targets, allowed []byte
 	err := row.Scan(&c.ID, &c.GatewayID, &c.Name, &c.Kind, &targets, &c.Status,
-		&c.ApprovedBy, &c.ApprovedAt, &c.LastAdvertisedAt, &c.CreatedAt, &c.UpdatedAt)
+		&c.ApprovedBy, &c.ApprovedAt, &c.LastAdvertisedAt, &c.CreatedAt, &c.UpdatedAt,
+		&c.ApprovedScopeDigest, &c.StatusReason, &c.DiscoveryGeneration, &c.LastDiscoveryAt, &allowed)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -776,6 +811,11 @@ func scanGatewayConnector(row pgx.Row) (*GatewayConnector, error) {
 	}
 	if err := json.Unmarshal(targets, &c.Targets); err != nil || c.Targets == nil {
 		c.Targets = []GatewayTarget{}
+	}
+	if allowed != nil {
+		if err := json.Unmarshal(allowed, &c.AllowedProjects); err != nil || c.AllowedProjects == nil {
+			c.AllowedProjects = []string{}
+		}
 	}
 	return &c, nil
 }
@@ -1015,23 +1055,6 @@ func (r *Gateways) ReplaceCatalog(ctx context.Context, gatewayID uuid.UUID, conn
 	return out, nil
 }
 
-// ApproveConnector moves an advertised connector of gatewayID to
-// approved.
-func (r *Gateways) ApproveConnector(ctx context.Context, gatewayID, connectorID uuid.UUID, by string, at time.Time) (*GatewayConnector, error) {
-	c, err := scanGatewayConnector(r.pool.QueryRow(ctx, `
-		UPDATE gateway_connectors SET status = 'approved', approved_by = $3, approved_at = $4
-		WHERE id = $1 AND gateway_id = $2 AND status = 'advertised'
-		RETURNING `+gatewayConnectorColumns, connectorID, gatewayID, by, at))
-	if !errors.Is(err, ErrNotFound) {
-		return c, err
-	}
-	prev, gerr := r.GetConnector(ctx, connectorID)
-	if gerr != nil || prev.GatewayID != gatewayID {
-		return nil, ErrNotFound
-	}
-	return nil, ErrGatewayConnectorNotApprovable
-}
-
 // Target re-confirm errors (api#312).
 var (
 	ErrGatewayTargetNotFound           = errors.New("storage: gateway target not found")
@@ -1106,7 +1129,8 @@ const gatewayBindingColumns = `
 	b.rollout_connector_id, COALESCE(b.rollout_target_id, ''),
 	b.argocd_connector_id, COALESCE(b.argocd_target_id, ''),
 	b.observation_timeout_s, b.enabled, b.created_by, b.created_at,
-	CASE WHEN ` + bindingTargetIdentityChangedSQL + ` THEN 'identity_changed' ELSE '' END`
+	COALESCE(b.suspended_reason, CASE WHEN ` + bindingTargetIdentityChangedSQL + ` THEN 'identity_changed' ELSE '' END),
+	b.target_source`
 
 // bindingTargetIdentityChangedSQL is true when binding b's Argo CD
 // target is identity_changed (api#312). The claim query and the binding
@@ -1125,7 +1149,7 @@ func scanGatewayBinding(row pgx.Row) (*GatewayBinding, error) {
 		&b.ESOConnectorID, &b.ESOTargetID,
 		&b.RolloutConnectorID, &b.RolloutTargetID,
 		&b.ArgoCDConnectorID, &b.ArgoCDTargetID,
-		&b.ObservationTimeoutS, &b.Enabled, &b.CreatedBy, &b.CreatedAt, &b.SuspendedReason)
+		&b.ObservationTimeoutS, &b.Enabled, &b.CreatedBy, &b.CreatedAt, &b.SuspendedReason, &b.TargetSource)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}

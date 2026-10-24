@@ -1,0 +1,58 @@
+{
+  "items": [
+    {
+      "gateway_id": "123e4567-e89b-42d3-a456-426614174000",
+      "connector_uuid": "9a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+      "connector_id": "argocd-main",
+      "target_id": "d-zk5ykqqvtcwquubd3reviuzqrz",
+      "source": "discovered",
+      "status": "present",
+      "app_project": "team-a-apps",
+      "namespace": "argocd",
+      "name": "billing-api",
+      "first_seen_at": "2026-10-24T12:00:03Z",
+      "last_seen_at": "2026-10-24T12:00:03Z",
+      "is_new": true,
+      "look_alike": false,
+      "binding_count": 0,
+      "team_ids": [
+        "5d6e7f80-1a2b-4c3d-8e9f-0a1b2c3d4e5f"
+      ]
+    },
+    {
+      "gateway_id": "123e4567-e89b-42d3-a456-426614174000",
+      "connector_uuid": "9a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+      "connector_id": "argocd-main",
+      "target_id": "d-li3oyoq5xwjxe72ps7qqn5dikf",
+      "source": "discovered",
+      "status": "missing",
+      "app_project": "team-a-apps",
+      "namespace": "argocd",
+      "name": "payments-api",
+      "first_seen_at": "2026-10-20T09:00:00Z",
+      "last_seen_at": "2026-10-24T11:55:00Z",
+      "is_new": false,
+      "look_alike": true,
+      "binding_count": 1,
+      "team_ids": [
+        "5d6e7f80-1a2b-4c3d-8e9f-0a1b2c3d4e5f"
+      ]
+    },
+    {
+      "gateway_id": "123e4567-e89b-42d3-a456-426614174000",
+      "connector_uuid": "1f2e3d4c-5b6a-4978-8a7b-6c5d4e3f2a1b",
+      "connector_id": "argocd-static",
+      "target_id": "payments-api",
+      "source": "static",
+      "status": "identity_changed",
+      "namespace": "argocd",
+      "name": "payments-api",
+      "first_seen_at": "2026-10-01T08:00:00Z",
+      "is_new": false,
+      "look_alike": true,
+      "binding_count": 1,
+      "app_project": "team-a-apps"
+    }
+  ],
+  "next_cursor": "eyJrIjoiZC16azV5In0"
+}

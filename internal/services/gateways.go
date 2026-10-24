@@ -82,7 +82,8 @@ type GatewayStore interface {
 	ListConnectors(ctx context.Context, gatewayID uuid.UUID) ([]*storage.GatewayConnector, error)
 	GetConnector(ctx context.Context, id uuid.UUID) (*storage.GatewayConnector, error)
 	ReplaceCatalog(ctx context.Context, gatewayID uuid.UUID, conns []storage.GatewayCatalogConnector, digest string, at time.Time) (*storage.GatewayCatalogOutcome, error)
-	ApproveConnector(ctx context.Context, gatewayID, connectorID uuid.UUID, by string, at time.Time) (*storage.GatewayConnector, error)
+	ApproveConnectorScope(ctx context.Context, gatewayID, connectorID uuid.UUID, digest, by string, at, seenSince time.Time) (*storage.GatewayApproveOutcome, error)
+	ConnectorScope(ctx context.Context, gatewayID uuid.UUID, connectorName string, seenSince time.Time) (storage.GatewayConnectorScope, error)
 	ConfirmTargetIdentity(ctx context.Context, gatewayID, connectorID uuid.UUID, targetID string) (*storage.GatewayTargetIdentityChange, *storage.GatewayConnector, error)
 	CreateBinding(ctx context.Context, b *storage.GatewayBinding) error
 	GetBinding(ctx context.Context, id uuid.UUID) (*storage.GatewayBinding, error)
@@ -101,6 +102,9 @@ type GatewayService struct {
 	now   func() time.Time
 
 	secretHashCacheTTL time.Duration
+	// discoveryLeaseTTL is the discovery lease TTL (api#308, decision
+	// E-3): 60 to 900 seconds, default 300.
+	discoveryLeaseTTL time.Duration
 
 	// cache fronts the secret-hash check with a revocation tombstone and
 	// a negative entry for unknown ids (skills#104).
@@ -110,7 +114,10 @@ type GatewayService struct {
 // NewGatewayService builds the service. rdb may be nil (no cache, no
 // audit rollup).
 func NewGatewayService(store GatewayStore, audit storage.AuditEventRepository, rdb *runtime.Client) *GatewayService {
-	s := &GatewayService{store: store, audit: audit, rdb: rdb, now: time.Now, secretHashCacheTTL: 60 * time.Second}
+	s := &GatewayService{
+		store: store, audit: audit, rdb: rdb, now: time.Now, secretHashCacheTTL: 60 * time.Second,
+		discoveryLeaseTTL: storage.GatewayDiscoveryLeaseTTLDefault,
+	}
 	s.cache = newCredCache(rdb, cacheKindGatewaySecretHash, s.secretHashCacheTTL)
 	return s
 }
@@ -625,6 +632,11 @@ type GatewayHeartbeatResult struct {
 	ClaimPollSeconds     int
 	ContractVersion      string
 	CatalogVersion       string
+	// Contract 2 only (api#308). Discovery is nil when the answer is
+	// contract 1. SendBoundTargets is true when the bound target version
+	// differs from the one the request carried.
+	Discovery        *storage.GatewayDiscoveryHeartbeat
+	SendBoundTargets bool
 }
 
 // Heartbeat records one replica's heartbeat for an authenticated Gateway.
@@ -633,15 +645,14 @@ func (s *GatewayService) Heartbeat(ctx context.Context, gatewayID uuid.UUID, in 
 	if err != nil {
 		return nil, err
 	}
-	connectors := in.Connectors
-	if connectors == nil {
-		connectors = []storage.GatewayConnectorHealth{}
-	}
+	connectors := in.health()
+	answer2 := in.listsContract(gatewayContractV2)
 	now := s.now().UTC()
 	out, err := s.store.RecordHeartbeat(ctx, storage.GatewayHeartbeat{
 		GatewayID: gatewayID, ReplicaID: replicaID, GatewayVersion: in.GatewayVersion,
 		ContractVersions: in.ContractVersions, Status: in.Status, InFlight: in.InFlight,
 		CatalogVersion: in.CatalogVersion, Connectors: connectors,
+		AnswerContract2: answer2, Contract2: in.contract2Shaped(), LeaseTTL: s.discoveryLeaseTTL,
 	}, now, now.Add(-GatewayReplicaWindow))
 	switch {
 	case errors.Is(err, storage.ErrGatewayReplicaLimit):
@@ -669,10 +680,21 @@ func (s *GatewayService) Heartbeat(ctx context.Context, gatewayID uuid.UUID, in 
 			Metadata: map[string]any{"gateway_id": gatewayID.String(), "replica_id": replicaID.String()},
 		})
 	}
-	return &GatewayHeartbeatResult{
+	res := &GatewayHeartbeatResult{
 		ServerTime: now, NextHeartbeatSeconds: gatewayHeartbeatIntervalSec, ClaimPollSeconds: gatewayClaimPollSec,
 		ContractVersion: gatewayContractVersion, CatalogVersion: out.CatalogVersion,
-	}, nil
+	}
+	if answer2 && out.Discovery != nil {
+		res.ContractVersion = gatewayContractV2
+		res.Discovery = out.Discovery
+		sent := ""
+		if in.BoundTargetsVersion != nil {
+			sent = *in.BoundTargetsVersion
+		}
+		res.SendBoundTargets = out.Discovery.BoundTargetsVersion != sent
+		s.auditDiscoveryHeartbeat(ctx, gatewayID, replicaID, out.Discovery)
+	}
+	return res, nil
 }
 
 // ---- E3 catalog --------------------------------------------------------
@@ -796,20 +818,6 @@ func (s *GatewayService) Get(ctx context.Context, id uuid.UUID) (*GatewayDetail,
 }
 
 // ---- connectors and bindings -------------------------------------------
-
-// ApproveConnector approves an advertised connector of a Gateway.
-func (s *GatewayService) ApproveConnector(ctx context.Context, gatewayID, connectorID uuid.UUID, by string) (*storage.GatewayConnector, error) {
-	c, err := s.store.ApproveConnector(ctx, gatewayID, connectorID, by, s.now().UTC())
-	if err != nil {
-		return nil, err
-	}
-	s.appendAudit(ctx, &storage.AuditEvent{
-		Actor: auditActor(ctx, by), Action: "gateway.connector.approved", Resource: gatewayActor(gatewayID),
-		Status:   storage.AuditStatusSuccess,
-		Metadata: map[string]any{"gateway_id": gatewayID.String(), "connector_id": c.ID.String(), "kind": c.Kind},
-	})
-	return c, nil
-}
 
 // ConfirmTargetIdentity is the platform-admin re-confirm (api#312): the
 // identity the Gateway now advertises for an identity_changed Argo CD
