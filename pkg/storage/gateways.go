@@ -584,6 +584,9 @@ type GatewayRevokeOutcome struct {
 	// TasksRequeued is the number of leased observation tasks moved back
 	// to queued with their attempts closed as cancelled.
 	TasksRequeued int
+	// SnapshotsDeleted is the number of sealed discovery snapshots a
+	// revoke deleted (api#308, decision E-6).
+	SnapshotsDeleted int
 }
 
 // Revoke sets the Gateway to revoked, revokes its unused enrollment
@@ -620,6 +623,9 @@ func (r *Gateways) Revoke(ctx context.Context, id uuid.UUID, by string, at time.
 	}
 	out := &GatewayRevokeOutcome{TokensRevoked: int(tag.RowsAffected())}
 	if out.TasksRequeued, err = requeueLeasedForGateway(ctx, tx, id, at); err != nil {
+		return nil, err
+	}
+	if out.SnapshotsDeleted, err = deleteGatewaySnapshots(ctx, tx, id); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {

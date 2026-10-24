@@ -953,6 +953,9 @@ func TestLive_Gateway_MachineRoutesArePinned(t *testing.T) {
 		"POST /api/v1/gateways/:id/tasks/:task_id/lease":   true,
 		"POST /api/v1/gateways/:id/tasks/:task_id/release": true,
 		"POST /api/v1/gateways/:id/tasks/:task_id/result":  true,
+		// api#308
+		"PUT /api/v1/gateways/:id/connectors/:connector_id/discovery": true,
+		"GET /api/v1/gateways/:id/connectors/:connector_id/snapshot":  true,
 	}
 	got := map[string]bool{}
 	for _, r := range f.l.app.GetRoutes(true) {

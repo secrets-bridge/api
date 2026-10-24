@@ -61,3 +61,29 @@ func TestLive_GatewayContractExamples_Heartbeat(t *testing.T) {
 		}
 	}
 }
+
+// TestLive_GatewayContractExamples_DiscoveryCatalog: every E8 request
+// example. A valid names-mode example passes parse and schema (it then
+// stops at the lease check: no lease is held); an invalid one is 422
+// schema_violation. valid-opaque.json is valid against the schema but
+// refused with 422 until opaque mode ships (decision E-8).
+func TestLive_GatewayContractExamples_DiscoveryCatalog(t *testing.T) {
+	d := newDiscFixture(t, newGatewayFixture(t), "contract-e8-gw")
+	for name, raw := range contractExamples(t, "gateway-discovery-catalog") {
+		code, body := d.uploadRaw(t, "argocd-main", raw)
+		switch name {
+		case "valid-names.json":
+			if code != http.StatusConflict || errCode(t, body) != "lease_not_held" {
+				t.Errorf("%s = %d %s; want past the schema (409 lease_not_held)", name, code, body)
+			}
+		case "valid-opaque.json":
+			if code != http.StatusUnprocessableEntity || errCode(t, body) != "schema_violation" {
+				t.Errorf("%s = %d %s; want 422 until opaque mode ships", name, code, body)
+			}
+		default:
+			if code != http.StatusUnprocessableEntity || errCode(t, body) != "schema_violation" {
+				t.Errorf("%s = %d %s; want 422 schema_violation", name, code, body)
+			}
+		}
+	}
+}

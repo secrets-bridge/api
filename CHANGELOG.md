@@ -59,6 +59,17 @@ on `main`.
   token on the Argo CD side.
 
 ### Added
+- Argo CD discovery upload and snapshot (#308): `PUT
+  /api/v1/gateways/:id/connectors/:connector_id/discovery` (E8) takes the
+  lease holder's catalog with its own 2 MiB limit answering
+  `catalog_too_large`, checks lease, generation, scope digest, caps and
+  name patterns in one transaction, replaces the discovered targets and
+  stores the sealed snapshot opaque. A retry of the same bytes answers
+  `duplicate`. A bound target that goes missing suspends its bindings and
+  cancels their open tasks. `GET .../snapshot` (E9) returns the latest
+  snapshot exactly as uploaded. Revoking a Gateway deletes its snapshots.
+  E7 accepts the refusal reason `target_snapshot_stale`, which does not
+  count as a failure.
 - Argo CD discovery, heartbeat side (#308, ADR 0002 S4): migration 0050
   adds the discovery storage (discovered targets, the AppProject to team
   mapping, the sealed snapshot, the approved scope digest, the discovery

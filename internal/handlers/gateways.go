@@ -773,9 +773,17 @@ func (h *Gateways) AdminGet(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	stale, err := h.svc.StaleSnapshots(c.Context(), id)
+	if err != nil {
+		return err
+	}
 	conns := make([]gatewayConnectorView, 0, len(d.Connectors))
 	for _, cn := range d.Connectors {
-		conns = append(conns, toConnectorView(cn).withScope(scopes[cn.ID]))
+		v := toConnectorView(cn).withScope(scopes[cn.ID])
+		if v.StatusReason == "" && stale[cn.ID] {
+			v.StatusReason = storage.GatewayConnectorReasonSnapshotStale
+		}
+		conns = append(conns, v)
 	}
 	bindings := make([]gatewayBindingView, 0, len(d.Bindings))
 	for _, b := range d.Bindings {
@@ -970,4 +978,68 @@ func (h *Gateways) AdminDeleteBinding(c fiber.Ctx) error {
 		return err
 	}
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// ---- E8 discovery upload and E9 snapshot (api#308) -----------------------
+
+// Discovery handles PUT /api/v1/gateways/:id/connectors/:connector_id/discovery
+// (E8, discovery-contract.md section 3). The route's body limit answers
+// 413 catalog_too_large above 2 MiB before this runs. Every error is one
+// closed code from gateway-discovery-error.schema.json.
+func (h *Gateways) Discovery(c fiber.Ctx) error {
+	id, err := authenticatedGateway(c)
+	if err != nil {
+		return err
+	}
+	res, err := h.svc.UploadDiscovery(c.Context(), id, c.Params("connector_id"), c.Body())
+	switch {
+	case errors.Is(err, services.ErrDiscoveryParse):
+		return gwError(c, fiber.StatusBadRequest, "invalid_request")
+	case errors.Is(err, services.ErrDiscoverySchema):
+		return gwError(c, fiber.StatusUnprocessableEntity, "schema_violation")
+	case errors.Is(err, storage.ErrNotFound):
+		return gwError(c, fiber.StatusNotFound, "connector_not_found")
+	case errors.Is(err, storage.ErrDiscoveryGenerationStale):
+		return gwError(c, fiber.StatusConflict, "discovery_generation_stale")
+	case errors.Is(err, storage.ErrDiscoveryLeaseNotHeld):
+		return gwError(c, fiber.StatusConflict, "lease_not_held")
+	case errors.Is(err, storage.ErrDiscoveryScopeMismatch):
+		return gwError(c, fiber.StatusConflict, "scope_digest_mismatch")
+	case errors.Is(err, storage.ErrDiscoveryCatalogTooLarge):
+		return gwError(c, fiber.StatusRequestEntityTooLarge, "catalog_too_large")
+	case errors.Is(err, services.ErrGatewayRevoked):
+		return gwError(c, fiber.StatusUnauthorized, "unauthorized")
+	case err != nil:
+		return err
+	}
+	return c.JSON(res)
+}
+
+type gatewaySnapshotResponse struct {
+	SchemaVersion string                 `json:"schema_version"`
+	ConnectorID   string                 `json:"connector_id"`
+	Generation    int64                  `json:"generation"`
+	DiscoveredAt  string                 `json:"discovered_at"`
+	Snapshot      storage.SealedSnapshot `json:"snapshot"`
+}
+
+// Snapshot handles GET /api/v1/gateways/:id/connectors/:connector_id/snapshot
+// (E9, section 4): the latest sealed snapshot exactly as uploaded, or
+// 404 snapshot_not_found for every "none" case.
+func (h *Gateways) Snapshot(c fiber.Ctx) error {
+	id, err := authenticatedGateway(c)
+	if err != nil {
+		return err
+	}
+	s, err := h.svc.GetSnapshot(c.Context(), id, c.Params("connector_id"))
+	switch {
+	case errors.Is(err, storage.ErrNotFound):
+		return gwError(c, fiber.StatusNotFound, "snapshot_not_found")
+	case err != nil:
+		return err
+	}
+	return c.JSON(gatewaySnapshotResponse{
+		SchemaVersion: services.SnapshotSchemaVersion(), ConnectorID: s.ConnectorName, Generation: s.Generation,
+		DiscoveredAt: s.DiscoveredAt.UTC().Format(time.RFC3339), Snapshot: s.Snapshot,
+	})
 }

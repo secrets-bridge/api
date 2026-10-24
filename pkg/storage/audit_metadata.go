@@ -151,6 +151,10 @@ var auditMetaKeys = map[string]auditMetaKind{
 	// only, never an AppProject, namespace or Application name
 	"scope_digest": metaDigest, "scope_digest_before": metaDigest, "scope_digest_after": metaDigest,
 	"adopted": metaBool, "app_project_count_before": metaNumber,
+	"generation": metaNumber, "targets_present": metaNumber, "targets_new": metaNumber, "targets_missing": metaNumber,
+	"targets_renamed": metaNumber, "targets_moved": metaNumber, "targets_pruned": metaNumber,
+	"entries_rejected": metaNumber, "entries_deferred": metaNumber, "app_project_count": metaNumber,
+	"argocd_target_ids": metaTokenList, "target_ids_truncated": metaBool, "snapshots_deleted": metaNumber,
 
 	// gateway observation queue (api#294): ids, enums, digests and counts only
 	"task_id": metaID, "attempt_id": metaID, "previous_attempt_id": metaID, "superseding_task_id": metaID,
