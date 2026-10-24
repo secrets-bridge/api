@@ -40,6 +40,11 @@ func (s GatewayStatus) Live() bool {
 	return s == GatewayStatusActive || s == GatewayStatusStale
 }
 
+// GatewayReplicaLiveWindow is how long a replica counts as seen after
+// its last heartbeat: towards max_replicas, in the admin rollup, and for
+// the over_privileged dispatch pause.
+const GatewayReplicaLiveWindow = 10 * time.Minute
+
 // Gateway connector statuses.
 const (
 	GatewayConnectorAdvertised = "advertised"

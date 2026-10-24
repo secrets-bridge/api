@@ -53,7 +53,7 @@ const (
 	gatewayTokenMaxTTL     = 24 * time.Hour
 	// GatewayReplicaWindow is how long a replica counts towards
 	// max_replicas after its last heartbeat.
-	GatewayReplicaWindow = 10 * time.Minute
+	GatewayReplicaWindow = storage.GatewayReplicaLiveWindow
 
 	cacheKindGatewaySecretHash  = "gateway-hash"
 	cacheKindGatewayAuthReject  = "gateway-auth-reject-audit"

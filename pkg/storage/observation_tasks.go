@@ -568,6 +568,24 @@ func (r *ObservationTasks) CreateTask(ctx context.Context, t *ObservationTask, a
 
 // ---- E4 claim ------------------------------------------------------------
 
+// connectorOverPrivilegedSQL is true when a replica of the task's
+// Gateway seen within the replica window ($2) last reported connector c
+// over_privileged, or reported over_privileged itself (api#312). It is
+// part of the claim query, so every api replica pauses the connector on
+// the first such heartbeat instead of waiting for the other Gateway
+// replicas' own rechecks. The replica's next healthy heartbeat
+// overwrites its row and lifts the pause. A replica that stops
+// heartbeating holds the pause until it leaves the window.
+const connectorOverPrivilegedSQL = `EXISTS (
+		SELECT 1 FROM gateway_replicas rp
+		WHERE rp.gateway_id = t.gateway_id AND rp.last_seen_at > now() - $2::interval
+		  AND (rp.status = 'over_privileged'
+		       OR rp.connector_health @> jsonb_build_array(jsonb_build_object('connector_id', c.name, 'status', 'over_privileged'))))`
+
+// gatewayReplicaWindowSQL is GatewayReplicaLiveWindow as a Postgres
+// interval.
+var gatewayReplicaWindowSQL = fmt.Sprintf("%d seconds", int(GatewayReplicaLiveWindow/time.Second))
+
 // ObservationClaim is what Claim leased.
 type ObservationClaim struct {
 	Task    *ObservationTask
@@ -583,8 +601,9 @@ type ObservationClaim struct {
 // FOR UPDATE SKIP LOCKED, so two claims never lease the same task. An
 // expired lease re-enters inline with a new attempt_id; the old attempt
 // is closed as lease_expired and its late result is refused. A task is
-// skipped while its binding is suspended (target identity_changed),
-// decided in this query so every api replica agrees (api#312).
+// skipped while its binding is suspended (target identity_changed) or
+// its connector is paused (over_privileged), both decided in this query
+// so every api replica agrees (api#312).
 func (r *ObservationTasks) Claim(ctx context.Context, gatewayID, replicaID uuid.UUID, lease time.Duration, perReplica int, contractVersion string) (*ObservationClaim, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -651,10 +670,11 @@ func (r *ObservationTasks) Claim(ctx context.Context, gatewayID, replicaID uuid.
 			JOIN gateway_connectors c ON c.id = b.argocd_connector_id
 			WHERE b.id = t.binding_id AND b.deleted_at IS NULL AND b.enabled
 			  AND c.gateway_id = t.gateway_id AND c.status = 'approved'
-			  AND NOT `+bindingTargetIdentityChangedSQL+`)
+			  AND NOT `+bindingTargetIdentityChangedSQL+`
+			  AND NOT `+connectorOverPrivilegedSQL+`)
 		ORDER BY t.not_before, t.created_at
 		LIMIT 1
-		FOR UPDATE OF t SKIP LOCKED`, gatewayID).Scan(&taskID, &prevAttempt)
+		FOR UPDATE OF t SKIP LOCKED`, gatewayID, gatewayReplicaWindowSQL).Scan(&taskID, &prevAttempt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNoObservationTask
 	}
