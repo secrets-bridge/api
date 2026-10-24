@@ -109,7 +109,10 @@ func (r *Gateways) ReplaceDiscovery(ctx context.Context, in DiscoveryReplace, at
 
 	var status GatewayStatus
 	var maxEntries int
-	err = tx.QueryRow(ctx, `SELECT status, discovery_max_entries FROM gateways WHERE id = $1 FOR UPDATE`, in.GatewayID).Scan(&status, &maxEntries)
+	// dbNow is the database clock: lease expiry is judged on the same
+	// clock the heartbeat granted it on.
+	var dbNow time.Time
+	err = tx.QueryRow(ctx, `SELECT status, discovery_max_entries, now() FROM gateways WHERE id = $1 FOR UPDATE`, in.GatewayID).Scan(&status, &maxEntries, &dbNow)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrGatewayNotLive
 	}
@@ -159,7 +162,7 @@ func (r *Gateways) ReplaceDiscovery(ctx context.Context, in DiscoveryReplace, at
 		return nil, ErrDiscoveryGenerationStale
 	}
 	// Step 8.
-	if c.leaseID == nil || *c.leaseID != in.LeaseID || !c.leaseExpires.After(at) ||
+	if c.leaseID == nil || *c.leaseID != in.LeaseID || !c.leaseExpires.After(dbNow) ||
 		*c.leaseReplica != in.ReplicaID || *c.leaseGen != in.Generation {
 		return nil, ErrDiscoveryLeaseNotHeld
 	}
@@ -297,10 +300,10 @@ func (r *Gateways) ReplaceDiscovery(ctx context.Context, in DiscoveryReplace, at
 	if _, err := tx.Exec(ctx, `
 		UPDATE gateway_connectors SET discovery_generation = $2, last_discovery_at = $3,
 			discovery_lease_id = NULL, discovery_lease_replica_id = NULL, discovery_lease_generation = NULL,
-			discovery_lease_expires_at = NULL, discovery_allowed_projects = $4,
+			discovery_lease_expires_at = NULL, discovery_allowed_projects = $4, discovery_scope_digest = $8,
 			last_upload_lease_id = $5, last_upload_sha256 = $6, last_upload_response = $7,
 			status_reason = CASE WHEN status_reason = 'snapshot_stale' THEN NULL ELSE status_reason END
-		WHERE id = $1`, c.id, in.Generation, at, allowed, in.LeaseID, in.BodySHA256, respRaw); err != nil {
+		WHERE id = $1`, c.id, in.Generation, at, allowed, in.LeaseID, in.BodySHA256, respRaw, in.ScopeDigest); err != nil {
 		return nil, fmt.Errorf("storage: record discovery generation: %w", err)
 	}
 
@@ -353,19 +356,6 @@ func uuidStrings(ids []uuid.UUID) []string {
 		out[i] = id.String()
 	}
 	return out
-}
-
-func collectIDs(rows pgx.Rows) ([]uuid.UUID, error) {
-	defer rows.Close()
-	out := []uuid.UUID{}
-	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("storage: scan id: %w", err)
-		}
-		out = append(out, id)
-	}
-	return out, rows.Err()
 }
 
 // bindingTeamCoveredSQL is true when binding b's discovered target is in

@@ -47,6 +47,10 @@ var (
 	gatewayNameRe         = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 	gatewayClusterNameRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	gatewaySHA256Re       = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	// gatewayDiscoveredShapeRe is the discovered target id shape. A
+	// static target may not use it, so the two id spaces never collide
+	// (ADR 0002 C3, review on #317 item 5).
+	gatewayDiscoveredShapeRe = regexp.MustCompile(`^d-[a-z2-7]{26}$`)
 )
 
 // Bounds. The 64 KiB body cap is the outer limit; these keep the stored
@@ -282,7 +286,7 @@ func normalizeCatalog(conns []GatewayCatalogConnector) ([]storage.GatewayCatalog
 		targets := make([]storage.GatewayTarget, 0, len(c.Targets))
 		tids := map[string]bool{}
 		for _, t := range c.Targets {
-			if !ValidGatewayLocalID(t.TargetID) || tids[t.TargetID] {
+			if !ValidGatewayLocalID(t.TargetID) || tids[t.TargetID] || gatewayDiscoveredShapeRe.MatchString(t.TargetID) {
 				return nil, gatewayInvalid("connectors.targets.target_id")
 			}
 			tids[t.TargetID] = true

@@ -38,8 +38,10 @@ ALTER TABLE gateways
 ALTER TABLE gateway_connectors
     ADD COLUMN approved_scope_digest TEXT
         CHECK (approved_scope_digest IS NULL OR approved_scope_digest ~ '^sha256:[0-9a-f]{64}$'),
+    -- over_privileged latches until a platform admin re-approves (ADR
+    -- 0002 C2 and section 6).
     ADD COLUMN status_reason TEXT
-        CHECK (status_reason IN ('scope_changed','scope_mismatch_between_replicas','snapshot_stale')),
+        CHECK (status_reason IN ('scope_changed','scope_mismatch_between_replicas','snapshot_stale','over_privileged')),
     -- Last accepted upload generation, and the highest generation ever
     -- granted (an expired lease burns its generation).
     ADD COLUMN discovery_generation BIGINT NOT NULL DEFAULT 0 CHECK (discovery_generation >= 0),
@@ -52,6 +54,10 @@ ALTER TABLE gateway_connectors
     ADD COLUMN last_discovery_at TIMESTAMPTZ,
     ADD COLUMN discovery_allowed_projects JSONB
         CHECK (discovery_allowed_projects IS NULL OR jsonb_typeof(discovery_allowed_projects) = 'array'),
+    -- The scope digest of the latest accepted upload: approve must carry
+    -- it, so the admin approves the AppProjects the console shows.
+    ADD COLUMN discovery_scope_digest TEXT
+        CHECK (discovery_scope_digest IS NULL OR discovery_scope_digest ~ '^sha256:[0-9a-f]{64}$'),
     ADD COLUMN last_upload_lease_id UUID,
     ADD COLUMN last_upload_sha256 BYTEA CHECK (last_upload_sha256 IS NULL OR length(last_upload_sha256) = 32),
     ADD COLUMN last_upload_response JSONB,
@@ -122,13 +128,16 @@ ALTER TABLE gateway_connector_bindings
 CREATE INDEX gateway_connector_bindings_argocd_target_idx
     ON gateway_connector_bindings (argocd_connector_id, argocd_target_id) WHERE deleted_at IS NULL;
 
+-- NOT VALID here (no scan under the ACCESS EXCLUSIVE lock); validated
+-- after COMMIT, which only takes SHARE UPDATE EXCLUSIVE and so does not
+-- block claims and results. The new set is a superset of the old one.
 ALTER TABLE observation_tasks DROP CONSTRAINT IF EXISTS observation_tasks_verdict_reason_check;
 ALTER TABLE observation_tasks ADD CONSTRAINT observation_tasks_verdict_reason_check CHECK (verdict_reason IN (
     'no_provider_version','volume_refresh_not_observable','subpath_mount_not_refreshed',
     'reload_mechanism_unknown','refresh_interval_exceeds_deadline','failure_observed',
     'no_stage_observed','superseded_by_later_write','source_changed','connector_missing',
     'gateway_errors','gateway_over_privileged','gateway_unavailable','deadline_reached',
-    'context_only','binding_removed','target_missing','binding_suspended'));
+    'context_only','binding_removed','target_missing','binding_suspended')) NOT VALID;
 
 -- team_covers reports whether team is root or a descendant of root,
 -- walking up from team (bounded depth). The dispatch re-check and the
@@ -147,3 +156,5 @@ LANGUAGE sql STABLE AS $$
 $$;
 
 COMMIT;
+
+ALTER TABLE observation_tasks VALIDATE CONSTRAINT observation_tasks_verdict_reason_check;
