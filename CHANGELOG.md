@@ -77,6 +77,20 @@ on `main`.
   token on the Argo CD side.
 
 ### Added
+- Argo CD discovery catalog read and scoped binding (#308): `GET
+  /api/v1/gateway-catalog` filters the catalog on the server by the
+  caller's teams before paging, with a keyset cursor bound to its
+  filters. `gateway.bind` can be granted with a `team_id` scope. A
+  team-scoped admin sees and binds only discovered targets whose
+  AppProject maps to one of its teams, into non-production environments
+  of its teams' projects; another team's target answers 404.
+  Production stays platform-only (`production_binding_platform_only`).
+  `GET` and `PUT /admin/gateways/:id/connectors/:cid/project-teams` hold
+  the AppProject to team mapping (audited
+  `gateway.connector.project_mapping_changed`); a change that uncovers a
+  binding suspends it. A team re-parent or project move that would widen
+  a team-scoped `gateway.bind` grant of the caller is refused with
+  `self_scope_expansion_not_allowed`.
 - Argo CD discovery upload and snapshot (#308): `PUT
   /api/v1/gateways/:id/connectors/:connector_id/discovery` (E8) takes the
   lease holder's catalog with its own 2 MiB limit answering

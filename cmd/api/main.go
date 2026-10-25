@@ -568,6 +568,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// caller's covered rows (empty when they cover none); detail
 	// endpoints 404 an out-of-scope id so existence never leaks.
 	tenancyH = tenancyH.WithScope(rbacResolver, teamScopeResolver)
+	// api#308: a re-parent or project move may not widen a team-scoped
+	// gateway.bind grant of the caller (skills#103 phase 1).
+	teamsH = teamsH.WithStructureCheck(rbacResolver, teamScopeResolver)
 	projectSecretsH = projectSecretsH.WithScope(rbacResolver, teamScopeResolver)
 
 	// API-N-05: project, environment and project-secret binding writes
@@ -1330,7 +1333,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// fresh second factor on every write.
 	gatewaySvc := services.NewGatewayService(storage.NewGateways(pool), auditRepo, rdb).
 		WithDiscoveryLeaseTTL(cfg.GatewayDiscoveryLeaseTTL)
-	gatewaysH := handlers.NewGateways(gatewaySvc, cfg.Env != ModeDev).WithObservations(observationSvc)
+	gatewaysH := handlers.NewGateways(gatewaySvc, cfg.Env != ModeDev).WithObservations(observationSvc).
+		WithBindScope(rbacResolver, teamScopeResolver)
 	// E4 to E7 fail closed: without Redis the limiter answers 503,
 	// which the Gateway client treats as transient and backs off on,
 	// instead of letting an unbounded claim or result rate through.
@@ -1404,14 +1408,25 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		denied("gateway.target.identity_confirmed", handlers.GatewayDenyConfirm),
 		gatewayBind, requireMFA, gatewaysH.AdminConfirmTargetIdentity)
 	v1.Post("/admin/gateway-enrollment-tokens/:id/revoke", gatewayMint, requireMFA, gatewaysH.AdminRevokeToken)
+	// api#308: binding takes global or team-scoped gateway.bind; the
+	// service applies the team, production and visibility rules.
+	gatewayBindScoped := auth.RequireGatewayBind(rbacResolver)
 	v1.Post("/admin/gateway-bindings", denied("gateway.binding.create", handlers.GatewayDenyBind),
-		gatewayBind, requireMFA, gatewaysH.AdminCreateBinding)
+		gatewayBindScoped, requireMFA, gatewaysH.AdminCreateBinding)
+	// api#308 (A1): the console catalog read, team-filtered on the
+	// server. Outside /admin because team-scoped admins use it (D7).
+	v1.Get("/gateway-catalog", gatewaysH.CatalogRead)
+	// api#308 (A2): the AppProject to team mapping, platform admins only.
+	v1.Get("/admin/gateways/:id/connectors/:cid/project-teams", gatewayList, gatewaysH.AdminGetProjectTeams)
+	v1.Put("/admin/gateways/:id/connectors/:cid/project-teams",
+		denied("gateway.connector.project_mapping_changed", handlers.GatewayDenyMapping),
+		gatewayBind, requireMFA, gatewaysH.AdminPutProjectTeams)
 	// api#298: the binding list and the observation source are metadata
 	// (no credential), so gateway.list reads them; every write stays on
 	// gateway.bind with a fresh second factor.
 	v1.Get("/admin/gateway-bindings", gatewayList, gatewaysH.AdminListBindings)
 	v1.Delete("/admin/gateway-bindings/:id", denied("gateway.binding.delete", handlers.GatewayDenyDelete),
-		gatewayBind, requireMFA, gatewaysH.AdminDeleteBinding)
+		gatewayBindScoped, requireMFA, gatewaysH.AdminDeleteBinding)
 	// api#294: disable or re-enable, a Gateway's tasks, and an
 	// environment's observation source (design section 9 permissions).
 	v1.Put("/admin/gateways/:id/enabled", gatewayRevoke, requireMFA, gatewaysH.AdminSetEnabled)

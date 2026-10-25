@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -39,6 +40,29 @@ type Gateways struct {
 	svc          *services.GatewayService
 	obs          *services.GatewayObservationService
 	requireHTTPS bool
+	// resolver and teamScope resolve the caller's gateway.bind scope for
+	// the catalog read and the bind routes (api#308).
+	resolver  auth.Resolver
+	teamScope auth.TeamScopeResolver
+}
+
+// WithBindScope wires the gateway.bind scope resolution (api#308).
+func (h *Gateways) WithBindScope(r auth.Resolver, tr auth.TeamScopeResolver) *Gateways {
+	h.resolver, h.teamScope = r, tr
+	return h
+}
+
+// bindCaller resolves the session caller's gateway.bind scope.
+func (h *Gateways) bindCaller(c fiber.Ctx) (services.BindCaller, error) {
+	userID, ok := auth.IdentityFromContext(c.Context())
+	if !ok {
+		return services.BindCaller{}, fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+	}
+	sc, err := auth.ResolveGatewayBindScope(c.Context(), userID, h.resolver, h.teamScope)
+	if err != nil {
+		return services.BindCaller{}, err
+	}
+	return services.BindCaller{Global: sc.Global, GlobalList: sc.GlobalList, Teams: sc.Teams}, nil
 }
 
 // NewGateways builds the handler. requireHTTPS refuses E1 over plain http
@@ -922,21 +946,29 @@ func (h *Gateways) AdminCreateBinding(c fiber.Ctx) error {
 	if req.GatewayID == uuid.Nil || req.EnvironmentID == uuid.Nil || req.ArgoCDConnectorID == uuid.Nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid_request")
 	}
+	caller, err := h.bindCaller(c)
+	if err != nil {
+		return err
+	}
 	b, err := h.svc.CreateBinding(c.Context(), services.CreateBindingInput{
 		GatewayID: req.GatewayID, EnvironmentID: req.EnvironmentID, ProjectID: req.ProjectID,
 		SecretID: req.SecretID, ProviderConnectionID: req.ProviderConnectionID, SecretRef: req.SecretRef,
 		ArgoCDConnectorID: req.ArgoCDConnectorID, ArgoCDTargetID: req.ArgoCDTargetID,
-		ObservationTimeoutS: req.ObservationTimeoutS, CreatedBy: actor,
+		ObservationTimeoutS: req.ObservationTimeoutS, CreatedBy: actor, Caller: caller,
 	})
 	if code := services.BindingErrorCode(err); code != "" {
 		status := fiber.StatusBadRequest
 		switch code {
 		case "binding_exists":
 			status = fiber.StatusConflict
-		case "gateway_not_found", "environment_not_found", "connector_not_found", "provider_connection_not_found", "reference_not_found":
+		case "gateway_not_found", "environment_not_found", "connector_not_found", "provider_connection_not_found", "reference_not_found",
+			"target_not_found":
 			status = fiber.StatusNotFound
-		case "connector_not_approved", "target_stale", "target_identity_changed", "gateway_revoked":
+		case "connector_not_approved", "target_stale", "target_identity_changed", "gateway_revoked",
+			"target_missing", "gateway_bound_target_limit":
 			status = fiber.StatusConflict
+		case "production_binding_platform_only", "target_team_mismatch":
+			status = fiber.StatusForbidden
 		}
 		return fiber.NewError(status, code)
 	}
@@ -980,7 +1012,11 @@ func (h *Gateways) AdminDeleteBinding(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if err := h.svc.DeleteBinding(c.Context(), id, actor); err != nil {
+	caller, err := h.bindCaller(c)
+	if err != nil {
+		return err
+	}
+	if err := h.svc.DeleteBinding(c.Context(), id, actor, caller); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "binding_not_found")
 		}
@@ -1051,4 +1087,167 @@ func (h *Gateways) Snapshot(c fiber.Ctx) error {
 		SchemaVersion: services.SnapshotSchemaVersion(), ConnectorID: s.ConnectorName, Generation: s.Generation,
 		DiscoveredAt: s.DiscoveredAt.UTC().Format(time.RFC3339), Snapshot: s.Snapshot,
 	})
+}
+
+// ---- A1 catalog read and A2 team mapping (api#308) -----------------------
+
+type gatewayCatalogItemView struct {
+	GatewayID     string   `json:"gateway_id"`
+	ConnectorUUID string   `json:"connector_uuid"`
+	ConnectorID   string   `json:"connector_id"`
+	TargetID      string   `json:"target_id"`
+	Source        string   `json:"source"`
+	Status        string   `json:"status"`
+	AppProject    string   `json:"app_project,omitempty"`
+	Namespace     string   `json:"namespace,omitempty"`
+	Name          string   `json:"name,omitempty"`
+	FirstSeenAt   string   `json:"first_seen_at"`
+	LastSeenAt    *string  `json:"last_seen_at,omitempty"`
+	IsNew         bool     `json:"is_new"`
+	LookAlike     bool     `json:"look_alike"`
+	BindingCount  int      `json:"binding_count"`
+	TeamIDs       []string `json:"team_ids,omitempty"`
+}
+
+type gatewayCatalogReadResponse struct {
+	Items      []gatewayCatalogItemView `json:"items"`
+	NextCursor string                   `json:"next_cursor,omitempty"`
+}
+
+// CatalogRead handles GET /api/v1/gateway-catalog (A1,
+// discovery-contract.md section 8.1): global gateway.list or
+// gateway.bind reads everything; a team-scoped gateway.bind reads the
+// discovered targets its teams' AppProjects map to; anyone else 403. It
+// never carries a uid, a snapshot, a digest or a URL.
+func (h *Gateways) CatalogRead(c fiber.Ctx) error {
+	caller, err := h.bindCaller(c)
+	if err != nil {
+		return err
+	}
+	page, err := h.svc.ListCatalog(c.Context(), caller, c.Queries())
+	switch {
+	case errors.Is(err, services.ErrGatewayCatalogForbidden):
+		return fiber.NewError(fiber.StatusForbidden, "permission_denied")
+	case errors.Is(err, services.ErrCatalogInvalidQuery):
+		return fiber.NewError(fiber.StatusBadRequest, "invalid_query")
+	case errors.Is(err, services.ErrCatalogInvalidCursor):
+		return fiber.NewError(fiber.StatusBadRequest, "invalid_cursor")
+	case err != nil:
+		return err
+	}
+	now := time.Now().UTC()
+	out := gatewayCatalogReadResponse{Items: make([]gatewayCatalogItemView, 0, len(page.Items)), NextCursor: page.NextCursor}
+	for _, it := range page.Items {
+		v := gatewayCatalogItemView{
+			GatewayID: it.Key.GatewayID.String(), ConnectorUUID: it.Key.ConnectorID.String(), ConnectorID: it.ConnectorID,
+			TargetID: it.Key.TargetID, Source: it.Source, Status: it.Status, AppProject: it.Key.AppProject,
+			Namespace: it.Key.Namespace, Name: it.Key.Name, FirstSeenAt: it.FirstSeenAt.UTC().Format(time.RFC3339),
+			LastSeenAt: timePtr(it.LastSeenAt), IsNew: now.Sub(it.FirstSeenAt) < 24*time.Hour,
+			LookAlike: it.LookAlike, BindingCount: it.BindingCount,
+		}
+		for _, t := range it.TeamIDs {
+			v.TeamIDs = append(v.TeamIDs, t.String())
+		}
+		out.Items = append(out.Items, v)
+	}
+	return c.JSON(out)
+}
+
+type gatewayProjectTeamsMapping struct {
+	AppProject string   `json:"app_project"`
+	TeamIDs    []string `json:"team_ids"`
+}
+
+type gatewayProjectTeamsBody struct {
+	Mappings []gatewayProjectTeamsMapping `json:"mappings"`
+}
+
+type gatewayProjectTeamsView struct {
+	Mappings        []gatewayProjectTeamsMapping `json:"mappings"`
+	AllowedProjects []string                     `json:"allowed_projects"`
+	Complete        bool                         `json:"complete"`
+}
+
+func toProjectTeamsView(p *storage.GatewayProjectTeams) gatewayProjectTeamsView {
+	v := gatewayProjectTeamsView{Mappings: []gatewayProjectTeamsMapping{}, AllowedProjects: p.AllowedProjects, Complete: p.Complete}
+	if v.AllowedProjects == nil {
+		v.AllowedProjects = []string{}
+	}
+	projects := make([]string, 0, len(p.Mappings))
+	for k := range p.Mappings {
+		projects = append(projects, k)
+	}
+	sort.Strings(projects)
+	for _, k := range projects {
+		m := gatewayProjectTeamsMapping{AppProject: k}
+		for _, t := range p.Mappings[k] {
+			m.TeamIDs = append(m.TeamIDs, t.String())
+		}
+		v.Mappings = append(v.Mappings, m)
+	}
+	return v
+}
+
+// AdminGetProjectTeams handles GET
+// /admin/gateways/:id/connectors/:cid/project-teams (gateway.list).
+func (h *Gateways) AdminGetProjectTeams(c fiber.Ctx) error {
+	id, err := pathUUID(c, "id")
+	if err != nil {
+		return err
+	}
+	cid, err := pathUUID(c, "cid")
+	if err != nil {
+		return err
+	}
+	p, err := h.svc.GetProjectTeams(c.Context(), id, cid)
+	if errors.Is(err, storage.ErrNotFound) {
+		return fiber.NewError(fiber.StatusNotFound, "connector_not_found")
+	}
+	if err != nil {
+		return err
+	}
+	return c.JSON(toProjectTeamsView(p))
+}
+
+// AdminPutProjectTeams handles PUT
+// /admin/gateways/:id/connectors/:cid/project-teams (global
+// gateway.bind, fresh MFA): a full replace of the AppProject to team
+// mapping (A2, section 8.3).
+func (h *Gateways) AdminPutProjectTeams(c fiber.Ctx) error {
+	actor, err := adminActor(c)
+	if err != nil {
+		return err
+	}
+	id, err := pathUUID(c, "id")
+	if err != nil {
+		return err
+	}
+	cid, err := pathUUID(c, "cid")
+	if err != nil {
+		return err
+	}
+	var body gatewayProjectTeamsBody
+	if err := decodeStrict(c.Body(), &body); err != nil || body.Mappings == nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid_request")
+	}
+	in := make([]services.ProjectTeamsInput, 0, len(body.Mappings))
+	for _, m := range body.Mappings {
+		in = append(in, services.ProjectTeamsInput{AppProject: m.AppProject, TeamIDs: m.TeamIDs})
+	}
+	p, err := h.svc.PutProjectTeams(c.Context(), id, cid, in, actor)
+	switch {
+	case errors.Is(err, services.ErrMappingInvalid):
+		return fiber.NewError(fiber.StatusBadRequest, "invalid_request")
+	case errors.Is(err, storage.ErrNotFound):
+		return fiber.NewError(fiber.StatusNotFound, "connector_not_found")
+	case errors.Is(err, storage.ErrGatewayUnknownAppProject):
+		return fiber.NewError(fiber.StatusUnprocessableEntity, "unknown_app_project")
+	case errors.Is(err, storage.ErrGatewayTeamNotFound):
+		return fiber.NewError(fiber.StatusNotFound, "team_not_found")
+	case errors.Is(err, storage.ErrGatewayProjectMappingIncomplete):
+		return fiber.NewError(fiber.StatusConflict, "project_mapping_incomplete")
+	case err != nil:
+		return err
+	}
+	return c.JSON(toProjectTeamsView(p))
 }

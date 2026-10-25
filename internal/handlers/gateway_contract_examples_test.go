@@ -188,3 +188,71 @@ func TestContractExamples_DiscoveryError(t *testing.T) {
 		return nil
 	})
 }
+
+var exDiscoveredIDRe = regexp.MustCompile(`^d-[a-z2-7]{26}$`)
+
+func TestContractExamples_CatalogRead(t *testing.T) {
+	runContractExamples(t, "gateway-catalog-read", func(r *gatewayCatalogReadResponse) error {
+		if r.NextCursor != "" && !regexp.MustCompile(`^[A-Za-z0-9_-]{1,512}$`).MatchString(r.NextCursor) {
+			return errors.New("cursor")
+		}
+		for _, it := range r.Items {
+			if !exUUIDRe.MatchString(it.GatewayID) || !exUUIDRe.MatchString(it.ConnectorUUID) || !exLocalIDRe.MatchString(it.ConnectorID) ||
+				!exLocalIDRe.MatchString(it.TargetID) || it.BindingCount < 0 {
+				return errors.New("item ids")
+			}
+			if _, err := time.Parse(time.RFC3339, it.FirstSeenAt); err != nil {
+				return errors.New("first_seen_at")
+			}
+			switch it.Source {
+			case "static":
+				if !slices.Contains([]string{"present", "stale", "identity_changed"}, it.Status) || it.AppProject != "" || it.TeamIDs != nil {
+					return errors.New("static item")
+				}
+			case "discovered":
+				if !slices.Contains([]string{"present", "missing"}, it.Status) || !exDiscoveredIDRe.MatchString(it.TargetID) {
+					return errors.New("discovered item")
+				}
+			default:
+				return errors.New("source")
+			}
+			for _, team := range it.TeamIDs {
+				if !exUUIDRe.MatchString(team) {
+					return errors.New("team id")
+				}
+			}
+		}
+		return nil
+	})
+}
+
+func TestContractExamples_ProjectTeamsGet(t *testing.T) {
+	for name, raw := range readContractExamples(t, "gateway-project-teams") {
+		var v gatewayProjectTeamsView
+		err := decodeStrict(raw, &v)
+		if err == nil {
+			for _, m := range v.Mappings {
+				if len(m.TeamIDs) == 0 || len(m.TeamIDs) > 16 {
+					err = errors.New("teams")
+				}
+				for _, team := range m.TeamIDs {
+					if !exUUIDRe.MatchString(team) {
+						err = errors.New("team id")
+					}
+				}
+			}
+		}
+		switch name {
+		case "valid-get.json":
+			if err != nil || !roundTrips(t, raw, &v) {
+				t.Errorf("%s refused or does not round-trip: %v", name, err)
+			}
+		case "valid-put.json":
+			// A PUT body: no allowed_projects or complete, which the GET adds.
+		default:
+			if err == nil {
+				t.Errorf("%s accepted as a GET response", name)
+			}
+		}
+	}
+}
