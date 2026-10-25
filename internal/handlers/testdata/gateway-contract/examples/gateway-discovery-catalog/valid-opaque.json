@@ -1,0 +1,32 @@
+{
+  "schema_version": "gateway.discovery-catalog/v1",
+  "replica_id": "7f3c9e2a-1b2c-4d5e-8f90-123456789abc",
+  "lease_id": "0b5e7c1a-3d2f-4e6a-9b8c-7d6e5f4a3b2c",
+  "generation": 7,
+  "discovered_at": "2026-10-24T12:00:00Z",
+  "scope_digest": "sha256:bf4357a6ba9936070285b4ac00d9d32ba1ad29922757fbd7556dc9f08c2784a7",
+  "endpoint_digest": "sha256:9508006565bb8a9beb9bb68e3984a5350e7e0320f55945cad5aeddbdd71115ce",
+  "identity_mode": "opaque",
+  "entries": [
+    {
+      "target_id": "d-li3oyoq5xwjxe72ps7qqn5dikf",
+      "project_alias": "team-a",
+      "label": "payments"
+    },
+    {
+      "target_id": "d-zk5ykqqvtcwquubd3reviuzqrz",
+      "project_alias": "team-a"
+    }
+  ],
+  "entries_rejected": 1,
+  "entries_deferred": 0,
+  "snapshot": {
+    "alg": "A256GCM+HKDF-SHA256/v1",
+    "nonce": "oKGio6Slpqeoqaqr",
+    "ciphertext": "9PsIQ8x9PHIxtoJLMc1EpRInCgZVl/noeGRP7EQHVmbNlI6YAhWH/zQC/uOOoCP8IplIPU+VA3KghSSiMdseGqEW0WV9atr6BHRaX4morwA4cO7VA8c7SYLjZTUso4X62h4v9LJNAeqWgJuoIrnqh7C+NVX/pl+jiBR4taNycD/1xQ27jSLb9IcG3jsOBoFmsKXWk+ZUXhhzevnJKXc6NVeuQ1eIPIsKQSfzyp+qqLaH+TDDnyXKKDvuCOUWTd+AQlauQ4RgvGWldXWnKxgsM1h6Yky//m0tgeQqhTThW3YPkIOShYL3QACIzUB6ULs4GEMt78aG9jYdW7Y7zqGT13+wtr2GBTlT24zLGVHuLj6fx7iy3iLrhK8bZyEop2qVHPJUdowZI3pOVmGOkJ9j6nVnIaFzYQ6fxhr7nPtrWg6LiFURNzJqPmBKeTekkqMPpdoqcdTkLqxeshb4HMVAG+dBYUm/+y358BLZCe8P62JXcUzxbE1Ny6t7bg=="
+  },
+  "project_aliases": [
+    "team-a",
+    "team-b"
+  ]
+}

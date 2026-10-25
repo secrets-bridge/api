@@ -1,0 +1,8 @@
+{
+  "status": "ok",
+  "server_time": "2026-10-24T12:00:00.123456Z",
+  "next_heartbeat_seconds": 30,
+  "claim_poll_seconds": 5,
+  "contract_version": "1",
+  "catalog_version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

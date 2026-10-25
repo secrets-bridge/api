@@ -236,6 +236,11 @@ type Config struct {
 	// LogoBackfill runs the inline-logo backfill at start when an object
 	// store is configured. SB_OBJECTSTORE_LOGO_BACKFILL, default true.
 	LogoBackfill bool
+
+	// GatewayDiscoveryLeaseTTL is the Argo CD discovery lease TTL
+	// (SB_GATEWAY_DISCOVERY_LEASE_TTL, api#308, decision E-3): default
+	// 5m, clamped to 1m to 15m. Zero means the default.
+	GatewayDiscoveryLeaseTTL time.Duration
 }
 
 func loadConfig() Config {
@@ -272,6 +277,7 @@ func loadConfig() Config {
 		RequireMFAAtLoginInvalid:       envBoolInvalid("SB_REQUIRE_MFA_AT_LOGIN"),
 		AllowInsecureHeaderAuth:        envBool("SB_ALLOW_INSECURE_HEADER_AUTH", false),
 		AllowDirectAgentMint:           envBool("SB_ALLOW_DIRECT_AGENT_MINT", false),
+		GatewayDiscoveryLeaseTTL:       envDuration("SB_GATEWAY_DISCOVERY_LEASE_TTL", 0),
 	}
 }
 

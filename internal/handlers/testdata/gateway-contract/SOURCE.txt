@@ -1,0 +1,9 @@
+Vendored copy of the gateway discovery wire contract examples.
+
+Source: github.com/secrets-bridge/gateway, branch docs/discovery-contract
+(PR secrets-bridge/gateway#32), commit 37e6257227b81dfdc96b076df3d9ec32091a43c5,
+directory internal/contract/testdata/examples.
+
+Copied unchanged. Refresh this copy, and this file, when the contract
+examples change; the api tests in internal/handlers and cmd/api check
+every example against the api decoders and response types.

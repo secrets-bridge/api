@@ -466,6 +466,7 @@ func (r *ObservationTasks) ListObservableBindings(ctx context.Context, scope Obs
 		JOIN gateways g ON g.id = b.gateway_id
 		JOIN gateway_connectors c ON c.id = b.argocd_connector_id AND c.gateway_id = b.gateway_id
 		WHERE b.deleted_at IS NULL AND b.enabled AND b.environment_id = $1
+		  AND b.suspended_reason IS NULL
 		  AND (($2::uuid IS NOT NULL AND b.secret_id = $2) OR
 		       ($3::uuid IS NOT NULL AND b.provider_connection_id = $3 AND b.secret_ref = $4::text))
 		  AND g.status NOT IN ('revoked','disabled')
@@ -582,6 +583,29 @@ const connectorOverPrivilegedSQL = `EXISTS (
 		  AND (rp.status = 'over_privileged'
 		       OR rp.connector_health @> jsonb_build_array(jsonb_build_object('connector_id', c.name, 'status', 'over_privileged'))))`
 
+// connectorScopeUnsettledSQL is true when a replica of the task's
+// Gateway seen within the replica window ($2) reports a scope digest for
+// connector c that is not the approved one, or c has no approved digest
+// while a replica reports one (api#308, ADR 0002 C6). It covers both a
+// changed scope that has not been re-approved yet and replicas that
+// disagree. Decided in the claim query, like the over_privileged pause.
+const connectorScopeUnsettledSQL = `EXISTS (
+		SELECT 1 FROM gateway_replicas rs, jsonb_array_elements(rs.connector_health) sh
+		WHERE rs.gateway_id = t.gateway_id AND rs.last_seen_at > now() - $2::interval
+		  AND sh->>'connector_id' = c.name AND sh ? 'scope_digest'
+		  AND (c.approved_scope_digest IS NULL OR sh->>'scope_digest' <> c.approved_scope_digest))`
+
+// claimerScopeApprovedSQL is true when connector c has no approved
+// digest (a contract 1 Gateway), or the claiming replica ($3), live in
+// the window ($2), last reported exactly the approved digest for c. A
+// replica that sent no digest yet (its first, contract 1 shaped
+// heartbeat), one that never heartbeated, and one at another digest
+// cannot claim (review on #317, item 1).
+const claimerScopeApprovedSQL = `(c.approved_scope_digest IS NULL OR EXISTS (
+		SELECT 1 FROM gateway_replicas ro, jsonb_array_elements(ro.connector_health) oh
+		WHERE ro.gateway_id = t.gateway_id AND ro.replica_id = $3 AND ro.last_seen_at > now() - $2::interval
+		  AND oh->>'connector_id' = c.name AND oh->>'scope_digest' = c.approved_scope_digest))`
+
 // gatewayReplicaWindowSQL is GatewayReplicaLiveWindow as a Postgres
 // interval.
 var gatewayReplicaWindowSQL = fmt.Sprintf("%d seconds", int(GatewayReplicaLiveWindow/time.Second))
@@ -670,11 +694,14 @@ func (r *ObservationTasks) Claim(ctx context.Context, gatewayID, replicaID uuid.
 			JOIN gateway_connectors c ON c.id = b.argocd_connector_id
 			WHERE b.id = t.binding_id AND b.deleted_at IS NULL AND b.enabled
 			  AND c.gateway_id = t.gateway_id AND c.status = 'approved'
+			  AND b.suspended_reason IS NULL
 			  AND NOT `+bindingTargetIdentityChangedSQL+`
-			  AND NOT `+connectorOverPrivilegedSQL+`)
+			  AND NOT `+connectorOverPrivilegedSQL+`
+			  AND NOT `+connectorScopeUnsettledSQL+`
+			  AND `+claimerScopeApprovedSQL+`)
 		ORDER BY t.not_before, t.created_at
 		LIMIT 1
-		FOR UPDATE OF t SKIP LOCKED`, gatewayID, gatewayReplicaWindowSQL).Scan(&taskID, &prevAttempt)
+		FOR UPDATE OF t SKIP LOCKED`, gatewayID, gatewayReplicaWindowSQL, replicaID).Scan(&taskID, &prevAttempt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNoObservationTask
 	}

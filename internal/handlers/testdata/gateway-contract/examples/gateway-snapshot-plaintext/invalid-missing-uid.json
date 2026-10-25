@@ -1,0 +1,18 @@
+{
+  "targets": [
+    {
+      "app_project": "team-a-apps",
+      "name": "payments-api",
+      "namespace": "argocd",
+      "target_id": "d-li3oyoq5xwjxe72ps7qqn5dikf"
+    },
+    {
+      "app_project": "team-a-apps",
+      "name": "billing-api",
+      "namespace": "argocd",
+      "target_id": "d-zk5ykqqvtcwquubd3reviuzqrz",
+      "uid": "6f1c2c1e-0000-4000-8000-0000000000b2"
+    }
+  ],
+  "v": "sb-gateway-snapshot/v1"
+}

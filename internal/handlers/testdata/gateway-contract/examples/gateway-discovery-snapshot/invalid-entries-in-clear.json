@@ -1,0 +1,25 @@
+{
+  "schema_version": "gateway.discovery-snapshot/v1",
+  "connector_id": "argocd-main",
+  "generation": 7,
+  "discovered_at": "2026-10-24T12:00:00Z",
+  "snapshot": {
+    "alg": "A256GCM+HKDF-SHA256/v1",
+    "nonce": "oKGio6Slpqeoqaqr",
+    "ciphertext": "9PsIQ8x9PHIxtoJLMc1EpRInCgZVl/noeGRP7EQHVmbNlI6YAhWH/zQC/uOOoCP8IplIPU+VA3KghSSiMdseGqEW0WV9atr6BHRaX4morwA4cO7VA8c7SYLjZTUso4X62h4v9LJNAeqWgJuoIrnqh7C+NVX/pl+jiBR4taNycD/1xQ27jSLb9IcG3jsOBoFmsKXWk+ZUXhhzevnJKXc6NVeuQ1eIPIsKQSfzyp+qqLaH+TDDnyXKKDvuCOUWTd+AQlauQ4RgvGWldXWnKxgsM1h6Yky//m0tgeQqhTThW3YPkIOShYL3QACIzUB6ULs4GEMt78aG9jYdW7Y7zqGT13+wtr2GBTlT24zLGVHuLj6fx7iy3iLrhK8bZyEop2qVHPJUdowZI3pOVmGOkJ9j6nVnIaFzYQ6fxhr7nPtrWg6LiFURNzJqPmBKeTekkqMPpdoqcdTkLqxeshb4HMVAG+dBYUm/+y358BLZCe8P62JXcUzxbE1Ny6t7bg=="
+  },
+  "entries": [
+    {
+      "target_id": "d-li3oyoq5xwjxe72ps7qqn5dikf",
+      "app_project": "team-a-apps",
+      "namespace": "argocd",
+      "name": "payments-api"
+    },
+    {
+      "target_id": "d-zk5ykqqvtcwquubd3reviuzqrz",
+      "app_project": "team-a-apps",
+      "namespace": "argocd",
+      "name": "billing-api"
+    }
+  ]
+}

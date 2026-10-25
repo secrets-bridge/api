@@ -1,0 +1,17 @@
+{
+  "replica_id": "7f3c9e2a-1b2c-4d5e-8f90-123456789abc",
+  "gateway_version": "0.3.0",
+  "contract_versions": [
+    "1"
+  ],
+  "status": "ok",
+  "in_flight": 0,
+  "catalog_version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "connectors": [
+    {
+      "connector_id": "argocd-main",
+      "kind": "argocd",
+      "status": "ok"
+    }
+  ]
+}

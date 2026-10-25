@@ -77,6 +77,25 @@ on `main`.
   token on the Argo CD side.
 
 ### Added
+- Argo CD discovery, heartbeat side (#308, ADR 0002 S4): migration 0050
+  adds the discovery storage (discovered targets, the AppProject to team
+  mapping, the sealed snapshot, the approved scope digest, the discovery
+  lease and binding suspension reasons). The E2 heartbeat negotiates
+  contract `"2"` and still answers `"1"` unchanged to a Gateway that
+  does not list it. A changed scope digest puts an approved connector
+  back to pending (`scope_changed`), suspends its bindings, pauses
+  dispatch and is audited as `gateway.connector.scope_changed`; replicas
+  that disagree pause dispatch too. One discovery lease per connector is
+  granted across api replicas, no sooner than the 60 second floor, with
+  a TTL from `SB_GATEWAY_DISCOVERY_LEASE_TTL` (default 5m). Approve
+  takes the scope digest the admin was shown; once a digest was
+  approved it is never cleared, and with discovery on it must be the
+  digest of the latest upload. Only a replica whose own heartbeat
+  reports the approved digest can claim. A connector reported
+  `over_privileged` latches back to pending (`status_reason:
+  over_privileged`) until a platform admin re-approves it after a
+  passing probe; the pause no longer lifts on the next healthy
+  heartbeat. E3 refuses static target ids in the discovered `d-` shape.
 - `redis_call_timeouts_total{site}` counts Redis calls on the auth paths
   (`auth_cache`) and in the rate limiter (`rate_limit`) that hit their
   deadline, so a slow Redis shows before limiters start failing open.
