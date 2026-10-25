@@ -45,7 +45,8 @@ on `main`.
 - Every Agent request under `/api/v1/agents/:id/*` must carry
   `X-Agent-Key-Fingerprint`. After the secret check, a missing or wrong
   fingerprint gets 409 `{"error":"agent_key_mismatch"}` and an
-  `agent.key.mismatch` audit row, at most one per agent per minute. The
+  `agent.key.mismatch` audit row, at most one per agent and
+  `error_kind` (`missing`, `malformed`, `mismatch`) per minute. The
   two key rotation calls are the exception: they take `X-Agent-Secret`
   only, because the old private key may be the one that was lost.
 - Wrap retrieval always seals to the bound key and returns
@@ -77,6 +78,13 @@ on `main`.
   that is logged as a warning at boot.
 
 ### Fixed
+- The `agent.key.mismatch` rollup used one slot per agent for every
+  kind, so a headerless call hid a wrong-key attempt (and its
+  `presented_key_fingerprint`) for 60s, and the row did not say how
+  many events it stood for. Each (agent, `error_kind`) now has its own
+  slot, and the first row after a window carries `suppressed_count`,
+  the number of events of that kind folded since the previous row
+  (skills#116).
 - A Gateway that refuses a recreated Application now suspends the
   target (api#314, gateway#25). When the integrator pins
   `applications[].uid` in the Gateway settings, the catalog identity
