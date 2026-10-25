@@ -781,7 +781,9 @@ func TestAgentSurface_RejectedAuthAuditRollup(t *testing.T) {
 	}
 
 	// skills#116: the right secret with a wrong key fingerprint is 409
-	// agent_key_mismatch, audited once per agent per minute.
+	// agent_key_mismatch, audited once per agent and error_kind per
+	// minute: the alternating missing and wrong fingerprints are two
+	// kinds, so two rows, and neither hides the other.
 	other, _, _ := sealing.GenerateRecipientKey()
 	for i := 0; i < 50; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+a.id.String()+"/jobs/claim", nil)
@@ -799,8 +801,13 @@ func TestAgentSurface_RejectedAuthAuditRollup(t *testing.T) {
 			t.Fatalf("wrong/missing fingerprint = %d %s; want 409 agent_key_mismatch", resp.StatusCode, body)
 		}
 	}
-	if n := fx.countRows(t, `SELECT count(*) FROM audit_events WHERE action = 'agent.key.mismatch'`); n != 1 {
-		t.Fatalf("50 key mismatches wrote %d audit rows; want 1", n)
+	if n := fx.countRows(t, `SELECT count(*) FROM audit_events WHERE action = 'agent.key.mismatch'`); n != 2 {
+		t.Fatalf("50 key mismatches over 2 kinds wrote %d audit rows; want 2", n)
+	}
+	for _, kind := range []string{"missing", "mismatch"} {
+		if n := fx.countRows(t, `SELECT count(*) FROM audit_events WHERE action = 'agent.key.mismatch' AND metadata->>'error_kind' = $1`, kind); n != 1 {
+			t.Fatalf("%s rows = %d; want 1", kind, n)
+		}
 	}
 
 	// A different reason is its own bucket: still audited (api#187).
