@@ -295,6 +295,9 @@ func TestSSO_RedirectURIComesFromThePublicAddress(t *testing.T) {
 	}
 }
 
+// ssoCapWindow mirrors ssoRefusalWindow in internal/services/sso_signin.go.
+const ssoCapWindow = 10 * time.Minute
+
 // Review: the cap on waiting accounts refuses the next one, and refusals
 // are aggregated in the audit log.
 func TestSSO_WaitingCap(t *testing.T) {
@@ -307,16 +310,31 @@ func TestSSO_WaitingCap(t *testing.T) {
 			t.Fatalf("sign-in %d under the cap was refused", i+1)
 		}
 	}
+	// The aggregation window is wall-clock aligned (ssoRefusalWindow in
+	// services/sso_signin.go). If a window boundary falls between two of
+	// the refusals, the new window's first refusal is audited too, with the
+	// previous window's summary: 3 rows, by design. The test can only see
+	// whether a boundary fell somewhere around the three requests, not
+	// between two refusals, so then either count is right. Under the race
+	// detector on CI the test can take 15s or more, which made the strict
+	// count fail on a few percent of runs.
+	windowOf := func() time.Time { return time.Now().UTC().Truncate(ssoCapWindow) }
+	first := windowOf()
 	for _, who := range []string{"c", "d", "e"} {
 		if r := h.signIn(googleClaims("cap-"+who, who+"@example.com", "example.com")); findCookie(r, loginTestSessionKey) != nil {
 			t.Fatalf("sign-in over the cap (%s) got a session", who)
 		}
 	}
+	crossed := !windowOf().Equal(first)
 	if n := h.count(`SELECT count(*) FROM local_users`); n != 2 {
 		t.Fatalf("accounts = %d, want 2", n)
 	}
-	if n := h.count(`SELECT count(*) FROM audit_events WHERE action = 'user.pending_refused'`); n != 1 {
+	n := h.count(`SELECT count(*) FROM audit_events WHERE action = 'user.pending_refused'`)
+	switch {
+	case !crossed && n != 1:
 		t.Fatalf("user.pending_refused events for 3 refusals in one window = %d, want 1", n)
+	case crossed && n != 1 && n != 3:
+		t.Fatalf("user.pending_refused events for 3 refusals around a window boundary = %d, want 1 or 3", n)
 	}
 	// Review S1: and no row per attempt next to the aggregate.
 	if n := h.auditReasons("pending_cap"); n != 0 {
