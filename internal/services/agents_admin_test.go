@@ -18,24 +18,21 @@ import (
 )
 
 // enroll a fresh agent and return (agentID, agentToken).
-func (h *enrollHarness) enroll(t *testing.T, name string) (uuid.UUID, string) {
+func (h *enrollHarness) enrollAgent(t *testing.T, name string) (uuid.UUID, string) {
 	t.Helper()
 	tok := h.generate(t, services.GenerateEnrollmentTokenInput{})
-	res, err := h.svc.Enroll(t.Context(), services.EnrollInput{
-		Token: tok.Token, AgentName: name, ProviderType: "aws-sm",
-		ClusterName: "eks-x", AgentVersion: "v0.1.0", Capabilities: []string{"discover"},
-	})
+	res, _, err := h.enroll(t, tok.Token, name)
 	if err != nil {
 		t.Fatalf("Enroll: %v", err)
 	}
-	return res.AgentID, res.AgentToken
+	return res.AgentID, res.AgentSecret
 }
 
 // richer heartbeat flips enrolled→active and records reported fields.
 func TestRecordHeartbeat_EnrolledToActive_UpdatesFields(t *testing.T) {
 	h := bootstrapEnroll(t, "aws-sm", "active")
 	ctx := t.Context()
-	id, token := h.enroll(t, "hb-agent")
+	id, token := h.enrollAgent(t, "hb-agent")
 
 	// precondition: enrolled + no last_seen.
 	var status string
@@ -83,7 +80,7 @@ func TestRecordHeartbeat_EnrolledToActive_UpdatesFields(t *testing.T) {
 func TestRecordHeartbeat_RevokedAgentRejected(t *testing.T) {
 	h := bootstrapEnroll(t, "aws-sm", "active")
 	ctx := t.Context()
-	id, token := h.enroll(t, "hb-revoked")
+	id, token := h.enrollAgent(t, "hb-revoked")
 
 	// first heartbeat OK.
 	if err := h.svc.RecordHeartbeat(ctx, id, token, services.HeartbeatInput{}); err != nil {
@@ -103,7 +100,7 @@ func TestRecordHeartbeat_RevokedAgentRejected(t *testing.T) {
 func TestRevoke_RecordsReasonAndActor(t *testing.T) {
 	h := bootstrapEnroll(t, "aws-sm", "active")
 	ctx := t.Context()
-	id, _ := h.enroll(t, "rev-agent")
+	id, _ := h.enrollAgent(t, "rev-agent")
 
 	if err := h.svc.Revoke(ctx, id, "admin-user-9", "credential rotation"); err != nil {
 		t.Fatalf("Revoke: %v", err)
@@ -136,25 +133,25 @@ func TestRevoke_RecordsReasonAndActor(t *testing.T) {
 	}
 }
 
-// a safe enrollment rejection emits a metadata-only agent.enrollment.rejected
-// audit (reason code only, never the token) — QA follow-up.
+// a safe enrollment rejection emits a metadata-only denied agent.enroll
+// audit (error_kind only, never the token): QA follow-up, skills#116.
 func TestEnroll_RejectionEmitsAudit(t *testing.T) {
 	h := bootstrapEnroll(t, "aws-sm", "active")
 	ctx := t.Context()
 
 	_, err := h.svc.Enroll(ctx, services.EnrollInput{
-		Token: "totally-bogus-token", AgentName: "x", ProviderType: "aws-sm",
+		SchemaVersion: "2", Token: "totally-bogus-token", Name: "x", ProviderType: "aws-sm",
 	})
-	if !errors.Is(err, services.ErrEnrollmentTokenInvalid) {
-		t.Fatalf("bad-token enroll err = %v; want ErrEnrollmentTokenInvalid", err)
+	if services.RejectionReason(err) != "token_invalid" {
+		t.Fatalf("bad-token enroll err = %v; want token_invalid", err)
 	}
 	var meta string
 	if err := h.pool.QueryRow(ctx,
-		`SELECT metadata::text FROM audit_events WHERE action='agent.enrollment.rejected'`).Scan(&meta); err != nil {
+		`SELECT metadata::text FROM audit_events WHERE action='agent.enroll' AND status='denied'`).Scan(&meta); err != nil {
 		t.Fatalf("query audit: %v", err)
 	}
 	if !strings.Contains(meta, "token_invalid") {
-		t.Errorf("enrollment.rejected audit missing reason: %s", meta)
+		t.Errorf("denied enroll audit missing error_kind: %s", meta)
 	}
 	if strings.Contains(meta, "totally-bogus-token") {
 		t.Errorf("token plaintext leaked into audit: %s", meta)
@@ -166,7 +163,7 @@ func TestEnroll_RejectionEmitsAudit(t *testing.T) {
 func TestAuthenticate_RejectionEmitsAudit(t *testing.T) {
 	h := bootstrapEnroll(t, "aws-sm", "active")
 	ctx := t.Context()
-	id, _ := h.enroll(t, "auth-rej")
+	id, _ := h.enrollAgent(t, "auth-rej")
 
 	err := h.svc.RecordHeartbeat(ctx, id, "not-the-real-token", services.HeartbeatInput{})
 	if !errors.Is(err, storage.ErrUnauthorized) {
@@ -190,7 +187,7 @@ func TestAuthenticate_RejectionEmitsAudit(t *testing.T) {
 func TestListAgents_AdminProjection(t *testing.T) {
 	h := bootstrapEnroll(t, "aws-sm", "active")
 	ctx := t.Context()
-	id, _ := h.enroll(t, "proj-agent")
+	id, _ := h.enrollAgent(t, "proj-agent")
 
 	rows, err := h.svc.ListAgents(ctx, storage.AgentAdminFilter{ProviderConnectionID: &h.connID})
 	if err != nil {
@@ -239,9 +236,9 @@ func TestRevokeEnrollmentToken_ThenEnrollRejected(t *testing.T) {
 	if err := h.svc.RevokeEnrollmentToken(ctx, tokID, "admin-user-1", "mis-issued"); err != nil {
 		t.Fatalf("RevokeEnrollmentToken: %v", err)
 	}
-	_, err := h.svc.Enroll(ctx, services.EnrollInput{Token: tok.Token, AgentName: "a1", ProviderType: "aws-sm"})
-	if err == nil || !errors.Is(err, services.ErrEnrollmentTokenRevoked) {
-		t.Fatalf("enroll after revoke err = %v; want ErrEnrollmentTokenRevoked", err)
+	_, err := h.svc.Enroll(ctx, services.EnrollInput{SchemaVersion: "2", Token: tok.Token, Name: "a1", ProviderType: "aws-sm"})
+	if services.RejectionReason(err) != "token_revoked" {
+		t.Fatalf("enroll after revoke err = %v; want token_revoked", err)
 	}
 	// revoking again (now revoked) → not found / not revocable.
 	if err := h.svc.RevokeEnrollmentToken(ctx, tokID, "admin-user-1", "again"); !errors.Is(err, storage.ErrEnrollmentTokenNotFound) {

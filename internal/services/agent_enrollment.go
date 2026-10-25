@@ -1,20 +1,36 @@
 package services
 
-// Agent Onboarding MVP (api#178) — enrollment-token generation + agent
-// self-enrollment. Extends AgentService without touching the certified
-// mint / heartbeat / AgentAuth paths. The persistent agent credential is
-// still agents.secret_hash (returned once as agent_token).
+// Agent enrollment (api#178, v2 in skills#116): enrollment-token
+// generation and the two-step enroll with proof of possession of a
+// customer-generated X25519 key.
+//
+//  1. EnrollChallenge: a valid token and a valid public key get a
+//     random 32-byte nonce sealed to that key (pkg/sealing). Only the
+//     nonce's SHA-256 is stored, bound to the token and the key, for
+//     120s, single use. The token is not consumed.
+//  2. Enroll: in one transaction the token is consumed, the challenge
+//     is checked (bound to this token, unused, unexpired, SHA-256 of
+//     the response equal to the stored hash, constant time), the agent
+//     is created with the challenge's key at version 1 and the
+//     provider connection of the token, and the challenge is marked
+//     used.
+//
+// The agent secret (agents.secret_hash) is returned once by Enroll.
+// Errors are generic; the reason is in the audit row only.
 
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/secrets-bridge/api/pkg/sealing"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
@@ -24,20 +40,57 @@ const (
 	enrollTokenMinTTLSeconds     = 60    // 1m
 	enrollTokenMaxTTLSeconds     = 86400 // 24h
 	enrollHeartbeatIntervalSec   = 30
-	enrollJobPollIntervalSec     = 5
+	enrollClaimIntervalSec       = 5
+	keyChallengeTTL              = 120 * time.Second
+	keyChallengeNonceSize        = 32
+
+	// EnrollSchemaVersion is the only enrollment request version. A
+	// request without it is refused; there is no legacy fallback.
+	EnrollSchemaVersion = "2"
 )
 
-// Enrollment sentinels — mapped to HTTP status in the handler layer.
+// Enrollment sentinels, mapped to HTTP status in the handler layer.
 var (
 	ErrEnrollmentNotConfigured      = errors.New("services: enrollment not configured")
-	ErrEnrollmentTokenInvalid       = errors.New("services: enrollment token invalid")
-	ErrEnrollmentTokenExpired       = errors.New("services: enrollment token expired")
-	ErrEnrollmentTokenConsumed      = errors.New("services: enrollment token already consumed")
-	ErrEnrollmentTokenRevoked       = errors.New("services: enrollment token revoked")
-	ErrEnrollmentProviderMismatch   = errors.New("services: provider_type mismatch")
-	ErrEnrollmentClusterMismatch    = errors.New("services: cluster_name mismatch")
 	ErrEnrollmentConnectionUnusable = errors.New("services: provider connection unavailable for enrollment")
+	// ErrEnrollmentRejected covers a bad, expired, used or revoked
+	// token, a provider or cluster mismatch and any challenge failure.
+	// The specific reason is only in the audit row (rejectionKind).
+	ErrEnrollmentRejected       = errors.New("services: enrollment rejected")
+	ErrInvalidPublicKey         = errors.New("services: invalid public key")
+	ErrUnsupportedSchemaVersion = errors.New("services: unsupported schema version")
+	ErrAgentNameTaken           = errors.New("services: agent name already in use")
 )
+
+// rejection carries an audit-only reason code under a generic sentinel.
+type rejection struct {
+	base error
+	kind string
+}
+
+func (r *rejection) Error() string { return r.base.Error() }
+func (r *rejection) Unwrap() error { return r.base }
+
+func reject(base error, kind string) error { return &rejection{base: base, kind: kind} }
+
+// rejectionKind returns the audit reason for err, or "" for an internal
+// error (a 5xx, not a rejection).
+func rejectionKind(err error) string {
+	var r *rejection
+	switch {
+	case errors.As(err, &r):
+		return r.kind
+	case errors.Is(err, ErrInvalidPublicKey):
+		return "invalid_public_key"
+	case errors.Is(err, ErrUnsupportedSchemaVersion):
+		return "unsupported_schema_version"
+	case errors.Is(err, ErrAgentNameTaken):
+		return "agent_name_taken"
+	case errors.Is(err, ErrInvalidInput):
+		return "invalid_request"
+	}
+	return ""
+}
 
 // GenerateEnrollmentTokenInput is the admin request to mint a one-time
 // enrollment token bound to a provider connection.
@@ -51,7 +104,7 @@ type GenerateEnrollmentTokenInput struct {
 }
 
 // GeneratedEnrollmentToken is returned by GenerateEnrollmentToken. Token is
-// the plaintext, returned exactly ONCE — only its hash is persisted.
+// the plaintext, returned exactly ONCE; only its hash is persisted.
 type GeneratedEnrollmentToken struct {
 	// ID is the token row's id, which POST
 	// /agent-enrollment-tokens/:id/revoke takes.
@@ -149,7 +202,8 @@ func (s *AgentService) GenerateEnrollmentToken(ctx context.Context, in GenerateE
 }
 
 // RevokeEnrollmentToken revokes an UNUSED enrollment token so it can never
-// be redeemed. Metadata-only audit. api#179.
+// be redeemed, and invalidates its open challenges. Metadata-only audit.
+// api#179.
 func (s *AgentService) RevokeEnrollmentToken(ctx context.Context, id uuid.UUID, revokedBy, reason string) error {
 	if s.enrollTokens == nil {
 		return ErrEnrollmentNotConfigured
@@ -177,80 +231,275 @@ func (s *AgentService) RevokeEnrollmentToken(ctx context.Context, id uuid.UUID, 
 	return nil
 }
 
-// EnrollInput is the agent's outbound self-enrollment request.
-type EnrollInput struct {
-	Token                string
-	AgentName            string
-	AgentVersion         string
-	ClusterName          string
-	ProviderType         string
-	Region               string
-	Capabilities         []string
-	PublicKeyFingerprint string
+// KeyChallenge is the challenge returned to the enrolling or rotating
+// client: the nonce sealed to the submitted public key.
+type KeyChallenge struct {
+	ChallengeID uuid.UUID
+	Sealed      *sealing.Envelope
+	ExpiresAt   time.Time
 }
 
-// EnrolledAgent is returned by Enroll. AgentToken is the persistent agent
-// credential — returned exactly ONCE, only its hash is stored.
+// EnrollChallengeInput is step 1 of the enrollment.
+type EnrollChallengeInput struct {
+	SchemaVersion      string
+	Token              string
+	PublicKey          string // std base64, 32 bytes
+	PublicKeyAlgorithm string
+}
+
+// EnrollInput is step 2 of the enrollment.
+type EnrollInput struct {
+	SchemaVersion     string
+	Token             string
+	ChallengeID       string
+	ChallengeResponse string // std base64 of the decrypted nonce
+	Name              string
+	ClusterName       string
+	ProviderType      string
+	Region            string
+}
+
+// EnrolledAgent is returned by Enroll. AgentSecret is the persistent
+// agent credential, returned exactly ONCE; only its hash is stored.
 type EnrolledAgent struct {
 	AgentID                  uuid.UUID
 	ProviderConnectionID     uuid.UUID
-	AgentToken               string
+	AgentSecret              string
+	PublicKeyFingerprint     string
+	PublicKeyVersion         int
 	HeartbeatIntervalSeconds int
-	JobPollIntervalSeconds   int
+	ClaimIntervalSeconds     int
 }
 
-// Enroll validates a one-time token, creates a provider-connection-bound
-// agent, consumes the token, and returns the persistent agent credential
-// once. No provider credentials or secret values are ever returned.
-//
-// On a safe rejection (bad/expired/consumed/revoked token, provider or
-// cluster mismatch, unusable connection) it emits a metadata-only
-// agent.enrollment.rejected audit (QA follow-up) — reason code only, never
-// the token, hash, or any secret material.
-func (s *AgentService) Enroll(ctx context.Context, in EnrollInput) (*EnrolledAgent, error) {
-	res, err := s.enroll(ctx, in)
+// enrollAuditMeta is what both enrollment audit rows may carry. Never
+// the token, the secret or the nonce.
+type enrollAuditMeta struct {
+	fingerprint  string
+	connectionID uuid.UUID
+	challengeID  uuid.UUID
+	agentID      uuid.UUID
+	tokenID      uuid.UUID
+}
+
+func (m enrollAuditMeta) fill(meta map[string]any) {
+	if m.fingerprint != "" {
+		meta["public_key_fingerprint"] = m.fingerprint
+	}
+	if m.connectionID != uuid.Nil {
+		meta["provider_connection_id"] = m.connectionID.String()
+	}
+	if m.challengeID != uuid.Nil {
+		meta["challenge_id"] = m.challengeID.String()
+	}
+	if m.agentID != uuid.Nil {
+		meta["agent_id"] = m.agentID.String()
+	}
+	if m.tokenID != uuid.Nil {
+		meta["enrollment_token_id"] = m.tokenID.String()
+	}
+}
+
+// auditEnrollDenied writes a denied enrollment row with its error_kind.
+// The routes are unauthenticated, so denials are rolled up: one row per
+// (action, reason) per rejectAuditWindow (API-N-07).
+func (s *AgentService) auditEnrollDenied(ctx context.Context, action string, err error, m enrollAuditMeta) {
+	kind := rejectionKind(err)
+	if kind == "" {
+		return
+	}
+	if !s.claimRejectAuditSlot(ctx, cacheKindEnrollRejectAudit, "unknown", action+":"+kind) {
+		return
+	}
+	meta := map[string]any{
+		"error_kind":            kind,
+		"rollup_window_seconds": int(rejectAuditWindow / time.Second),
+	}
+	m.fill(meta)
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "agent:enroll",
+		Action:   action,
+		Resource: "agent_enrollment_token",
+		Status:   storage.AuditStatusDenied,
+		Metadata: meta,
+	})
+}
+
+// usableEnrollmentToken resolves a presented token and checks it is
+// unrevoked, unconsumed, unexpired and on an active connection.
+func (s *AgentService) usableEnrollmentToken(ctx context.Context, token string, now time.Time) (*storage.AgentEnrollmentToken, *storage.ProviderConnection, error) {
+	if token == "" {
+		return nil, nil, reject(ErrEnrollmentRejected, "token_invalid")
+	}
+	hash := sha256.Sum256([]byte(token))
+	tok, err := s.enrollTokens.GetByHash(ctx, hash[:])
 	if err != nil {
-		// Rolled up like agent.auth.rejected (API-N-07): the route is
-		// unauthenticated and the enrolling caller has no agent id, so
-		// one row per reason per window.
-		if reason, ok := enrollRejectReason(err); ok && s.claimRejectAuditSlot(ctx, cacheKindEnrollRejectAudit, "unknown", reason) {
-			_ = s.audit.Append(ctx, &storage.AuditEvent{
-				Actor:    "agent:enroll",
-				Action:   "agent.enrollment.rejected",
-				Resource: "agent_enrollment_token",
-				Status:   storage.AuditStatusDenied,
-				Metadata: map[string]any{
-					"reason":                reason,
-					"rollup_window_seconds": int(rejectAuditWindow / time.Second),
-				},
-			})
+		if errors.Is(err, storage.ErrEnrollmentTokenNotFound) {
+			return nil, nil, reject(ErrEnrollmentRejected, "token_invalid")
 		}
+		return nil, nil, fmt.Errorf("agents: resolve enrollment token: %w", err)
 	}
-	return res, err
+	switch {
+	case tok.RevokedAt != nil:
+		return tok, nil, reject(ErrEnrollmentRejected, "token_revoked")
+	case tok.ConsumedAt != nil:
+		return tok, nil, reject(ErrEnrollmentRejected, "token_already_consumed")
+	case !tok.ExpiresAt.After(now):
+		return tok, nil, reject(ErrEnrollmentRejected, "token_expired")
+	}
+	conn, err := s.provConns.Get(ctx, tok.ProviderConnectionID)
+	if err != nil {
+		if errors.Is(err, storage.ErrConnectionNotFound) {
+			return tok, nil, reject(ErrEnrollmentRejected, "provider_connection_unavailable")
+		}
+		return tok, nil, fmt.Errorf("agents: resolve provider connection: %w", err)
+	}
+	if conn.Status != storage.ProviderConnectionStatusActive {
+		return tok, conn, reject(ErrEnrollmentRejected, "provider_connection_unavailable")
+	}
+	return tok, conn, nil
 }
 
-// enrollRejectReason maps a safe rejection sentinel to a coarse reason code
-// for the metadata-only audit. Returns ok=false for internal/config errors
-// (those are 5xx, not rejections) so we don't audit them as denials.
-func enrollRejectReason(err error) (string, bool) {
-	switch {
-	case errors.Is(err, ErrEnrollmentTokenInvalid):
-		return "token_invalid", true
-	case errors.Is(err, ErrEnrollmentTokenExpired):
-		return "token_expired", true
-	case errors.Is(err, ErrEnrollmentTokenConsumed):
-		return "token_already_consumed", true
-	case errors.Is(err, ErrEnrollmentTokenRevoked):
-		return "token_revoked", true
-	case errors.Is(err, ErrEnrollmentProviderMismatch):
-		return "provider_type_mismatch", true
-	case errors.Is(err, ErrEnrollmentClusterMismatch):
-		return "cluster_name_mismatch", true
-	case errors.Is(err, ErrEnrollmentConnectionUnusable):
-		return "provider_connection_unavailable", true
-	default:
-		return "", false
+// newSealedChallenge makes a fresh nonce, seals it to pub and returns
+// the envelope and the nonce's SHA-256. The nonce itself is zeroed.
+func newSealedChallenge(pub []byte) (*sealing.Envelope, []byte, error) {
+	nonce, err := randomBytes(keyChallengeNonceSize)
+	if err != nil {
+		return nil, nil, fmt.Errorf("agents: random challenge: %w", err)
 	}
+	defer zeroBytes(nonce)
+	env, err := sealing.Seal(nonce, pub)
+	if err != nil {
+		return nil, nil, fmt.Errorf("agents: seal challenge: %w", err)
+	}
+	sum := sha256.Sum256(nonce)
+	return env, sum[:], nil
+}
+
+// EnrollChallenge is step 1: validate the token (without consuming it)
+// and the key, and return a challenge sealed to the key.
+func (s *AgentService) EnrollChallenge(ctx context.Context, in EnrollChallengeInput) (*KeyChallenge, error) {
+	var m enrollAuditMeta
+	res, err := s.enrollChallenge(ctx, in, &m)
+	if err != nil {
+		s.auditEnrollDenied(ctx, "agent.enroll.challenge", err, m)
+		return nil, err
+	}
+	meta := map[string]any{"expires_at": res.ExpiresAt.Format(time.RFC3339)}
+	m.fill(meta)
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "agent:enroll",
+		Action:   "agent.enroll.challenge",
+		Resource: "agent_enrollment_token",
+		Status:   storage.AuditStatusSuccess,
+		Metadata: meta,
+	})
+	return res, nil
+}
+
+func (s *AgentService) enrollChallenge(ctx context.Context, in EnrollChallengeInput, m *enrollAuditMeta) (*KeyChallenge, error) {
+	if s.enrollTokens == nil || s.provConns == nil {
+		return nil, ErrEnrollmentNotConfigured
+	}
+	if in.SchemaVersion != EnrollSchemaVersion {
+		return nil, ErrUnsupportedSchemaVersion
+	}
+	pub, err := sealing.ParsePublicKey(in.PublicKey, in.PublicKeyAlgorithm)
+	if err != nil || in.PublicKeyAlgorithm != sealing.KeyAlgorithm {
+		return nil, ErrInvalidPublicKey
+	}
+	m.fingerprint = sealing.Fingerprint(pub)
+
+	now := s.now().UTC()
+	tok, _, err := s.usableEnrollmentToken(ctx, in.Token, now)
+	if tok != nil {
+		m.connectionID, m.tokenID = tok.ProviderConnectionID, tok.ID
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	env, nonceHash, err := newSealedChallenge(pub)
+	if err != nil {
+		return nil, err
+	}
+	ch := &storage.KeyChallenge{
+		ParentID:           tok.ID,
+		PublicKey:          pub,
+		PublicKeyAlgorithm: sealing.KeyAlgorithm,
+		NonceHash:          nonceHash,
+		ExpiresAt:          now.Add(keyChallengeTTL),
+	}
+	if err := s.enrollTokens.CreateEnrollmentChallenge(ctx, ch); err != nil {
+		return nil, fmt.Errorf("agents: create enrollment challenge: %w", err)
+	}
+	m.challengeID = ch.ID
+	return &KeyChallenge{ChallengeID: ch.ID, Sealed: env, ExpiresAt: ch.ExpiresAt}, nil
+}
+
+// verifyChallenge is the shared check for an enrollment or rotation
+// challenge, run with the row locked: bound to parentID (and agentID
+// for a rotation), unused, not invalidated, unexpired, and SHA-256 of
+// the response equal to the stored hash in constant time. The public
+// key is validated again before it is bound.
+func verifyChallenge(ch *storage.KeyChallenge, base error, parentID, agentID uuid.UUID, responseHash []byte, now time.Time) error {
+	switch {
+	case ch.ParentID != parentID || (agentID != uuid.Nil && ch.AgentID != agentID):
+		return reject(base, "challenge_token_mismatch")
+	case ch.UsedAt != nil:
+		return reject(base, "challenge_used")
+	case ch.InvalidatedAt != nil:
+		return reject(base, "challenge_invalidated")
+	case !ch.ExpiresAt.After(now):
+		return reject(base, "challenge_expired")
+	case subtle.ConstantTimeCompare(ch.NonceHash, responseHash) != 1:
+		return reject(base, "challenge_mismatch")
+	case sealing.ValidatePublicKey(ch.PublicKey) != nil:
+		return reject(base, "invalid_public_key")
+	}
+	return nil
+}
+
+// decodeChallengeResponse parses the challenge id and returns the
+// SHA-256 of the decoded response. A malformed response hashes to
+// nothing that can match, so it fails as challenge_mismatch.
+func decodeChallengeResponse(base error, id, response string) (uuid.UUID, []byte, error) {
+	chID, err := uuid.Parse(id)
+	if err != nil {
+		return uuid.Nil, nil, reject(base, "challenge_not_found")
+	}
+	raw, err := base64.StdEncoding.Strict().DecodeString(response)
+	if err != nil || len(raw) != keyChallengeNonceSize {
+		return chID, nil, reject(base, "challenge_mismatch")
+	}
+	defer zeroBytes(raw)
+	sum := sha256.Sum256(raw)
+	return chID, sum[:], nil
+}
+
+// Enroll is step 2: consume the token, check the challenge, create the
+// agent bound to the token's provider connection and the challenge's
+// key, and return the agent secret once.
+func (s *AgentService) Enroll(ctx context.Context, in EnrollInput) (*EnrolledAgent, error) {
+	var m enrollAuditMeta
+	res, err := s.enroll(ctx, in, &m)
+	if err != nil {
+		s.auditEnrollDenied(ctx, "agent.enroll", err, m)
+		return nil, err
+	}
+	meta := map[string]any{
+		"public_key_version": res.PublicKeyVersion,
+		"cluster_name":       in.ClusterName,
+		"provider_type":      in.ProviderType,
+	}
+	m.fill(meta)
+	_ = s.audit.Append(ctx, &storage.AuditEvent{
+		Actor:    "agent:" + res.AgentID.String(),
+		Action:   "agent.enroll",
+		Resource: "agent:" + res.AgentID.String(),
+		Status:   storage.AuditStatusSuccess,
+		Metadata: meta,
+	})
+	return res, nil
 }
 
 // unconsumableTokenErr names why the transactional consume matched no
@@ -260,78 +509,58 @@ func (s *AgentService) unconsumableTokenErr(ctx context.Context, id uuid.UUID, n
 	tok, err := s.enrollTokens.Get(ctx, id)
 	switch {
 	case err != nil:
-		return ErrEnrollmentTokenInvalid
+		return reject(ErrEnrollmentRejected, "token_invalid")
 	case tok.RevokedAt != nil:
-		return ErrEnrollmentTokenRevoked
+		return reject(ErrEnrollmentRejected, "token_revoked")
 	case tok.ConsumedAt != nil:
-		return ErrEnrollmentTokenConsumed
+		return reject(ErrEnrollmentRejected, "token_already_consumed")
 	case !tok.ExpiresAt.After(now):
-		return ErrEnrollmentTokenExpired
+		return reject(ErrEnrollmentRejected, "token_expired")
 	default:
-		return ErrEnrollmentTokenConsumed
+		return reject(ErrEnrollmentRejected, "token_already_consumed")
 	}
 }
 
-func (s *AgentService) enroll(ctx context.Context, in EnrollInput) (*EnrolledAgent, error) {
+func (s *AgentService) enroll(ctx context.Context, in EnrollInput, m *enrollAuditMeta) (*EnrolledAgent, error) {
 	if s.enrollTokens == nil || s.provConns == nil {
 		return nil, ErrEnrollmentNotConfigured
 	}
-	if in.Token == "" {
-		return nil, ErrEnrollmentTokenInvalid
+	if in.SchemaVersion != EnrollSchemaVersion {
+		return nil, ErrUnsupportedSchemaVersion
 	}
-	if in.AgentName == "" {
-		return nil, errors.New("agents: agent_name is required")
-	}
-
-	hash := sha256.Sum256([]byte(in.Token))
-	tok, err := s.enrollTokens.GetByHash(ctx, hash[:])
-	if err != nil {
-		if errors.Is(err, storage.ErrEnrollmentTokenNotFound) {
-			return nil, ErrEnrollmentTokenInvalid
-		}
-		return nil, fmt.Errorf("agents: resolve enrollment token: %w", err)
+	if in.Name == "" {
+		return nil, fmt.Errorf("%w: name is required", ErrInvalidInput)
 	}
 
 	now := s.now().UTC()
-	// Order matters: revoked/consumed are terminal states distinct from
-	// expiry so QA + the UI can tell them apart.
-	if tok.RevokedAt != nil {
-		return nil, ErrEnrollmentTokenRevoked
+	tok, conn, err := s.usableEnrollmentToken(ctx, in.Token, now)
+	if tok != nil {
+		m.connectionID, m.tokenID = tok.ProviderConnectionID, tok.ID
 	}
-	if tok.ConsumedAt != nil {
-		return nil, ErrEnrollmentTokenConsumed
-	}
-	if !tok.ExpiresAt.After(now) {
-		return nil, ErrEnrollmentTokenExpired
-	}
-
-	conn, err := s.provConns.Get(ctx, tok.ProviderConnectionID)
 	if err != nil {
-		if errors.Is(err, storage.ErrConnectionNotFound) {
-			return nil, ErrEnrollmentConnectionUnusable
-		}
-		return nil, fmt.Errorf("agents: resolve provider connection: %w", err)
+		return nil, err
 	}
-	if conn.Status != storage.ProviderConnectionStatusActive {
-		return nil, ErrEnrollmentConnectionUnusable
+	chID, responseHash, err := decodeChallengeResponse(ErrEnrollmentRejected, in.ChallengeID, in.ChallengeResponse)
+	m.challengeID = chID
+	if err != nil {
+		if rejectionKind(err) == "challenge_mismatch" {
+			s.invalidateEnrollChallenge(ctx, chID, tok.ID, now)
+		}
+		return nil, err
 	}
 
-	// Provider type must agree with the bound connection (and the token's
-	// expected value when configured). Empty agent-provided type defaults
-	// to the connection's.
+	// The provider type must agree with the bound connection (and the
+	// token's expected value when set). Empty means the connection's.
 	connType := string(conn.Type)
 	providerType := in.ProviderType
 	if providerType == "" {
 		providerType = connType
 	}
-	if providerType != connType {
-		return nil, ErrEnrollmentProviderMismatch
-	}
-	if tok.ExpectedProviderType != "" && tok.ExpectedProviderType != providerType {
-		return nil, ErrEnrollmentProviderMismatch
+	if providerType != connType || (tok.ExpectedProviderType != "" && tok.ExpectedProviderType != providerType) {
+		return nil, reject(ErrEnrollmentRejected, "provider_type_mismatch")
 	}
 	if tok.ExpectedClusterName != "" && tok.ExpectedClusterName != in.ClusterName {
-		return nil, ErrEnrollmentClusterMismatch
+		return nil, reject(ErrEnrollmentRejected, "cluster_name_mismatch")
 	}
 
 	secretBytes, err := randomBytes(32)
@@ -342,54 +571,75 @@ func (s *AgentService) enroll(ctx context.Context, in EnrollInput) (*EnrolledAge
 	secretHash := sha256.Sum256([]byte(secret))
 
 	connID := tok.ProviderConnectionID
-	caps := in.Capabilities
-	if caps == nil {
-		caps = []string{}
-	}
 	agent := &storage.Agent{
-		Name:                 in.AgentName,
+		Name:                 in.Name,
 		Status:               storage.AgentStatusEnrolled,
 		SecretHash:           secretHash[:],
 		ProviderConnectionID: &connID,
 		ClusterName:          in.ClusterName,
 		ProviderType:         providerType,
 		Region:               in.Region,
-		AgentVersion:         in.AgentVersion,
-		PublicKeyFingerprint: in.PublicKeyFingerprint,
-		Capabilities:         caps,
+		Capabilities:         []string{},
 	}
-	// Single-use guard (API-18): burn the token FIRST and create the agent
-	// in the same transaction. The consume re-checks consumed/revoked/
-	// expired under the row lock, so a concurrent double enrollment (or a
-	// token revoked after the checks above) never leaves an agent row
-	// behind, and a failed insert un-burns the token.
-	if err := s.enrollTokens.ConsumeAndCreateAgent(ctx, tok.ID, now, agent); err != nil {
-		if errors.Is(err, storage.ErrEnrollmentTokenNotFound) {
-			return nil, s.unconsumableTokenErr(ctx, tok.ID, now)
+	verify := func(ch *storage.KeyChallenge) error {
+		m.fingerprint = sealing.Fingerprint(ch.PublicKey)
+		if err := verifyChallenge(ch, ErrEnrollmentRejected, tok.ID, uuid.Nil, responseHash, now); err != nil {
+			return err
 		}
+		agent.PublicKeyFingerprint = m.fingerprint
+		return nil
+	}
+	err = s.enrollTokens.EnrollWithChallenge(ctx, tok.ID, chID, now, verify, agent)
+	switch {
+	case err == nil:
+	case errors.Is(err, storage.ErrEnrollmentTokenNotFound):
+		return nil, s.unconsumableTokenErr(ctx, tok.ID, now)
+	case errors.Is(err, storage.ErrChallengeNotFound):
+		return nil, reject(ErrEnrollmentRejected, "challenge_not_found")
+	case rejectionKind(err) == "challenge_mismatch":
+		s.invalidateEnrollChallenge(ctx, chID, tok.ID, now)
+		return nil, err
+	case rejectionKind(err) != "":
+		return nil, err
+	case isUniqueViolation(err):
+		return nil, ErrAgentNameTaken
+	default:
 		return nil, fmt.Errorf("agents: enroll agent: %w", err)
 	}
-
-	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "agent:" + agent.ID.String(),
-		Action:   "agent.enrolled",
-		Resource: "agent:" + agent.ID.String(),
-		Status:   storage.AuditStatusSuccess,
-		Metadata: map[string]any{
-			"agent_id":               agent.ID.String(),
-			"provider_connection_id": connID.String(),
-			"cluster_name":           in.ClusterName,
-			"provider_type":          providerType,
-			"agent_version":          in.AgentVersion,
-			"capabilities":           caps,
-		},
-	})
+	m.agentID = agent.ID
 
 	return &EnrolledAgent{
 		AgentID:                  agent.ID,
 		ProviderConnectionID:     connID,
-		AgentToken:               secret,
+		AgentSecret:              secret,
+		PublicKeyFingerprint:     agent.PublicKeyFingerprint,
+		PublicKeyVersion:         1,
 		HeartbeatIntervalSeconds: enrollHeartbeatIntervalSec,
-		JobPollIntervalSeconds:   enrollJobPollIntervalSec,
+		ClaimIntervalSeconds:     enrollClaimIntervalSec,
 	}, nil
 }
+
+// invalidateEnrollChallenge burns a challenge after a wrong response,
+// so each challenge gets one guess. Only a challenge of this token is
+// burned, so another token's holder cannot burn it. Best-effort.
+func (s *AgentService) invalidateEnrollChallenge(ctx context.Context, chID, tokenID uuid.UUID, now time.Time) {
+	if chID == uuid.Nil {
+		return
+	}
+	_ = s.enrollTokens.InvalidateEnrollmentChallenge(ctx, chID, tokenID, now)
+}
+
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
+// RejectionReason is the audit-only reason code of an enrollment or
+// rotation rejection ("" for anything else). Never sent to the client.
+func RejectionReason(err error) string { return rejectionKind(err) }

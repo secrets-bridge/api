@@ -76,9 +76,10 @@ func bootstrapAdminAgents(t *testing.T) *adminAgentsFixture {
 		t.Fatalf("seed connection: %v", err)
 	}
 	if err := pool.QueryRow(ctx, `
-		INSERT INTO agents (name, status, secret_hash, provider_connection_id, provider_type, cluster_name, capabilities)
-		VALUES ('adm-agent','enrolled','\x00', $1, 'aws-sm', 'eks-x', '["discover"]'::jsonb)
-		RETURNING id`, connID).Scan(&fx.agentID); err != nil {
+		INSERT INTO agents (name, status, secret_hash, provider_connection_id, provider_type, cluster_name, capabilities,
+		                    public_key, public_key_algorithm, public_key_fingerprint)
+		VALUES ('adm-agent','enrolled','\x00', $1, 'aws-sm', 'eks-x', '["discover"]'::jsonb, $2, 'x25519', $3)
+		RETURNING id`, connID, testAgentPub, testAgentFingerprint).Scan(&fx.agentID); err != nil {
 		t.Fatalf("seed agent: %v", err)
 	}
 

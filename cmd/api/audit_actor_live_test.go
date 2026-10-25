@@ -108,7 +108,7 @@ func TestLive_AuditActors_RealActorEverywhere(t *testing.T) {
 
 	// Agent mint, then a discover job the agent claims and completes:
 	// the completion hook's audit row is the agent's, not "worker".
-	code, body = l.call(t, http.MethodPost, "/api/v1/agents", op, map[string]any{"name": "tenant-a-uat-agent"})
+	code, body = l.call(t, http.MethodPost, "/api/v1/agents", op, agentMintBody("tenant-a-uat-agent"))
 	if code != http.StatusCreated {
 		t.Fatalf("mint = %d %s", code, body)
 	}
@@ -121,7 +121,7 @@ func TestLive_AuditActors_RealActorEverywhere(t *testing.T) {
 		t.Fatalf("discover-now = %d %s", code, body)
 	}
 	expect("job.enqueue", user)
-	agentHdr := map[string]string{"X-Agent-Secret": minted.AgentSecret}
+	agentHdr := agentHeaders(minted.AgentSecret)
 	code, body = l.callAs(t, http.MethodPost, "/api/v1/agents/"+minted.ID.String()+"/jobs/claim", agentHdr, nil)
 	if code != http.StatusOK {
 		t.Fatalf("claim = %d %s", code, body)

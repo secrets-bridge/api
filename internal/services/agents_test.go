@@ -71,7 +71,7 @@ func TestMint_ReturnsSecret(t *testing.T) {
 	svc, _, _ := bootstrap(t)
 	ctx := t.Context()
 
-	minted, err := svc.Mint(ctx, services.MintInput{Name: "agent-prod-eu", Scope: map[string]any{"cluster": "prod-eu"}})
+	minted, err := svc.Mint(ctx, keyedMint(services.MintInput{Name: "agent-prod-eu", Scope: map[string]any{"cluster": "prod-eu"}}))
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestMint_ReturnsSecret(t *testing.T) {
 func TestMint_PersistsHashOnly(t *testing.T) {
 	svc, pool, _ := bootstrap(t)
 	ctx := t.Context()
-	minted, err := svc.Mint(ctx, services.MintInput{Name: "agent"})
+	minted, err := svc.Mint(ctx, keyedMint(services.MintInput{Name: "agent"}))
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestMint_PersistsHashOnly(t *testing.T) {
 func TestHeartbeat_HappyPath(t *testing.T) {
 	svc, pool, _ := bootstrap(t)
 	ctx := t.Context()
-	minted, _ := svc.Mint(ctx, services.MintInput{Name: "agent"})
+	minted, _ := svc.Mint(ctx, keyedMint(services.MintInput{Name: "agent"}))
 
 	if err := svc.Heartbeat(ctx, minted.ID, minted.AgentSecret); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
@@ -128,7 +128,7 @@ func TestHeartbeat_HappyPath(t *testing.T) {
 func TestHeartbeat_WrongSecretRejected(t *testing.T) {
 	svc, _, _ := bootstrap(t)
 	ctx := t.Context()
-	minted, _ := svc.Mint(ctx, services.MintInput{Name: "agent"})
+	minted, _ := svc.Mint(ctx, keyedMint(services.MintInput{Name: "agent"}))
 
 	if err := svc.Heartbeat(ctx, minted.ID, "fake-secret"); !errors.Is(err, storage.ErrUnauthorized) {
 		t.Fatalf("expected ErrUnauthorized, got %v", err)
@@ -146,7 +146,7 @@ func TestHeartbeat_UnknownAgent(t *testing.T) {
 func TestHeartbeat_RevokedAgentRejected(t *testing.T) {
 	svc, pool, _ := bootstrap(t)
 	ctx := t.Context()
-	minted, _ := svc.Mint(ctx, services.MintInput{Name: "agent"})
+	minted, _ := svc.Mint(ctx, keyedMint(services.MintInput{Name: "agent"}))
 
 	if err := storage.NewAgents(pool).UpdateStatus(ctx, minted.ID, storage.AgentStatusRevoked); err != nil {
 		t.Fatalf("revoke: %v", err)
@@ -162,7 +162,7 @@ func TestHeartbeat_PodRestartScenario(t *testing.T) {
 	// going". No PVC, no re-mint, no re-registration.
 	svc, _, _ := bootstrap(t)
 	ctx := t.Context()
-	minted, _ := svc.Mint(ctx, services.MintInput{Name: "agent"})
+	minted, _ := svc.Mint(ctx, keyedMint(services.MintInput{Name: "agent"}))
 
 	for i := 0; i < 3; i++ {
 		if err := svc.Heartbeat(ctx, minted.ID, minted.AgentSecret); err != nil {
@@ -175,7 +175,7 @@ func TestList_OmitsCredentials(t *testing.T) {
 	svc, _, _ := bootstrap(t)
 	ctx := t.Context()
 	for _, name := range []string{"a", "b", "c"} {
-		if _, err := svc.Mint(ctx, services.MintInput{Name: name}); err != nil {
+		if _, err := svc.Mint(ctx, keyedMint(services.MintInput{Name: name})); err != nil {
 			t.Fatalf("Mint %s: %v", name, err)
 		}
 	}
@@ -196,7 +196,7 @@ func TestList_OmitsCredentials(t *testing.T) {
 func TestHeartbeat_CachesLastSeenInRedis(t *testing.T) {
 	svc, _, rdb := bootstrap(t)
 	ctx := t.Context()
-	minted, _ := svc.Mint(ctx, services.MintInput{Name: "agent"})
+	minted, _ := svc.Mint(ctx, keyedMint(services.MintInput{Name: "agent"}))
 
 	if err := svc.Heartbeat(ctx, minted.ID, minted.AgentSecret); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
@@ -225,7 +225,7 @@ func TestHeartbeat_CachesLastSeenInRedis(t *testing.T) {
 func TestHeartbeat_ColdCachePrimes(t *testing.T) {
 	svc, _, rdb := bootstrap(t)
 	ctx := t.Context()
-	minted, _ := svc.Mint(ctx, services.MintInput{Name: "agent"})
+	minted, _ := svc.Mint(ctx, keyedMint(services.MintInput{Name: "agent"}))
 
 	// Cache should be empty before the first heartbeat.
 	if cached := scanCacheKey(t, rdb, "*:agent-hash:"+minted.ID.String()); cached != 0 {
@@ -247,7 +247,7 @@ func TestHeartbeat_ColdCachePrimes(t *testing.T) {
 func TestHeartbeat_UsesCachedHashWhenWarm(t *testing.T) {
 	svc, _, rdb := bootstrap(t)
 	ctx := t.Context()
-	minted, _ := svc.Mint(ctx, services.MintInput{Name: "agent"})
+	minted, _ := svc.Mint(ctx, keyedMint(services.MintInput{Name: "agent"}))
 
 	// First heartbeat to prime the cache and confirm it works.
 	if err := svc.Heartbeat(ctx, minted.ID, minted.AgentSecret); err != nil {
@@ -261,8 +261,9 @@ func TestHeartbeat_UsesCachedHashWhenWarm(t *testing.T) {
 	poisonSecret := "completely-different-secret"
 	poisonHash := sha256.Sum256([]byte(poisonSecret))
 	poisonPayload, _ := json.Marshal(map[string]any{
-		"status": "active",
-		"hash":   base64.StdEncoding.EncodeToString(poisonHash[:]),
+		"status":      "active",
+		"hash":        base64.StdEncoding.EncodeToString(poisonHash[:]),
+		"fingerprint": minted.PublicKeyFingerprint,
 	})
 	cacheKey := rdb.Key("agent-hash", minted.ID.String())
 	if _, err := rdb.Raw().Set(ctx, cacheKey, poisonPayload, time.Minute).Result(); err != nil {
@@ -285,7 +286,7 @@ func TestHeartbeat_UsesCachedHashWhenWarm(t *testing.T) {
 func TestRevoke_InvalidatesCache(t *testing.T) {
 	svc, _, rdb := bootstrap(t)
 	ctx := t.Context()
-	minted, _ := svc.Mint(ctx, services.MintInput{Name: "agent"})
+	minted, _ := svc.Mint(ctx, keyedMint(services.MintInput{Name: "agent"}))
 
 	// Prime the cache with a successful heartbeat.
 	if err := svc.Heartbeat(ctx, minted.ID, minted.AgentSecret); err != nil {
@@ -339,7 +340,7 @@ func scanCacheKey(t *testing.T, rdb *runtime.Client, pattern string) int {
 func TestAuthenticate_RejectAuditRollup_FallsBackWithoutRedis(t *testing.T) {
 	svc, pool, _ := bootstrap(t)
 	ctx := t.Context()
-	minted, err := svc.Mint(ctx, services.MintInput{Name: "agent"})
+	minted, err := svc.Mint(ctx, keyedMint(services.MintInput{Name: "agent"}))
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}

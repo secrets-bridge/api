@@ -115,12 +115,13 @@ func bootstrapAgentClaim(t *testing.T) *agentClaimHarness {
 // the decoded claim response.
 func (h *agentClaimHarness) claim(t *testing.T) map[string]any {
 	t.Helper()
-	agent, err := h.agents.Mint(t.Context(), services.MintInput{Name: "claim-test-" + uuid.NewString()})
+	agent, err := h.agents.Mint(t.Context(), keyedMint(services.MintInput{Name: "claim-test-" + uuid.NewString()}))
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+agent.ID.String()+"/jobs/claim", nil)
 	req.Header.Set("X-Agent-Secret", agent.AgentSecret)
+	req.Header.Set("X-Agent-Key-Fingerprint", agent.PublicKeyFingerprint)
 	resp, err := h.app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
 	if err != nil {
 		t.Fatalf("claim: %v", err)

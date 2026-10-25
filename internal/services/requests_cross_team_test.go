@@ -39,21 +39,21 @@ import (
 //     audit_events metadata
 
 type crossTeamHarness struct {
-	reqSvc        *services.RequestService
-	pool          *storage.Pool
-	envRepo       *storage.Environments
-	teamRepo      *storage.Teams
-	projRepo      *storage.Projects
-	wrapsR        *storage.SecretWraps
-	requestsR     *storage.AccessRequests
-	approvalsR    *storage.Approvals
-	provConnRepo  *storage.ProviderConnections
-	wfRepo        *storage.Workflows
-	policiesR     *storage.Policies
-	secretsR      *storage.Secrets
-	bindingsR     *storage.ProjectSecrets
-	jobsR         *storage.SyncJobs
-	destBindings  *storage.ProjectProviderConnections
+	reqSvc       *services.RequestService
+	pool         *storage.Pool
+	envRepo      *storage.Environments
+	teamRepo     *storage.Teams
+	projRepo     *storage.Projects
+	wrapsR       *storage.SecretWraps
+	requestsR    *storage.AccessRequests
+	approvalsR   *storage.Approvals
+	provConnRepo *storage.ProviderConnections
+	wfRepo       *storage.Workflows
+	policiesR    *storage.Policies
+	secretsR     *storage.Secrets
+	bindingsR    *storage.ProjectSecrets
+	jobsR        *storage.SyncJobs
+	destBindings *storage.ProjectProviderConnections
 }
 
 // grantCrossTeamPerm gives userID one permission at the given scope via a
@@ -581,7 +581,7 @@ func TestCrossTeam_FillWrapsServedOnlyToClaimingAgent(t *testing.T) {
 	agents := storage.NewAgents(h.pool)
 	mk := func(name string) uuid.UUID {
 		a := &storage.Agent{Name: name + "-" + uuid.NewString()[:8], SecretHash: []byte("h")}
-		if err := agents.Create(ctx, a); err != nil {
+		if err := agents.Create(ctx, keyedAgent(a)); err != nil {
 			t.Fatalf("create agent: %v", err)
 		}
 		return a.ID

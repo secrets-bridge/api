@@ -19,7 +19,7 @@
 |---|---|---|
 | Postgres schema + migrations | Live | `pkg/storage/migrations/0001`-`0026_*.sql` |
 | Redis runtime (idempotency, locks, rate-limit, pub-sub) | Live | `pkg/runtime/` |
-| Agent registration + heartbeat (single-credential model) | Live | `internal/services/agents.go` |
+| Agent enrollment v2 (customer-generated X25519 key, proof of possession, audited rotation) + heartbeat | Live | `internal/services/agent_enrollment.go`, `agent_key_rotation.go`, `agents.go` |
 | Agent job claim → complete loop | Live | `internal/services/jobs.go` |
 | Patch + read-flow request lifecycle | Live | `internal/services/requests.go` |
 | KMS-envelope-encrypted secret wraps | Live | `pkg/keymgmt/` (backends: local / vault-transit / aws-kms) |

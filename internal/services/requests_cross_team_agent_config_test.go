@@ -76,7 +76,7 @@ func TestVerifyCrossTeam_PatchJobCarriesOnlyAgentProviderKeys(t *testing.T) {
 	// Claim it the way the agent does: real AgentAuth + claim handler.
 	auditRepo := storage.NewAuditEvents(h.pool)
 	agentSvc := services.NewAgentService(storage.NewAgents(h.pool), auditRepo, nil)
-	agent, err := agentSvc.Mint(ctx, services.MintInput{Name: "ct-agentcfg-" + uuid.NewString()})
+	agent, err := agentSvc.Mint(ctx, keyedMint(services.MintInput{Name: "ct-agentcfg-" + uuid.NewString()}))
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
@@ -86,6 +86,7 @@ func TestVerifyCrossTeam_PatchJobCarriesOnlyAgentProviderKeys(t *testing.T) {
 
 	httpReq := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+agent.ID.String()+"/jobs/claim", nil)
 	httpReq.Header.Set("X-Agent-Secret", agent.AgentSecret)
+	httpReq.Header.Set("X-Agent-Key-Fingerprint", agent.PublicKeyFingerprint)
 	resp, err := app.Test(httpReq, fiber.TestConfig{Timeout: 10 * time.Second})
 	if err != nil {
 		t.Fatalf("claim: %v", err)

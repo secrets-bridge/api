@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -77,11 +78,10 @@ func sealable(a *storage.Agent) bool {
 // WrapPayload is the JSON returned to the agent. EXACTLY ONE of Value
 // (plaintext-over-TLS) or Sealed (wire-envelope) is populated:
 //
-//   - The CP SEALS the response to the agent's registered X25519
-//     public key; only the Sealed field is set.
-//   - An agent with no usable key is refused with 409 before the wrap
-//     is consumed. Value (plaintext base64) is returned only with the
-//     SB_ALLOW_UNSEALED_WRAPS break-glass (api#264).
+//   - The CP SEALS the response to the agent's bound X25519 public
+//     key; Sealed and RecipientKeyFingerprint are always set.
+//   - Value is never set by retrieval any more (skills#116): every
+//     agent has a key. The field stays for the wire shape.
 //
 // The agent inspects which field is populated and decodes accordingly.
 type WrapPayload struct {
@@ -93,6 +93,10 @@ type WrapPayload struct {
 	ByteLength  int             `json:"byte_length"`
 	ContentHash string          `json:"content_hash"` // hex SHA-256 of plaintext
 	Algorithm   string          `json:"algorithm"`    // the wrap's AEAD (storage layer)
+	// RecipientKeyFingerprint names the key Sealed is sealed to
+	// (skills#116). The Agent refuses a wrap whose fingerprint isn't its
+	// own key's.
+	RecipientKeyFingerprint string `json:"recipient_key_fingerprint"`
 }
 
 // SealedEnvelope is the wire-envelope shape returned by the CP when the
@@ -150,11 +154,21 @@ func (h *Wraps) Retrieve(c fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "load agent: "+err.Error())
 	}
-	seal := sealable(agent)
-	if !seal && !h.allowUnsealed {
+	// Every agent that is not revoked has a key (migration 0051), so a
+	// wrap always leaves sealed; SB_ALLOW_UNSEALED_WRAPS no longer
+	// applies to retrieval (skills#116).
+	if !sealable(agent) {
 		h.requests.AuditUnsealedWrapRefused(c.Context(), "wrap.retrieve", agentID, wrapID, "agent_public_key_missing")
 		return fiber.NewError(fiber.StatusConflict,
-			"agent_public_key_required: register the agent's X25519 public key; wraps are only delivered sealed")
+			"agent_public_key_required: wraps are only delivered sealed")
+	}
+	// The key AgentAuth checked must still be the bound key: a rotation
+	// between that read and this one would seal the wrap to a key the
+	// caller does not hold and burn it. Checked before the consume.
+	fingerprint := sealing.Fingerprint(agent.PublicKey)
+	if checked, ok := middleware.AgentKeyFingerprintFromContext(c.Context()); !ok ||
+		subtle.ConstantTimeCompare([]byte(checked), []byte(fingerprint)) != 1 {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "agent_key_mismatch"})
 	}
 
 	plaintext, wrap, err := h.requests.RetrieveWrap(c.Context(), wrapID, agentID)
@@ -174,22 +188,17 @@ func (h *Wraps) Retrieve(c fiber.Ctx) error {
 		body.RequestID = wrap.RequestID.String()
 	}
 
-	// SEAL to the agent's key. Plaintext-over-TLS only with the
-	// SB_ALLOW_UNSEALED_WRAPS break-glass, checked above.
-	if seal {
-		env, err := sealing.Seal(plaintext, agent.PublicKey)
-		if err != nil {
-			return fiber.NewError(fiber.StatusInternalServerError, "seal: "+err.Error())
-		}
-		body.Sealed = &SealedEnvelope{
-			Algorithm:          env.Algorithm,
-			Ciphertext:         base64.StdEncoding.EncodeToString(env.Ciphertext),
-			Nonce:              base64.StdEncoding.EncodeToString(env.Nonce),
-			EphemeralPublicKey: base64.StdEncoding.EncodeToString(env.EphemeralPublicKey),
-		}
-	} else {
-		v := base64.StdEncoding.EncodeToString(plaintext)
-		body.Value = &v
+	// SEAL to the agent's key, the one AgentAuth just checked.
+	env, err := sealing.Seal(plaintext, agent.PublicKey)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "seal failed")
+	}
+	body.RecipientKeyFingerprint = fingerprint
+	body.Sealed = &SealedEnvelope{
+		Algorithm:          env.Algorithm,
+		Ciphertext:         base64.StdEncoding.EncodeToString(env.Ciphertext),
+		Nonce:              base64.StdEncoding.EncodeToString(env.Nonce),
+		EphemeralPublicKey: base64.StdEncoding.EncodeToString(env.EphemeralPublicKey),
 	}
 	return c.Status(fiber.StatusOK).JSON(body)
 }

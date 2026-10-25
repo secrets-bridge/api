@@ -168,6 +168,15 @@ var auditMetaKeys = map[string]auditMetaKind{
 	"observation_source_before": metaToken, "observation_source_after": metaToken,
 	"stages": metaTokenList, "outcomes": metaTokenList, "linkages": metaTokenList,
 
+	// agent enrollment v2 and key rotation (skills#116): key
+	// fingerprints, ids and versions only, never a token, a nonce, a
+	// secret or a key
+	"public_key_fingerprint": metaDigest, "presented_key_fingerprint": metaDigest,
+	"old_public_key_fingerprint": metaDigest, "new_public_key_fingerprint": metaDigest,
+	"challenge_id": metaID, "rotation_token_id": metaID,
+	"public_key_version": metaNumber, "old_public_key_version": metaNumber, "new_public_key_version": metaNumber,
+	"rotation_tokens_revoked": metaNumber, "rotation_challenges_invalidated": metaNumber,
+
 	// free-text errors: never stored
 	"error": metaErrorText, "sessions_revoke_err": metaErrorText, "wrap_refresh_errors": metaErrorText,
 }

@@ -444,7 +444,7 @@ type obsAgent struct {
 func (c *catFixture) obsAgent(t *testing.T) obsAgent {
 	t.Helper()
 	op := c.l.grantUser(t, []string{"agent.mint"}, `{}`)
-	code, body := c.l.call(t, http.MethodPost, "/api/v1/agents", op, map[string]any{"name": "cat-agent-" + uuid.NewString()[:8]})
+	code, body := c.l.call(t, http.MethodPost, "/api/v1/agents", op, agentMintBody("cat-agent-"+uuid.NewString()[:8]))
 	if code != http.StatusCreated {
 		t.Fatalf("mint agent = %d %s", code, body)
 	}
@@ -453,7 +453,7 @@ func (c *catFixture) obsAgent(t *testing.T) obsAgent {
 		AgentSecret string    `json:"agent_secret"`
 	}
 	mustJSON(t, body, &a)
-	return obsAgent{base: "/api/v1/agents/" + a.ID.String(), hdr: map[string]string{"X-Agent-Secret": a.AgentSecret}}
+	return obsAgent{base: "/api/v1/agents/" + a.ID.String(), hdr: agentHeaders(a.AgentSecret)}
 }
 
 // TestLive_GatewayCatalog_DiscoveredEndToEnd: a team-scoped binding of a

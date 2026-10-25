@@ -694,7 +694,7 @@ func TestLive_JobAgentActions_RecordRealActor(t *testing.T) {
 	}
 	l.requireOneAudit(t, "job.enqueue", op)
 
-	if code, body := l.call(t, http.MethodPost, "/api/v1/agents", op, map[string]any{"name": "tenant-a-uat-agent"}); code != http.StatusCreated {
+	if code, body := l.call(t, http.MethodPost, "/api/v1/agents", op, agentMintBody("tenant-a-uat-agent")); code != http.StatusCreated {
 		t.Fatalf("mint = %d %s", code, body)
 	}
 	l.requireOneAudit(t, "agent.mint", op)

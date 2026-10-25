@@ -29,6 +29,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/secrets-bridge/api/pkg/runtime"
+	"github.com/secrets-bridge/api/pkg/sealing"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
@@ -59,6 +60,10 @@ type AgentService struct {
 	// called — the certified mint/heartbeat/auth paths never touch them.
 	enrollTokens storage.AgentEnrollmentTokenRepository
 	provConns    AgentProviderConnectionLookup
+
+	// rotations backs the audited key rotation flow (skills#116). Nil
+	// unless WithKeyRotation is called.
+	rotations storage.AgentKeyRotationRepository
 
 	// cache fronts the secret-hash check with a revocation tombstone and
 	// a negative entry for unknown ids (skills#104).
@@ -100,36 +105,44 @@ const (
 	cacheKindSecretHash = "agent-hash"
 	cacheKindLastSeen   = "agent-lastseen"
 	// Rollup slots for rejected agent auth / enrollment audits (API-N-07).
-	cacheKindAuthRejectAudit   = "agent-auth-reject-audit"
-	cacheKindEnrollRejectAudit = "agent-enroll-reject-audit"
+	cacheKindAuthRejectAudit     = "agent-auth-reject-audit"
+	cacheKindEnrollRejectAudit   = "agent-enroll-reject-audit"
+	cacheKindRotationRejectAudit = "agent-rotation-reject-audit"
+	cacheKindKeyMismatchAudit    = "agent-key-mismatch-audit"
 )
 
 // cachedSecretHash holds the marshalled form stored in Redis. We track
 // the agent's status alongside the hash so a `revoked` row whose cache
 // hasn't been invalidated yet still fails the validation check.
+//
+// Fingerprint is the bound wire key's fingerprint (skills#116), so the
+// AgentAuth key check costs no extra read. An entry without one (written
+// before it existed) reads as a miss.
 type cachedSecretHash struct {
-	Status string `json:"status"`
-	Hash   []byte `json:"hash"`
+	Status      string `json:"status"`
+	Hash        []byte `json:"hash"`
+	Fingerprint string `json:"fingerprint"`
 }
 
 // MintedAgent is returned by Mint. AgentSecret is the plaintext
 // long-lived credential — it is returned exactly ONCE and not
 // recoverable from the database afterwards.
 type MintedAgent struct {
-	ID          uuid.UUID
-	Name        string
-	AgentSecret string
+	ID                   uuid.UUID
+	Name                 string
+	AgentSecret          string
+	PublicKeyFingerprint string
+	PublicKeyVersion     int
 }
 
-// MintInput captures everything Mint accepts. PublicKey is optional;
-// when present (Piece 8b agents that ran key generation at startup),
-// the CP will SEAL wrap retrieval responses to that key instead of
-// returning plaintext-over-TLS.
+// MintInput captures everything Mint accepts. PublicKey is required
+// (skills#116) and validated like an enrollment key: 32 bytes, x25519,
+// not all zero and not of low order. Wraps are sealed to it.
 type MintInput struct {
 	Name               string
 	Scope              map[string]any
 	PublicKey          []byte
-	PublicKeyAlgorithm string // "x25519" today; future schemes slot in
+	PublicKeyAlgorithm string // "x25519"
 }
 
 // Mint creates a new agent and returns its long-lived credential. The
@@ -140,15 +153,10 @@ func (s *AgentService) Mint(ctx context.Context, in MintInput) (*MintedAgent, er
 	if in.Name == "" {
 		return nil, errors.New("agents: name is required")
 	}
-	if len(in.PublicKey) > 0 && in.PublicKeyAlgorithm == "" {
-		return nil, errors.New("agents: public_key_algorithm is required when public_key is provided")
+	if in.PublicKeyAlgorithm != sealing.KeyAlgorithm || sealing.ValidatePublicKey(in.PublicKey) != nil {
+		return nil, ErrInvalidPublicKey
 	}
-	if in.PublicKeyAlgorithm != "" && in.PublicKeyAlgorithm != "x25519" {
-		return nil, fmt.Errorf("agents: unsupported public_key_algorithm %q", in.PublicKeyAlgorithm)
-	}
-	if in.PublicKeyAlgorithm == "x25519" && len(in.PublicKey) != 32 {
-		return nil, fmt.Errorf("agents: x25519 public key must be 32 bytes, got %d", len(in.PublicKey))
-	}
+	fingerprint := sealing.Fingerprint(in.PublicKey)
 
 	secretBytes, err := randomBytes(32)
 	if err != nil {
@@ -164,14 +172,18 @@ func (s *AgentService) Mint(ctx context.Context, in MintInput) (*MintedAgent, er
 		SecretHash:         hash[:],
 		PublicKey:          in.PublicKey,
 		PublicKeyAlgorithm: in.PublicKeyAlgorithm,
+		// The schema checks the fingerprint column against the key.
+		PublicKeyFingerprint: fingerprint,
 	}
 	if err := s.agents.Create(ctx, agent); err != nil {
 		return nil, fmt.Errorf("agents: create: %w", err)
 	}
 
-	meta := map[string]any{"name": in.Name}
-	if len(in.PublicKey) > 0 {
-		meta["public_key_algorithm"] = in.PublicKeyAlgorithm
+	meta := map[string]any{
+		"name":                   in.Name,
+		"public_key_algorithm":   in.PublicKeyAlgorithm,
+		"public_key_fingerprint": fingerprint,
+		"public_key_version":     1,
 	}
 	_ = s.audit.Append(ctx, &storage.AuditEvent{
 		Actor:    auditActorFromContext(ctx),
@@ -182,9 +194,11 @@ func (s *AgentService) Mint(ctx context.Context, in MintInput) (*MintedAgent, er
 	})
 
 	return &MintedAgent{
-		ID:          agent.ID,
-		Name:        agent.Name,
-		AgentSecret: secret,
+		ID:                   agent.ID,
+		Name:                 agent.Name,
+		AgentSecret:          secret,
+		PublicKeyFingerprint: fingerprint,
+		PublicKeyVersion:     1,
 	}, nil
 }
 
@@ -201,43 +215,95 @@ func (s *AgentService) Mint(ctx context.Context, in MintInput) (*MintedAgent, er
 //     unknown-id entry).
 //  3. ConstantTimeCompare against the cached/loaded hash.
 func (s *AgentService) Authenticate(ctx context.Context, id uuid.UUID, agentSecret string) error {
+	_, err := s.authenticate(ctx, id, agentSecret)
+	return err
+}
+
+// ErrAgentKeyMismatch: the agent secret is right, but the request's
+// X-Agent-Key-Fingerprint is missing or is not the bound key's.
+var ErrAgentKeyMismatch = errors.New("services: agent key mismatch")
+
+// AuthenticateAgentKey is Authenticate plus the wire-key check
+// (skills#116): after the secret check, the presented fingerprint must
+// equal the bound key's, compared in constant time. A mismatch or a
+// missing header is ErrAgentKeyMismatch and an agent.key.mismatch audit
+// row, at most one per agent per minute.
+func (s *AgentService) AuthenticateAgentKey(ctx context.Context, id uuid.UUID, agentSecret, fingerprint string) error {
+	cached, err := s.authenticate(ctx, id, agentSecret)
+	if err != nil {
+		return err
+	}
+	kind := ""
+	switch {
+	case fingerprint == "":
+		kind = "missing"
+	case !sealing.IsFingerprint(fingerprint):
+		kind = "malformed"
+	case subtle.ConstantTimeCompare([]byte(fingerprint), []byte(cached.Fingerprint)) != 1:
+		kind = "mismatch"
+	}
+	if kind == "" {
+		return nil
+	}
+	if s.claimRejectAuditSlot(ctx, cacheKindKeyMismatchAudit, id.String(), "key") {
+		meta := map[string]any{
+			"agent_id":               id.String(),
+			"error_kind":             kind,
+			"public_key_fingerprint": cached.Fingerprint,
+			"rollup_window_seconds":  int(rejectAuditWindow / time.Second),
+		}
+		if kind == "mismatch" {
+			meta["presented_key_fingerprint"] = fingerprint
+		}
+		_ = s.audit.Append(ctx, &storage.AuditEvent{
+			Actor:    "agent:" + id.String(),
+			Action:   "agent.key.mismatch",
+			Resource: "agent:" + id.String(),
+			Status:   storage.AuditStatusDenied,
+			Metadata: meta,
+		})
+	}
+	return ErrAgentKeyMismatch
+}
+
+func (s *AgentService) authenticate(ctx context.Context, id uuid.UUID, agentSecret string) (cachedSecretHash, error) {
+	var cached cachedSecretHash
 	r := s.cache.read(ctx, id)
 	if r.revoked != "" {
 		s.auditAuthRejected(ctx, id, "revoked")
-		return storage.ErrUnauthorized
+		return cached, storage.ErrUnauthorized
 	}
 	if r.missing {
 		s.auditAuthRejected(ctx, id, "unknown_agent")
-		return storage.ErrNotFound
+		return cached, storage.ErrNotFound
 	}
-	var cached cachedSecretHash
-	if !r.hit || json.Unmarshal(r.entry, &cached) != nil {
+	if !r.hit || json.Unmarshal(r.entry, &cached) != nil || cached.Fingerprint == "" {
 		agent, err := s.agents.Get(ctx, id)
 		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
 				s.cache.markMissing(ctx, id)
 				s.auditAuthRejected(ctx, id, "unknown_agent")
 			}
-			return err
+			return cached, err
 		}
-		cached = cachedSecretHash{Status: string(agent.Status), Hash: agent.SecretHash}
+		cached = cachedSecretHash{Status: string(agent.Status), Hash: agent.SecretHash, Fingerprint: agent.PublicKeyFingerprint}
 		s.fillSecretHashCache(ctx, id, cached) // best-effort
 	}
 
 	if cached.Status == string(storage.AgentStatusRevoked) {
 		s.auditAuthRejected(ctx, id, "revoked")
-		return storage.ErrUnauthorized
+		return cached, storage.ErrUnauthorized
 	}
 	if len(cached.Hash) == 0 {
 		s.auditAuthRejected(ctx, id, "no_credential")
-		return storage.ErrUnauthorized
+		return cached, storage.ErrUnauthorized
 	}
 	presented := sha256.Sum256([]byte(agentSecret))
 	if subtle.ConstantTimeCompare(presented[:], cached.Hash) != 1 {
 		s.auditAuthRejected(ctx, id, "bad_secret")
-		return storage.ErrUnauthorized
+		return cached, storage.ErrUnauthorized
 	}
-	return nil
+	return cached, nil
 }
 
 // auditAuthRejected records a metadata-only agent.auth.rejected event
@@ -314,47 +380,6 @@ func (s *AgentService) Heartbeat(ctx context.Context, id uuid.UUID, agentSecret 
 	return nil
 }
 
-// Revoke transitions an agent to status=revoked AND deletes its cached
-// secret hash so the next heartbeat is rejected immediately. Direct
-// calls to storage.AgentRepository.UpdateStatus bypass the cache
-// invalidation; callers must use this entry point.
-// SetPublicKey upserts the agent's wire-envelope public key. The
-// agent calls this after generating its X25519 keypair at startup so
-// future GetWrap responses come sealed (Piece 8b). Validates the
-// key shape; emits an audit event with the new key id so an operator
-// can spot a key rotation in the audit log.
-func (s *AgentService) SetPublicKey(ctx context.Context, id uuid.UUID, publicKey []byte, algorithm string) error {
-	if len(publicKey) == 0 {
-		return errors.New("agents: public_key is required")
-	}
-	if algorithm == "" {
-		algorithm = "x25519"
-	}
-	if algorithm != "x25519" {
-		return fmt.Errorf("agents: unsupported public_key_algorithm %q", algorithm)
-	}
-	if len(publicKey) != 32 {
-		return fmt.Errorf("agents: x25519 public key must be 32 bytes, got %d", len(publicKey))
-	}
-	if err := s.agents.UpdatePublicKey(ctx, id, publicKey, algorithm); err != nil {
-		return fmt.Errorf("agents: update public key: %w", err)
-	}
-	// content_hash-style identifier for the new key — useful in audit
-	// without revealing the key itself.
-	sum := sha256.Sum256(publicKey)
-	_ = s.audit.Append(ctx, &storage.AuditEvent{
-		Actor:    "agent:" + id.String(),
-		Action:   "agent.public_key.set",
-		Resource: "agent:" + id.String(),
-		Status:   storage.AuditStatusSuccess,
-		Metadata: map[string]any{
-			"algorithm":      algorithm,
-			"public_key_sha": base64.RawURLEncoding.EncodeToString(sum[:8]),
-		},
-	})
-	return nil
-}
-
 // Revoke transitions an agent to status=revoked, stamps revoked_at +
 // revoked_by (the acting admin's identity), AND deletes its cached secret
 // hash so the next heartbeat is rejected immediately. Direct calls to
@@ -372,15 +397,20 @@ func (s *AgentService) Revoke(ctx context.Context, id uuid.UUID, revokedBy, reas
 	// predates it (skills#104). ensureRevoked confirms the tombstone after
 	// the commit and keeps retrying while Redis is unavailable.
 	_ = s.cache.markRevoked(ctx, id, tombstoneRevoked)
-	if err := s.agents.Revoke(ctx, id, revokedBy, s.now().UTC()); err != nil {
+	// The same statement revokes any open key rotation token and
+	// invalidates its challenges (skills#116).
+	rev, err := s.agents.Revoke(ctx, id, revokedBy, s.now().UTC())
+	if err != nil {
 		return err
 	}
 	cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked, finalState(tombstoneRevoked))
 
 	actor := auditActor(ctx, revokedBy)
 	meta := map[string]any{
-		"agent_id": id.String(),
-		"reason":   reason,
+		"agent_id":                        id.String(),
+		"reason":                          reason,
+		"rotation_tokens_revoked":         rev.RotationTokensRevoked,
+		"rotation_challenges_invalidated": rev.RotationChallengesInvalidated,
 	}
 	if row.ProviderConnectionID != nil {
 		meta["provider_connection_id"] = row.ProviderConnectionID.String()
@@ -415,7 +445,8 @@ func (s *AgentService) fillSecretHashCache(ctx context.Context, id uuid.UUID, c 
 	}
 	s.cache.fill(ctx, id, raw, func() bool {
 		fresh, err := s.agents.Get(ctx, id)
-		return err == nil && string(fresh.Status) == c.Status && bytes.Equal(fresh.SecretHash, c.Hash)
+		return err == nil && string(fresh.Status) == c.Status && bytes.Equal(fresh.SecretHash, c.Hash) &&
+			fresh.PublicKeyFingerprint == c.Fingerprint
 	})
 }
 
@@ -472,3 +503,7 @@ func randomBytes(n int) ([]byte, error) {
 	}
 	return b, nil
 }
+
+// IsKeyMismatch reports whether err is ErrAgentKeyMismatch, for the
+// AgentAuth middleware (which cannot import this package).
+func (s *AgentService) IsKeyMismatch(err error) bool { return errors.Is(err, ErrAgentKeyMismatch) }

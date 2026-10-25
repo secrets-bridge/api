@@ -50,6 +50,9 @@ type agentSurface struct {
 	reqSvc   *services.RequestService
 	jobsR    *storage.SyncJobs
 	connID   uuid.UUID
+	// fps maps an agent secret to its key fingerprint, so call sends
+	// the X-Agent-Key-Fingerprint header the agent would.
+	fps sync.Map
 }
 
 type surfaceAgent struct {
@@ -140,7 +143,8 @@ func bootstrapAgentSurfaceOpts(t *testing.T, wrap func(*storage.Agents) storage.
 		wrapSvc, workflowsR, policy, auditR, jobSvc)
 	jobSvc.OnCompleted(reqSvc.OnJobCompleted)
 	agentSvc := services.NewAgentService(agentRepo, auditR, rdb).
-		WithEnrollment(storage.NewAgentEnrollmentTokens(pool), storage.NewProviderConnections(pool))
+		WithEnrollment(storage.NewAgentEnrollmentTokens(pool), storage.NewProviderConnections(pool)).
+		WithKeyRotation(storage.NewAgentKeyRotations(pool))
 
 	var connID uuid.UUID
 	if err := pool.QueryRow(ctx, `
@@ -155,7 +159,10 @@ func bootstrapAgentSurfaceOpts(t *testing.T, wrap func(*storage.Agents) storage.
 	agentsH := handlers.NewAgents(agentSvc)
 	jobsH := handlers.NewJobs(jobSvc)
 	wrapsH := handlers.NewWraps(reqSvc, wrapSvc, agentsR, km).WithAllowUnsealed(allowUnsealed)
+	v1.Post("/agents/enroll/challenge", agentsH.EnrollChallenge)
 	v1.Post("/agents/enroll", agentsH.Enroll)
+	v1.Post("/agents/:id/key-rotation/challenge", middleware.AgentSecretAuth(agentSvc), agentsH.KeyRotationChallenge)
+	v1.Post("/agents/:id/key-rotation", middleware.AgentSecretAuth(agentSvc), agentsH.ConfirmKeyRotation)
 	agentRoutes := v1.Group("/agents/:id", middleware.AgentAuth(agentSvc))
 	agentRoutes.Post("/jobs/claim", jobsH.Claim)
 	agentRoutes.Post("/jobs/:job/complete", jobsH.Complete)
@@ -172,27 +179,22 @@ func bootstrapAgentSurfaceOpts(t *testing.T, wrap func(*storage.Agents) storage.
 	}
 }
 
-// mint creates an agent. withKey registers an X25519 public key so
-// wrap retrievals come back sealed (the production default).
-func (fx *agentSurface) mint(t *testing.T, name string, withKey bool) surfaceAgent {
+// mint creates an agent with its own X25519 key (every agent has one,
+// skills#116). The second argument is kept for the call sites; a
+// keyless agent can no longer exist.
+func (fx *agentSurface) mint(t *testing.T, name string, _ bool) surfaceAgent {
 	t.Helper()
-	in := services.MintInput{Name: name}
-	var a surfaceAgent
-	if withKey {
-		priv, err := ecdh.X25519().GenerateKey(rand.Reader)
-		if err != nil {
-			t.Fatalf("x25519: %v", err)
-		}
-		a.priv = priv.Bytes()
-		a.pub = priv.PublicKey().Bytes()
-		in.PublicKey = a.pub
-		in.PublicKeyAlgorithm = "x25519"
+	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("x25519: %v", err)
 	}
-	m, err := fx.agentSvc.Mint(t.Context(), in)
+	a := surfaceAgent{priv: priv.Bytes(), pub: priv.PublicKey().Bytes()}
+	m, err := fx.agentSvc.Mint(t.Context(), services.MintInput{Name: name, PublicKey: a.pub, PublicKeyAlgorithm: "x25519"})
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
 	a.id, a.secret = m.ID, m.AgentSecret
+	fx.fps.Store(a.secret, m.PublicKeyFingerprint)
 	return a
 }
 
@@ -212,6 +214,9 @@ func (fx *agentSurface) call(t *testing.T, method, path, secret string, body any
 	}
 	if secret != "" {
 		req.Header.Set("X-Agent-Secret", secret)
+		if fp, ok := fx.fps.Load(secret); ok {
+			req.Header.Set("X-Agent-Key-Fingerprint", fp.(string))
+		}
 	}
 	resp, err := fx.app.Test(req, fiber.TestConfig{Timeout: 20 * time.Second})
 	if err != nil {
@@ -439,6 +444,9 @@ func TestAgentSurface_PatchFlow_HappyPath(t *testing.T) {
 		var p handlers.WrapPayload
 		if err := json.Unmarshal(body, &p); err != nil || p.Sealed == nil {
 			t.Fatalf("expected a sealed payload (err=%v)", err)
+		}
+		if p.RecipientKeyFingerprint != sealing.Fingerprint(a.pub) {
+			t.Fatalf("recipient_key_fingerprint = %q; want the agent's key", p.RecipientKeyFingerprint)
 		}
 		ct, _ := base64.StdEncoding.DecodeString(p.Sealed.Ciphertext)
 		nonce, _ := base64.StdEncoding.DecodeString(p.Sealed.Nonce)
@@ -762,14 +770,37 @@ func TestAgentSurface_RejectedAuthAuditRollup(t *testing.T) {
 	}
 
 	for i := 0; i < 100; i++ {
-		code, _ := fx.call(t, http.MethodPost, "/api/v1/agents/enroll", "",
-			map[string]any{"enrollment_token": fmt.Sprintf("bogus-%d", i), "agent_name": "x"})
-		if code != http.StatusUnauthorized {
-			t.Fatalf("bogus enroll = %d; want 401", code)
+		code, body := fx.call(t, http.MethodPost, "/api/v1/agents/enroll", "",
+			map[string]any{"schema_version": "2", "enrollment_token": fmt.Sprintf("bogus-%d", i), "name": "x"})
+		if code != http.StatusUnauthorized || !bytes.Contains(body, []byte(`"enrollment_rejected"`)) {
+			t.Fatalf("bogus enroll = %d %s; want 401 enrollment_rejected", code, body)
 		}
 	}
-	if n := fx.countRows(t, `SELECT count(*) FROM audit_events WHERE action = 'agent.enrollment.rejected'`); n != 1 {
+	if n := fx.countRows(t, `SELECT count(*) FROM audit_events WHERE action = 'agent.enroll' AND status = 'denied'`); n != 1 {
 		t.Fatalf("100 bogus enrollments wrote %d audit rows; want 1", n)
+	}
+
+	// skills#116: the right secret with a wrong key fingerprint is 409
+	// agent_key_mismatch, audited once per agent per minute.
+	other, _, _ := sealing.GenerateRecipientKey()
+	for i := 0; i < 50; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+a.id.String()+"/jobs/claim", nil)
+		req.Header.Set("X-Agent-Secret", a.secret)
+		if i%2 == 0 {
+			req.Header.Set("X-Agent-Key-Fingerprint", sealing.Fingerprint(other))
+		}
+		resp, err := fx.app.Test(req, fiber.TestConfig{Timeout: 20 * time.Second})
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte(`"agent_key_mismatch"`)) {
+			t.Fatalf("wrong/missing fingerprint = %d %s; want 409 agent_key_mismatch", resp.StatusCode, body)
+		}
+	}
+	if n := fx.countRows(t, `SELECT count(*) FROM audit_events WHERE action = 'agent.key.mismatch'`); n != 1 {
+		t.Fatalf("50 key mismatches wrote %d audit rows; want 1", n)
 	}
 
 	// A different reason is its own bucket: still audited (api#187).
@@ -799,6 +830,16 @@ func TestAgentSurface_ConcurrentEnrollOneToken(t *testing.T) {
 			t.Fatalf("GenerateEnrollmentToken: %v", err)
 		}
 		codes := make([]int, n)
+		bodies := make([]map[string]any, n)
+		for i := range bodies {
+			chID, resp := fx.httpChallenge(t, tok.Token)
+			bodies[i] = map[string]any{
+				"schema_version": "2", "enrollment_token": tok.Token,
+				"challenge_id": chID, "challenge_response": resp,
+				"name":          fmt.Sprintf("enroll-race-%d-%d", round, i),
+				"provider_type": "aws-sm",
+			}
+		}
 		var wg sync.WaitGroup
 		start := make(chan struct{})
 		for i := 0; i < n; i++ {
@@ -806,11 +847,7 @@ func TestAgentSurface_ConcurrentEnrollOneToken(t *testing.T) {
 			go func(i int) {
 				defer wg.Done()
 				<-start
-				codes[i], _ = fx.call(t, http.MethodPost, "/api/v1/agents/enroll", "", map[string]any{
-					"enrollment_token": tok.Token,
-					"agent_name":       fmt.Sprintf("enroll-race-%d-%d", round, i),
-					"provider_type":    "aws-sm",
-				})
+				codes[i], _ = fx.call(t, http.MethodPost, "/api/v1/agents/enroll", "", bodies[i])
 			}(i)
 		}
 		close(start)
@@ -821,7 +858,7 @@ func TestAgentSurface_ConcurrentEnrollOneToken(t *testing.T) {
 			switch c {
 			case http.StatusCreated:
 				created++
-			case http.StatusConflict:
+			case http.StatusUnauthorized:
 			default:
 				t.Fatalf("round %d: unexpected enroll status %d (all: %v)", round, c, codes)
 			}
@@ -860,13 +897,94 @@ func (fx *agentSurface) enrollAgent(t *testing.T, name, cluster, connCluster, co
 	if err != nil {
 		t.Fatalf("GenerateEnrollmentToken: %v", err)
 	}
+	chID, resp := fx.httpChallenge(t, tok.Token)
 	res, err := fx.agentSvc.Enroll(ctx, services.EnrollInput{
-		Token: tok.Token, AgentName: name, ClusterName: cluster, ProviderType: connType,
+		SchemaVersion: "2", Token: tok.Token, ChallengeID: chID, ChallengeResponse: resp,
+		Name: name, ClusterName: cluster, ProviderType: connType,
 	})
 	if err != nil {
 		t.Fatalf("Enroll: %v", err)
 	}
-	return surfaceAgent{id: res.AgentID, secret: res.AgentToken}
+	fx.fps.Store(res.AgentSecret, res.PublicKeyFingerprint)
+	return surfaceAgent{id: res.AgentID, secret: res.AgentSecret}
+}
+
+// httpChallenge runs the challenge step over HTTP with a fresh key and
+// returns the challenge id and the opened response, as the enroll CLI
+// does.
+func (fx *agentSurface) httpChallenge(t *testing.T, token string) (string, string) {
+	t.Helper()
+	chID, resp, _, _ := fx.httpChallengeKey(t, "/api/v1/agents/enroll/challenge", "", map[string]any{
+		"schema_version": "2", "enrollment_token": token,
+	})
+	return chID, resp
+}
+
+// httpChallengeKey posts body plus a fresh public key to a challenge
+// endpoint and opens the answer with the private key.
+func (fx *agentSurface) httpChallengeKey(t *testing.T, path, secret string, body map[string]any) (string, string, []byte, []byte) {
+	t.Helper()
+	pub, priv, err := sealing.GenerateRecipientKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body["public_key"] = base64.StdEncoding.EncodeToString(pub)
+	body["public_key_algorithm"] = "x25519"
+	code, out := fx.call(t, http.MethodPost, path, secret, body)
+	if code != http.StatusOK {
+		t.Fatalf("challenge = %d %s", code, out)
+	}
+	ch, resp := openChallenge(t, out, pub, priv)
+	return ch, resp, pub, priv
+}
+
+func openChallenge(t *testing.T, body, pub, priv []byte) (string, string) {
+	t.Helper()
+	var ch handlers.ChallengeResponse
+	if err := json.Unmarshal(body, &ch); err != nil {
+		t.Fatal(err)
+	}
+	dec := func(s string) []byte { b, _ := base64.StdEncoding.DecodeString(s); return b }
+	nonce, err := sealing.Open(&sealing.Envelope{
+		Algorithm: ch.SealedChallenge.Algorithm, Ciphertext: dec(ch.SealedChallenge.Ciphertext),
+		Nonce: dec(ch.SealedChallenge.Nonce), EphemeralPublicKey: dec(ch.SealedChallenge.EphemeralPublicKey),
+	}, priv, pub)
+	if err != nil {
+		t.Fatalf("open challenge: %v", err)
+	}
+	return ch.ChallengeID, base64.StdEncoding.EncodeToString(nonce)
+}
+
+// httpEnroll enrolls a new agent over HTTP on fx.connID and keeps its
+// keys, as the enroll CLI hands them to the agent's Secret.
+func (fx *agentSurface) httpEnroll(t *testing.T, name string) surfaceAgent {
+	t.Helper()
+	tok, err := fx.agentSvc.GenerateEnrollmentToken(t.Context(), services.GenerateEnrollmentTokenInput{
+		ProviderConnectionID: fx.connID, CreatedBy: "admin-user-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chID, resp, pub, priv := fx.httpChallengeKey(t, "/api/v1/agents/enroll/challenge", "", map[string]any{
+		"schema_version": "2", "enrollment_token": tok.Token,
+	})
+	code, body := fx.call(t, http.MethodPost, "/api/v1/agents/enroll", "", map[string]any{
+		"schema_version": "2", "enrollment_token": tok.Token, "challenge_id": chID, "challenge_response": resp,
+		"name": name, "provider_type": "aws-sm",
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("enroll = %d %s", code, body)
+	}
+	var res handlers.EnrollResponse
+	if err := json.Unmarshal(body, &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.PublicKeyFingerprint != sealing.Fingerprint(pub) || res.PublicKeyVersion != 1 || res.AgentSecret == "" {
+		t.Fatalf("enroll response %s", body)
+	}
+	a := surfaceAgent{id: uuid.MustParse(res.AgentID), secret: res.AgentSecret, pub: pub, priv: priv}
+	fx.fps.Store(a.secret, res.PublicKeyFingerprint)
+	return a
 }
 
 func (fx *agentSurface) postDiscovery(t *testing.T, a surfaceAgent, cluster, providerType, ref string) (int, []byte) {
@@ -968,10 +1086,11 @@ func TestAgentSurface_DiscoveryClusterComesFromConnection(t *testing.T) {
 func TestAgentSurface_DiscoveryUploadLegacyMintedAgent(t *testing.T) {
 	fx := bootstrapAgentSurface(t)
 	mint := func(name string, scope map[string]any) surfaceAgent {
-		m, err := fx.agentSvc.Mint(t.Context(), services.MintInput{Name: name, Scope: scope})
+		m, err := fx.agentSvc.Mint(t.Context(), keyedMint(services.MintInput{Name: name, Scope: scope}))
 		if err != nil {
 			t.Fatalf("Mint: %v", err)
 		}
+		fx.fps.Store(m.AgentSecret, m.PublicKeyFingerprint)
 		return surfaceAgent{id: m.ID, secret: m.AgentSecret}
 	}
 	full := mint("legacy-full", map[string]any{"cluster": "legacy-c", "provider": "vault"})
@@ -1075,33 +1194,6 @@ func TestAgentSurface_ExpiredLeaseCannotPostOrFetch(t *testing.T) {
 
 // ---- api#264: sealed wraps only -------------------------------------
 
-// An agent with no X25519 key on file gets a 409 for its own claimed
-// patch wrap. The wrap is not consumed, no plaintext comes back, and the
-// refusal is audited. The same agent with a key gets it sealed.
-func TestAgentSurface_KeylessAgentFetchRefusedWithoutBurning(t *testing.T) {
-	fx := bootstrapAgentSurface(t)
-	a := fx.mint(t, "agent-keyless", false)
-	fx.approvedPatch(t, map[string][]byte{"DB_PASSWORD": []byte("canary-sealed-only")})
-	job := fx.claim(t, a)
-	wid := wrapIDsFromPayload(t, job)[0]
-
-	code, body := fx.getWrap(t, a, wid)
-	if code != http.StatusConflict {
-		t.Fatalf("keyless fetch = %d (%s); want 409", code, body)
-	}
-	if bytes.Contains(body, []byte("canary-sealed-only")) || bytes.Contains(body, []byte(base64.StdEncoding.EncodeToString([]byte("canary-sealed-only")))) ||
-		bytes.Contains(body, []byte(`"value"`)) {
-		t.Fatalf("refusal carries the value: %s", body)
-	}
-	if n := fx.countRows(t, `SELECT count(*) FROM secret_wraps WHERE id = $1 AND consumed_at IS NULL`, wid); n != 1 {
-		t.Fatal("refused fetch burned the wrap")
-	}
-	if n := fx.countRows(t, `SELECT count(*) FROM audit_events WHERE action = 'wrap.retrieve' AND status = 'denied'
-		AND metadata->>'reason' = 'agent_public_key_missing' AND metadata->>'wrap_id' = $1`, wid); n != 1 {
-		t.Fatalf("refusal audit rows = %d; want 1", n)
-	}
-}
-
 // Posting a plaintext `value` is refused with 400 and stores nothing;
 // the envelope path still works for the same key.
 func TestAgentSurface_PlaintextValueCreateRefused(t *testing.T) {
@@ -1129,9 +1221,10 @@ func TestAgentSurface_PlaintextValueCreateRefused(t *testing.T) {
 	}
 }
 
-// With SB_ALLOW_UNSEALED_WRAPS the legacy shapes still work, for an agent
-// that predates wire-envelope.
-func TestAgentSurface_UnsealedBreakGlassKeepsLegacyShapes(t *testing.T) {
+// With SB_ALLOW_UNSEALED_WRAPS an agent may still post a plaintext
+// value, but retrieval is sealed whatever the switch: every agent has a
+// key (skills#116).
+func TestAgentSurface_UnsealedBreakGlassKeepsLegacyPost(t *testing.T) {
 	fx := bootstrapAgentSurfaceOpts(t, nil, true)
 	a := fx.mint(t, "agent-legacy", false)
 	fx.approvedPatch(t, map[string][]byte{"DB_PASSWORD": []byte("canary-legacy")})
@@ -1139,11 +1232,11 @@ func TestAgentSurface_UnsealedBreakGlassKeepsLegacyShapes(t *testing.T) {
 	wid := wrapIDsFromPayload(t, job)[0]
 	code, body := fx.getWrap(t, a, wid)
 	if code != http.StatusOK {
-		t.Fatalf("legacy keyless fetch with the switch = %d (%s); want 200", code, body)
+		t.Fatalf("fetch with the switch = %d (%s); want 200", code, body)
 	}
 	var p handlers.WrapPayload
-	if err := json.Unmarshal(body, &p); err != nil || p.Sealed != nil || p.Value == nil || *p.Value != base64.StdEncoding.EncodeToString([]byte("canary-legacy")) {
-		t.Fatalf("legacy fetch did not return the plaintext shape (err=%v)", err)
+	if err := json.Unmarshal(body, &p); err != nil || p.Sealed == nil || p.Value != nil {
+		t.Fatalf("fetch with the switch was not sealed (err=%v)", err)
 	}
 
 	b := fx.mint(t, "agent-legacy-read", false)

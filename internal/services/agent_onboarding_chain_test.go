@@ -19,15 +19,13 @@ func TestOnboarding_EnrollThenHeartbeatAuthenticates(t *testing.T) {
 
 	// enroll agent 1 via the token flow.
 	tok1 := h.generate(t, services.GenerateEnrollmentTokenInput{})
-	a1, err := h.svc.Enroll(ctx, services.EnrollInput{
-		Token: tok1.Token, AgentName: "onboard-1", ProviderType: "aws-sm", ClusterName: "eks-x",
-	})
+	a1, _, err := h.enroll(t, tok1.Token, "onboard-1")
 	if err != nil {
 		t.Fatalf("Enroll a1: %v", err)
 	}
 
 	// the persistent agent_token authenticates on the certified heartbeat.
-	if err := h.svc.Heartbeat(ctx, a1.AgentID, a1.AgentToken); err != nil {
+	if err := h.svc.Heartbeat(ctx, a1.AgentID, a1.AgentSecret); err != nil {
 		t.Fatalf("heartbeat with enrolled agent_token: %v want success", err)
 	}
 
@@ -38,17 +36,15 @@ func TestOnboarding_EnrollThenHeartbeatAuthenticates(t *testing.T) {
 
 	// a second agent's credential cannot authenticate as the first.
 	tok2 := h.generate(t, services.GenerateEnrollmentTokenInput{})
-	a2, err := h.svc.Enroll(ctx, services.EnrollInput{
-		Token: tok2.Token, AgentName: "onboard-2", ProviderType: "aws-sm", ClusterName: "eks-x",
-	})
+	a2, _, err := h.enroll(t, tok2.Token, "onboard-2")
 	if err != nil {
 		t.Fatalf("Enroll a2: %v", err)
 	}
-	if err := h.svc.Heartbeat(ctx, a1.AgentID, a2.AgentToken); !errors.Is(err, storage.ErrUnauthorized) {
+	if err := h.svc.Heartbeat(ctx, a1.AgentID, a2.AgentSecret); !errors.Is(err, storage.ErrUnauthorized) {
 		t.Errorf("cross-agent heartbeat err = %v; want ErrUnauthorized", err)
 	}
 	// a2's own token still works.
-	if err := h.svc.Heartbeat(ctx, a2.AgentID, a2.AgentToken); err != nil {
+	if err := h.svc.Heartbeat(ctx, a2.AgentID, a2.AgentSecret); err != nil {
 		t.Errorf("a2 heartbeat with own token: %v want success", err)
 	}
 }

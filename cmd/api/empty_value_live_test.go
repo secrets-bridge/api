@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/ecdh"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -65,8 +63,8 @@ func TestLive_ReadFlow_EmptyValueRevealed(t *testing.T) {
 		t.Fatalf("approve = %d %s", code, body)
 	}
 
-	// A keyed agent, the production shape: it registers an X25519 key.
-	code, body = l.call(t, http.MethodPost, "/api/v1/agents", op, map[string]any{"name": "tenant-a-uat-agent"})
+	// A keyed agent: the key is bound at mint (skills#116).
+	code, body = l.call(t, http.MethodPost, "/api/v1/agents", op, agentMintBody("tenant-a-uat-agent"))
 	if code != http.StatusCreated {
 		t.Fatalf("mint = %d %s", code, body)
 	}
@@ -75,18 +73,8 @@ func TestLive_ReadFlow_EmptyValueRevealed(t *testing.T) {
 		AgentSecret string    `json:"agent_secret"`
 	}
 	mustJSON(t, body, &agent)
-	agentHdr := map[string]string{"X-Agent-Secret": agent.AgentSecret}
+	agentHdr := agentHeaders(agent.AgentSecret)
 	agentBase := "/api/v1/agents/" + agent.ID.String()
-	agentKey, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("x25519: %v", err)
-	}
-	if code, body := l.callAs(t, http.MethodPut, agentBase+"/public-key", agentHdr, map[string]any{
-		"public_key":           base64.StdEncoding.EncodeToString(agentKey.PublicKey().Bytes()),
-		"public_key_algorithm": "x25519",
-	}); code != http.StatusNoContent && code != http.StatusOK {
-		t.Fatalf("register public key = %d %s", code, body)
-	}
 	code, body = l.callAs(t, http.MethodPost, agentBase+"/jobs/claim", agentHdr, nil)
 	if code != http.StatusOK {
 		t.Fatalf("claim = %d %s", code, body)

@@ -312,7 +312,7 @@ func hygAssertNoStore(t *testing.T, where string, r hygResp) {
 func (fx *hygFixture) mintAgent(t *testing.T) (uuid.UUID, string) {
 	t.Helper()
 	svc := services.NewAgentService(storage.NewAgents(fx.pool), storage.NewAuditEvents(fx.pool), fx.rdb)
-	m, err := svc.Mint(t.Context(), services.MintInput{Name: hygName("hyg-agent")})
+	m, err := svc.Mint(t.Context(), services.MintInput{Name: hygName("hyg-agent"), PublicKey: liveAgentPub, PublicKeyAlgorithm: "x25519"})
 	if err != nil {
 		t.Fatalf("mint agent: %v", err)
 	}
@@ -480,7 +480,7 @@ func TestHygiene_TOTPEnroll_KMSErrorIsStable(t *testing.T) {
 func TestHygiene_WrapEnvelope_KMSErrorIsStable(t *testing.T) {
 	fx := newHygFixture(t, Config{}, nil)
 	agentID, secret := fx.mintAgent(t)
-	hdr := map[string]string{"X-Agent-Secret": secret}
+	hdr := agentHeaders(secret)
 
 	fx.km.failDecrypt.Store(true)
 	body := map[string]any{
@@ -588,8 +588,19 @@ func TestHygiene_NoStore_SecretBearingResponses(t *testing.T) {
 	enrollToken, _ := r.json(t)["enrollment_token"].(string)
 
 	// 4. Self-enrollment returns the persistent agent credential.
+	ec := newEnrollClient(t)
+	r = fx.do(t, http.MethodPost, "/api/v1/agents/enroll/challenge", nil, ec.challengeBody(enrollToken))
+	if r.status != http.StatusOK {
+		t.Fatalf("enroll challenge: status = %d (%s)", r.status, r.body)
+	}
+	hygAssertNoStore(t, "POST /agents/enroll/challenge", r)
+	chID, chResp, err := ec.open([]byte(r.body))
+	if err != nil {
+		t.Fatalf("open challenge: %v", err)
+	}
 	r = fx.do(t, http.MethodPost, "/api/v1/agents/enroll", nil, map[string]any{
-		"enrollment_token": enrollToken, "agent_name": hygName("hyg-enrolled"), "provider_type": "vault",
+		"schema_version": "2", "enrollment_token": enrollToken, "challenge_id": chID, "challenge_response": chResp,
+		"name": hygName("hyg-enrolled"), "provider_type": "vault",
 	})
 	if r.status != http.StatusCreated {
 		t.Fatalf("enroll: status = %d (%s)", r.status, r.body)
@@ -597,7 +608,7 @@ func TestHygiene_NoStore_SecretBearingResponses(t *testing.T) {
 	hygAssertNoStore(t, "POST /agents/enroll", r)
 
 	// 5. Legacy direct mint returns agent_secret.
-	r = fx.do(t, http.MethodPost, "/api/v1/agents", minter, map[string]any{"name": hygName("hyg-legacy")})
+	r = fx.do(t, http.MethodPost, "/api/v1/agents", minter, agentMintBody(hygName("hyg-legacy")))
 	if r.status != http.StatusCreated {
 		t.Fatalf("legacy mint: status = %d (%s)", r.status, r.body)
 	}
@@ -605,7 +616,7 @@ func TestHygiene_NoStore_SecretBearingResponses(t *testing.T) {
 
 	// 6. DEK issuance returns a plaintext data key.
 	agentID, secret := fx.mintAgent(t)
-	agentHdr := map[string]string{"X-Agent-Secret": secret}
+	agentHdr := agentHeaders(secret)
 	r = hygDo(t, fx.app, http.MethodPost, "/api/v1/agents/"+agentID.String()+"/dek", nil, agentHdr, nil)
 	if r.status != http.StatusCreated {
 		t.Fatalf("dek: status = %d (%s)", r.status, r.body)

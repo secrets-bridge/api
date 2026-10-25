@@ -5,7 +5,7 @@ package handlers
 // /admin/agents and /provider-connections/:id/agents) so the global session
 // gate applies, and each carries an explicit agent.list / agent.revoke
 // permission. Responses NEVER include the secret hash, public key, or any
-// credential material.
+// credential material. The key fingerprint and version are not credentials.
 
 import (
 	"errors"
@@ -33,6 +33,11 @@ type AgentAdminItem struct {
 	LastStatus             string   `json:"last_status,omitempty"`
 	RevokedAt              *string  `json:"revoked_at,omitempty"`
 	CreatedAt              string   `json:"created_at"`
+	// The bound wire key (skills#116): its fingerprint and version,
+	// never the key.
+	PublicKeyFingerprint string `json:"public_key_fingerprint,omitempty"`
+	PublicKeyVersion     int    `json:"public_key_version"`
+	PublicKeyAlgorithm   string `json:"public_key_algorithm,omitempty"`
 }
 
 type agentAdminListResponse struct {
@@ -52,6 +57,9 @@ func toAgentAdminItem(r *storage.AgentAdminRow) AgentAdminItem {
 		Capabilities:           r.Capabilities,
 		LastStatus:             r.LastStatus,
 		CreatedAt:              r.CreatedAt.UTC().Format(rfc3339Nano),
+		PublicKeyFingerprint:   r.PublicKeyFingerprint,
+		PublicKeyVersion:       r.PublicKeyVersion,
+		PublicKeyAlgorithm:     r.PublicKeyAlgorithm,
 	}
 	if r.ProviderConnectionID != nil {
 		s := r.ProviderConnectionID.String()
