@@ -101,7 +101,7 @@ var auditMetaKeys = map[string]auditMetaKind{
 	"open_requests_count_at_delete": metaNumber, "request_ttl_seconds": metaNumber, "required": metaNumber,
 	"requests_swept": metaNumber, "rollup_window_seconds": metaNumber, "sessions_swept": metaNumber,
 	"skipped_locked": metaNumber, "source_votes": metaNumber, "source_votes_needed": metaNumber,
-	"stale_after_seconds": metaNumber, "team_policy_rule_count": metaNumber, "threshold": metaNumber,
+	"stale_after_seconds": metaNumber, "suppressed_count": metaNumber, "team_policy_rule_count": metaNumber, "threshold": metaNumber,
 	"ttl_seconds": metaNumber, "pending_cap": metaNumber, "risk_level": metaNumber, "risk_level_before": metaNumber, "window_minutes": metaNumber, "undeclared_count": metaNumber, "width": metaNumber, "wrap_count": metaNumber,
 	"wrap_errors": metaNumber, "wraps_already_closed": metaNumber, "priority": metaNumber,
 	"wraps_expired": metaNumber, "wraps_self_healed": metaNumber,

@@ -227,7 +227,10 @@ var ErrAgentKeyMismatch = errors.New("services: agent key mismatch")
 // (skills#116): after the secret check, the presented fingerprint must
 // equal the bound key's, compared in constant time. A mismatch or a
 // missing header is ErrAgentKeyMismatch and an agent.key.mismatch audit
-// row, at most one per agent per minute.
+// row, at most one per (agent, error_kind) per rejectAuditWindow. Each
+// kind has its own slot, so a headerless call cannot hide a following
+// wrong-key attempt; the events a slot folds are counted and the next
+// row for that slot carries them as suppressed_count.
 func (s *AgentService) AuthenticateAgentKey(ctx context.Context, id uuid.UUID, agentSecret, fingerprint string) error {
 	cached, err := s.authenticate(ctx, id, agentSecret)
 	if err != nil {
@@ -245,7 +248,7 @@ func (s *AgentService) AuthenticateAgentKey(ctx context.Context, id uuid.UUID, a
 	if kind == "" {
 		return nil
 	}
-	if s.claimRejectAuditSlot(ctx, cacheKindKeyMismatchAudit, id.String(), "key") {
+	if ok, suppressed := s.claimCountedRejectAuditSlot(ctx, cacheKindKeyMismatchAudit, id.String(), kind); ok {
 		meta := map[string]any{
 			"agent_id":               id.String(),
 			"error_kind":             kind,
@@ -254,6 +257,9 @@ func (s *AgentService) AuthenticateAgentKey(ctx context.Context, id uuid.UUID, a
 		}
 		if kind == "mismatch" {
 			meta["presented_key_fingerprint"] = fingerprint
+		}
+		if suppressed > 0 {
+			meta["suppressed_count"] = suppressed
 		}
 		_ = s.audit.Append(ctx, &storage.AuditEvent{
 			Actor:    "agent:" + id.String(),
@@ -357,6 +363,45 @@ func (s *AgentService) claimRejectAuditSlot(ctx context.Context, kind, subject, 
 		return true
 	}
 	return ok
+}
+
+// rejectAuditSuppressedTTL bounds how long the count of folded events
+// waits in Redis for the next row of its slot.
+const rejectAuditSuppressedTTL = 7 * 24 * time.Hour
+
+// claimCountedRejectAuditSlot is claimRejectAuditSlot that also counts
+// what the slot folds: a rejection that loses the slot increments a
+// counter beside it, and the next one that wins the slot takes the
+// counter (GETDEL) and returns it, so the row it writes says how many
+// events it stands for since the previous row. On any Redis error it
+// returns (true, 0), like claimRejectAuditSlot.
+func (s *AgentService) claimCountedRejectAuditSlot(ctx context.Context, kind, subject, reason string) (bool, int64) {
+	if s.rdb == nil {
+		return true, 0
+	}
+	key := s.rdb.Key(kind, subject+":"+reason)
+	cctx, cancel := withCacheDeadline(ctx)
+	defer cancel()
+	ok, err := s.rdb.Raw().SetNX(cctx, key, "1", rejectAuditWindow).Result()
+	_ = countTimeout(err)
+	if err != nil {
+		return true, 0
+	}
+	counter := key + ":suppressed"
+	if !ok {
+		pipe := s.rdb.Raw().TxPipeline()
+		pipe.Incr(cctx, counter)
+		pipe.Expire(cctx, counter, rejectAuditSuppressedTTL)
+		_, err := pipe.Exec(cctx)
+		_ = countTimeout(err)
+		return false, 0
+	}
+	n, err := s.rdb.Raw().GetDel(cctx, counter).Int64()
+	_ = countTimeout(err)
+	if err != nil {
+		return true, 0
+	}
+	return true, n
 }
 
 // Heartbeat authenticates the agent and bumps last_seen_at. Best-effort
