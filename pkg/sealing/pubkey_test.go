@@ -84,3 +84,39 @@ func TestFingerprint(t *testing.T) {
 		}
 	}
 }
+
+// One point, one encoding: bit 255 set, or a value of p or more, is
+// refused, so a key cannot be rotated to another encoding of itself and
+// get a second fingerprint.
+func TestValidatePublicKey_RefusesNonCanonical(t *testing.T) {
+	pub, _, err := GenerateRecipientKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	high := append([]byte(nil), pub...)
+	high[31] |= 0x80
+	if ValidatePublicKey(high) == nil {
+		t.Fatal("a key with bit 255 set was accepted")
+	}
+	if Fingerprint(high) == Fingerprint(pub) {
+		t.Fatal("the two encodings share a fingerprint, the test proves nothing")
+	}
+	// 9 + p encodes the base point u = 9; p - 2 is the largest canonical
+	// value that is not of low order.
+	for name, c := range map[string]struct {
+		hex string
+		ok  bool
+	}{
+		"u=9":       {"0900000000000000000000000000000000000000000000000000000000000000", true},
+		"9+p":       {"f6ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", false},
+		"p-2":       {"ebffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", true},
+		"p+18":      {"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", false},
+		"u=9 high":  {"0900000000000000000000000000000000000000000000000000000000000080", false},
+		"p-2 bytes": {"ebfffffffffffffffffffffffffffffffffffffffffffffffffffffffeffff7f", true},
+	} {
+		raw, _ := hex.DecodeString(c.hex)
+		if err := ValidatePublicKey(raw); (err == nil) != c.ok {
+			t.Errorf("%s: err %v, want accepted=%v", name, err, c.ok)
+		}
+	}
+}

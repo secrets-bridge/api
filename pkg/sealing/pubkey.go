@@ -18,8 +18,8 @@ const PublicKeySize = 32
 const FingerprintPrefix = "sha256:"
 
 // ErrInvalidPublicKey is returned for a key that is not a usable X25519
-// recipient: wrong algorithm, wrong encoding or length, the all-zero
-// key, or a low-order point.
+// recipient: wrong algorithm, wrong encoding or length, a non-canonical
+// encoding, the all-zero key, or a low-order point.
 var ErrInvalidPublicKey = errors.New("sealing: invalid public key")
 
 // checkScalar is a fixed, non-zero X25519 scalar. ECDH with a low-order
@@ -29,9 +29,10 @@ var ErrInvalidPublicKey = errors.New("sealing: invalid public key")
 var checkScalar = sha256.Sum256([]byte("secrets-bridge.public-key-check.v1"))
 
 // ValidatePublicKey reports whether raw is a 32-byte X25519 public key
-// that a wrap can be sealed to: not all zero and not of low order.
+// that a wrap can be sealed to: canonically encoded, not all zero and not
+// of low order.
 func ValidatePublicKey(raw []byte) error {
-	if len(raw) != PublicKeySize {
+	if len(raw) != PublicKeySize || !canonical(raw) {
 		return ErrInvalidPublicKey
 	}
 	curve := ecdh.X25519()
@@ -49,6 +50,29 @@ func ValidatePublicKey(raw []byte) error {
 	}
 	zero(shared)
 	return nil
+}
+
+// canonical reports whether raw is the one standard encoding of its
+// point: bit 255 clear and the little-endian value below p = 2^255 - 19.
+// X25519 ignores bit 255 and reduces mod p, so without this check one
+// point has up to four encodings, and the fingerprint, taken over the raw
+// bytes, up to four values: a rotation to another encoding of the same key
+// would pass as a new key. crypto/ecdh only produces canonical keys.
+func canonical(raw []byte) bool {
+	if raw[31]&0x80 != 0 {
+		return false
+	}
+	// p is ed ff..ff 7f little-endian; a value is >= p only with that top
+	// byte, 30 bytes of ff and a low byte of ed or more.
+	if raw[31] != 0x7f {
+		return true
+	}
+	for _, b := range raw[1:31] {
+		if b != 0xff {
+			return true
+		}
+	}
+	return raw[0] < 0xed
 }
 
 // ParsePublicKey decodes a std-base64 public key with its algorithm
