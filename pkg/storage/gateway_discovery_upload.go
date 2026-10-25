@@ -112,7 +112,7 @@ func (r *Gateways) ReplaceDiscovery(ctx context.Context, in DiscoveryReplace, at
 	// dbNow is the database clock: lease expiry is judged on the same
 	// clock the heartbeat granted it on.
 	var dbNow time.Time
-	err = tx.QueryRow(ctx, `SELECT status, discovery_max_entries, now() FROM gateways WHERE id = $1 FOR UPDATE`, in.GatewayID).Scan(&status, &maxEntries, &dbNow)
+	err = tx.QueryRow(ctx, `SELECT status, discovery_max_entries, now() FROM gateways WHERE id = $1 FOR NO KEY UPDATE`, in.GatewayID).Scan(&status, &maxEntries, &dbNow)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrGatewayNotLive
 	}
@@ -132,14 +132,17 @@ func (r *Gateways) ReplaceDiscovery(ctx context.Context, in DiscoveryReplace, at
 		leaseExpires             *time.Time
 		lastLease                *uuid.UUID
 		lastSHA, lastResponseRaw []byte
+		status string
+		approvedDigest *string
 	}
 	err = tx.QueryRow(ctx, `
 		SELECT id, discovery_generation, discovery_lease_id, discovery_lease_replica_id, discovery_lease_generation,
-		       discovery_lease_expires_at, last_upload_lease_id, last_upload_sha256, last_upload_response
+		       discovery_lease_expires_at, last_upload_lease_id, last_upload_sha256, last_upload_response,
+		       status, approved_scope_digest
 		FROM gateway_connectors
 		WHERE gateway_id = $1 AND name = $2 AND kind = 'argocd' AND status <> 'missing'
 		FOR UPDATE`, in.GatewayID, in.ConnectorName).
-		Scan(&c.id, &c.generation, &c.leaseID, &c.leaseReplica, &c.leaseGen, &c.leaseExpires, &c.lastLease, &c.lastSHA, &c.lastResponseRaw)
+		Scan(&c.id, &c.generation, &c.leaseID, &c.leaseReplica, &c.leaseGen, &c.leaseExpires, &c.lastLease, &c.lastSHA, &c.lastResponseRaw, &c.status, &c.approvedDigest)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -177,6 +180,20 @@ func (r *Gateways) ReplaceDiscovery(ctx context.Context, in DiscoveryReplace, at
 		return nil, fmt.Errorf("storage: holder scope digest: %w", err)
 	}
 	if holderDigest == "" || holderDigest != in.ScopeDigest || in.RecomputedScope != in.ScopeDigest {
+		return nil, ErrDiscoveryScopeMismatch
+	}
+
+	// A holder may switch scopes after acquiring its lease. Refuse a new
+	// snapshot until every currently-live replica agrees on the uploaded
+	// digest, and an approved connector still approves exactly that digest.
+	// This check is under the connector lock (see review on api#320).
+	live, err := readLiveScope(ctx, tx, in.GatewayID, in.ConnectorName, dbNow.Add(-GatewayReplicaLiveWindow))
+	if err != nil {
+		return nil, err
+	}
+	agreed, ok := live.agreed()
+	if !ok || agreed != in.ScopeDigest || live.overPrivileged ||
+		(c.status == GatewayConnectorApproved && (c.approvedDigest == nil || *c.approvedDigest != in.ScopeDigest)) {
 		return nil, ErrDiscoveryScopeMismatch
 	}
 
@@ -245,6 +262,23 @@ func (r *Gateways) ReplaceDiscovery(ctx context.Context, in DiscoveryReplace, at
 		in.GatewayID, c.id).Scan(&others); err != nil {
 		return nil, fmt.Errorf("storage: count gateway discovered targets: %w", err)
 	}
+	// If this upload would cross the gateway-wide cap, reclaim unbound
+	// targets that became missing in this same upload. Otherwise a full
+	// Application UID churn can strand the connector over the cap forever.
+	// Bound missing targets remain for their suspended bindings.
+	missingCount := len(newlyMissing)
+	if others+len(in.Entries)+kept > GatewayMaxDiscoveredTargets {
+		remainingMissing := newlyMissing[:0]
+		for _, id := range newlyMissing {
+			if !existing[id].bound {
+				prune = append(prune, id)
+				kept--
+			} else {
+				remainingMissing = append(remainingMissing, id)
+			}
+		}
+		newlyMissing = remainingMissing
+	}
 	if others+len(in.Entries)+kept > GatewayMaxDiscoveredTargets {
 		return nil, ErrDiscoveryCatalogTooLarge
 	}
@@ -286,7 +320,7 @@ func (r *Gateways) ReplaceDiscovery(ctx context.Context, in DiscoveryReplace, at
 	}
 	out.Result = DiscoveryResult{
 		Status: "accepted", Generation: in.Generation, TargetsPresent: len(in.Entries), TargetsNew: out.Result.TargetsNew,
-		TargetsMissing: len(newlyMissing), TargetsRenamed: len(out.Renamed),
+		TargetsMissing: missingCount, TargetsRenamed: len(out.Renamed),
 	}
 	out.Moved = len(moved)
 	respRaw, err := json.Marshal(out.Result)
@@ -416,7 +450,7 @@ func (r *Gateways) GetSnapshot(ctx context.Context, gatewayID uuid.UUID, connect
 	err := r.pool.QueryRow(ctx, `
 		SELECT c.name, s.generation, s.discovered_at, s.alg, s.nonce, s.ciphertext
 		FROM gateway_discovery_snapshots s JOIN gateway_connectors c ON c.id = s.connector_id
-		WHERE c.gateway_id = $1 AND c.name = $2 AND c.kind = 'argocd'`, gatewayID, connectorName).
+		WHERE c.gateway_id = $1 AND c.name = $2 AND c.kind = 'argocd' AND c.status <> 'missing'`, gatewayID, connectorName).
 		Scan(&s.ConnectorName, &s.Generation, &s.DiscoveredAt, &s.Snapshot.Alg, &s.Snapshot.Nonce, &s.Snapshot.Ciphertext)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
