@@ -970,6 +970,49 @@ func identityMatchesPin(conn *storage.GatewayConnector, st StageEvidence) error 
 	return nil
 }
 
+// reportIdentityChanged is the Gateway-reported half of the identity
+// pin (api#314). An integrator who pins applications[].uid in the
+// Gateway settings makes the Gateway compute its catalog identity from
+// that uid, so a recreated Application never changes the advertised
+// digest: the Gateway refuses the object and posts an error stage with
+// error_code target_identity_changed instead. An accepted such stage
+// for a pinned Argo CD target marks the target identity_changed like a
+// catalog change does (bindings suspended, dispatch skipped, new binds
+// refused) and audits gateway.target.identity_changed once, with
+// trigger gateway_reported, in this transaction. Later stages for the
+// target are refused as target_identity_changed, and the storage call
+// re-reads the target under a row lock, so the row is never repeated.
+// Nothing from the stage is pinned: it carries no uid or digest.
+func (s *GatewayObservationService) reportIdentityChanged(ctx context.Context, rt *storage.ObservationResultTx, res *EvidenceResult, attempt *storage.ObservationTaskAttempt, connectors map[string]*storage.GatewayConnector) error {
+	task := rt.Task
+	for _, st := range *res.Stages {
+		conn := connectors[st.Stage]
+		if st.Stage != StageArgoCDContext || conn == nil || conn.Kind != GatewayKindArgoCD ||
+			st.Outcome != OutcomeError || st.ErrorCode != RefusalTargetIdentityChanged {
+			continue
+		}
+		ch, err := rt.ReportTargetIdentityChanged(ctx, conn.ID, st.Source.TargetID)
+		if err != nil {
+			return err
+		}
+		if ch == nil {
+			continue
+		}
+		if err := rt.Audit(ctx, s.audit, &storage.AuditEvent{
+			Actor: gatewayActor(task.GatewayID), Action: "gateway.target.identity_changed", Resource: gatewayActor(task.GatewayID),
+			Status: storage.AuditStatusFailure, CorrelationID: task.CorrelationID,
+			Metadata: map[string]any{
+				"gateway_id": task.GatewayID.String(), "connector_id": ch.ConnectorID.String(), "argocd_target_id": ch.TargetID,
+				"identity_digest_before": ch.Old, "identity_digest_after": ch.New, "bindings_suspended": ch.Bindings,
+				"trigger": storage.GatewayIdentityTriggerReported, "task_id": task.ID.String(), "attempt_id": attempt.AttemptID.String(),
+			},
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // checkWindow is design section 4.8 rule 9: observed_at within
 // [started_at - skew, finished_at + skew], finished_at not after the CP
 // clock plus skew, started_at not before the claim minus skew.
@@ -1174,6 +1217,10 @@ func (s *GatewayObservationService) accept(ctx context.Context, rt *storage.Obse
 				return nil, err
 			}
 		}
+	}
+
+	if err := s.reportIdentityChanged(ctx, rt, res, attempt, connectors); err != nil {
+		return nil, err
 	}
 
 	final, verdict, reason := computeVerdict(task.ExpectedStages, stages, task.VersionSource)

@@ -75,3 +75,97 @@ func TestMergeTargets_DifferentIdentitySuspends(t *testing.T) {
 		t.Fatalf("old pin again: changes %+v, target %+v; want still identity_changed", changes, back[0])
 	}
 }
+
+// The gateway_reported change (api#314).
+
+func TestReportIdentityChanged_MarksAPinnedTargetOnce(t *testing.T) {
+	targets, _ := mergeTargets(nil, advertise(pinA))
+	ch, ok := reportIdentityChanged(targets, "payments-api")
+	if !ok || ch.Old != pinA || ch.New != pinA || ch.TargetID != "payments-api" {
+		t.Fatalf("change = %+v %v; want one change from the pin to the pin", ch, ok)
+	}
+	if g := targets[0]; !g.Suspended() || g.IdentityDigest != pinA || g.IdentityChangeTrigger != GatewayIdentityTriggerReported {
+		t.Fatalf("target = %+v; want identity_changed, gateway_reported, pin kept", g)
+	}
+	if _, ok := reportIdentityChanged(targets, "payments-api"); ok {
+		t.Fatal("a second report of the same change was reported again")
+	}
+}
+
+func TestReportIdentityChanged_NeedsALivePin(t *testing.T) {
+	unpinned := advertise("")
+	if _, ok := reportIdentityChanged(unpinned, "payments-api"); ok || unpinned[0].IdentityStatus != "" {
+		t.Fatalf("unpinned target was marked: %+v", unpinned[0])
+	}
+	pinned, _ := mergeTargets(nil, advertise(pinA))
+	if _, ok := reportIdentityChanged(pinned, "other"); ok {
+		t.Fatal("an unknown target was marked")
+	}
+	stale, _ := mergeTargets(pinned, nil)
+	if _, ok := reportIdentityChanged(stale, "payments-api"); ok || stale[0].Suspended() {
+		t.Fatalf("stale target was marked: %+v", stale[0])
+	}
+	changed, _ := mergeTargets(pinned, advertise(pinB))
+	if _, ok := reportIdentityChanged(changed, "payments-api"); ok || changed[0].IdentityChangeTrigger != GatewayIdentityTriggerCatalog {
+		t.Fatalf("catalog change was re-reported: %+v", changed[0])
+	}
+}
+
+func TestMergeTargets_CatalogChangeClearsReportedTrigger(t *testing.T) {
+	targets, _ := mergeTargets(nil, advertise(pinA))
+	reportIdentityChanged(targets, "payments-api")
+	same, changes := mergeTargets(targets, advertise(pinA))
+	if len(changes) != 0 || same[0].IdentityChangeTrigger != GatewayIdentityTriggerReported {
+		t.Fatalf("pin again: changes %+v target %+v; want no change, trigger kept", changes, same[0])
+	}
+	got, changes := mergeTargets(same, advertise(pinB))
+	if len(changes) != 1 || got[0].IdentityChangeTrigger != GatewayIdentityTriggerCatalog || got[0].IdentityAdvertised != pinB || !got[0].Suspended() {
+		t.Fatalf("new identity: changes %+v target %+v; want a catalog change", changes, got[0])
+	}
+}
+
+func TestConfirmable_PinAgainIsConfirmable(t *testing.T) {
+	pinned, _ := mergeTargets(nil, advertise(pinA))
+	if err := confirmable(pinned[0]); err != ErrGatewayTargetIdentityNotChanged {
+		t.Fatalf("pinned target: %v; want not changed", err)
+	}
+	reverted, _ := mergeTargets(pinned, advertise(pinB))
+	reverted, _ = mergeTargets(reverted, advertise(pinA))
+	if err := confirmable(reverted[0]); err != nil {
+		t.Fatalf("catalog change back to the pin: %v; want confirmable", err)
+	}
+	reported, _ := mergeTargets(nil, advertise(pinA))
+	reportIdentityChanged(reported, "payments-api")
+	if err := confirmable(reported[0]); err != nil {
+		t.Fatalf("gateway_reported change: %v; want confirmable", err)
+	}
+	changed, _ := mergeTargets(pinned, advertise(pinB))
+	if err := confirmable(changed[0]); err != nil {
+		t.Fatalf("catalog change: %v; want confirmable", err)
+	}
+	stale, _ := mergeTargets(changed, nil)
+	if err := confirmable(stale[0]); err != ErrGatewayTargetStale {
+		t.Fatalf("stale target: %v; want stale", err)
+	}
+}
+
+func TestGatewayTarget_ChangeTrigger(t *testing.T) {
+	pinned, _ := mergeTargets(nil, advertise(pinA))
+	if got := pinned[0].ChangeTrigger(); got != "" {
+		t.Fatalf("pinned target trigger = %q; want none", got)
+	}
+	changed, _ := mergeTargets(pinned, advertise(pinB))
+	if got := changed[0].ChangeTrigger(); got != GatewayIdentityTriggerCatalog {
+		t.Fatalf("catalog change trigger = %q; want catalog", got)
+	}
+	// A target that went identity_changed before the field existed.
+	legacy := changed[0]
+	legacy.IdentityChangeTrigger = ""
+	if got := legacy.ChangeTrigger(); got != GatewayIdentityTriggerCatalog {
+		t.Fatalf("legacy identity_changed trigger = %q; want catalog", got)
+	}
+	reportIdentityChanged(pinned, "payments-api")
+	if got := pinned[0].ChangeTrigger(); got != GatewayIdentityTriggerReported {
+		t.Fatalf("reported change trigger = %q; want gateway_reported", got)
+	}
+}

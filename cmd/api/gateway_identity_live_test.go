@@ -206,6 +206,9 @@ func TestLive_GatewayIdentity_ChangeSuspendsUntilReconfirmed(t *testing.T) {
 	if status, suspended := f.adminTargetStatus(t); status != "identity_changed" || suspended != "identity_changed" {
 		t.Fatalf("admin read = %q suspended %q; want identity_changed on both", status, suspended)
 	}
+	if got := f.adminTargetTrigger(t); got != "catalog" {
+		t.Fatalf("admin identity_change_trigger = %q; want catalog", got)
+	}
 	rows := f.l.auditRows(t, "gateway.target.identity_changed")
 	if len(rows) != 1 {
 		t.Fatalf("identity_changed audits = %d; want exactly 1", len(rows))
@@ -214,6 +217,7 @@ func TestLive_GatewayIdentity_ChangeSuspendsUntilReconfirmed(t *testing.T) {
 	want := map[string]any{
 		"gateway_id": f.gw.GatewayID, "connector_id": f.connID, "argocd_target_id": "payments-api",
 		"identity_digest_before": identityA, "identity_digest_after": identityB, "bindings_suspended": float64(1),
+		"trigger": "catalog",
 	}
 	if len(m) != len(want) {
 		t.Fatalf("identity_changed metadata = %v; want exactly %v", m, want)

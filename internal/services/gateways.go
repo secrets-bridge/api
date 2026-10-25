@@ -761,6 +761,7 @@ func (s *GatewayService) PutCatalog(ctx context.Context, gatewayID uuid.UUID, co
 			Metadata: map[string]any{
 				"gateway_id": gatewayID.String(), "connector_id": ch.ConnectorID.String(), "argocd_target_id": ch.TargetID,
 				"identity_digest_before": ch.Old, "identity_digest_after": ch.New, "bindings_suspended": ch.Bindings,
+				"trigger": storage.GatewayIdentityTriggerCatalog,
 			},
 		})
 	}
