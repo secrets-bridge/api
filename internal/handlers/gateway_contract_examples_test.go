@@ -16,9 +16,13 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/secrets-bridge/api/internal/services"
+	"github.com/secrets-bridge/api/pkg/storage"
 )
 
 const contractExamplesDir = "testdata/gateway-contract/examples"
@@ -140,4 +144,47 @@ func checkHeartbeatResponse(r *gatewayHeartbeatResponse) error {
 
 func TestContractExamples_HeartbeatResponse(t *testing.T) {
 	runContractExamples(t, "gateway-heartbeat-response", checkHeartbeatResponse)
+}
+
+func TestContractExamples_DiscoveryResult(t *testing.T) {
+	runContractExamples(t, "gateway-discovery-result", func(r *storage.DiscoveryResult) error {
+		if (r.Status != "accepted" && r.Status != "duplicate") || r.Generation < 1 ||
+			r.TargetsPresent < 0 || r.TargetsNew < 0 || r.TargetsMissing < 0 || r.TargetsRenamed < 0 {
+			return errors.New("discovery result")
+		}
+		return nil
+	})
+}
+
+var exWholeSecondRe = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$`)
+var exNonceRe = regexp.MustCompile(`^[A-Za-z0-9+/]{16}$`)
+var exCipherRe = regexp.MustCompile(`^[A-Za-z0-9+/]+={0,2}$`)
+
+func TestContractExamples_DiscoverySnapshot(t *testing.T) {
+	runContractExamples(t, "gateway-discovery-snapshot", func(r *gatewaySnapshotResponse) error {
+		s := r.Snapshot
+		if r.SchemaVersion != services.SnapshotSchemaVersion() || !exLocalIDRe.MatchString(r.ConnectorID) || r.Generation < 1 ||
+			!exWholeSecondRe.MatchString(r.DiscoveredAt) || s.Alg != "A256GCM+HKDF-SHA256/v1" || !exNonceRe.MatchString(s.Nonce) ||
+			len(s.Ciphertext) < 24 || !exCipherRe.MatchString(s.Ciphertext) {
+			return errors.New("snapshot")
+		}
+		return nil
+	})
+}
+
+// gatewayDiscoveryErrorCodes are the codes the E8 and E9 handlers send.
+var gatewayDiscoveryErrorCodes = []string{
+	"invalid_request", "unauthorized", "connector_not_found", "snapshot_not_found", "lease_not_held",
+	"discovery_generation_stale", "scope_digest_mismatch", "catalog_too_large", "schema_violation",
+}
+
+func TestContractExamples_DiscoveryError(t *testing.T) {
+	runContractExamples(t, "gateway-discovery-error", func(r *struct {
+		Error string `json:"error"`
+	}) error {
+		if !slices.Contains(gatewayDiscoveryErrorCodes, r.Error) {
+			return errors.New("error code")
+		}
+		return nil
+	})
 }

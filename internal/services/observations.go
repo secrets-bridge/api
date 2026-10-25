@@ -350,7 +350,9 @@ func (s *GatewayObservationService) Start(ctx context.Context, req *storage.Acce
 	now := s.now().UTC()
 	created := 0
 	for _, b := range bindings {
-		if targetStale(b) {
+		// A discovered binding is listed only while dispatchable; a static
+		// one is skipped while its advertised target is stale.
+		if b.TargetSource != storage.GatewayTargetSourceDiscovered && targetStale(b) {
 			continue
 		}
 		jobID := job.ID
@@ -920,6 +922,9 @@ func resourceMatchesTarget(conn *storage.GatewayConnector, st StageEvidence) err
 // observation.evidence.rejected reason.
 const (
 	RefusalTargetIdentityChanged = "target_identity_changed"
+	// RefusalTargetSnapshotStale is the E7 refusal reason of a replica
+	// with no usable snapshot (api#308).
+	RefusalTargetSnapshotStale   = "target_snapshot_stale"
 	RefusalIdentityDigestMissing = "identity_digest_missing"
 	RefusalIdentityDigestMatch   = "identity_digest_mismatch"
 )
@@ -1166,7 +1171,7 @@ func (s *GatewayObservationService) accept(ctx context.Context, rt *storage.Obse
 		stages[k] = v
 	}
 	failures := task.FailureCount
-	if res.AttemptStatus == "refused" {
+	if res.AttemptStatus == "refused" && res.RefusalReason != RefusalTargetSnapshotStale {
 		failures++
 	}
 	var stageNames, outcomes, linkages []string

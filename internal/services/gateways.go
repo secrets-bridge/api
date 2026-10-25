@@ -84,6 +84,9 @@ type GatewayStore interface {
 	ReplaceCatalog(ctx context.Context, gatewayID uuid.UUID, conns []storage.GatewayCatalogConnector, digest string, at time.Time) (*storage.GatewayCatalogOutcome, error)
 	ApproveConnectorScope(ctx context.Context, gatewayID, connectorID uuid.UUID, digest, by string, at, seenSince time.Time) (*storage.GatewayApproveOutcome, error)
 	ConnectorScope(ctx context.Context, gatewayID uuid.UUID, connectorName string, seenSince time.Time) (storage.GatewayConnectorScope, error)
+	ReplaceDiscovery(ctx context.Context, in storage.DiscoveryReplace, at time.Time) (*storage.DiscoveryOutcome, error)
+	GetSnapshot(ctx context.Context, gatewayID uuid.UUID, connectorName string) (*storage.GatewaySnapshot, error)
+	SnapshotDiscoveredAt(ctx context.Context, gatewayID uuid.UUID) (map[uuid.UUID]time.Time, error)
 	ConfirmTargetIdentity(ctx context.Context, gatewayID, connectorID uuid.UUID, targetID string) (*storage.GatewayTargetIdentityChange, *storage.GatewayConnector, error)
 	CreateBinding(ctx context.Context, b *storage.GatewayBinding) error
 	GetBinding(ctx context.Context, id uuid.UUID) (*storage.GatewayBinding, error)
@@ -291,7 +294,7 @@ func (s *GatewayService) Revoke(ctx context.Context, id uuid.UUID, by, reason st
 	cacheErr := s.cache.ensureRevoked(ctx, id, tombstoneRevoked, finalState(tombstoneRevoked))
 	meta := map[string]any{
 		"gateway_id": id.String(), "enrollment_tokens_revoked": out.TokensRevoked,
-		"tasks_requeued": out.TasksRequeued,
+		"tasks_requeued": out.TasksRequeued, "snapshots_deleted": out.SnapshotsDeleted,
 	}
 	if reason != "" {
 		meta["reason"] = reason

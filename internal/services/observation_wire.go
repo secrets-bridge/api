@@ -122,6 +122,10 @@ var (
 	obsRefusalReasons = []string{
 		"unknown_connector", "unbound_target", "stage_not_supported_by_connector", "scope_mismatch",
 		"schema_violation", "unsupported_schema_version", "deadline_passed",
+		// api#308 (discovery-contract.md section 7.2, decision E-10):
+		// a contract 2 Gateway with no usable snapshot for a discovered
+		// target. Not a failure of the binding.
+		RefusalTargetSnapshotStale,
 	}
 	obsConditionStatuses = []string{"True", "False", "Unknown"}
 )

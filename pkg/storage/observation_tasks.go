@@ -85,6 +85,12 @@ const (
 	// ObservationReasonBindingRemoved: the admin deleted the binding the
 	// task came from while it was open.
 	ObservationReasonBindingRemoved = "binding_removed"
+	// ObservationReasonTargetMissing: the binding's discovered target
+	// left the catalog (api#308, ADR 0002 section 4.4).
+	ObservationReasonTargetMissing = "target_missing"
+	// ObservationReasonBindingSuspended: the binding was suspended, for
+	// example its AppProject mapping no longer covers its project.
+	ObservationReasonBindingSuspended = "binding_suspended"
 )
 
 // ObservationSource is environments.observation_source: which observer
@@ -449,6 +455,10 @@ type ObservableBinding struct {
 	ArgoCDConnectorName string
 	ArgoCDTargetID      string
 	ArgoCDTargets       []GatewayTarget
+	// TargetSource is static or discovered (api#308). A discovered
+	// binding is only listed while its target is present and its
+	// AppProject still maps to a team covering the binding project.
+	TargetSource string
 }
 
 // ListObservableBindings returns the bindings a task may be created
@@ -461,12 +471,13 @@ func (r *ObservationTasks) ListObservableBindings(ctx context.Context, scope Obs
 	}
 	rows, err := r.pool.Query(ctx, `
 		SELECT b.id, b.gateway_id, g.status, b.environment_id, b.expected_stages, b.observation_timeout_s,
-		       c.name, b.argocd_target_id, c.advertised_targets
+		       c.name, b.argocd_target_id, c.advertised_targets, b.target_source
 		FROM gateway_connector_bindings b
 		JOIN gateways g ON g.id = b.gateway_id
 		JOIN gateway_connectors c ON c.id = b.argocd_connector_id AND c.gateway_id = b.gateway_id
 		WHERE b.deleted_at IS NULL AND b.enabled AND b.environment_id = $1
 		  AND b.suspended_reason IS NULL
+		  AND `+bindingDiscoveredDispatchableSQL+`
 		  AND (($2::uuid IS NOT NULL AND b.secret_id = $2) OR
 		       ($3::uuid IS NOT NULL AND b.provider_connection_id = $3 AND b.secret_ref = $4::text))
 		  AND g.status NOT IN ('revoked','disabled')
@@ -481,7 +492,7 @@ func (r *ObservationTasks) ListObservableBindings(ctx context.Context, scope Obs
 		var b ObservableBinding
 		var stages, targets []byte
 		if err := rows.Scan(&b.BindingID, &b.GatewayID, &b.GatewayStatus, &b.EnvironmentID, &stages, &b.ObservationTimeoutS,
-			&b.ArgoCDConnectorName, &b.ArgoCDTargetID, &targets); err != nil {
+			&b.ArgoCDConnectorName, &b.ArgoCDTargetID, &targets, &b.TargetSource); err != nil {
 			return nil, fmt.Errorf("storage: scan observable binding: %w", err)
 		}
 		if err := json.Unmarshal(stages, &b.ExpectedStages); err != nil || b.ExpectedStages == nil {
@@ -595,6 +606,16 @@ const connectorScopeUnsettledSQL = `EXISTS (
 		  AND sh->>'connector_id' = c.name AND sh ? 'scope_digest'
 		  AND (c.approved_scope_digest IS NULL OR sh->>'scope_digest' <> c.approved_scope_digest))`
 
+// bindingDiscoveredDispatchableSQL is true for a static binding, and for
+// a discovered one while its target is present in the current
+// generation and its AppProject maps to a team that covers the binding
+// project (api#308, discovery-contract.md section 8.5). Task creation
+// and the claim query use it.
+const bindingDiscoveredDispatchableSQL = `(b.target_source = 'static' OR (
+		EXISTS (SELECT 1 FROM gateway_discovered_targets pdt
+			WHERE pdt.connector_id = b.argocd_connector_id AND pdt.target_id = b.argocd_target_id AND pdt.status = 'present')
+		AND ` + bindingTeamCoveredSQL + `))`
+
 // claimerScopeApprovedSQL is true when connector c has no approved
 // digest (a contract 1 Gateway), or the claiming replica ($3), live in
 // the window ($2), last reported exactly the approved digest for c. A
@@ -698,6 +719,7 @@ func (r *ObservationTasks) Claim(ctx context.Context, gatewayID, replicaID uuid.
 			  AND NOT `+bindingTargetIdentityChangedSQL+`
 			  AND NOT `+connectorOverPrivilegedSQL+`
 			  AND NOT `+connectorScopeUnsettledSQL+`
+			  AND `+bindingDiscoveredDispatchableSQL+`
 			  AND `+claimerScopeApprovedSQL+`)
 		ORDER BY t.not_before, t.created_at
 		LIMIT 1

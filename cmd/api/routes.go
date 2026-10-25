@@ -63,6 +63,9 @@ type gatewayMachineRoutes struct {
 	lease   []fiber.Handler
 	release []fiber.Handler
 	result  []fiber.Handler
+	// E8 and E9 (api#308).
+	discovery []fiber.Handler
+	snapshot  []fiber.Handler
 }
 
 func (g gatewayMachineRoutes) register(v1 fiber.Router) {
@@ -77,6 +80,8 @@ func (g gatewayMachineRoutes) register(v1 fiber.Router) {
 	mount(grp.Post, "/tasks/:task_id/lease", g.lease)
 	mount(grp.Post, "/tasks/:task_id/release", g.release)
 	mount(grp.Post, "/tasks/:task_id/result", g.result)
+	mount(grp.Put, "/connectors/:connector_id/discovery", g.discovery)
+	mount(grp.Get, "/connectors/:connector_id/snapshot", g.snapshot)
 }
 
 // hs is sugar for building a handler chain (middleware first, final

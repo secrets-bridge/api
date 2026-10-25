@@ -73,15 +73,19 @@ func ByAuthenticatedGateway() BucketFunc {
 
 // BodyLimit answers 413 `{"error":"payload_too_large"}` for a body over
 // n bytes, before any decoding.
-func BodyLimit(n int) fiber.Handler {
+func BodyLimit(n int) fiber.Handler { return BodyLimitCode(n, "payload_too_large") }
+
+// BodyLimitCode is BodyLimit answering code instead. The E8 discovery
+// upload answers catalog_too_large (api#308).
+func BodyLimitCode(n int, code string) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		if cl := c.Get(fiber.HeaderContentLength); cl != "" {
 			if v, err := strconv.Atoi(cl); err == nil && v > n {
-				return fiber.NewError(fiber.StatusRequestEntityTooLarge, "payload_too_large")
+				return fiber.NewError(fiber.StatusRequestEntityTooLarge, code)
 			}
 		}
 		if len(c.Body()) > n {
-			return fiber.NewError(fiber.StatusRequestEntityTooLarge, "payload_too_large")
+			return fiber.NewError(fiber.StatusRequestEntityTooLarge, code)
 		}
 		return c.Next()
 	}

@@ -1371,6 +1371,13 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		lease:   hs(gatewayLimit("gateway:lease", 1200), middleware.BodyLimit(4<<10), gatewaysH.RenewLease),
 		release: hs(gatewayLimit("gateway:release", 1200), middleware.BodyLimit(4<<10), gatewaysH.Release),
 		result:  hs(gatewayLimit("gateway:result", 1200), middleware.BodyLimit(64<<10), gatewaysH.Result),
+		// E8 and E9 (api#308): 60 uploads and 600 snapshot reads per
+		// minute per Gateway, after auth. The upload has its own 2 MiB
+		// limit answering catalog_too_large (the server-wide fiber limit,
+		// 4 MiB by default, is above it).
+		discovery: hs(gatewayLimit("gateway:discovery", 60),
+			middleware.BodyLimitCode(services.GatewayDiscoveryBodyLimit, "catalog_too_large"), gatewaysH.Discovery),
+		snapshot: hs(gatewayLimit("gateway:snapshot", 600), middleware.BodyLimit(0), gatewaysH.Snapshot),
 	}.register(v1)
 
 	gatewayMint := auth.Require(auth.PermGatewayMint, rbacResolver)
