@@ -467,6 +467,13 @@ type gatewayTargetView struct {
 	// IdentityStatus is unpinned (no identity advertised yet), pinned or
 	// identity_changed (bindings suspended until re-confirmed).
 	IdentityStatus string `json:"identity_status"`
+	// IdentityChangeTrigger is set while identity_changed (api#314):
+	// catalog (the Gateway advertised another identity) or
+	// gateway_reported (the Gateway refused the object, the advertised
+	// identity is still the pin). A re-confirm of a gateway_reported
+	// change keeps the pin, so it flips back on the next such error until
+	// the integrator fixes the settings uid.
+	IdentityChangeTrigger string `json:"identity_change_trigger,omitempty"`
 }
 
 // Identity status of a target with no pin, as the admin read shows it.
@@ -482,7 +489,7 @@ func toConnectorView(c *storage.GatewayConnector) gatewayConnectorView {
 		targets = append(targets, gatewayTargetView{
 			TargetID: t.TargetID, Namespace: t.Namespace, Name: t.Name,
 			RefreshIntervalSeconds: t.RefreshIntervalSeconds, ProgressDeadlineSeconds: t.ProgressDeadlineSeconds,
-			Stale: t.Stale, IdentityStatus: status,
+			Stale: t.Stale, IdentityStatus: status, IdentityChangeTrigger: t.ChangeTrigger(),
 		})
 	}
 	return gatewayConnectorView{
