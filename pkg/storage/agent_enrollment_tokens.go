@@ -47,12 +47,18 @@ type AgentEnrollmentTokenRepository interface {
 	// `at` (single-use guard). Returns ErrEnrollmentTokenNotFound when
 	// the row is consumed / revoked / expired / gone.
 	MarkConsumed(ctx context.Context, id, agentID uuid.UUID, at time.Time) error
-	// ConsumeAndCreateAgent burns the token and inserts the enrolled
-	// agent in ONE transaction, token first (API-18): a losing
-	// concurrent enroll or a revoked/expired token never creates an
-	// agent row, and a failed insert rolls the consume back. Returns
+	// CreateEnrollmentChallenge stores a proof-of-possession challenge
+	// (nonce hash, key) bound to a token (skills#116).
+	CreateEnrollmentChallenge(ctx context.Context, c *KeyChallenge) error
+	// InvalidateEnrollmentChallenge burns an unused challenge of tokenID.
+	InvalidateEnrollmentChallenge(ctx context.Context, id, tokenID uuid.UUID, at time.Time) error
+	// EnrollWithChallenge burns the token, verifies the locked
+	// challenge, inserts the agent with the challenge's key and marks
+	// the challenge used, in ONE transaction, token first (API-18): a
+	// losing concurrent enroll or a revoked/expired token never creates
+	// an agent row, and a failed insert rolls the consume back. Returns
 	// ErrEnrollmentTokenNotFound when the token cannot be consumed.
-	ConsumeAndCreateAgent(ctx context.Context, tokenID uuid.UUID, at time.Time, a *Agent) error
+	EnrollWithChallenge(ctx context.Context, tokenID, challengeID uuid.UUID, at time.Time, verify ChallengeVerifier, a *Agent) error
 	// Get resolves a token by id (admin revoke path). (api#179)
 	Get(ctx context.Context, id uuid.UUID) (*AgentEnrollmentToken, error)
 	// Revoke stamps revoked_at + revoked_by on an UNUSED, un-revoked token.
@@ -135,44 +141,6 @@ func (r *AgentEnrollmentTokens) MarkConsumed(ctx context.Context, id, agentID uu
 	return nil
 }
 
-// ConsumeAndCreateAgent burns the token, inserts the enrolled agent and
-// links the two, all in one transaction. The consume runs first and
-// holds the token row lock, so concurrent enrolls with one token
-// serialise on it: the first commits, the rest re-check the guard,
-// match nothing and roll back without ever inserting an agent.
-func (r *AgentEnrollmentTokens) ConsumeAndCreateAgent(ctx context.Context, tokenID uuid.UUID, at time.Time, a *Agent) error {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("storage: begin enrollment: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	var consumed uuid.UUID
-	err = tx.QueryRow(ctx, `
-		UPDATE agent_enrollment_tokens
-		SET    consumed_at = $2
-		WHERE  id = $1 AND `+consumableTokenSQL+`
-		RETURNING id`, tokenID, at).Scan(&consumed)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrEnrollmentTokenNotFound
-	}
-	if err != nil {
-		return fmt.Errorf("storage: consume enrollment token: %w", err)
-	}
-	if err := insertEnrolledAgent(ctx, tx, a); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx,
-		`UPDATE agent_enrollment_tokens SET consumed_by_agent_id = $2 WHERE id = $1`,
-		tokenID, a.ID); err != nil {
-		return fmt.Errorf("storage: link enrollment token to agent: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("storage: commit enrollment: %w", err)
-	}
-	return nil
-}
-
 // Get resolves a token by id.
 func (r *AgentEnrollmentTokens) Get(ctx context.Context, id uuid.UUID) (*AgentEnrollmentToken, error) {
 	q := `SELECT ` + agentEnrollmentTokenColumns + `
@@ -181,17 +149,26 @@ func (r *AgentEnrollmentTokens) Get(ctx context.Context, id uuid.UUID) (*AgentEn
 }
 
 // Revoke stamps revoked_at + revoked_by on a token that is not yet consumed
-// or revoked. Zero rows (already consumed/revoked/gone) → ErrEnrollmentTokenNotFound.
+// or revoked, and invalidates its open challenges in the same statement.
+// Zero rows (already consumed/revoked/gone) → ErrEnrollmentTokenNotFound.
 func (r *AgentEnrollmentTokens) Revoke(ctx context.Context, id uuid.UUID, revokedBy string, at time.Time) error {
 	const q = `
-		UPDATE agent_enrollment_tokens
-		SET    revoked_at = $2, revoked_by = NULLIF($3, '')
-		WHERE  id = $1 AND consumed_at IS NULL AND revoked_at IS NULL`
-	tag, err := r.pool.Exec(ctx, q, id, at, revokedBy)
-	if err != nil {
+		WITH t AS (
+			UPDATE agent_enrollment_tokens
+			SET    revoked_at = $2, revoked_by = NULLIF($3, '')
+			WHERE  id = $1 AND consumed_at IS NULL AND revoked_at IS NULL
+			RETURNING id),
+		c AS (
+			UPDATE agent_enrollment_challenges
+			SET    invalidated_at = $2
+			WHERE  enrollment_token_id IN (SELECT id FROM t) AND used_at IS NULL AND invalidated_at IS NULL
+			RETURNING id)
+		SELECT (SELECT count(*) FROM t), (SELECT count(*) FROM c)`
+	var n, challenges int64
+	if err := r.pool.QueryRow(ctx, q, id, at, revokedBy).Scan(&n, &challenges); err != nil {
 		return fmt.Errorf("storage: revoke enrollment token: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
+	if n == 0 {
 		return ErrEnrollmentTokenNotFound
 	}
 	return nil

@@ -411,7 +411,7 @@ func TestLive_Gateway_AuthIsolation(t *testing.T) {
 	gw := f.enrolled(t, "isolation-gw")
 
 	minter := f.l.grantUser(t, []string{"agent.mint"}, `{}`)
-	code, body := f.l.call(t, http.MethodPost, "/api/v1/agents", minter, map[string]any{"name": "isolation-agent"})
+	code, body := f.l.call(t, http.MethodPost, "/api/v1/agents", minter, agentMintBody("isolation-agent"))
 	if code != http.StatusCreated {
 		t.Fatalf("mint agent = %d %s", code, body)
 	}
@@ -423,7 +423,7 @@ func TestLive_Gateway_AuthIsolation(t *testing.T) {
 
 	// Warm both caches with a good call each.
 	if code, body := f.l.callAs(t, http.MethodPost, "/api/v1/agents/"+agent.ID+"/heartbeat",
-		map[string]string{"X-Agent-Secret": agent.AgentSecret}, nil); code != http.StatusNoContent {
+		agentHeaders(agent.AgentSecret), nil); code != http.StatusNoContent {
 		t.Fatalf("agent heartbeat = %d %s", code, body)
 	}
 	if code, body := f.heartbeat(t, gw.GatewayID, gw.GatewaySecret, uuid.NewString()); code != http.StatusOK {
@@ -439,7 +439,7 @@ func TestLive_Gateway_AuthIsolation(t *testing.T) {
 	for _, id := range []string{agent.ID, gw.GatewayID} {
 		for _, hdr := range []map[string]string{
 			{"X-Gateway-Secret": agent.AgentSecret},
-			{"X-Agent-Secret": agent.AgentSecret},
+			agentHeaders(agent.AgentSecret),
 			{"X-Agent-Secret": gw.GatewaySecret},
 		} {
 			for _, p := range gwPaths(id) {

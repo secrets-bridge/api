@@ -1,12 +1,15 @@
 package handlers
 
-// Agent Onboarding MVP (api#178) — HTTP layer for enrollment-token
-// generation (admin) + agent self-enrollment (token-only).
+// Agent onboarding (api#178, v2 in skills#116): HTTP layer for
+// enrollment-token generation (admin) and the two-step enrollment with
+// proof of possession of a customer-generated key.
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"regexp"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
@@ -82,12 +85,15 @@ func (h *Agents) GenerateEnrollmentToken(c fiber.Ctx) error {
 	})
 }
 
-// Install hint names. The agent chart reads the token from a Secret and
-// never from a chart value, which would be stored in the Helm release.
+// Install hint names (skills#116). The enrollment runs on the customer
+// side with the agent binary's enroll subcommand, which generates the
+// X25519 key locally; the chart then mounts the resulting Secret read
+// only. The token and the private key are never chart values.
 const (
-	agentChartRef     = "oci://ghcr.io/secrets-bridge/charts/secrets-bridge-agent"
-	agentNamespace    = "secrets-bridge"
-	agentEnrollSecret = "secrets-bridge-agent-enroll"
+	agentChartRef       = "oci://ghcr.io/secrets-bridge/charts/secrets-bridge-agent"
+	agentNamespace      = "secrets-bridge"
+	agentIdentitySecret = "secrets-bridge-agent-identity"
+	agentBinary         = "secrets-bridge-agent"
 )
 
 // hintValueRe is what a connection or request value may hold to go into
@@ -107,28 +113,29 @@ func hintValue(v, placeholder string) string {
 
 // enrollmentInstallHint returns copy-paste commands for a new token:
 //
-//   - kubectl: the Secret the agent chart reads the token from;
-//   - helm: the agent chart in enrollment mode, pointed at that Secret;
-//   - cli: the agent binary's environment, to run it outside the chart.
+//   - kubectl: run the local enroll and store the bundle straight into
+//     the Kubernetes Secret the chart mounts;
+//   - cli: run the local enroll and write the bundle to a 0600 file, to
+//     put into AWS Secrets Manager or Vault (and sync with ESO);
+//   - helm: the agent chart pointed at that Secret.
 //
-// No line carries the token (ui#151). kubectl and cli start with a
-// silent prompt (`read -rs`; paste the token, then Enter) and hand it
-// over through stdin or the environment, so it never reaches a command line, shell history or the
-// process arguments. The control plane URL, chart version and anything
-// the connection doesn't say are <placeholders>, and so is any value
-// hintValue refuses.
+// No line carries the token (ui#151): both start with a silent prompt
+// (`read -rs`; paste the token, then Enter) and hand it to the enroll
+// command on stdin (--token-file -), so it never reaches a command line,
+// shell history or the process arguments. The control plane URL, chart
+// version and anything the connection doesn't say are <placeholders>,
+// and so is any value hintValue refuses.
 func enrollmentInstallHint(res *services.GeneratedEnrollmentToken, expectedCluster string) map[string]string {
 	cluster := hintValue(firstSet(expectedCluster, res.ClusterName), "<cluster-name>")
 	scope := func(k, placeholder string) string { return hintValue(res.Scope[k], placeholder) }
 
+	enroll := agentBinary + " enroll --cp-endpoint <CONTROL_PLANE_URL> --token-file -" +
+		" --name <agent-name> --cluster-name " + cluster + " --provider-type " + res.ProviderType
 	sets := []string{
 		"cp.endpoint=<CONTROL_PLANE_URL>",
 		"clusterName=" + cluster,
 		"agent.providerType=" + res.ProviderType,
-		"enrollment.enabled=true",
-		"enrollment.tokenSecretName=" + agentEnrollSecret,
-		"identity.mode=file",
-		"identity.persistence.enabled=true",
+		"identity.existingSecret=" + agentIdentitySecret,
 	}
 	switch res.ProviderType {
 	case "vault":
@@ -148,9 +155,11 @@ func enrollmentInstallHint(res *services.GeneratedEnrollmentToken, expectedClust
 			sets = append(sets, "providers.vault.kvPrefix="+scope("kvPrefix", "<kv-prefix>"))
 		}
 	case "aws-sm":
+		region := scope("region", "<aws-region>")
+		enroll += " --region " + region
 		sets = append(sets,
 			"providers.awsSecretsManager.enabled=true",
-			"providers.awsSecretsManager.region="+scope("region", "<aws-region>"))
+			"providers.awsSecretsManager.region="+region)
 		if res.Scope["endpoint"] != "" {
 			sets = append(sets, "providers.awsSecretsManager.endpoint="+scope("endpoint", "<aws-endpoint>"))
 		}
@@ -161,16 +170,15 @@ func enrollmentInstallHint(res *services.GeneratedEnrollmentToken, expectedClust
 		helm += " --set " + s
 	}
 
+	const prompt = "read -rs SB_ENROLL_TOKEN\n"
+	const feed = `printf '%s' "$SB_ENROLL_TOKEN" | `
+	const unset = "\nunset SB_ENROLL_TOKEN"
 	return map[string]string{
-		"kubectl": "read -rs SB_ENROLL_TOKEN\n" +
-			fmt.Sprintf(`printf '%%s' "$SB_ENROLL_TOKEN" | kubectl -n %s create secret generic %s --from-file=enrollment_token=/dev/stdin`,
-				agentNamespace, agentEnrollSecret) + "\n" +
-			"unset SB_ENROLL_TOKEN",
+		"kubectl": prompt + feed + enroll + " --format env --output - | " +
+			fmt.Sprintf("kubectl -n %s create secret generic %s --from-env-file=/dev/stdin", agentNamespace, agentIdentitySecret) +
+			unset,
+		"cli":  prompt + feed + enroll + " --format json --output agent-credentials.json" + unset,
 		"helm": helm,
-		"cli": "read -rs SB_ENROLLMENT_TOKEN && export SB_ENROLLMENT_TOKEN\n" +
-			fmt.Sprintf("SB_CP_ENDPOINT=<CONTROL_PLANE_URL> SB_ENROLLMENT_ENABLED=true "+
-				"SB_IDENTITY_FILE=<identity-file> SB_CLUSTER_NAME=%s SB_PROVIDER_TYPE=%s agent",
-				cluster, res.ProviderType),
 	}
 }
 
@@ -184,89 +192,142 @@ func firstSet(vals ...string) string {
 	return ""
 }
 
-// EnrollRequest is the agent body for POST /agents/enroll.
-type EnrollRequest struct {
-	EnrollmentToken      string   `json:"enrollment_token"`
-	AgentName            string   `json:"agent_name"`
-	AgentVersion         string   `json:"agent_version,omitempty"`
-	ClusterName          string   `json:"cluster_name,omitempty"`
-	ProviderType         string   `json:"provider_type,omitempty"`
-	Region               string   `json:"region,omitempty"`
-	Capabilities         []string `json:"capabilities,omitempty"`
-	PublicKeyFingerprint string   `json:"public_key_fingerprint,omitempty"`
+// SealedChallenge is a pkg/sealing envelope, all byte fields std base64.
+// The plaintext is the 32-byte challenge nonce.
+type SealedChallenge struct {
+	Algorithm          string `json:"algorithm"`
+	EphemeralPublicKey string `json:"ephemeral_public_key"`
+	Nonce              string `json:"nonce"`
+	Ciphertext         string `json:"ciphertext"`
 }
 
-// EnrollResponse returns the persistent agent credential EXACTLY ONCE.
-type EnrollResponse struct {
-	AgentID                  string `json:"agent_id"`
-	ProviderConnectionID     string `json:"provider_connection_id"`
-	AgentToken               string `json:"agent_token"`
-	HeartbeatIntervalSeconds int    `json:"heartbeat_interval_seconds"`
-	JobPollIntervalSeconds   int    `json:"job_poll_interval_seconds"`
+// ChallengeResponse is returned by both challenge endpoints (enroll and
+// key rotation).
+type ChallengeResponse struct {
+	ChallengeID     string          `json:"challenge_id"`
+	SealedChallenge SealedChallenge `json:"sealed_challenge"`
+	ExpiresAt       string          `json:"expires_at"`
 }
 
-// Enroll handles POST /agents/enroll. Auth is the enrollment token ONLY —
-// no session, no AgentAuth (the agent has no credential yet). This route is
-// under the /api/v1/agents/ session-exempt prefix by design; the token is
-// its authentication.
-func (h *Agents) Enroll(c fiber.Ctx) error {
-	var req EnrollRequest
-	if err := c.Bind().JSON(&req); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
+func challengeResponse(ch *services.KeyChallenge) ChallengeResponse {
+	return ChallengeResponse{
+		ChallengeID: ch.ChallengeID.String(),
+		SealedChallenge: SealedChallenge{
+			Algorithm:          ch.Sealed.Algorithm,
+			EphemeralPublicKey: base64.StdEncoding.EncodeToString(ch.Sealed.EphemeralPublicKey),
+			Nonce:              base64.StdEncoding.EncodeToString(ch.Sealed.Nonce),
+			Ciphertext:         base64.StdEncoding.EncodeToString(ch.Sealed.Ciphertext),
+		},
+		ExpiresAt: ch.ExpiresAt.UTC().Format(time.RFC3339),
 	}
+}
 
-	res, err := h.svc.Enroll(c.Context(), services.EnrollInput{
-		Token:                req.EnrollmentToken,
-		AgentName:            req.AgentName,
-		AgentVersion:         req.AgentVersion,
-		ClusterName:          req.ClusterName,
-		ProviderType:         req.ProviderType,
-		Region:               req.Region,
-		Capabilities:         req.Capabilities,
-		PublicKeyFingerprint: req.PublicKeyFingerprint,
+// EnrollChallengeRequest is the body of POST /agents/enroll/challenge.
+type EnrollChallengeRequest struct {
+	SchemaVersion      string `json:"schema_version"`
+	EnrollmentToken    string `json:"enrollment_token"`
+	PublicKey          string `json:"public_key"`
+	PublicKeyAlgorithm string `json:"public_key_algorithm"`
+}
+
+// EnrollChallenge handles POST /agents/enroll/challenge. Auth is the
+// enrollment token only, which is validated here and NOT consumed. Like
+// Enroll it is under the /api/v1/agents/ session-exempt prefix and is
+// registered before the AgentAuth group.
+func (h *Agents) EnrollChallenge(c fiber.Ctx) error {
+	var req EnrollChallengeRequest
+	if err := c.Bind().JSON(&req); err != nil {
+		return enrollError(c, fiber.StatusBadRequest, "invalid_request")
+	}
+	ch, err := h.svc.EnrollChallenge(c.Context(), services.EnrollChallengeInput{
+		SchemaVersion:      req.SchemaVersion,
+		Token:              req.EnrollmentToken,
+		PublicKey:          req.PublicKey,
+		PublicKeyAlgorithm: req.PublicKeyAlgorithm,
 	})
 	if err != nil {
 		return enrollErr(c, err)
 	}
+	return c.Status(fiber.StatusOK).JSON(challengeResponse(ch))
+}
 
+// EnrollRequest is the body of POST /agents/enroll (schema version 2).
+type EnrollRequest struct {
+	SchemaVersion     string `json:"schema_version"`
+	EnrollmentToken   string `json:"enrollment_token"`
+	ChallengeID       string `json:"challenge_id"`
+	ChallengeResponse string `json:"challenge_response"`
+	Name              string `json:"name"`
+	ClusterName       string `json:"cluster_name,omitempty"`
+	ProviderType      string `json:"provider_type,omitempty"`
+	Region            string `json:"region,omitempty"`
+}
+
+// EnrollResponse returns the agent credential EXACTLY ONCE.
+type EnrollResponse struct {
+	AgentID                  string `json:"agent_id"`
+	AgentSecret              string `json:"agent_secret"`
+	PublicKeyFingerprint     string `json:"public_key_fingerprint"`
+	PublicKeyVersion         int    `json:"public_key_version"`
+	HeartbeatIntervalSeconds int    `json:"heartbeat_interval_seconds"`
+	ClaimIntervalSeconds     int    `json:"claim_interval_seconds"`
+}
+
+// Enroll handles POST /agents/enroll. Auth is the enrollment token plus
+// the challenge response: no session, no AgentAuth (the agent has no
+// credential yet). Under the /api/v1/agents/ session-exempt prefix by
+// design.
+func (h *Agents) Enroll(c fiber.Ctx) error {
+	var req EnrollRequest
+	if err := c.Bind().JSON(&req); err != nil {
+		return enrollError(c, fiber.StatusBadRequest, "invalid_request")
+	}
+	res, err := h.svc.Enroll(c.Context(), services.EnrollInput{
+		SchemaVersion:     req.SchemaVersion,
+		Token:             req.EnrollmentToken,
+		ChallengeID:       req.ChallengeID,
+		ChallengeResponse: req.ChallengeResponse,
+		Name:              req.Name,
+		ClusterName:       req.ClusterName,
+		ProviderType:      req.ProviderType,
+		Region:            req.Region,
+	})
+	if err != nil {
+		return enrollErr(c, err)
+	}
 	return c.Status(fiber.StatusCreated).JSON(EnrollResponse{
 		AgentID:                  res.AgentID.String(),
-		ProviderConnectionID:     res.ProviderConnectionID.String(),
-		AgentToken:               res.AgentToken,
+		AgentSecret:              res.AgentSecret,
+		PublicKeyFingerprint:     res.PublicKeyFingerprint,
+		PublicKeyVersion:         res.PublicKeyVersion,
 		HeartbeatIntervalSeconds: res.HeartbeatIntervalSeconds,
-		JobPollIntervalSeconds:   res.JobPollIntervalSeconds,
+		ClaimIntervalSeconds:     res.ClaimIntervalSeconds,
 	})
 }
 
-// enrollErr maps enrollment sentinels to safe, metadata-only error bodies
-// ({"error": "<code>"}). No token, hash, or provider payload ever appears.
+func enrollError(c fiber.Ctx, status int, code string) error {
+	return c.Status(status).JSON(fiber.Map{"error": code})
+}
+
+// enrollErr maps the enrollment and rotation errors to the generic
+// bodies of the contract ({"error": "<code>"}). The specific reason is
+// only in the audit row. No token, hash, nonce or key ever appears.
 func enrollErr(c fiber.Ctx, err error) error {
-	code := fiber.StatusInternalServerError
-	body := "enrollment_failed"
 	switch {
-	case errors.Is(err, services.ErrEnrollmentTokenInvalid):
-		code, body = fiber.StatusUnauthorized, "enrollment_token_invalid"
-	case errors.Is(err, services.ErrEnrollmentTokenExpired):
-		code, body = fiber.StatusUnauthorized, "enrollment_token_expired"
-	case errors.Is(err, services.ErrEnrollmentTokenConsumed):
-		code, body = fiber.StatusConflict, "enrollment_token_already_consumed"
-	case errors.Is(err, services.ErrEnrollmentTokenRevoked):
-		code, body = fiber.StatusForbidden, "enrollment_token_revoked"
-	case errors.Is(err, services.ErrEnrollmentProviderMismatch):
-		code, body = fiber.StatusBadRequest, "provider_type_mismatch"
-	case errors.Is(err, services.ErrEnrollmentClusterMismatch):
-		code, body = fiber.StatusBadRequest, "cluster_name_mismatch"
-	case errors.Is(err, services.ErrEnrollmentConnectionUnusable):
-		code, body = fiber.StatusConflict, "provider_connection_unavailable"
-	case errors.Is(err, services.ErrEnrollmentNotConfigured):
-		code, body = fiber.StatusServiceUnavailable, "enrollment_not_configured"
+	case errors.Is(err, services.ErrEnrollmentRejected):
+		return enrollError(c, fiber.StatusUnauthorized, "enrollment_rejected")
+	case errors.Is(err, services.ErrKeyRotationRejected):
+		return enrollError(c, fiber.StatusUnauthorized, "key_rotation_rejected")
+	case errors.Is(err, services.ErrInvalidPublicKey):
+		return enrollError(c, fiber.StatusBadRequest, "invalid_public_key")
+	case errors.Is(err, services.ErrUnsupportedSchemaVersion):
+		return enrollError(c, fiber.StatusBadRequest, "unsupported_schema_version")
 	case errors.Is(err, services.ErrInvalidInput):
-		code, body = fiber.StatusBadRequest, "invalid_request"
-	default:
-		// agent_name required + any unexpected error → generic 400/500.
-		if err != nil && err.Error() == "agents: agent_name is required" {
-			code, body = fiber.StatusBadRequest, "agent_name_required"
-		}
+		return enrollError(c, fiber.StatusBadRequest, "invalid_request")
+	case errors.Is(err, services.ErrAgentNameTaken):
+		return enrollError(c, fiber.StatusConflict, "agent_name_taken")
+	case errors.Is(err, services.ErrEnrollmentNotConfigured), errors.Is(err, services.ErrKeyRotationNotConfigured):
+		return enrollError(c, fiber.StatusServiceUnavailable, "enrollment_not_configured")
 	}
-	return c.Status(code).JSON(fiber.Map{"error": body})
+	return enrollError(c, fiber.StatusInternalServerError, "enrollment_failed")
 }

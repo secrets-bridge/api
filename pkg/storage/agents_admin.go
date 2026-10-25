@@ -37,6 +37,11 @@ type AgentAdminRow struct {
 	RevokedAt              *time.Time
 	RevokedBy              string
 	CreatedAt              time.Time
+	// The bound wire key, as its fingerprint and version (skills#116).
+	// Never the key itself.
+	PublicKeyFingerprint string
+	PublicKeyVersion     int
+	PublicKeyAlgorithm   string
 }
 
 // AgentAdminFilter narrows ListAdmin. Empty fields are wildcards.
@@ -55,7 +60,8 @@ const agentAdminSelect = `
 	       a.capabilities, a.last_seen_at,
 	       COALESCE(a.last_status, ''), COALESCE(a.last_error, ''),
 	       a.disabled_at, a.revoked_at, COALESCE(a.revoked_by, ''),
-	       a.created_at
+	       a.created_at, COALESCE(a.public_key_fingerprint, ''), a.public_key_version,
+	       COALESCE(a.public_key_algorithm, '')
 	FROM agents a
 	LEFT JOIN provider_connections pc ON pc.id = a.provider_connection_id`
 
@@ -127,7 +133,7 @@ func scanAgentAdmin(row interface {
 		&caps, &a.LastSeenAt,
 		&a.LastStatus, &a.LastError,
 		&a.DisabledAt, &a.RevokedAt, &a.RevokedBy,
-		&a.CreatedAt)
+		&a.CreatedAt, &a.PublicKeyFingerprint, &a.PublicKeyVersion, &a.PublicKeyAlgorithm)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound

@@ -12,6 +12,63 @@ on `main`.
 ## [Unreleased]
 
 ### Changed
+- Agent enrollment v2 (skills#116, #327). The Agent's X25519 key is
+  generated on the customer side and bound at enrollment after a proof
+  of possession. Enrollment takes two calls, both with `schema_version:
+  "2"`; a request without it gets 400 `unsupported_schema_version`, with
+  no legacy fallback:
+  - `POST /api/v1/agents/enroll/challenge` with the enrollment token and
+    the public key validates both without consuming the token and
+    returns a 32-byte nonce sealed to the key with `pkg/sealing`
+    (`challenge_id`, `sealed_challenge`, `expires_at`). Only the nonce's
+    SHA-256 is stored, bound to the token and the key, for 120s and one
+    use.
+  - `POST /api/v1/agents/enroll` with the token, the challenge id and
+    the decrypted nonce consumes the token, checks the challenge in
+    constant time and creates the agent with that key at
+    `public_key_version` 1, bound to the token's provider connection, in
+    one transaction. The response (201) is the only time
+    `agent_secret` is returned, with `agent_id`,
+    `public_key_fingerprint`, `public_key_version`,
+    `heartbeat_interval_seconds` and `claim_interval_seconds`.
+  - Errors are `{"error": "<code>"}`: 401 `enrollment_rejected` (bad,
+    expired, used or revoked token, provider or cluster mismatch, any
+    challenge failure), 400 `invalid_public_key`, 409
+    `agent_name_taken`, 429 when rate limited (30 a minute per client
+    address on both calls). The reason is only in the audit row.
+  - A wrong challenge response burns that challenge. Revoking an
+    enrollment token invalidates its open challenges.
+- A public key must be 32 bytes of std base64 with algorithm `x25519`,
+  and is refused when it is all zero or of low order (checked by X25519
+  with a fixed scalar). The fingerprint is `sha256:` plus the lowercase
+  hex SHA-256 of the raw key.
+- Every Agent request under `/api/v1/agents/:id/*` must carry
+  `X-Agent-Key-Fingerprint`. After the secret check, a missing or wrong
+  fingerprint gets 409 `{"error":"agent_key_mismatch"}` and an
+  `agent.key.mismatch` audit row, at most one per agent per minute. The
+  two key rotation calls are the exception: they take `X-Agent-Secret`
+  only, because the old private key may be the one that was lost.
+- Wrap retrieval always seals to the bound key and returns
+  `recipient_key_fingerprint`. A rotation between the auth check and
+  the seal answers 409 `agent_key_mismatch` before the wrap is
+  consumed. `SB_ALLOW_UNSEALED_WRAPS` no longer applies to retrieval.
+- The direct mint (`POST /api/v1/agents`, dev only with
+  `SB_ALLOW_DIRECT_AGENT_MINT`) requires a valid `public_key` and
+  `public_key_algorithm`, and returns the fingerprint and version.
+- The admin agent projection carries `public_key_fingerprint`,
+  `public_key_version` and `public_key_algorithm`, never the key.
+- The enrollment token's install hint runs `secrets-bridge-agent enroll
+  --token-file -` on the customer side and points the chart at
+  `identity.existingSecret=secrets-bridge-agent-identity`.
+- Audit: `agent.enroll.challenge` and `agent.enroll` (success or
+  denied, with `error_kind`, the fingerprint and the provider
+  connection) replace `agent.enrolled` and `agent.enrollment.rejected`.
+  No token, secret or nonce is ever in a row.
+- **On upgrade** (pre-release): migration 0051 marks every agent without
+  a usable 32-byte x25519 key revoked (`revoked_by =
+  migration:0051_agent_enrollment_v2`). An agent with one keeps it at
+  version 1 and its fingerprint is recomputed from the key. Re-enroll
+  revoked agents with the enroll command.
 - `SB_REQUIRE_MFA_AT_LOGIN` is on by default unless `SB_ENV=dev`. With
   it off, an account with no second factor could add its first one from
   the session alone and then pass step-up. **On upgrade**, a production
@@ -63,6 +120,15 @@ on `main`.
   heartbeats write; it used a different key and never matched.
 
 ### Removed
+- `PUT /api/v1/agents/:id/public-key`, `AgentService.SetPublicKey` and
+  `AgentRepository.UpdatePublicKey` (skills#116). No route overwrites an
+  agent's key; the schema refuses a key change without a version bump
+  of one and a fingerprint that is not the key's.
+- The single-step `POST /api/v1/agents/enroll` request shape
+  (`agent_name`, `agent_version`, `capabilities`,
+  `public_key_fingerprint`) and its `agent_token` response.
+
+### Removed
 - The control-plane Argo CD integration (secrets-bridge/gateway#13):
   `pkg/argocd`, the Argo CD endpoint and GitOps services, the
   `/argocd-endpoints` (CRUD, `enabled`, `discovered-apps`) and
@@ -75,6 +141,34 @@ on `main`.
   `observation_source = control_plane` to `none`, makes `none` the
   default and refuses `control_plane`. Rotate the Argo CD account
   token on the Argo CD side.
+
+### Added
+- Audited agent key rotation (skills#116). `POST
+  /api/v1/admin/agents/:id/key-rotation` (`agent.mint` and a fresh
+  second factor) returns 201 `{"rotation_token", "expires_at"}`, a
+  one-time token for 15 minutes, stored hashed, bound to the agent and
+  its key version; a new one revokes the open one. The operator's
+  `secrets-bridge-agent rotate-key` then calls `POST
+  /api/v1/agents/:id/key-rotation/challenge` (`X-Agent-Secret`,
+  `schema_version`, `rotation_token`, `public_key`,
+  `public_key_algorithm`) and `POST /api/v1/agents/:id/key-rotation`
+  (`schema_version`, `rotation_token`, `challenge_id`,
+  `challenge_response`), which sets the new key and bumps
+  `public_key_version`. The agent secret is unchanged; an Agent still
+  on the old key gets 409 `agent_key_mismatch` until it restarts with
+  the new Secret. Errors: 401 `key_rotation_rejected`, 400
+  `invalid_public_key` (also for the current key) and
+  `unsupported_schema_version`. Audit: `agent.key_rotation.requested`,
+  `agent.key_rotation.challenge`, `agent.key.rotated` (old and new
+  fingerprints and versions). Revoking the agent revokes any open
+  rotation token and invalidates its challenges in the same statement.
+- Migration 0051: `agent_enrollment_challenges`,
+  `agent_key_rotation_tokens`, `agent_key_rotation_challenges`,
+  `agents.public_key_version`, a CHECK that every agent that is not
+  revoked has a valid key with a matching fingerprint, and a trigger
+  that lets the key change only with a version bump of one.
+- `pkg/sealing`: `ValidatePublicKey`, `ParsePublicKey`, `Fingerprint`,
+  `IsFingerprint`.
 
 ### Added
 - Argo CD discovery catalog read and scoped binding (#308): `GET

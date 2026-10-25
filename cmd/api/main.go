@@ -410,7 +410,8 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// self-enrollment onto the existing agent service. Mutates the same
 	// agentSvc pointer AgentAuth + agentsH already hold; the certified
 	// mint/heartbeat/auth paths are untouched.
-	agentSvc.WithEnrollment(storage.NewAgentEnrollmentTokens(pool), provConnRepo)
+	agentSvc.WithEnrollment(storage.NewAgentEnrollmentTokens(pool), provConnRepo).
+		WithKeyRotation(storage.NewAgentKeyRotations(pool))
 	// Discovery uploads are pinned to the uploading agent's own cluster +
 	// provider type (agents row / bound connection), not the batch body.
 	secretsSvc.WithAgentIdentity(agentRepo, provConnRepo)
@@ -842,12 +843,31 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// authenticated user without agent.list. Richer projection + filters
 	// live on GET /admin/agents.
 	v1.Get("/agents", auth.Require(auth.PermAgentList, rbacResolver), agentsH.List)
-	// Agent self-enrollment (api#178). Auth = the enrollment token ONLY.
-	// This route IS under the /api/v1/agents/ session-exempt prefix by
-	// design (the enrolling agent has no session and no X-Agent-Secret
-	// yet); the token it presents is validated in the handler/service.
-	// It is NOT on the AgentAuth :id group. Registered before that group.
-	v1.Post("/agents/enroll", agentsH.Enroll)
+	// Agent enrollment v2 (api#178, skills#116): challenge, then enroll.
+	// Auth = the enrollment token (and, for enroll, the challenge
+	// response) ONLY. Both routes ARE under the /api/v1/agents/
+	// session-exempt prefix by design (the enrolling client has no
+	// session and no X-Agent-Secret yet); the token is validated in the
+	// service. They are NOT on the AgentAuth :id group and are registered
+	// before it. Rate limited per client IP: the routes are
+	// unauthenticated.
+	enrollLimit := middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
+		Name: "agent:enroll", Bucket: middleware.ByIP(),
+		Limit: 30, Window: 60 * time.Second,
+	})
+	v1.Post("/agents/enroll/challenge", enrollLimit, agentsH.EnrollChallenge)
+	v1.Post("/agents/enroll", enrollLimit, agentsH.Enroll)
+	// Key rotation, agent side (skills#116): X-Agent-Secret plus the
+	// admin's rotation token, then proof of possession of the new key.
+	// Registered before the AgentAuth group so the key fingerprint check
+	// does not apply: the old private key may be the one that was lost.
+	rotateAuth := middleware.AgentSecretAuth(agentSvc)
+	rotateLimit := middleware.RateLimit(rdb, logger, middleware.RateLimitConfig{
+		Name: "agent:key-rotation", Bucket: middleware.ByPathAgentID(),
+		Limit: 10, Window: 60 * time.Second,
+	})
+	v1.Post("/agents/:id/key-rotation/challenge", rotateAuth, rotateLimit, agentsH.KeyRotationChallenge)
+	v1.Post("/agents/:id/key-rotation", rotateAuth, rotateLimit, agentsH.ConfirmKeyRotation)
 
 	// Agent management admin surface (api#179). Deliberately OFF the
 	// /api/v1/agents/ session-exempt prefix (under /admin/agents), so the
@@ -993,6 +1013,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// stamped. Defined here so the direct-reveal submit below AND the
 	// request-lifecycle routes further down share one instance.
 	requireMFA := middleware.RequireFreshMFA(sessionSvc, mfaVerifySvc)
+
+	// Agent key rotation, admin side (skills#116): a one-time rotation
+	// token, behind agent.mint AND a fresh second factor.
+	v1.Post("/admin/agents/:id/key-rotation",
+		auth.Require(auth.PermAgentMint, rbacResolver), requireMFA, agentsH.RequestKeyRotation)
 
 	// Sign-in providers and the install's public address, set from the
 	// console (api#267). A global auth.sso.edit for every route, and a
@@ -1455,10 +1480,9 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		}),
 		agentsH.Heartbeat,
 	)
-	// Agent self-registers its X25519 public key after generating
-	// the keypair at startup. Idempotent. Lets existing minted
-	// agents opt into the sealed-wire path without an admin re-mint.
-	agentRoutes.Put("/public-key", agentsH.SetPublicKey)
+	// There is no route that sets an agent's public key (skills#116):
+	// it is bound at enrollment and changes only through the key
+	// rotation routes above.
 	agentRoutes.Post("/jobs/claim", jobsH.Claim)
 	agentRoutes.Post("/jobs/:job/complete", jobsH.Complete)
 	// Single-shot wrap retrieval. RetrieveWrap requires the owning

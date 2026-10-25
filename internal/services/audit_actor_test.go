@@ -29,7 +29,7 @@ func TestAuditActor_FromContext(t *testing.T) {
 
 	// Session user (what middleware.AuthWith stores for a signed-in caller).
 	userCtx := context.WithValue(t.Context(), middleware.CtxKeyActor, "00000000-0000-4000-8000-0000000000c1")
-	m, err := agents.Mint(userCtx, services.MintInput{Name: "tenant-a-uat"})
+	m, err := agents.Mint(userCtx, keyedMint(services.MintInput{Name: "tenant-a-uat"}))
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}

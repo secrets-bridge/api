@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/secrets-bridge/api/pkg/sealing"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
@@ -52,7 +53,7 @@ func TestEnrollmentTokens_MarkConsumed_RefusesRevokedAndExpired(t *testing.T) {
 	ctx := t.Context()
 	agents := storage.NewAgents(pool)
 	a := &storage.Agent{Name: "agent-x", SecretHash: []byte("h")}
-	if err := agents.Create(ctx, a); err != nil {
+	if err := agents.Create(ctx, keyedStorageAgent(t, a)); err != nil {
 		t.Fatalf("create agent: %v", err)
 	}
 	repo := storage.NewAgentEnrollmentTokens(pool)
@@ -69,14 +70,19 @@ func TestEnrollmentTokens_MarkConsumed_RefusesRevokedAndExpired(t *testing.T) {
 	}
 }
 
-// ConsumeAndCreateAgent never inserts an agent for a token it cannot
-// consume, and links the agent when it can.
-func TestEnrollmentTokens_ConsumeAndCreateAgent(t *testing.T) {
+// EnrollWithChallenge never inserts an agent for a token it cannot
+// consume or a challenge the verifier refuses, binds the challenge's
+// key, and links the agent when it can (skills#116).
+func TestEnrollmentTokens_EnrollWithChallenge(t *testing.T) {
 	pool := freshDB(t)
 	ctx := t.Context()
 	repo := storage.NewAgentEnrollmentTokens(pool)
+	pub, _, err := sealing.GenerateRecipientKey()
+	if err != nil {
+		t.Fatal(err)
+	}
 	newAgent := func(name string, connID uuid.UUID) *storage.Agent {
-		return &storage.Agent{Name: name, SecretHash: []byte("h"), ProviderConnectionID: &connID}
+		return &storage.Agent{Name: name, SecretHash: []byte("h"), ProviderConnectionID: &connID, PublicKeyFingerprint: sealing.Fingerprint(pub)}
 	}
 	connOf := func(id uuid.UUID) uuid.UUID {
 		tok, err := repo.Get(ctx, id)
@@ -85,28 +91,54 @@ func TestEnrollmentTokens_ConsumeAndCreateAgent(t *testing.T) {
 		}
 		return tok.ProviderConnectionID
 	}
+	challenge := func(tokenID uuid.UUID) uuid.UUID {
+		c := &storage.KeyChallenge{ParentID: tokenID, PublicKey: pub, PublicKeyAlgorithm: "x25519",
+			NonceHash: make([]byte, 32), ExpiresAt: time.Now().Add(time.Minute)}
+		if err := repo.CreateEnrollmentChallenge(ctx, c); err != nil {
+			t.Fatalf("challenge: %v", err)
+		}
+		return c.ID
+	}
+	accept := func(*storage.KeyChallenge) error { return nil }
 
 	for name, alter := range map[string]string{"revoked": revokeTokenSQL, "expired": expireTokenSQL} {
-		id := seedEnrollmentToken(t, pool, alter)
-		if err := repo.ConsumeAndCreateAgent(ctx, id, time.Now(), newAgent("agent-"+name, connOf(id))); !errors.Is(err, storage.ErrEnrollmentTokenNotFound) {
+		id := seedEnrollmentToken(t, pool, "")
+		ch := challenge(id)
+		if _, err := pool.Exec(ctx, alter, id); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.EnrollWithChallenge(ctx, id, ch, time.Now(), accept, newAgent("agent-"+name, connOf(id))); !errors.Is(err, storage.ErrEnrollmentTokenNotFound) {
 			t.Fatalf("%s token: err = %v; want ErrEnrollmentTokenNotFound", name, err)
 		}
 	}
+	id := seedEnrollmentToken(t, pool, "")
+	ch := challenge(id)
+	refused := errors.New("refused")
+	if err := repo.EnrollWithChallenge(ctx, id, ch, time.Now(), func(*storage.KeyChallenge) error { return refused },
+		newAgent("agent-refused", connOf(id))); !errors.Is(err, refused) {
+		t.Fatalf("refused challenge: err = %v", err)
+	}
+	if err := repo.EnrollWithChallenge(ctx, id, uuid.New(), time.Now(), accept, newAgent("agent-nochal", connOf(id))); !errors.Is(err, storage.ErrChallengeNotFound) {
+		t.Fatalf("unknown challenge: err = %v", err)
+	}
 	var n int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM agents`).Scan(&n); err != nil || n != 0 {
-		t.Fatalf("refused consumes left %d agent rows (err=%v)", n, err)
+		t.Fatalf("refused enrolls left %d agent rows (err=%v)", n, err)
 	}
 
-	id := seedEnrollmentToken(t, pool, "")
 	a := newAgent("agent-ok", connOf(id))
-	if err := repo.ConsumeAndCreateAgent(ctx, id, time.Now(), a); err != nil {
+	if err := repo.EnrollWithChallenge(ctx, id, ch, time.Now(), accept, a); err != nil {
 		t.Fatalf("live token: %v", err)
 	}
 	tok, _ := repo.Get(ctx, id)
 	if tok.ConsumedAt == nil || tok.ConsumedByAgentID == nil || *tok.ConsumedByAgentID != a.ID {
 		t.Fatalf("token not consumed by the new agent: %+v", tok)
 	}
-	if err := repo.ConsumeAndCreateAgent(ctx, id, time.Now(), newAgent("agent-again", connOf(id))); !errors.Is(err, storage.ErrEnrollmentTokenNotFound) {
+	got, err := storage.NewAgents(pool).Get(ctx, a.ID)
+	if err != nil || string(got.PublicKey) != string(pub) || got.PublicKeyVersion != 1 {
+		t.Fatalf("bound key: %v %+v", err, got)
+	}
+	if err := repo.EnrollWithChallenge(ctx, id, ch, time.Now(), accept, newAgent("agent-again", connOf(id))); !errors.Is(err, storage.ErrEnrollmentTokenNotFound) {
 		t.Fatalf("second consume: err = %v; want ErrEnrollmentTokenNotFound", err)
 	}
 }
@@ -117,7 +149,7 @@ func TestSecretWraps_ConsumeClearsCiphertext(t *testing.T) {
 	ctx := t.Context()
 	agents := storage.NewAgents(pool)
 	a := &storage.Agent{Name: "agent-y", SecretHash: []byte("h")}
-	if err := agents.Create(ctx, a); err != nil {
+	if err := agents.Create(ctx, keyedStorageAgent(t, a)); err != nil {
 		t.Fatalf("create agent: %v", err)
 	}
 	wraps := storage.NewSecretWraps(pool)

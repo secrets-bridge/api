@@ -58,7 +58,7 @@ func TestSeal_EmptyPlaintext(t *testing.T) {
 func TestWrap_EmptyPlaintextRoundTrip(t *testing.T) {
 	svc, agents, pool := bootstrapWraps(t)
 	ctx := t.Context()
-	minted, err := agents.Mint(ctx, services.MintInput{Name: "agent-1"})
+	minted, err := agents.Mint(ctx, keyedMint(services.MintInput{Name: "agent-1"}))
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}

@@ -148,7 +148,7 @@ func newObsFixture(t *testing.T) *obsFixture {
 	gf.setSource(t, f.env, "gateway")
 
 	op := f.l.grantUser(t, []string{"agent.mint"}, `{}`)
-	code, body := f.l.call(t, http.MethodPost, "/api/v1/agents", op, map[string]any{"name": "obs-agent-" + uuid.NewString()[:8]})
+	code, body := f.l.call(t, http.MethodPost, "/api/v1/agents", op, agentMintBody("obs-agent-"+uuid.NewString()[:8]))
 	if code != http.StatusCreated {
 		t.Fatalf("mint agent = %d %s", code, body)
 	}
@@ -157,7 +157,7 @@ func newObsFixture(t *testing.T) *obsFixture {
 		AgentSecret string    `json:"agent_secret"`
 	}
 	mustJSON(t, body, &agent)
-	f.agentHdr = map[string]string{"X-Agent-Secret": agent.AgentSecret}
+	f.agentHdr = agentHeaders(agent.AgentSecret)
 	f.agentBase = "/api/v1/agents/" + agent.ID.String()
 	return f
 }

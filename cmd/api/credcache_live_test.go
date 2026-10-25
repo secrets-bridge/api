@@ -26,7 +26,7 @@ func TestLive_CredentialCacheUnconfirmedAnswers503(t *testing.T) {
 	f := newGatewayFixture(t)
 	gw := f.enrolled(t, "cache-503")
 	op := f.l.grantUser(t, []string{"agent.mint", "agent.revoke"}, `{}`)
-	code, body := f.l.call(t, http.MethodPost, "/api/v1/agents", op, map[string]any{"name": "cache-503-agent"})
+	code, body := f.l.call(t, http.MethodPost, "/api/v1/agents", op, agentMintBody("cache-503-agent"))
 	if code != http.StatusCreated {
 		t.Fatalf("mint = %d %s", code, body)
 	}
@@ -35,7 +35,7 @@ func TestLive_CredentialCacheUnconfirmedAnswers503(t *testing.T) {
 		AgentSecret string    `json:"agent_secret"`
 	}
 	mustJSON(t, body, &minted)
-	agentHdr := map[string]string{"X-Agent-Secret": minted.AgentSecret}
+	agentHdr := agentHeaders(minted.AgentSecret)
 	if code, body := f.l.callAs(t, http.MethodPost, "/api/v1/agents/"+minted.ID.String()+"/heartbeat", agentHdr, nil); code != http.StatusNoContent && code != http.StatusOK {
 		t.Fatalf("agent heartbeat = %d %s", code, body)
 	}

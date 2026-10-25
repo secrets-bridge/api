@@ -34,6 +34,7 @@ func newAgentEnrollRoutingApp() *fiber.App {
 	)
 	reachable := func(c fiber.Ctx) error { return c.SendString("reachable") }
 	v1.Post("/provider-connections/:id/agent-enrollment-token", reachable)
+	v1.Post("/agents/enroll/challenge", reachable)
 	v1.Post("/agents/enroll", reachable)
 	return app
 }
@@ -49,7 +50,9 @@ func TestAgentEnroll_Routing_SessionGating(t *testing.T) {
 
 	// The enroll route IS session-exempt by design — token-only auth is
 	// enforced in the handler, not by the session gate.
-	if got := statusOf(t, app, http.MethodPost, "/api/v1/agents/enroll", nil); got != http.StatusOK {
-		t.Errorf("unauthenticated enroll route = %d; want 200 reachable (session-exempt; token checked in handler)", got)
+	for _, p := range []string{"/api/v1/agents/enroll/challenge", "/api/v1/agents/enroll"} {
+		if got := statusOf(t, app, http.MethodPost, p, nil); got != http.StatusOK {
+			t.Errorf("unauthenticated %s = %d; want 200 reachable (session-exempt; token checked in handler)", p, got)
+		}
 	}
 }

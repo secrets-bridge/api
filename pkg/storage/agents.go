@@ -22,14 +22,17 @@ type Agent struct {
 	Status     AgentStatus
 	SecretHash []byte
 	// PublicKey is the agent's X25519 public key (32 bytes) used by
-	// the CP to seal wrap retrieval responses (Piece 8b). NULL means
-	// the agent registered before wire-envelope encryption was wired;
-	// the CP falls back to plaintext-over-TLS for those.
+	// the CP to seal wrap retrieval responses (Piece 8b). Required for
+	// every agent that is not revoked (migration 0051); generated on
+	// the customer side and bound at enrollment (skills#116).
 	PublicKey          []byte
 	PublicKeyAlgorithm string
-	LastSeenAt         *time.Time
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	// PublicKeyVersion starts at 1 and goes up by one on each key
+	// rotation (skills#116), the only way the key changes.
+	PublicKeyVersion int
+	LastSeenAt       *time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 
 	// Agent Onboarding MVP (migration 0038) — all nullable/additive so
 	// the certified mint path (which leaves them zero) is unaffected.
@@ -89,8 +92,10 @@ type AgentRepository interface {
 	// column unchanged. No-op on revoked agents. (api#179)
 	RecordHeartbeat(ctx context.Context, id uuid.UUID, at time.Time, agentVersion, lastStatus *string, capabilities *[]string) error
 
-	// Revoke sets status=revoked + revoked_at + revoked_by. (api#179)
-	Revoke(ctx context.Context, id uuid.UUID, revokedBy string, at time.Time) error
+	// Revoke sets status=revoked + revoked_at + revoked_by (api#179) and,
+	// in the same statement, revokes any open key rotation token and
+	// invalidates its challenges (skills#116).
+	Revoke(ctx context.Context, id uuid.UUID, revokedBy string, at time.Time) (*AgentRevokeResult, error)
 
 	// ListAdmin / GetAdmin are the admin read projection (onboarding
 	// columns + provider-connection name; never credentials). (api#179)
@@ -100,10 +105,15 @@ type AgentRepository interface {
 	// UpdateStatus transitions an agent to a new status.
 	UpdateStatus(ctx context.Context, id uuid.UUID, status AgentStatus) error
 
-	// UpdatePublicKey upserts an agent's X25519 public key. Used by
-	// the agent self-registration endpoint so an existing minted
-	// agent can flip into the sealed-wire path without a re-mint.
-	UpdatePublicKey(ctx context.Context, id uuid.UUID, publicKey []byte, algorithm string) error
+	// There is no method that sets the public key of an existing agent:
+	// the key is bound at creation and changes only through
+	// AgentKeyRotations.Rotate (skills#116).
+}
+
+// AgentRevokeResult counts what a revoke closed besides the agent.
+type AgentRevokeResult struct {
+	RotationTokensRevoked         int64
+	RotationChallengesInvalidated int64
 }
 
 // ErrUnauthorized is returned when authentication material is presented
@@ -137,22 +147,25 @@ func (r *Agents) Create(ctx context.Context, a *Agent) error {
 		return fmt.Errorf("storage: marshal agent scope: %w", err)
 	}
 
+	// public_key_version starts at its default of 1. The schema refuses
+	// an agent that is not revoked without a valid key, and a
+	// fingerprint that is not the key's.
 	const insertGenerated = `
-		INSERT INTO agents (name, scope, status, secret_hash, public_key, public_key_algorithm)
-		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''))
-		RETURNING id, created_at, updated_at`
+		INSERT INTO agents (name, scope, status, secret_hash, public_key, public_key_algorithm, public_key_fingerprint)
+		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), NULLIF($7, ''))
+		RETURNING id, public_key_version, created_at, updated_at`
 	const insertWithID = `
-		INSERT INTO agents (id, name, scope, status, secret_hash, public_key, public_key_algorithm)
-		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''))
-		RETURNING created_at, updated_at`
+		INSERT INTO agents (id, name, scope, status, secret_hash, public_key, public_key_algorithm, public_key_fingerprint)
+		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), NULLIF($8, ''))
+		RETURNING public_key_version, created_at, updated_at`
 
 	var row pgx.Row
 	if a.ID == uuid.Nil {
-		row = r.pool.QueryRow(ctx, insertGenerated, a.Name, scope, a.Status, a.SecretHash, a.PublicKey, a.PublicKeyAlgorithm)
-		return row.Scan(&a.ID, &a.CreatedAt, &a.UpdatedAt)
+		row = r.pool.QueryRow(ctx, insertGenerated, a.Name, scope, a.Status, a.SecretHash, a.PublicKey, a.PublicKeyAlgorithm, a.PublicKeyFingerprint)
+		return row.Scan(&a.ID, &a.PublicKeyVersion, &a.CreatedAt, &a.UpdatedAt)
 	}
-	row = r.pool.QueryRow(ctx, insertWithID, a.ID, a.Name, scope, a.Status, a.SecretHash, a.PublicKey, a.PublicKeyAlgorithm)
-	return row.Scan(&a.CreatedAt, &a.UpdatedAt)
+	row = r.pool.QueryRow(ctx, insertWithID, a.ID, a.Name, scope, a.Status, a.SecretHash, a.PublicKey, a.PublicKeyAlgorithm, a.PublicKeyFingerprint)
+	return row.Scan(&a.PublicKeyVersion, &a.CreatedAt, &a.UpdatedAt)
 }
 
 // CreateEnrolled inserts an enrolled agent bound to a provider connection.
@@ -201,12 +214,12 @@ func insertEnrolledAgent(ctx context.Context, q rowQuerier, a *Agent) error {
 		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''),
 			$7, NULLIF($8, ''), NULLIF($9, ''), NULLIF($10, ''),
 			NULLIF($11, ''), NULLIF($12, ''), $13)
-		RETURNING id, created_at, updated_at`
+		RETURNING id, public_key_version, created_at, updated_at`
 	row := q.QueryRow(ctx, insert,
 		a.Name, scope, a.Status, a.SecretHash, a.PublicKey, a.PublicKeyAlgorithm,
 		a.ProviderConnectionID, a.ClusterName, a.ProviderType, a.Region,
 		a.AgentVersion, a.PublicKeyFingerprint, caps)
-	return row.Scan(&a.ID, &a.CreatedAt, &a.UpdatedAt)
+	return row.Scan(&a.ID, &a.PublicKeyVersion, &a.CreatedAt, &a.UpdatedAt)
 }
 
 // Get fetches one agent by ID. Returns ErrNotFound when no row matches.
@@ -214,6 +227,7 @@ func (r *Agents) Get(ctx context.Context, id uuid.UUID) (*Agent, error) {
 	const q = `
 		SELECT id, name, scope, status, secret_hash,
 		       public_key, COALESCE(public_key_algorithm, ''),
+		       COALESCE(public_key_fingerprint, ''), public_key_version,
 		       last_seen_at, created_at, updated_at
 		FROM agents WHERE id = $1`
 	return scanAgent(r.pool.QueryRow(ctx, q, id))
@@ -224,6 +238,7 @@ func (r *Agents) GetByName(ctx context.Context, name string) (*Agent, error) {
 	const q = `
 		SELECT id, name, scope, status, secret_hash,
 		       public_key, COALESCE(public_key_algorithm, ''),
+		       COALESCE(public_key_fingerprint, ''), public_key_version,
 		       last_seen_at, created_at, updated_at
 		FROM agents WHERE name = $1`
 	return scanAgent(r.pool.QueryRow(ctx, q, name))
@@ -234,6 +249,7 @@ func (r *Agents) List(ctx context.Context) ([]*Agent, error) {
 	const q = `
 		SELECT id, name, scope, status, secret_hash,
 		       public_key, COALESCE(public_key_algorithm, ''),
+		       COALESCE(public_key_fingerprint, ''), public_key_version,
 		       last_seen_at, created_at, updated_at
 		FROM agents ORDER BY created_at ASC`
 	rows, err := r.pool.Query(ctx, q)
@@ -306,19 +322,34 @@ func (r *Agents) RecordHeartbeat(ctx context.Context, id uuid.UUID, at time.Time
 
 // Revoke sets status=revoked + revoked_at + revoked_by (actor identity).
 // api#179 replaces bare UpdateStatus(revoked) for the admin revoke path.
-func (r *Agents) Revoke(ctx context.Context, id uuid.UUID, revokedBy string, at time.Time) error {
+// One statement, so a rotation can never be left open on a revoked agent.
+func (r *Agents) Revoke(ctx context.Context, id uuid.UUID, revokedBy string, at time.Time) (*AgentRevokeResult, error) {
 	const q = `
-		UPDATE agents
-		SET    status = 'revoked', revoked_at = $2, revoked_by = NULLIF($3, '')
-		WHERE  id = $1`
-	tag, err := r.pool.Exec(ctx, q, id, at, revokedBy)
-	if err != nil {
-		return fmt.Errorf("storage: revoke agent: %w", err)
+		WITH a AS (
+			UPDATE agents
+			SET    status = 'revoked', revoked_at = $2, revoked_by = NULLIF($3, '')
+			WHERE  id = $1
+			RETURNING id),
+		t AS (
+			UPDATE agent_key_rotation_tokens
+			SET    revoked_at = $2, revoke_reason = 'agent_revoked'
+			WHERE  agent_id IN (SELECT id FROM a) AND consumed_at IS NULL AND revoked_at IS NULL
+			RETURNING id),
+		c AS (
+			UPDATE agent_key_rotation_challenges
+			SET    invalidated_at = $2
+			WHERE  agent_id IN (SELECT id FROM a) AND used_at IS NULL AND invalidated_at IS NULL
+			RETURNING id)
+		SELECT (SELECT count(*) FROM a), (SELECT count(*) FROM t), (SELECT count(*) FROM c)`
+	var n int64
+	var res AgentRevokeResult
+	if err := r.pool.QueryRow(ctx, q, id, at, revokedBy).Scan(&n, &res.RotationTokensRevoked, &res.RotationChallengesInvalidated); err != nil {
+		return nil, fmt.Errorf("storage: revoke agent: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
+	if n == 0 {
+		return nil, ErrNotFound
 	}
-	return nil
+	return &res, nil
 }
 
 // UpdateStatus transitions an agent to a new status.
@@ -327,25 +358,6 @@ func (r *Agents) UpdateStatus(ctx context.Context, id uuid.UUID, status AgentSta
 	tag, err := r.pool.Exec(ctx, q, id, status)
 	if err != nil {
 		return fmt.Errorf("storage: update agent status: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-// UpdatePublicKey upserts the agent's wire-envelope public key. Used
-// by the agent self-registration endpoint so existing agents can opt
-// into the sealed-wire path without an admin re-mint.
-func (r *Agents) UpdatePublicKey(ctx context.Context, id uuid.UUID, publicKey []byte, algorithm string) error {
-	const q = `
-		UPDATE agents
-		SET public_key = $2,
-		    public_key_algorithm = NULLIF($3, '')
-		WHERE id = $1`
-	tag, err := r.pool.Exec(ctx, q, id, publicKey, algorithm)
-	if err != nil {
-		return fmt.Errorf("storage: update agent public key: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
@@ -364,7 +376,7 @@ func scanAgent(row interface {
 		lastSeen   *time.Time
 	)
 	err := row.Scan(&a.ID, &a.Name, &scopeRaw, &a.Status, &secretHash,
-		&publicKey, &a.PublicKeyAlgorithm,
+		&publicKey, &a.PublicKeyAlgorithm, &a.PublicKeyFingerprint, &a.PublicKeyVersion,
 		&lastSeen, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

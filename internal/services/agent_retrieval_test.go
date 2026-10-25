@@ -249,7 +249,7 @@ func bootstrapAgent(t *testing.T, h *requestHarness, name string) (*storage.Agen
 		Status:     storage.AgentStatusActive,
 		SecretHash: []byte("not-used-in-service-tests-just-needs-32-byte"),
 	}
-	if err := agents.Create(t.Context(), a); err != nil {
+	if err := agents.Create(t.Context(), keyedAgent(a)); err != nil {
 		t.Fatalf("agents.Create: %v", err)
 	}
 	return a, ""

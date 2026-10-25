@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"encoding/base64"
 	"errors"
 	"strings"
 	"time"
@@ -12,6 +11,7 @@ import (
 	"github.com/secrets-bridge/api/internal/auth"
 	"github.com/secrets-bridge/api/internal/middleware"
 	"github.com/secrets-bridge/api/internal/services"
+	"github.com/secrets-bridge/api/pkg/sealing"
 	"github.com/secrets-bridge/api/pkg/storage"
 )
 
@@ -34,24 +34,26 @@ func (h *Agents) WithDirectMint(enabled bool) *Agents {
 	return h
 }
 
-// MintRequest is the body of POST /api/v1/agents. PublicKey is the
-// agent's X25519 public key, base64-encoded. When present, the CP
-// SEALS wrap retrieval responses to this key (Piece 8b); when absent,
-// the CP falls back to plaintext-over-TLS (backwards compat).
+// MintRequest is the body of POST /api/v1/agents (dev and test only,
+// SB_ALLOW_DIRECT_AGENT_MINT). PublicKey, the agent's X25519 public key
+// in std base64, is required and validated like an enrollment key
+// (skills#116). Wraps are sealed to it.
 type MintRequest struct {
 	Name               string         `json:"name"`
 	Scope              map[string]any `json:"scope,omitempty"`
-	PublicKey          string         `json:"public_key,omitempty"`           // base64
-	PublicKeyAlgorithm string         `json:"public_key_algorithm,omitempty"` // "x25519" today
+	PublicKey          string         `json:"public_key"`           // std base64, 32 bytes
+	PublicKeyAlgorithm string         `json:"public_key_algorithm"` // "x25519"
 }
 
 // MintResponse is returned by POST /api/v1/agents. The agent_secret is
 // returned EXACTLY ONCE — the admin must save it and hand it to the
 // agent through a K8s Secret / env vars / SOPS-encrypted Helm values.
 type MintResponse struct {
-	ID          uuid.UUID `json:"id"`
-	Name        string    `json:"name"`
-	AgentSecret string    `json:"agent_secret"`
+	ID                   uuid.UUID `json:"id"`
+	Name                 string    `json:"name"`
+	AgentSecret          string    `json:"agent_secret"`
+	PublicKeyFingerprint string    `json:"public_key_fingerprint"`
+	PublicKeyVersion     int       `json:"public_key_version"`
 }
 
 // Mint handles the admin-initiated mint of a new agent. The response
@@ -65,7 +67,7 @@ func (h *Agents) Mint(c fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"error": "direct_agent_mint_disabled",
 			"message": "direct agent mint is disabled; onboard via the enrollment flow: " +
-				"POST /provider-connections/:id/agent-enrollment-token then POST /agents/enroll",
+				"POST /provider-connections/:id/agent-enrollment-token, then the agent's enroll command",
 		})
 	}
 	var req MintRequest
@@ -76,63 +78,26 @@ func (h *Agents) Mint(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "name is required")
 	}
 
-	in := services.MintInput{Name: req.Name, Scope: req.Scope}
-	if req.PublicKey != "" {
-		pk, err := base64.StdEncoding.DecodeString(req.PublicKey)
-		if err != nil {
-			return fiber.NewError(fiber.StatusBadRequest, "public_key is not valid base64: "+err.Error())
-		}
-		in.PublicKey = pk
-		in.PublicKeyAlgorithm = req.PublicKeyAlgorithm
-		if in.PublicKeyAlgorithm == "" {
-			in.PublicKeyAlgorithm = "x25519"
-		}
+	pk, err := sealing.ParsePublicKey(req.PublicKey, req.PublicKeyAlgorithm)
+	if err != nil || req.PublicKeyAlgorithm != sealing.KeyAlgorithm {
+		return enrollError(c, fiber.StatusBadRequest, "invalid_public_key")
 	}
-	minted, err := h.svc.Mint(c.Context(), in)
+	minted, err := h.svc.Mint(c.Context(), services.MintInput{
+		Name: req.Name, Scope: req.Scope, PublicKey: pk, PublicKeyAlgorithm: req.PublicKeyAlgorithm,
+	})
 	if err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+		if errors.Is(err, services.ErrInvalidPublicKey) {
+			return enrollError(c, fiber.StatusBadRequest, "invalid_public_key")
+		}
+		return fiber.NewError(fiber.StatusInternalServerError, "could not mint agent")
 	}
 	return c.Status(fiber.StatusCreated).JSON(MintResponse{
-		ID:          minted.ID,
-		Name:        minted.Name,
-		AgentSecret: minted.AgentSecret,
+		ID:                   minted.ID,
+		Name:                 minted.Name,
+		AgentSecret:          minted.AgentSecret,
+		PublicKeyFingerprint: minted.PublicKeyFingerprint,
+		PublicKeyVersion:     minted.PublicKeyVersion,
 	})
-}
-
-// PublicKeyRequest is the body the agent PUTs to register its X25519
-// public key after generating the keypair at startup. Idempotent —
-// repeatedly posting the same key is a no-op.
-type PublicKeyRequest struct {
-	PublicKey          string `json:"public_key"`           // base64
-	PublicKeyAlgorithm string `json:"public_key_algorithm"` // "x25519"
-}
-
-// SetPublicKey handles PUT /api/v1/agents/:id/public-key. Authentication
-// is AgentAuth — only the agent itself can register its own public key.
-func (h *Agents) SetPublicKey(c fiber.Ctx) error {
-	agentID, ok := middleware.AgentIDFromContext(c.Context())
-	if !ok {
-		return fiber.NewError(fiber.StatusInternalServerError, "agent identity missing in context")
-	}
-	var body PublicKeyRequest
-	if err := c.Bind().JSON(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
-	}
-	if body.PublicKey == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "public_key is required")
-	}
-	pk, err := base64.StdEncoding.DecodeString(body.PublicKey)
-	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "public_key is not valid base64: "+err.Error())
-	}
-	alg := body.PublicKeyAlgorithm
-	if alg == "" {
-		alg = "x25519"
-	}
-	if err := h.svc.SetPublicKey(c.Context(), agentID, pk, alg); err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
-	}
-	return c.SendStatus(fiber.StatusNoContent)
 }
 
 // Heartbeat is the agent's check-in. Authentication is handled by the

@@ -101,9 +101,9 @@ func TestAgentSurface_PatchFlow_EmptyValueSealed(t *testing.T) {
 	}
 }
 
-// With SB_ALLOW_UNSEALED_WRAPS, the legacy shapes carry an empty value
-// explicitly: `"value": ""` on create is accepted, and the unsealed
-// fetch answers `"value": ""` rather than dropping the field.
+// With SB_ALLOW_UNSEALED_WRAPS, a legacy `"value": ""` on create is
+// accepted. Retrieval is sealed whatever the switch (skills#116), so the
+// empty value comes back as a sealed empty plaintext.
 func TestAgentSurface_UnsealedBreakGlassEmptyValue(t *testing.T) {
 	fx := bootstrapAgentSurfaceOpts(t, nil, true)
 
@@ -114,12 +114,14 @@ func TestAgentSurface_UnsealedBreakGlassEmptyValue(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("legacy fetch = %d (%s); want 200", code, body)
 	}
-	var raw map[string]any
-	if err := json.Unmarshal(body, &raw); err != nil {
-		t.Fatal(err)
+	var p handlers.WrapPayload
+	if err := json.Unmarshal(body, &p); err != nil || p.Sealed == nil || p.Value != nil {
+		t.Fatalf("fetch with the switch was not sealed (err=%v): %s", err, body)
 	}
-	if v, ok := raw["value"]; !ok || v != "" {
-		t.Fatalf("legacy fetch value = %v (present=%t); want an explicit empty string", v, ok)
+	dec := func(s string) []byte { b, _ := base64.StdEncoding.DecodeString(s); return b }
+	if pt, err := sealing.Open(&sealing.Envelope{Ciphertext: dec(p.Sealed.Ciphertext), Nonce: dec(p.Sealed.Nonce),
+		EphemeralPublicKey: dec(p.Sealed.EphemeralPublicKey), Algorithm: p.Sealed.Algorithm}, a.priv, a.pub); err != nil || len(pt) != 0 {
+		t.Fatalf("sealed empty value opened to %d bytes (err=%v)", len(pt), err)
 	}
 
 	b := fx.mint(t, "agent-legacy-read", false)
@@ -282,6 +284,9 @@ func (fx *agentSurface) callRaw(t *testing.T, method, path, secret, raw string) 
 	req := httptest.NewRequest(method, path, strings.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Agent-Secret", secret)
+	if fp, ok := fx.fps.Load(secret); ok {
+		req.Header.Set("X-Agent-Key-Fingerprint", fp.(string))
+	}
 	resp, err := fx.app.Test(req, fiber.TestConfig{Timeout: 20 * time.Second})
 	if err != nil {
 		t.Fatalf("app.Test %s %s: %v", method, path, err)

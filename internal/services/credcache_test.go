@@ -75,7 +75,7 @@ func (c *countingAgents) Get(ctx context.Context, id uuid.UUID) (*storage.Agent,
 func TestAgentAuth_RevokeWinsAFillRace(t *testing.T) {
 	svc, _, _ := bootstrap(t)
 	ctx := t.Context()
-	minted, err := svc.Mint(ctx, services.MintInput{Name: "race"})
+	minted, err := svc.Mint(ctx, keyedMint(services.MintInput{Name: "race"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestAgentAuth_RevokeWinsAFillRace(t *testing.T) {
 func TestAgentAuth_RevokeSurvivesAFailedCacheDelete(t *testing.T) {
 	svc, _, _ := bootstrap(t)
 	ctx := t.Context()
-	minted, err := svc.Mint(ctx, services.MintInput{Name: "del"})
+	minted, err := svc.Mint(ctx, keyedMint(services.MintInput{Name: "del"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestAgentAuth_UnknownIDIsCachedBriefly(t *testing.T) {
 		t.Fatalf("Postgres lookups for one unknown id = %d, want 1", n)
 	}
 	// A real agent is unaffected.
-	minted, err := svc.Mint(ctx, services.MintInput{Name: "known"})
+	minted, err := svc.Mint(ctx, keyedMint(services.MintInput{Name: "known"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +286,7 @@ func eventually(cond func() bool) bool {
 func TestAgentAuth_RevokeDuringARedisOutage(t *testing.T) {
 	svc, _, proxy, pool := proxiedServices(t)
 	ctx := t.Context()
-	minted, err := svc.Mint(ctx, services.MintInput{Name: "outage"})
+	minted, err := svc.Mint(ctx, keyedMint(services.MintInput{Name: "outage"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,11 +346,11 @@ func TestGatewayAuth_RevokeDuringARedisOutage(t *testing.T) {
 func TestAuth_RedisDownFailsSafeToPostgres(t *testing.T) {
 	agents, gws, proxy, _ := proxiedServices(t)
 	ctx := t.Context()
-	live, err := agents.Mint(ctx, services.MintInput{Name: "live"})
+	live, err := agents.Mint(ctx, keyedMint(services.MintInput{Name: "live"}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	gone, err := agents.Mint(ctx, services.MintInput{Name: "gone"})
+	gone, err := agents.Mint(ctx, keyedMint(services.MintInput{Name: "gone"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -414,7 +414,7 @@ func TestGatewayAuth_DisableKeepsARevokedReason(t *testing.T) {
 func TestAgentAuth_FillNeverWritesPastATombstone(t *testing.T) {
 	svc, _, _ := bootstrap(t)
 	ctx := t.Context()
-	minted, err := svc.Mint(ctx, services.MintInput{Name: "fill"})
+	minted, err := svc.Mint(ctx, keyedMint(services.MintInput{Name: "fill"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,11 +549,11 @@ func TestGatewayAuth_RetriedRevokeReconfirmsTheTombstone(t *testing.T) {
 func TestAuth_BlackholedRedisIsBounded(t *testing.T) {
 	agents, gws, proxy, _ := proxiedServices(t)
 	ctx := t.Context()
-	a, err := agents.Mint(ctx, services.MintInput{Name: "blackhole"})
+	a, err := agents.Mint(ctx, keyedMint(services.MintInput{Name: "blackhole"}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := agents.Mint(ctx, services.MintInput{Name: "blackhole-revoke"})
+	b, err := agents.Mint(ctx, keyedMint(services.MintInput{Name: "blackhole-revoke"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -818,7 +818,7 @@ func TestGatewayAuth_PendingGatewayEnrollsRightAfterAnEnable(t *testing.T) {
 func TestAgentList_ReadsTheLastSeenTheHeartbeatWrote(t *testing.T) {
 	svc, pool, _ := bootstrap(t)
 	ctx := t.Context()
-	minted, err := svc.Mint(ctx, services.MintInput{Name: "lastseen"})
+	minted, err := svc.Mint(ctx, keyedMint(services.MintInput{Name: "lastseen"}))
 	if err != nil {
 		t.Fatal(err)
 	}
