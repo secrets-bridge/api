@@ -454,14 +454,19 @@ type gatewayConnectorView struct {
 	// the digest every live replica reports now, the one an approve body
 	// carries; ScopeMismatch is true while they disagree. Platform
 	// admins only (gateway.list): the catalog read never carries them.
-	StatusReason        string   `json:"status_reason,omitempty"`
-	ScopeDigest         string   `json:"scope_digest,omitempty"`
-	ScopeMismatch       bool     `json:"scope_mismatch,omitempty"`
-	ApprovedScopeDigest string   `json:"approved_scope_digest,omitempty"`
-	DiscoveryEnabled    bool     `json:"discovery_enabled,omitempty"`
-	DiscoveryGeneration int64    `json:"discovery_generation,omitempty"`
-	LastDiscoveryAt     *string  `json:"last_discovery_at,omitempty"`
-	AllowedProjects     []string `json:"allowed_projects,omitempty"`
+	// DiscoveryScopeDigest is the scope of the latest accepted upload,
+	// the one AllowedProjects came from. With discovery on, an approve
+	// answers 409 scope_digest_changed until it equals ScopeDigest, so the
+	// console waits for the next catalog instead of offering approve.
+	StatusReason         string   `json:"status_reason,omitempty"`
+	ScopeDigest          string   `json:"scope_digest,omitempty"`
+	ScopeMismatch        bool     `json:"scope_mismatch,omitempty"`
+	ApprovedScopeDigest  string   `json:"approved_scope_digest,omitempty"`
+	DiscoveryScopeDigest string   `json:"discovery_scope_digest,omitempty"`
+	DiscoveryEnabled     bool     `json:"discovery_enabled,omitempty"`
+	DiscoveryGeneration  int64    `json:"discovery_generation,omitempty"`
+	LastDiscoveryAt      *string  `json:"last_discovery_at,omitempty"`
+	AllowedProjects      []string `json:"allowed_projects,omitempty"`
 }
 
 func replicaConnectors(hs []storage.GatewayConnectorHealth) []gatewayReplicaConnectorView {
@@ -519,7 +524,7 @@ func toConnectorView(c *storage.GatewayConnector) gatewayConnectorView {
 	return gatewayConnectorView{
 		ID: c.ID.String(), ConnectorID: c.Name, Kind: c.Kind, Status: c.Status, Targets: targets,
 		ApprovedBy: c.ApprovedBy, ApprovedAt: timePtr(c.ApprovedAt), LastAdvertisedAt: timePtr(c.LastAdvertisedAt),
-		StatusReason: c.StatusReason, ApprovedScopeDigest: c.ApprovedScopeDigest,
+		StatusReason: c.StatusReason, ApprovedScopeDigest: c.ApprovedScopeDigest, DiscoveryScopeDigest: c.DiscoveryScopeDigest,
 		DiscoveryGeneration: c.DiscoveryGeneration, LastDiscoveryAt: timePtr(c.LastDiscoveryAt),
 		AllowedProjects: c.AllowedProjects,
 	}
@@ -1149,6 +1154,51 @@ func (h *Gateways) CatalogRead(c fiber.Ctx) error {
 			v.TeamIDs = append(v.TeamIDs, t.String())
 		}
 		out.Items = append(out.Items, v)
+	}
+	return c.JSON(out)
+}
+
+// gatewayBindingItemView is a binding in the team-filtered read.
+// AppProject, Namespace and Name are absent when the caller can't see
+// the target: only the binding's own fields and suspended_reason remain.
+type gatewayBindingItemView struct {
+	gatewayBindingView
+	AppProject string `json:"app_project,omitempty"`
+	Namespace  string `json:"namespace,omitempty"`
+	Name       string `json:"name,omitempty"`
+}
+
+type gatewayBindingsReadResponse struct {
+	Items      []gatewayBindingItemView `json:"items"`
+	NextCursor string                   `json:"next_cursor,omitempty"`
+}
+
+// BindingsRead handles GET /api/v1/gateway-bindings: global gateway.list
+// or gateway.bind reads every live binding; a team-scoped gateway.bind
+// reads the discovered bindings of its teams' projects; anyone else 403.
+// /admin/gateway-bindings stays global-only.
+func (h *Gateways) BindingsRead(c fiber.Ctx) error {
+	caller, err := h.bindCaller(c)
+	if err != nil {
+		return err
+	}
+	page, err := h.svc.ListBindingItems(c.Context(), caller, c.Queries())
+	switch {
+	case errors.Is(err, services.ErrGatewayCatalogForbidden):
+		return fiber.NewError(fiber.StatusForbidden, "permission_denied")
+	case errors.Is(err, services.ErrCatalogInvalidQuery):
+		return fiber.NewError(fiber.StatusBadRequest, "invalid_query")
+	case errors.Is(err, services.ErrCatalogInvalidCursor):
+		return fiber.NewError(fiber.StatusBadRequest, "invalid_cursor")
+	case err != nil:
+		return err
+	}
+	out := gatewayBindingsReadResponse{Items: make([]gatewayBindingItemView, 0, len(page.Items)), NextCursor: page.NextCursor}
+	for _, it := range page.Items {
+		out.Items = append(out.Items, gatewayBindingItemView{
+			gatewayBindingView: toBindingView(it.Binding),
+			AppProject:         it.AppProject, Namespace: it.Namespace, Name: it.Name,
+		})
 	}
 	return c.JSON(out)
 }

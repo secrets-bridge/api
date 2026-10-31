@@ -91,6 +91,7 @@ type GatewayStore interface {
 	CreateBinding(ctx context.Context, b *storage.GatewayBinding) error
 	GetBinding(ctx context.Context, id uuid.UUID) (*storage.GatewayBinding, error)
 	ListBindings(ctx context.Context, gatewayID *uuid.UUID) ([]*storage.GatewayBinding, error)
+	ListBindingItems(ctx context.Context, f storage.BindingFilter) ([]storage.BindingItem, error)
 	DeleteBinding(ctx context.Context, id uuid.UUID, at time.Time) ([]*storage.ObservationTask, error)
 	EnvironmentProject(ctx context.Context, envID uuid.UUID) (uuid.UUID, error)
 	SecretBoundToProject(ctx context.Context, secretID, projectID uuid.UUID) (bool, error)

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -187,6 +188,59 @@ func TestGetMe_HappyPath(t *testing.T) {
 	// MFA lookup wasn't wired in bootstrapMe → safe default `false`.
 	if got.MFAEnrolled {
 		t.Errorf("MFAEnrolled default got true, want false (no lookup wired)")
+	}
+}
+
+// global_permissions holds only what an unscoped grant gives, so the
+// console can tell a team admin from a platform admin.
+func TestGetMe_GlobalPermissions(t *testing.T) {
+	app, pool := bootstrapMe(t)
+	ctx := t.Context()
+	uID := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO local_users (id, email, password_hash, display_name)
+		 VALUES ($1, $2, '\x00', $3)`,
+		uID, "scoped-"+uID.String()[:8]+"@example.com", "Scoped",
+	); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	for _, g := range []struct{ perms, scope string }{
+		{`["gateway.list","secret.list"]`, `{}`},
+		{`["gateway.bind","secret.list"]`, `{"team_id":"` + uuid.NewString() + `"}`},
+	} {
+		roleID := uuid.New()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO roles (id, name, permissions, is_system) VALUES ($1, $2, $3::jsonb, false)`,
+			roleID, "me-"+roleID.String()[:8], g.perms,
+		); err != nil {
+			t.Fatalf("seed role: %v", err)
+		}
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO user_roles (id, user_id, role_id, scope) VALUES ($1, $2, $3, $4::jsonb)`,
+			uuid.New(), uID, roleID, g.scope,
+		); err != nil {
+			t.Fatalf("seed user_role: %v", err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/users/me", nil)
+	req.Header.Set("X-User-Id", uID.String())
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var got handlers.MeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	slices.Sort(got.Permissions)
+	slices.Sort(got.GlobalPermissions)
+	if want := []string{"gateway.bind", "gateway.list", "secret.list"}; !slices.Equal(got.Permissions, want) {
+		t.Errorf("Permissions got %v want %v", got.Permissions, want)
+	}
+	if want := []string{"gateway.list", "secret.list"}; !slices.Equal(got.GlobalPermissions, want) {
+		t.Errorf("GlobalPermissions got %v want %v", got.GlobalPermissions, want)
 	}
 }
 

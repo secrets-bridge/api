@@ -70,6 +70,8 @@ type catFixture struct {
 	x, y    *tenant
 	entries []discEntry
 	byName  map[string]discEntry
+	// uploader is the replica that uploaded the catalog.
+	uploader string
 }
 
 func newCatFixture(t *testing.T) *catFixture {
@@ -88,6 +90,7 @@ func newCatFixture(t *testing.T) *catFixture {
 		c.byName[e.AppProject+"/"+e.Name] = e
 	}
 	l := d.lease(t)
+	c.uploader = l.replica
 	d.mustUpload(t, uploadBody(l, c.entries))
 	if code, raw := c.putMapping(t, c.mapping(c.x.team, c.y.team)); code != http.StatusOK {
 		t.Fatalf("mapping = %d %s", code, raw)
