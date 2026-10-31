@@ -250,6 +250,8 @@ type GatewayConnector struct {
 	// AllowedProjects is the allowed AppProject list of the latest
 	// accepted discovery upload, nil when there is none.
 	AllowedProjects []string
+	// DiscoveryScopeDigest is the scope digest of that upload.
+	DiscoveryScopeDigest string
 }
 
 // Target returns the advertised target with id, if any.
@@ -838,14 +840,14 @@ const gatewayConnectorColumns = `
 	id, gateway_id, name, kind, advertised_targets, status,
 	COALESCE(approved_by, ''), approved_at, last_advertised_at, created_at, updated_at,
 	COALESCE(approved_scope_digest, ''), COALESCE(status_reason, ''), discovery_generation,
-	last_discovery_at, discovery_allowed_projects`
+	last_discovery_at, discovery_allowed_projects, COALESCE(discovery_scope_digest, '')`
 
 func scanGatewayConnector(row pgx.Row) (*GatewayConnector, error) {
 	var c GatewayConnector
 	var targets, allowed []byte
 	err := row.Scan(&c.ID, &c.GatewayID, &c.Name, &c.Kind, &targets, &c.Status,
 		&c.ApprovedBy, &c.ApprovedAt, &c.LastAdvertisedAt, &c.CreatedAt, &c.UpdatedAt,
-		&c.ApprovedScopeDigest, &c.StatusReason, &c.DiscoveryGeneration, &c.LastDiscoveryAt, &allowed)
+		&c.ApprovedScopeDigest, &c.StatusReason, &c.DiscoveryGeneration, &c.LastDiscoveryAt, &allowed, &c.DiscoveryScopeDigest)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -1263,15 +1265,18 @@ const bindingTargetIdentityChangedSQL = `EXISTS (
 		WHERE ic.id = b.argocd_connector_id AND it->>'target_id' = b.argocd_target_id
 		  AND it->>'identity_status' = 'identity_changed')`
 
-func scanGatewayBinding(row pgx.Row) (*GatewayBinding, error) {
+// scanGatewayBinding scans gatewayBindingColumns, then extra for any
+// columns a query adds after them.
+func scanGatewayBinding(row pgx.Row, extra ...any) (*GatewayBinding, error) {
 	var b GatewayBinding
 	var stages []byte
-	err := row.Scan(&b.ID, &b.GatewayID, &b.EnvironmentID, &b.ProjectID, &b.SecretID, &b.ProviderConnectionID,
+	dest := []any{&b.ID, &b.GatewayID, &b.EnvironmentID, &b.ProjectID, &b.SecretID, &b.ProviderConnectionID,
 		&b.SecretRef, &stages,
 		&b.ESOConnectorID, &b.ESOTargetID,
 		&b.RolloutConnectorID, &b.RolloutTargetID,
 		&b.ArgoCDConnectorID, &b.ArgoCDTargetID,
-		&b.ObservationTimeoutS, &b.Enabled, &b.CreatedBy, &b.CreatedAt, &b.SuspendedReason, &b.TargetSource)
+		&b.ObservationTimeoutS, &b.Enabled, &b.CreatedBy, &b.CreatedAt, &b.SuspendedReason, &b.TargetSource}
+	err := row.Scan(append(dest, extra...)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
