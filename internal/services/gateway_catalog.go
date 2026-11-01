@@ -63,7 +63,11 @@ var (
 	catalogCursorRe  = regexp.MustCompile(`^[A-Za-z0-9_-]{1,512}$`)
 	catalogQueryKeys = map[string]bool{
 		"gateway_id": true, "connector_uuid": true, "app_project": true, "namespace": true, "q": true,
-		"source": true, "status": true, "bound": true, "new": true, "team_id": true, "limit": true, "cursor": true,
+		"source": true, "status": true, "bound": true, "new": true, "team_id": true, "project_id": true,
+		"limit": true, "cursor": true,
+	}
+	bindingQueryKeys = map[string]bool{
+		"gateway_id": true, "project_id": true, "suspended": true, "limit": true, "cursor": true,
 	}
 )
 
@@ -73,9 +77,48 @@ type CatalogPage struct {
 	NextCursor string
 }
 
-type catalogCursor struct {
-	K storage.CatalogKey `json:"k"`
-	H string             `json:"h"`
+// BindingPage is one page of the bindings read.
+type BindingPage struct {
+	Items      []storage.BindingItem
+	NextCursor string
+}
+
+// keysetCursor carries a page's last sort key and the hash of its
+// filters.
+type keysetCursor[K any] struct {
+	K K      `json:"k"`
+	H string `json:"h"`
+}
+
+func encodeCursor[K any](key K, hash string) (string, error) {
+	raw, err := json.Marshal(keysetCursor[K]{K: key, H: hash})
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+// decodeCursor returns the key of cursor v, made under the filters of
+// hash, or ErrCatalogInvalidCursor.
+func decodeCursor[K any](v, hash string) (*K, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(v)
+	var cur keysetCursor[K]
+	if len(v) > catalogMaxCursor || !catalogCursorRe.MatchString(v) || err != nil || json.Unmarshal(raw, &cur) != nil || cur.H != hash {
+		return nil, ErrCatalogInvalidCursor
+	}
+	return &cur.K, nil
+}
+
+// parseLimit returns the page size of a raw limit, def when empty.
+func parseLimit(v string, def int) (int, bool) {
+	if v == "" {
+		return def, true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 || n > catalogMaxLimit || strconv.Itoa(n) != v {
+		return 0, false
+	}
+	return n, true
 }
 
 // filterHash binds a cursor to the filters it was made with (limit
@@ -143,6 +186,9 @@ func (s *GatewayService) ListCatalog(ctx context.Context, caller BindCaller, par
 	if f.TeamID, ok = parseOptUUID(params["team_id"]); !ok {
 		return nil, ErrCatalogInvalidQuery
 	}
+	if f.ProjectID, ok = parseOptUUID(params["project_id"]); !ok {
+		return nil, ErrCatalogInvalidQuery
+	}
 	if f.Bound, ok = parseOptBool(params["bound"]); !ok {
 		return nil, ErrCatalogInvalidQuery
 	}
@@ -158,21 +204,15 @@ func (s *GatewayService) ListCatalog(ctx context.Context, caller BindCaller, par
 		f.Status != "" && !slices.Contains([]string{"present", "missing", "stale", "identity_changed"}, f.Status):
 		return nil, ErrCatalogInvalidQuery
 	}
-	if v := params["limit"]; v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > catalogMaxLimit || strconv.Itoa(n) != v {
-			return nil, ErrCatalogInvalidQuery
-		}
-		f.Limit = n
+	if f.Limit, ok = parseLimit(params["limit"], catalogDefaultLimit); !ok {
+		return nil, ErrCatalogInvalidQuery
 	}
 	hash := filterHash(params)
 	if v := params["cursor"]; v != "" {
-		raw, err := base64.RawURLEncoding.DecodeString(v)
-		var cur catalogCursor
-		if len(v) > catalogMaxCursor || !catalogCursorRe.MatchString(v) || err != nil || json.Unmarshal(raw, &cur) != nil || cur.H != hash {
-			return nil, ErrCatalogInvalidCursor
+		var err error
+		if f.After, err = decodeCursor[storage.CatalogKey](v, hash); err != nil {
+			return nil, err
 		}
-		f.After = &cur.K
 	}
 	items, err := s.store.ListCatalog(ctx, f)
 	if err != nil {
@@ -181,11 +221,59 @@ func (s *GatewayService) ListCatalog(ctx context.Context, caller BindCaller, par
 	page := &CatalogPage{Items: items}
 	if len(items) > f.Limit {
 		page.Items = items[:f.Limit]
-		raw, err := json.Marshal(catalogCursor{K: page.Items[f.Limit-1].Key, H: hash})
-		if err != nil {
+		if page.NextCursor, err = encodeCursor(page.Items[f.Limit-1].Key, hash); err != nil {
 			return nil, err
 		}
-		page.NextCursor = base64.RawURLEncoding.EncodeToString(raw)
+	}
+	return page, nil
+}
+
+// ListBindingItems is the team-filtered bindings read: who may read is
+// A1's rule, and a team-scoped caller gets the discovered bindings of
+// its teams' projects, suspended ones included. A target the caller
+// can't see comes without its AppProject, namespace and name. The filter
+// is in the query, before paging. params is the raw query.
+func (s *GatewayService) ListBindingItems(ctx context.Context, caller BindCaller, params map[string]string) (*BindingPage, error) {
+	if !caller.readsAll() && len(caller.Teams) == 0 {
+		return nil, ErrGatewayCatalogForbidden
+	}
+	for k, v := range params {
+		if !bindingQueryKeys[k] || v == "" {
+			return nil, ErrCatalogInvalidQuery
+		}
+	}
+	f := storage.BindingFilter{All: caller.readsAll(), Teams: caller.Teams}
+	var ok bool
+	if f.GatewayID, ok = parseOptUUID(params["gateway_id"]); !ok {
+		return nil, ErrCatalogInvalidQuery
+	}
+	if f.ProjectID, ok = parseOptUUID(params["project_id"]); !ok {
+		return nil, ErrCatalogInvalidQuery
+	}
+	if f.Suspended, ok = parseOptBool(params["suspended"]); !ok {
+		return nil, ErrCatalogInvalidQuery
+	}
+	if f.Limit, ok = parseLimit(params["limit"], catalogDefaultLimit); !ok {
+		return nil, ErrCatalogInvalidQuery
+	}
+	hash := filterHash(params)
+	if v := params["cursor"]; v != "" {
+		var err error
+		if f.After, err = decodeCursor[storage.BindingKey](v, hash); err != nil {
+			return nil, err
+		}
+	}
+	items, err := s.store.ListBindingItems(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	page := &BindingPage{Items: items}
+	if len(items) > f.Limit {
+		page.Items = items[:f.Limit]
+		last := page.Items[f.Limit-1].Binding
+		if page.NextCursor, err = encodeCursor(storage.BindingKey{CreatedAt: last.CreatedAt, ID: last.ID}, hash); err != nil {
+			return nil, err
+		}
 	}
 	return page, nil
 }

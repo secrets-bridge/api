@@ -183,6 +183,11 @@ type MeResponse struct {
 	// "secret.list") collected across every active role grant the
 	// user holds. The UI uses this to gate sidebar nav items + buttons.
 	Permissions []string `json:"permissions"`
+	// GlobalPermissions is the subset of Permissions held through an
+	// unscoped grant, which is what auth.Require asks for. The UI uses it
+	// where a team-scoped grant isn't enough, so it doesn't offer an
+	// action that answers 403.
+	GlobalPermissions []string `json:"global_permissions"`
 	// Teams the user is a direct member of. Hierarchical access (a
 	// section head seeing reports' work) is computed server-side via
 	// the team-scope resolver — the UI doesn't need the subtree here.
@@ -247,12 +252,20 @@ func (h *Me) GetMe(c fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 	permSet := map[string]struct{}{}
+	globalSet := map[string]struct{}{}
 	for _, g := range grants {
 		permSet[g.Permission] = struct{}{}
+		if len(g.Scope) == 0 {
+			globalSet[g.Permission] = struct{}{}
+		}
 	}
 	perms := make([]string, 0, len(permSet))
 	for p := range permSet {
 		perms = append(perms, p)
+	}
+	globalPerms := make([]string, 0, len(globalSet))
+	for p := range globalSet {
+		globalPerms = append(globalPerms, p)
 	}
 
 	teams, err := h.teams.ListTeamsForUser(c.Context(), uid)
@@ -308,13 +321,14 @@ func (h *Me) GetMe(c fiber.Ctx) error {
 	}
 
 	return c.JSON(MeResponse{
-		ID:          user.ID.String(),
-		Email:       user.Email,
-		DisplayName: user.DisplayName,
-		Permissions: perms,
-		Teams:       teamsOut,
-		Projects:    projects,
-		MFAEnrolled: mfaEnrolled,
+		ID:                user.ID.String(),
+		Email:             user.Email,
+		DisplayName:       user.DisplayName,
+		Permissions:       perms,
+		GlobalPermissions: globalPerms,
+		Teams:             teamsOut,
+		Projects:          projects,
+		MFAEnrolled:       mfaEnrolled,
 
 		PendingApproval: user.PendingApproval,
 		HasPassword:     hasPassword,

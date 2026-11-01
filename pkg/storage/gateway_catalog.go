@@ -42,7 +42,12 @@ type CatalogFilter struct {
 	Bound         *bool
 	New           *bool
 	TeamID        *uuid.UUID
-	Limit         int
+	// ProjectID keeps the targets this project can bind: every static
+	// target, and a discovered target only when a team its AppProject maps
+	// to covers the project's team (bind rule 5). It matches nothing for a
+	// project outside a team-scoped caller's teams.
+	ProjectID *uuid.UUID
+	Limit     int
 	// After is the keyset of the last item of the previous page.
 	After *CatalogKey
 	Now   time.Time
@@ -117,6 +122,13 @@ WHERE ($3::uuid IS NULL OR gateway_id = $3)
   AND ($10::boolean IS NULL OR (binding_count > 0) = $10)
   AND ($11::boolean IS NULL OR (first_seen_at > $12::timestamptz - interval '24 hours') = $11)
   AND ($13::text IS NULL OR $13::text = ANY(team_ids))
+  AND ($22::uuid IS NULL OR EXISTS (
+       SELECT 1 FROM projects p
+       WHERE p.id = $22 AND ($1::boolean OR p.team_id = ANY($2::uuid[]))
+         AND (source = 'static' OR EXISTS (
+              SELECT 1 FROM gateway_connector_project_teams pt
+              WHERE pt.connector_id = connector_uuid AND pt.app_project = items.app_project
+                AND team_covers(pt.team_id, p.team_id)))))
   AND ($14::boolean IS NOT TRUE OR
        (gateway_id, connector_uuid, app_project COLLATE "C", namespace COLLATE "C", name COLLATE "C", target_id COLLATE "C")
        > ($15::uuid, $16::uuid, $17::text COLLATE "C", $18::text COLLATE "C", $19::text COLLATE "C", $20::text COLLATE "C"))
@@ -135,7 +147,7 @@ func (r *Gateways) ListCatalog(ctx context.Context, f CatalogFilter) ([]CatalogI
 	}
 	rows, err := r.pool.Query(ctx, catalogSQL, global, teams,
 		f.GatewayID, f.ConnectorUUID, f.AppProject, f.Namespace, f.Q, f.Source, f.Status, f.Bound, f.New, f.Now, f.TeamID,
-		after, a.GatewayID, a.ConnectorID, a.AppProject, a.Namespace, a.Name, a.TargetID, f.Limit+1)
+		after, a.GatewayID, a.ConnectorID, a.AppProject, a.Namespace, a.Name, a.TargetID, f.Limit+1, f.ProjectID)
 	if err != nil {
 		return nil, fmt.Errorf("storage: catalog read: %w", err)
 	}
@@ -150,6 +162,89 @@ func (r *Gateways) ListCatalog(ctx context.Context, f CatalogFilter) ([]CatalogI
 			return nil, fmt.Errorf("storage: scan catalog item: %w", err)
 		}
 		if it.TeamIDs, err = parseUUIDs(teamIDs); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+// BindingFilter is a validated bindings read. All is a global caller;
+// otherwise the caller gets the discovered bindings of the projects of
+// Teams (the expanded subtrees).
+type BindingFilter struct {
+	All       bool
+	Teams     []uuid.UUID
+	GatewayID *uuid.UUID
+	ProjectID *uuid.UUID
+	Suspended *bool
+	Limit     int
+	// After is the keyset of the last item of the previous page.
+	After *BindingKey
+}
+
+// BindingKey is the sort key: newest first, then binding id.
+type BindingKey struct {
+	CreatedAt time.Time `json:"c"`
+	ID        uuid.UUID `json:"i"`
+}
+
+// BindingItem is a binding with its target, as far as the caller can
+// see the target. AppProject, Namespace and Name are empty when it
+// can't: a binding stays listed for its project's team after a mapping
+// change or a scope change hides the target, so the team finds out why
+// it stopped. A team-scoped delete of such a binding answers 404.
+type BindingItem struct {
+	Binding    *GatewayBinding
+	AppProject string
+	Namespace  string
+	Name       string
+}
+
+// bindingListSQL is the bindings read. $1 all, $2 caller teams, then
+// the filters, the keyset and the limit. The target join applies the
+// catalog's visibility rule (C4), so it never shows a team a target the
+// catalog hides from it.
+const bindingListSQL = `SELECT ` + gatewayBindingColumns + `,
+	COALESCE(v.app_project, ''), COALESCE(v.namespace, ''), COALESCE(v.name, '')
+FROM gateway_connector_bindings b
+JOIN environments e ON e.id = b.environment_id
+JOIN projects p ON p.id = e.project_id
+LEFT JOIN LATERAL (
+	SELECT dt.app_project, dt.namespace, dt.name
+	FROM gateway_discovered_targets dt JOIN gateway_connectors c ON c.id = dt.connector_id
+	WHERE dt.connector_id = b.argocd_connector_id AND dt.target_id = b.argocd_target_id
+	  AND ($1::boolean OR (c.status = 'approved' AND EXISTS (
+		SELECT 1 FROM gateway_connector_project_teams vt
+		WHERE vt.connector_id = c.id AND vt.app_project = dt.app_project AND vt.team_id = ANY($2::uuid[]))))
+) v ON true
+WHERE b.deleted_at IS NULL
+  AND ($1::boolean OR (b.target_source = 'discovered' AND p.team_id = ANY($2::uuid[])))
+  AND ($3::uuid IS NULL OR b.gateway_id = $3)
+  AND ($4::uuid IS NULL OR e.project_id = $4)
+  AND ($5::boolean IS NULL OR (b.suspended_reason IS NOT NULL OR ` + bindingTargetIdentityChangedSQL + `) = $5)
+  AND ($6::boolean IS NOT TRUE OR (b.created_at, b.id) < ($7::timestamptz, $8::uuid))
+ORDER BY b.created_at DESC, b.id DESC
+LIMIT $9`
+
+// ListBindingItems returns up to f.Limit+1 bindings (one more than a
+// page, so the caller knows whether a next page exists).
+func (r *Gateways) ListBindingItems(ctx context.Context, f BindingFilter) ([]BindingItem, error) {
+	after := f.After != nil
+	var a BindingKey
+	if after {
+		a = *f.After
+	}
+	rows, err := r.pool.Query(ctx, bindingListSQL, f.All, uuidStrings(f.Teams),
+		f.GatewayID, f.ProjectID, f.Suspended, after, a.CreatedAt, a.ID, f.Limit+1)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list binding items: %w", err)
+	}
+	defer rows.Close()
+	var out []BindingItem
+	for rows.Next() {
+		var it BindingItem
+		if it.Binding, err = scanGatewayBinding(rows, &it.AppProject, &it.Namespace, &it.Name); err != nil {
 			return nil, err
 		}
 		out = append(out, it)

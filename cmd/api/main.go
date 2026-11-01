@@ -1450,6 +1450,10 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// (no credential), so gateway.list reads them; every write stays on
 	// gateway.bind with a fresh second factor.
 	v1.Get("/admin/gateway-bindings", gatewayList, gatewaysH.AdminListBindings)
+	// Same gate and team filter idea as the catalog: the handler reads
+	// the caller's scope, so a team-scoped admin sees its own projects'
+	// bindings and why they are suspended.
+	v1.Get("/gateway-bindings", gatewaysH.BindingsRead)
 	v1.Delete("/admin/gateway-bindings/:id", denied("gateway.binding.delete", handlers.GatewayDenyDelete),
 		gatewayBindScoped, requireMFA, gatewaysH.AdminDeleteBinding)
 	// api#294: disable or re-enable, a Gateway's tasks, and an
