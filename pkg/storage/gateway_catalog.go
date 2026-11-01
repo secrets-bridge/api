@@ -26,11 +26,12 @@ var (
 	ErrGatewayTeamNotFound      = errors.New("storage: team not found")
 )
 
-// CatalogFilter is a validated A1 query. Teams nil means a global
-// caller; otherwise the caller sees discovered targets on approved
-// connectors whose AppProject maps to one of Teams (the expanded
-// subtrees), and team_ids lists only those teams.
+// CatalogFilter is a validated A1 query. All is a global caller;
+// otherwise the caller sees discovered targets on approved connectors
+// whose AppProject maps to one of Teams (the expanded subtrees), and
+// team_ids and binding_count cover only those teams.
 type CatalogFilter struct {
+	All           bool
 	Teams         []uuid.UUID
 	GatewayID     *uuid.UUID
 	ConnectorUUID *uuid.UUID
@@ -106,7 +107,10 @@ WITH visible AS (
 ), items AS (
 	SELECT v.*, COALESCE(n.places, 1) > 1 AS look_alike,
 	       (SELECT count(*) FROM gateway_connector_bindings b
-	        WHERE b.argocd_connector_id = v.connector_uuid AND b.argocd_target_id = v.target_id AND b.deleted_at IS NULL) AS binding_count
+	        JOIN environments e ON e.id = b.environment_id
+	        JOIN projects p ON p.id = e.project_id
+	        WHERE b.argocd_connector_id = v.connector_uuid AND b.argocd_target_id = v.target_id AND b.deleted_at IS NULL
+	          AND ($1::boolean OR p.team_id = ANY($2::uuid[]))) AS binding_count
 	FROM visible v LEFT JOIN names n ON n.gateway_id = v.gateway_id AND n.name = v.name
 )
 SELECT gateway_id, connector_uuid, connector_name, target_id, source, status, app_project, namespace, name,
@@ -138,14 +142,13 @@ LIMIT $21`
 // ListCatalog returns up to f.Limit+1 items (one more than a page, so
 // the caller knows whether a next page exists).
 func (r *Gateways) ListCatalog(ctx context.Context, f CatalogFilter) ([]CatalogItem, error) {
-	global := f.Teams == nil
 	teams := uuidStrings(f.Teams)
 	after := f.After != nil
 	var a CatalogKey
 	if after {
 		a = *f.After
 	}
-	rows, err := r.pool.Query(ctx, catalogSQL, global, teams,
+	rows, err := r.pool.Query(ctx, catalogSQL, f.All, teams,
 		f.GatewayID, f.ConnectorUUID, f.AppProject, f.Namespace, f.Q, f.Source, f.Status, f.Bound, f.New, f.Now, f.TeamID,
 		after, a.GatewayID, a.ConnectorID, a.AppProject, a.Namespace, a.Name, a.TargetID, f.Limit+1, f.ProjectID)
 	if err != nil {

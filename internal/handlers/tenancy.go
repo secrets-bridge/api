@@ -215,17 +215,21 @@ func (h *Tenancy) SetProjectTeam(c fiber.Ctx) error {
 	if err := structureCheck(c, h.resolver, h.teamScope, nil, before, teamID); err != nil {
 		return err
 	}
-	if err := h.projects.SetTeam(c.Context(), id, teamID); err != nil {
+	moved, err := h.projects.MoveToTeam(c.Context(), id, teamID)
+	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "not found")
 		}
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 	auditWrite(c, h.audit, "project.team.update", "project:"+id.String(), map[string]any{
-		"project_id":     id.String(),
-		"team_id_before": uuidPtrMeta(before),
-		"team_id_after":  uuidPtrMeta(teamID),
+		"project_id":         id.String(),
+		"team_id_before":     uuidPtrMeta(before),
+		"team_id_after":      uuidPtrMeta(teamID),
+		"bindings_suspended": moved.BindingsSuspended,
+		"tasks_cancelled":    len(moved.Cancelled),
 	})
+	services.AuditMovedBindings(c.Context(), h.audit, moved)
 	return c.SendStatus(fiber.StatusNoContent)
 }
 

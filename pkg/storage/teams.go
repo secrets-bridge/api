@@ -69,6 +69,9 @@ type TeamRepository interface {
 	Update(ctx context.Context, id uuid.UUID, name, description string, parent *uuid.UUID) error
 	UpdateStatus(ctx context.Context, id uuid.UUID, status TeamStatus) error
 	Delete(ctx context.Context, id uuid.UUID) error
+	// DeleteTeam is Delete that also reports the discovered Gateway
+	// bindings the delete suspended.
+	DeleteTeam(ctx context.Context, id uuid.UUID) (*GatewayMoveOutcome, error)
 
 	// Hierarchy walk. DescendantIDs returns the team and ALL its
 	// descendants, depth-first, deduped. Used by the access resolver to
@@ -201,18 +204,29 @@ func (r *Teams) Update(ctx context.Context, id uuid.UUID, name, description stri
 		parentArg = *parent
 	}
 
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("teams.Update: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
 	const q = `
 		UPDATE teams
 		   SET name = $1,
 		       description = NULLIF($2, ''),
 		       parent_team_id = $3
 		 WHERE id = $4`
-	ct, err := r.pool.Exec(ctx, q, name, description, parentArg, id)
+	ct, err := tx.Exec(ctx, q, name, description, parentArg, id)
 	if err != nil {
 		return mapTeamErr(err)
 	}
 	if ct.RowsAffected() == 0 {
 		return ErrNotFound
+	}
+	if _, err := suspendMovedBindings(ctx, tx, `team_covers($1, p.team_id)`, []any{id}, time.Now().UTC()); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("teams.Update: commit: %w", err)
 	}
 	return nil
 }
@@ -243,18 +257,18 @@ func (r *Teams) UpdateWithLineageAudit(
 	parent *uuid.UUID,
 	actor string,
 	audit *AuditEvents,
-) error {
+) (*GatewayMoveOutcome, error) {
 	if name == "" {
-		return errors.New("storage: team Name is required")
+		return nil, errors.New("storage: team Name is required")
 	}
 	if parent != nil && *parent != uuid.Nil {
 		desc, err := r.DescendantIDs(ctx, id)
 		if err != nil {
-			return fmt.Errorf("teams.UpdateWithLineageAudit cycle check: %w", err)
+			return nil, fmt.Errorf("teams.UpdateWithLineageAudit cycle check: %w", err)
 		}
 		for _, d := range desc {
 			if d == *parent {
-				return ErrCyclicParent
+				return nil, ErrCyclicParent
 			}
 		}
 	}
@@ -265,7 +279,7 @@ func (r *Teams) UpdateWithLineageAudit(
 
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("teams.UpdateWithLineageAudit: begin: %w", err)
+		return nil, fmt.Errorf("teams.UpdateWithLineageAudit: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -275,9 +289,9 @@ func (r *Teams) UpdateWithLineageAudit(
 		`SELECT parent_team_id FROM teams WHERE id = $1 FOR UPDATE`, id,
 	).Scan(&oldParent); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
+			return nil, ErrNotFound
 		}
-		return fmt.Errorf("teams.UpdateWithLineageAudit: load: %w", err)
+		return nil, fmt.Errorf("teams.UpdateWithLineageAudit: load: %w", err)
 	}
 
 	// Apply the UPDATE.
@@ -288,7 +302,7 @@ func (r *Teams) UpdateWithLineageAudit(
 		       parent_team_id = $3
 		 WHERE id = $4`, name, description, parentArg, id,
 	); err != nil {
-		return mapTeamErr(err)
+		return nil, mapTeamErr(err)
 	}
 
 	// Determine whether parent actually changed.
@@ -298,6 +312,15 @@ func (r *Teams) UpdateWithLineageAudit(
 		newParent = &v
 	}
 	parentChanged := !uuidPtrEqual(oldParent, newParent)
+
+	// A re-parent can take a project's team out of the subtree a
+	// discovered binding's AppProject maps to (ADR 0002 C4).
+	moved := &GatewayMoveOutcome{}
+	if parentChanged {
+		if moved, err = suspendMovedBindings(ctx, tx, `team_covers($1, p.team_id)`, []any{id}, time.Now().UTC()); err != nil {
+			return nil, err
+		}
+	}
 
 	if parentChanged && audit != nil {
 		// Compute affected counts INSIDE the same transaction so the
@@ -320,7 +343,7 @@ func (r *Teams) UpdateWithLineageAudit(
 			    (SELECT COUNT(*) FROM projects WHERE team_id IN (SELECT id FROM descendants))`,
 			id,
 		).Scan(&ruleCount, &projectCount); err != nil {
-			return fmt.Errorf("teams.UpdateWithLineageAudit: counts: %w", err)
+			return nil, fmt.Errorf("teams.UpdateWithLineageAudit: counts: %w", err)
 		}
 
 		oldParentStr := ""
@@ -342,13 +365,18 @@ func (r *Teams) UpdateWithLineageAudit(
 				"new_parent_team_id":     newParentStr,
 				"team_policy_rule_count": ruleCount,
 				"affected_project_count": projectCount,
+				"bindings_suspended":     moved.BindingsSuspended,
+				"tasks_cancelled":        len(moved.Cancelled),
 			},
 		}); err != nil {
-			return fmt.Errorf("teams.UpdateWithLineageAudit: audit append: %w", err)
+			return nil, fmt.Errorf("teams.UpdateWithLineageAudit: audit append: %w", err)
 		}
 	}
 
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("teams.UpdateWithLineageAudit: commit: %w", err)
+	}
+	return moved, nil
 }
 
 // actorOrSystem returns "system" when actor is empty, mirroring the
@@ -388,18 +416,46 @@ func (r *Teams) UpdateStatus(ctx context.Context, id uuid.UUID, status TeamStatu
 // missing → ErrNotFound) or a delete-restrict (referencing rows still
 // exist → ErrHasChildren); this Delete sets the latter explicitly.
 func (r *Teams) Delete(ctx context.Context, id uuid.UUID) error {
-	ct, err := r.pool.Exec(ctx, `DELETE FROM teams WHERE id = $1`, id)
+	_, err := r.DeleteTeam(ctx, id)
+	return err
+}
+
+// DeleteTeam deletes a team and, in the same transaction, suspends the
+// discovered Gateway bindings of its projects: the delete leaves those
+// projects with no team (ON DELETE SET NULL), so nothing covers them.
+func (r *Teams) DeleteTeam(ctx context.Context, id uuid.UUID) (*GatewayMoveOutcome, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("teams.DeleteTeam: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	rows, err := tx.Query(ctx, `SELECT id FROM projects WHERE team_id = $1 FOR UPDATE`, id)
+	if err != nil {
+		return nil, fmt.Errorf("teams.DeleteTeam: projects: %w", err)
+	}
+	projects, err := collectIDs(rows)
+	if err != nil {
+		return nil, err
+	}
+	ct, err := tx.Exec(ctx, `DELETE FROM teams WHERE id = $1`, id)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
-			return ErrHasChildren
+			return nil, ErrHasChildren
 		}
-		return mapTeamErr(err)
+		return nil, mapTeamErr(err)
 	}
 	if ct.RowsAffected() == 0 {
-		return ErrNotFound
+		return nil, ErrNotFound
 	}
-	return nil
+	out, err := suspendMovedBindings(ctx, tx, `p.id = ANY($1::uuid[])`, []any{uuidStrings(projects)}, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("teams.DeleteTeam: commit: %w", err)
+	}
+	return out, nil
 }
 
 // DescendantIDs returns root and every team in its subtree, depth-

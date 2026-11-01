@@ -168,6 +168,14 @@ func auditTaskClosed(ctx context.Context, audit storage.AuditEventRepository, ac
 	})
 }
 
+// AuditMovedBindings audits the tasks a project or team move cancelled
+// when it suspended their bindings.
+func AuditMovedBindings(ctx context.Context, audit storage.AuditEventRepository, out *storage.GatewayMoveOutcome) {
+	for _, t := range out.Cancelled {
+		auditTaskClosed(ctx, audit, auditActor(ctx, ""), "observation.task.cancelled", t)
+	}
+}
+
 // ---- environment observation source ------------------------------------------
 
 // Source returns the observation source of the environment a request

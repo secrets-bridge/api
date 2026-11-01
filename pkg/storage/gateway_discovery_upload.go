@@ -410,13 +410,42 @@ const bindingTeamCoveredSQL = `EXISTS (
 // binding project, and cancels their open tasks with binding_suspended.
 // mapping_removed replaces scope_changed but never target_missing.
 func suspendUncoveredBindings(ctx context.Context, tx pgx.Tx, connectorID uuid.UUID, targetIDs []string, at time.Time) (int, []*ObservationTask, error) {
-	rows, err := tx.Query(ctx, `
-		UPDATE gateway_connector_bindings b SET suspended_reason = 'mapping_removed', suspended_at = $3
-		WHERE b.argocd_connector_id = $1 AND b.deleted_at IS NULL AND b.target_source = 'discovered'
-		  AND ($2::text[] IS NULL OR b.argocd_target_id = ANY($2::text[]))
+	return suspendBindingsWhere(ctx, tx,
+		`b.argocd_connector_id = $1 AND ($2::text[] IS NULL OR b.argocd_target_id = ANY($2::text[]))`,
+		[]any{connectorID, targetIDs}, at)
+}
+
+// GatewayMoveOutcome is what a project or team move did to the
+// discovered bindings it left uncovered. The caller audits it.
+type GatewayMoveOutcome struct {
+	BindingsSuspended int
+	Cancelled         []*ObservationTask
+}
+
+// suspendMovedBindings is suspendUncoveredBindings for a structure
+// change: a project move, a team re-parent or a team delete. projects
+// is a condition on projects p. It runs in the transaction of the move,
+// so a move never commits with a binding left uncovered and live, and
+// moving back resumes nothing.
+func suspendMovedBindings(ctx context.Context, tx pgx.Tx, projects string, args []any, at time.Time) (*GatewayMoveOutcome, error) {
+	n, cancelled, err := suspendBindingsWhere(ctx, tx,
+		`b.environment_id IN (SELECT e.id FROM environments e JOIN projects p ON p.id = e.project_id WHERE `+projects+`)`, args, at)
+	if err != nil {
+		return nil, err
+	}
+	return &GatewayMoveOutcome{BindingsSuspended: n, Cancelled: cancelled}, nil
+}
+
+// suspendBindingsWhere is the shared suspension. where is a condition
+// on bindings b, using args.
+func suspendBindingsWhere(ctx context.Context, tx pgx.Tx, where string, args []any, at time.Time) (int, []*ObservationTask, error) {
+	rows, err := tx.Query(ctx, fmt.Sprintf(`
+		UPDATE gateway_connector_bindings b SET suspended_reason = 'mapping_removed', suspended_at = $%d
+		WHERE b.deleted_at IS NULL AND b.target_source = 'discovered'
 		  AND (b.suspended_reason IS NULL OR b.suspended_reason = 'scope_changed')
-		  AND NOT `+bindingTeamCoveredSQL+`
-		RETURNING b.id`, connectorID, targetIDs, at)
+		  AND %s
+		  AND NOT %s
+		RETURNING b.id`, len(args)+1, where, bindingTeamCoveredSQL), append(args, at)...)
 	if err != nil {
 		return 0, nil, fmt.Errorf("storage: suspend uncovered bindings: %w", err)
 	}
