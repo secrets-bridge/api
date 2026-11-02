@@ -64,7 +64,7 @@ func TestLive_AuditReaders_SeeOwnEventsAndReadableTrails(t *testing.T) {
 	// An admin's own event, which no one else should see without a
 	// global admin permission.
 	admin := l.grantUser(t, []string{"team.edit", "audit.read"}, `{}`)
-	if code, body := l.call(t, http.MethodPost, "/api/v1/teams", admin, map[string]any{"name": "team-" + uuid.NewString()[:8]}); code != http.StatusCreated {
+	if code, body := l.callFresh(t, http.MethodPost, "/api/v1/teams", admin, map[string]any{"name": "team-" + uuid.NewString()[:8]}); code != http.StatusCreated {
 		t.Fatalf("create team = %d %s", code, body)
 	}
 

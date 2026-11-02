@@ -23,7 +23,7 @@ func TestLive_WorkflowPut_IsPartial(t *testing.T) {
 	if err := l.pool.QueryRow(ctx, `SELECT id FROM roles WHERE name = 'approver'`).Scan(&approverRole); err != nil {
 		t.Fatalf("approver role: %v", err)
 	}
-	code, body := l.call(t, http.MethodPost, "/api/v1/workflows", admin, map[string]any{
+	code, body := l.callFresh(t, http.MethodPost, "/api/v1/workflows", admin, map[string]any{
 		"name": "prod-cross-team", "min_approvers": 2, "approver_role_id": approverRole,
 		"wrap_ttl_created_seconds": 3600, "wrap_ttl_approved_seconds": 1800,
 		"wrap_ttl_claimed_seconds": 300, "request_ttl_seconds": 7200,
@@ -70,7 +70,7 @@ func TestLive_WorkflowPut_IsPartial(t *testing.T) {
 	path := "/api/v1/workflows/" + wf.ID.String()
 
 	// A body that only touches the name changes nothing else.
-	if code, body := l.call(t, http.MethodPut, path, admin, map[string]any{"name": "prod-cross-team-renamed"}); code != http.StatusNoContent {
+	if code, body := l.callFresh(t, http.MethodPut, path, admin, map[string]any{"name": "prod-cross-team-renamed"}); code != http.StatusNoContent {
 		t.Fatalf("name-only PUT = %d %s", code, body)
 	}
 	r := read()
@@ -84,7 +84,7 @@ func TestLive_WorkflowPut_IsPartial(t *testing.T) {
 
 	// The old admin form's body (every classic field, none of the new
 	// ones, no approver_role_id) also leaves the knobs alone.
-	if code, body := l.call(t, http.MethodPut, path, admin, map[string]any{
+	if code, body := l.callFresh(t, http.MethodPut, path, admin, map[string]any{
 		"name": "prod-cross-team", "min_approvers": 3,
 		"wrap_ttl_created_seconds": 3600, "wrap_ttl_approved_seconds": 1800,
 		"wrap_ttl_claimed_seconds": 300, "request_ttl_seconds": 7200,
@@ -99,7 +99,7 @@ func TestLive_WorkflowPut_IsPartial(t *testing.T) {
 	}
 
 	// Explicit false / 0 / null are applied.
-	if code, body := l.call(t, http.MethodPut, path, admin, map[string]any{
+	if code, body := l.callFresh(t, http.MethodPut, path, admin, map[string]any{
 		"requires_security_approval": false, "enabled": false, "min_approvers": 0,
 		"approver_role_id": nil, "fill_ttl_seconds": 600,
 	}); code != http.StatusNoContent {
@@ -114,7 +114,7 @@ func TestLive_WorkflowPut_IsPartial(t *testing.T) {
 	}
 
 	// GET exposes the knobs.
-	code, body = l.call(t, http.MethodGet, path, admin, nil)
+	code, body = l.callFresh(t, http.MethodGet, path, admin, nil)
 	var got map[string]any
 	mustJSON(t, body, &got)
 	if code != http.StatusOK || got["requires_security_approval"] != false || got["fill_ttl_seconds"] != float64(600) {
@@ -128,7 +128,7 @@ func TestLive_WorkflowPut_IsPartial(t *testing.T) {
 		{"request_ttl_seconds": -5},
 		{"min_approvers": -1},
 	} {
-		if code, _ := l.call(t, http.MethodPut, path, admin, bad); code != http.StatusBadRequest {
+		if code, _ := l.callFresh(t, http.MethodPut, path, admin, bad); code != http.StatusBadRequest {
 			t.Errorf("PUT %v = %d, want 400", bad, code)
 		}
 	}
@@ -145,7 +145,7 @@ func TestLive_PolicyPut_IsPartial(t *testing.T) {
 	if err := l.pool.QueryRow(ctx, `SELECT id FROM workflow_definitions WHERE is_default LIMIT 1`).Scan(&wfID); err != nil {
 		t.Fatalf("default workflow: %v", err)
 	}
-	code, body := l.call(t, http.MethodPost, "/api/v1/policies", admin, map[string]any{
+	code, body := l.callFresh(t, http.MethodPost, "/api/v1/policies", admin, map[string]any{
 		"name": "uat-direct", "selector": map[string]any{"environment": "uat"}, "workflow_id": wfID,
 		"priority": 500, "enabled": true, "direct_reveal_allowed": true, "requires_mfa": true, "reveal_ttl_seconds": 120,
 	})
@@ -169,13 +169,13 @@ func TestLive_PolicyPut_IsPartial(t *testing.T) {
 	// name + workflow_id only (what a minimal client sends): the old
 	// handler reset the selector to {} (match everything) and switched the
 	// rule and its reveal flags off.
-	if code, body := l.call(t, http.MethodPut, path, admin, map[string]any{"name": "uat-direct-renamed", "workflow_id": wfID}); code != http.StatusNoContent {
+	if code, body := l.callFresh(t, http.MethodPut, path, admin, map[string]any{"name": "uat-direct-renamed", "workflow_id": wfID}); code != http.StatusNoContent {
 		t.Fatalf("name+workflow PUT = %d %s", code, body)
 	}
 	if _, sel, _, enabled, direct, _, _ := read(); sel != `{"environment": "uat"}` || !enabled || !direct {
 		t.Errorf("name+workflow PUT reset fields: selector=%s enabled=%v direct=%v", sel, enabled, direct)
 	}
-	if code, body := l.call(t, http.MethodPut, path, admin, map[string]any{"name": "uat-direct-renamed"}); code != http.StatusNoContent {
+	if code, body := l.callFresh(t, http.MethodPut, path, admin, map[string]any{"name": "uat-direct-renamed"}); code != http.StatusNoContent {
 		t.Fatalf("name-only PUT = %d %s", code, body)
 	}
 	name, sel, prio, enabled, direct, mfa, ttl := read()
@@ -186,7 +186,7 @@ func TestLive_PolicyPut_IsPartial(t *testing.T) {
 		t.Errorf("name-only PUT reset fields: selector=%s priority=%d enabled=%v direct=%v mfa=%v ttl=%d", sel, prio, enabled, direct, mfa, ttl)
 	}
 
-	if code, body := l.call(t, http.MethodPut, path, admin, map[string]any{"enabled": false, "priority": 0}); code != http.StatusNoContent {
+	if code, body := l.callFresh(t, http.MethodPut, path, admin, map[string]any{"enabled": false, "priority": 0}); code != http.StatusNoContent {
 		t.Fatalf("explicit PUT = %d %s", code, body)
 	}
 	_, sel, prio, enabled, direct, _, _ = read()
@@ -201,13 +201,13 @@ func TestLive_OtherPuts_KeepOmittedFields(t *testing.T) {
 	admin := l.grantUser(t, []string{"role.edit", "team.edit", "integration.edit", "integration.bind"}, `{}`)
 
 	// PUT /roles/:id/permissions without the key no longer strips the role.
-	code, body := l.call(t, http.MethodPost, "/api/v1/roles", admin, map[string]any{"name": "it-reader", "permissions": []string{"audit.read"}})
+	code, body := l.callFresh(t, http.MethodPost, "/api/v1/roles", admin, map[string]any{"name": "it-reader", "permissions": []string{"audit.read"}})
 	if code != http.StatusCreated {
 		t.Fatalf("create role = %d %s", code, body)
 	}
 	var role struct{ ID uuid.UUID }
 	mustJSON(t, body, &role)
-	if code, _ := l.call(t, http.MethodPut, "/api/v1/roles/"+role.ID.String()+"/permissions", admin, map[string]any{}); code != http.StatusBadRequest {
+	if code, _ := l.callFresh(t, http.MethodPut, "/api/v1/roles/"+role.ID.String()+"/permissions", admin, map[string]any{}); code != http.StatusBadRequest {
 		t.Errorf("permissions-less PUT = %d, want 400", code)
 	}
 	var perms string
@@ -215,7 +215,7 @@ func TestLive_OtherPuts_KeepOmittedFields(t *testing.T) {
 	if perms != `["audit.read"]` {
 		t.Errorf("role permissions = %s, want [\"audit.read\"]", perms)
 	}
-	if code, _ := l.call(t, http.MethodPut, "/api/v1/roles/"+role.ID.String()+"/permissions", admin,
+	if code, _ := l.callFresh(t, http.MethodPut, "/api/v1/roles/"+role.ID.String()+"/permissions", admin,
 		map[string]any{"permissions": []string{}}); code != http.StatusNoContent {
 		t.Errorf("explicit [] PUT = %d, want 204", code)
 	}
@@ -229,7 +229,7 @@ func TestLive_OtherPuts_KeepOmittedFields(t *testing.T) {
 	if _, err := l.pool.Exec(ctx, `INSERT INTO teams (id, name, parent_team_id, description) VALUES ($1, 'team-alpha-uat', $2, 'uat squad')`, child, parent); err != nil {
 		t.Fatalf("seed child: %v", err)
 	}
-	if code, body := l.call(t, http.MethodPut, "/api/v1/teams/"+child.String(), admin, map[string]any{"name": "team-alpha-uat2"}); code != http.StatusOK {
+	if code, body := l.callFresh(t, http.MethodPut, "/api/v1/teams/"+child.String(), admin, map[string]any{"name": "team-alpha-uat2"}); code != http.StatusOK {
 		t.Fatalf("team name-only PUT = %d %s", code, body)
 	}
 	var gotParent *uuid.UUID
@@ -238,7 +238,7 @@ func TestLive_OtherPuts_KeepOmittedFields(t *testing.T) {
 	if gotParent == nil || *gotParent != parent || desc == nil || *desc != "uat squad" {
 		t.Errorf("team name-only PUT: parent=%v description=%v, want both kept", gotParent, desc)
 	}
-	if code, _ := l.call(t, http.MethodPut, "/api/v1/teams/"+child.String(), admin,
+	if code, _ := l.callFresh(t, http.MethodPut, "/api/v1/teams/"+child.String(), admin,
 		map[string]any{"name": "team-alpha-uat2", "parent_team_id": nil}); code != http.StatusOK {
 		t.Errorf("team explicit-null PUT = %d", code)
 	}
@@ -252,7 +252,7 @@ func TestLive_OtherPuts_KeepOmittedFields(t *testing.T) {
 	if _, err := l.pool.Exec(ctx, `INSERT INTO projects (id, name, team_id) VALUES ($1, 'tenant-a', $2)`, proj, parent); err != nil {
 		t.Fatalf("seed project: %v", err)
 	}
-	if code, _ := l.call(t, http.MethodPut, "/api/v1/projects/"+proj.String()+"/team", admin, map[string]any{}); code != http.StatusBadRequest {
+	if code, _ := l.callFresh(t, http.MethodPut, "/api/v1/projects/"+proj.String()+"/team", admin, map[string]any{}); code != http.StatusBadRequest {
 		t.Errorf("project team PUT without team_id = %d, want 400", code)
 	}
 	var projTeam *uuid.UUID
@@ -273,7 +273,7 @@ func TestLive_OtherPuts_KeepOmittedFields(t *testing.T) {
 		t.Fatalf("seed secret: %v", err)
 	}
 	bindPath := "/api/v1/projects/" + proj.String() + "/secrets"
-	if code, body := l.call(t, http.MethodPost, bindPath, admin, map[string]any{
+	if code, body := l.callFresh(t, http.MethodPost, bindPath, admin, map[string]any{
 		"secret_id": secID, "allowed_keys": []string{"DB_USER"}, "allowed_ops": []string{"read"}, "environment_id": env.String(),
 	}); code != http.StatusCreated {
 		t.Fatalf("bind = %d %s", code, body)
@@ -284,21 +284,21 @@ func TestLive_OtherPuts_KeepOmittedFields(t *testing.T) {
 			proj, secID).Scan(&keys, &ops)
 		return
 	}
-	if code, body := l.call(t, http.MethodPut, bindPath+"/"+secID.String(), admin,
+	if code, body := l.callFresh(t, http.MethodPut, bindPath+"/"+secID.String(), admin,
 		map[string]any{"allowed_ops": []string{"read", "patch"}}); code != http.StatusOK {
 		t.Fatalf("ops-only PUT = %d %s", code, body)
 	}
 	if keys, ops := readKeys(); keys == nil || *keys != "{DB_USER}" || ops != "{read,patch}" {
 		t.Errorf("ops-only PUT: allowed_keys=%v allowed_ops=%s, want {DB_USER} kept", keys, ops)
 	}
-	if code, body := l.call(t, http.MethodPut, bindPath+"/"+secID.String(), admin,
+	if code, body := l.callFresh(t, http.MethodPut, bindPath+"/"+secID.String(), admin,
 		map[string]any{"allowed_keys": []string{"DB_USER", "DB_PASSWORD"}}); code != http.StatusOK {
 		t.Fatalf("keys-only PUT = %d %s", code, body)
 	}
 	if keys, ops := readKeys(); keys == nil || *keys != "{DB_USER,DB_PASSWORD}" || ops != "{read,patch}" {
 		t.Errorf("keys-only PUT: allowed_keys=%v allowed_ops=%s", keys, ops)
 	}
-	if code, _ := l.call(t, http.MethodPut, bindPath+"/"+secID.String(), admin, map[string]any{"allowed_keys": nil}); code != http.StatusOK {
+	if code, _ := l.callFresh(t, http.MethodPut, bindPath+"/"+secID.String(), admin, map[string]any{"allowed_keys": nil}); code != http.StatusOK {
 		t.Errorf("explicit null allowed_keys PUT = %d", code)
 	}
 	if keys, _ := readKeys(); keys != nil {
@@ -307,7 +307,7 @@ func TestLive_OtherPuts_KeepOmittedFields(t *testing.T) {
 
 	// Provider connection: a body without discover_enabled / cluster_name
 	// / description keeps them.
-	code, body = l.call(t, http.MethodPost, "/api/v1/provider-connections", admin, map[string]any{
+	code, body = l.callFresh(t, http.MethodPost, "/api/v1/provider-connections", admin, map[string]any{
 		"name": "vault-a", "type": "vault", "auth_method": "token",
 		"scope":        map[string]string{"address": "https://vault.example.com", "mount": "secret"},
 		"cluster_name": "tenant-a-uat", "description": "tenant a vault",
@@ -318,7 +318,7 @@ func TestLive_OtherPuts_KeepOmittedFields(t *testing.T) {
 	}
 	var conn struct{ ID uuid.UUID }
 	mustJSON(t, body, &conn)
-	if code, body := l.call(t, http.MethodPut, "/api/v1/provider-connections/"+conn.ID.String(), admin, map[string]any{
+	if code, body := l.callFresh(t, http.MethodPut, "/api/v1/provider-connections/"+conn.ID.String(), admin, map[string]any{
 		"name": "vault-a", "auth_method": "token",
 		"scope":                     map[string]string{"address": "https://vault.example.com", "mount": "secret"},
 		"discover_interval_seconds": 600,
@@ -333,7 +333,7 @@ func TestLive_OtherPuts_KeepOmittedFields(t *testing.T) {
 	if !discover || cluster == nil || *cluster != "tenant-a-uat" || cdesc == nil || *cdesc != "tenant a vault" || interval != 600 {
 		t.Errorf("connection PUT: discover=%v cluster=%v description=%v interval=%d", discover, cluster, cdesc, interval)
 	}
-	if code, body := l.call(t, http.MethodPut, "/api/v1/provider-connections/"+conn.ID.String(), admin,
+	if code, body := l.callFresh(t, http.MethodPut, "/api/v1/provider-connections/"+conn.ID.String(), admin,
 		map[string]any{"discover_enabled": false, "description": ""}); code != http.StatusOK {
 		t.Fatalf("connection explicit PUT = %d %s", code, body)
 	}

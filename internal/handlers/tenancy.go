@@ -212,7 +212,9 @@ func (h *Tenancy) SetProjectTeam(c fiber.Ctx) error {
 	if current, err := h.projects.Get(c.Context(), id); err == nil {
 		before = current.TeamID
 	}
-	if err := structureCheck(c, h.resolver, h.teamScope, nil, before, teamID); err != nil {
+	if err := structureCheck(c, h.resolver, h.teamScope, h.audit, structureMove{
+		action: "project.team.update", resource: "project:" + id.String(), prevTeam: before, dest: teamID,
+	}); err != nil {
 		return err
 	}
 	moved, err := h.projects.MoveToTeam(c.Context(), id, teamID)

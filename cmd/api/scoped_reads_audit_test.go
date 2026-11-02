@@ -36,7 +36,8 @@ type liveApp struct {
 	app  *fiber.App
 	pool *storage.Pool
 	// logs holds everything the app logged, for canary checks.
-	logs *hygLogBuffer
+	logs  *hygLogBuffer
+	fresh map[string]string // user id -> session cookie, for callFresh
 }
 
 func newLiveApp(t *testing.T, opts ...func(*Config)) *liveApp {
@@ -152,6 +153,21 @@ func (l *liveApp) addGrant(t *testing.T, uid string, perms []string, scopeJSON s
 		t.Fatalf("seed user_role: %v", err)
 	}
 	return roleID
+}
+
+// callFresh is call with a session holding a fresh second factor, which
+// the routes behind requireMFA need; X-User-Id has no session to stamp.
+func (l *liveApp) callFresh(t *testing.T, method, path, user string, body any) (int, []byte) {
+	t.Helper()
+	cookie, ok := l.fresh[user]
+	if !ok {
+		cookie = l.sessionFor(t, uuid.MustParse(user), user+"@example.com")
+		if l.fresh == nil {
+			l.fresh = map[string]string{}
+		}
+		l.fresh[user] = cookie
+	}
+	return l.callAs(t, method, path, map[string]string{"Cookie": cookie}, body)
 }
 
 func (l *liveApp) call(t *testing.T, method, path, user string, body any) (int, []byte) {
@@ -420,7 +436,7 @@ func TestLive_MalformedGrantScope_RejectedAndFailsClosed(t *testing.T) {
 		{"environment": 7},
 	}
 	for _, scope := range bad {
-		code, body := l.call(t, http.MethodPost, "/api/v1/user-roles", admin,
+		code, body := l.callFresh(t, http.MethodPost, "/api/v1/user-roles", admin,
 			map[string]any{"user_id": target, "role_id": roleID, "scope": scope})
 		if code != http.StatusBadRequest {
 			t.Errorf("POST /user-roles scope=%v = %d %s, want 400", scope, code, body)
@@ -441,7 +457,7 @@ func TestLive_MalformedGrantScope_RejectedAndFailsClosed(t *testing.T) {
 		{"project_id": strings.ToUpper(uuid.NewString())},
 		{"team_id": team.String(), "environment": "uat", "secret_ref_prefix": "team-alpha/uat/", "provider_type": "vault"},
 	} {
-		code, body := l.call(t, http.MethodPost, "/api/v1/user-roles", admin,
+		code, body := l.callFresh(t, http.MethodPost, "/api/v1/user-roles", admin,
 			map[string]any{"user_id": target, "role_id": roleID, "scope": scope})
 		if code != http.StatusCreated {
 			t.Errorf("POST /user-roles valid scope=%v = %d %s, want 201", scope, code, body)
@@ -460,7 +476,7 @@ func TestLive_PrivilegeAndTenancyWrites_AuditedWithSessionActor(t *testing.T) {
 	}, `{}`)
 
 	// roles
-	code, body := l.call(t, http.MethodPost, "/api/v1/roles", admin,
+	code, body := l.callFresh(t, http.MethodPost, "/api/v1/roles", admin,
 		map[string]any{"name": "it-auditor", "permissions": []string{"audit.read"}})
 	if code != http.StatusCreated {
 		t.Fatalf("create role = %d %s", code, body)
@@ -468,7 +484,7 @@ func TestLive_PrivilegeAndTenancyWrites_AuditedWithSessionActor(t *testing.T) {
 	var role struct{ ID uuid.UUID }
 	mustJSON(t, body, &role)
 	l.requireOneAudit(t, "role.create", admin)
-	if code, body = l.call(t, http.MethodPut, "/api/v1/roles/"+role.ID.String()+"/permissions", admin,
+	if code, body = l.callFresh(t, http.MethodPut, "/api/v1/roles/"+role.ID.String()+"/permissions", admin,
 		map[string]any{"permissions": []string{"audit.read", "secret.list"}}); code != http.StatusNoContent {
 		t.Fatalf("update role = %d %s", code, body)
 	}
@@ -479,7 +495,7 @@ func TestLive_PrivilegeAndTenancyWrites_AuditedWithSessionActor(t *testing.T) {
 
 	// user-roles: body granted_by is ignored, the session actor is stored.
 	target := uuid.New().String()
-	code, body = l.call(t, http.MethodPost, "/api/v1/user-roles", admin, map[string]any{
+	code, body = l.callFresh(t, http.MethodPost, "/api/v1/user-roles", admin, map[string]any{
 		"user_id": target, "role_id": role.ID, "granted_by": "system:oidc",
 		"scope": map[string]any{"project_id": uuid.NewString()},
 	})
@@ -505,14 +521,14 @@ func TestLive_PrivilegeAndTenancyWrites_AuditedWithSessionActor(t *testing.T) {
 	if g.Metadata["user_id"] != target || g.Metadata["role_id"] != role.ID.String() {
 		t.Errorf("user_role.grant metadata = %v", g.Metadata)
 	}
-	if code, body = l.call(t, http.MethodDelete, "/api/v1/user-roles/"+grant.ID.String(), admin, nil); code != http.StatusNoContent {
+	if code, body = l.callFresh(t, http.MethodDelete, "/api/v1/user-roles/"+grant.ID.String(), admin, nil); code != http.StatusNoContent {
 		t.Fatalf("revoke = %d %s", code, body)
 	}
 	rv := l.requireOneAudit(t, "user_role.revoke", admin)
 	if rv.Metadata["user_id"] != target || rv.Metadata["role_id"] != role.ID.String() {
 		t.Errorf("user_role.revoke metadata = %v", rv.Metadata)
 	}
-	if code, body = l.call(t, http.MethodDelete, "/api/v1/roles/"+role.ID.String(), admin, nil); code != http.StatusNoContent {
+	if code, body = l.callFresh(t, http.MethodDelete, "/api/v1/roles/"+role.ID.String(), admin, nil); code != http.StatusNoContent {
 		t.Fatalf("delete role = %d %s", code, body)
 	}
 	l.requireOneAudit(t, "role.delete", admin)
@@ -523,7 +539,7 @@ func TestLive_PrivilegeAndTenancyWrites_AuditedWithSessionActor(t *testing.T) {
 		"wrap_ttl_created_seconds": 3600, "wrap_ttl_approved_seconds": 3600,
 		"wrap_ttl_claimed_seconds": 300, "request_ttl_seconds": 3600,
 	}
-	code, body = l.call(t, http.MethodPost, "/api/v1/workflows", admin, wfBody)
+	code, body = l.callFresh(t, http.MethodPost, "/api/v1/workflows", admin, wfBody)
 	if code != http.StatusCreated {
 		t.Fatalf("create workflow = %d %s", code, body)
 	}
@@ -532,7 +548,7 @@ func TestLive_PrivilegeAndTenancyWrites_AuditedWithSessionActor(t *testing.T) {
 	l.requireOneAudit(t, "workflow.create", admin)
 	wfBody["min_approvers"] = 0
 	wfBody["require_justification"] = true
-	if code, body = l.call(t, http.MethodPut, "/api/v1/workflows/"+wf.ID.String(), admin, wfBody); code != http.StatusNoContent {
+	if code, body = l.callFresh(t, http.MethodPut, "/api/v1/workflows/"+wf.ID.String(), admin, wfBody); code != http.StatusNoContent {
 		t.Fatalf("update workflow = %d %s", code, body)
 	}
 	wu := l.requireOneAudit(t, "workflow.update", admin)
@@ -540,20 +556,20 @@ func TestLive_PrivilegeAndTenancyWrites_AuditedWithSessionActor(t *testing.T) {
 	if !containsAll(changed, "min_approvers", "require_justification") {
 		t.Errorf("workflow.update changed_keys = %v, want min_approvers + require_justification", changed)
 	}
-	if code, body = l.call(t, http.MethodDelete, "/api/v1/workflows/"+wf.ID.String(), admin, nil); code != http.StatusNoContent {
+	if code, body = l.callFresh(t, http.MethodDelete, "/api/v1/workflows/"+wf.ID.String(), admin, nil); code != http.StatusNoContent {
 		t.Fatalf("delete workflow = %d %s", code, body)
 	}
 	l.requireOneAudit(t, "workflow.delete", admin)
 
 	// projects
-	code, body = l.call(t, http.MethodPost, "/api/v1/projects", admin, map[string]any{"name": "tenant-a"})
+	code, body = l.callFresh(t, http.MethodPost, "/api/v1/projects", admin, map[string]any{"name": "tenant-a"})
 	if code != http.StatusCreated {
 		t.Fatalf("create project = %d %s", code, body)
 	}
 	var proj struct{ ID uuid.UUID }
 	mustJSON(t, body, &proj)
 	l.requireOneAudit(t, "project.create", admin)
-	if code, body = l.call(t, http.MethodPut, "/api/v1/projects/"+proj.ID.String()+"/status", admin,
+	if code, body = l.callFresh(t, http.MethodPut, "/api/v1/projects/"+proj.ID.String()+"/status", admin,
 		map[string]any{"status": "archived"}); code != http.StatusNoContent {
 		t.Fatalf("project status = %d %s", code, body)
 	}
@@ -562,7 +578,7 @@ func TestLive_PrivilegeAndTenancyWrites_AuditedWithSessionActor(t *testing.T) {
 	if _, err := l.pool.Exec(ctx, `INSERT INTO teams (id, name) VALUES ($1, 'team-alpha')`, teamID); err != nil {
 		t.Fatalf("seed team: %v", err)
 	}
-	if code, body = l.call(t, http.MethodPut, "/api/v1/projects/"+proj.ID.String()+"/team", admin,
+	if code, body = l.callFresh(t, http.MethodPut, "/api/v1/projects/"+proj.ID.String()+"/team", admin,
 		map[string]any{"team_id": teamID}); code != http.StatusNoContent {
 		t.Fatalf("project team = %d %s", code, body)
 	}
@@ -573,7 +589,7 @@ func TestLive_PrivilegeAndTenancyWrites_AuditedWithSessionActor(t *testing.T) {
 
 	// environments: the kind travels on create + delete, so a
 	// delete-and-recreate kind change is visible in the audit chain.
-	code, body = l.call(t, http.MethodPost, "/api/v1/environments", admin,
+	code, body = l.callFresh(t, http.MethodPost, "/api/v1/environments", admin,
 		map[string]any{"project_id": proj.ID, "name": "uat", "type": "uat", "kind": "non_prod"})
 	if code != http.StatusCreated {
 		t.Fatalf("create env = %d %s", code, body)
@@ -584,7 +600,7 @@ func TestLive_PrivilegeAndTenancyWrites_AuditedWithSessionActor(t *testing.T) {
 	if ec.Metadata["kind"] != "non_prod" || ec.Metadata["project_id"] != proj.ID.String() {
 		t.Errorf("environment.create metadata = %v", ec.Metadata)
 	}
-	if code, body = l.call(t, http.MethodPut, "/api/v1/environments/"+env.ID.String(), admin,
+	if code, body = l.callFresh(t, http.MethodPut, "/api/v1/environments/"+env.ID.String(), admin,
 		map[string]any{"risk_level": 3}); code != http.StatusOK {
 		t.Fatalf("update env = %d %s", code, body)
 	}
@@ -599,7 +615,7 @@ func TestLive_PrivilegeAndTenancyWrites_AuditedWithSessionActor(t *testing.T) {
 		t.Fatalf("seed secret: %v", err)
 	}
 	bindPath := "/api/v1/projects/" + proj.ID.String() + "/secrets"
-	code, body = l.call(t, http.MethodPost, bindPath, admin, map[string]any{
+	code, body = l.callFresh(t, http.MethodPost, bindPath, admin, map[string]any{
 		"secret_id": sec.ID, "allowed_keys": []string{"DB_USER"}, "allowed_ops": []string{"read"},
 		"environment_id": env.ID.String(), "created_by": "system:oidc",
 	})
@@ -618,18 +634,18 @@ func TestLive_PrivilegeAndTenancyWrites_AuditedWithSessionActor(t *testing.T) {
 	if pb.Metadata["secret_id"] != sec.ID.String() || pb.Metadata["environment_id"] != env.ID.String() {
 		t.Errorf("project_secret.bind metadata = %v", pb.Metadata)
 	}
-	if code, body = l.call(t, http.MethodPut, bindPath+"/"+sec.ID.String(), admin, map[string]any{
+	if code, body = l.callFresh(t, http.MethodPut, bindPath+"/"+sec.ID.String(), admin, map[string]any{
 		"allowed_keys": []string{"DB_USER", "DB_PASSWORD"}, "allowed_ops": []string{"read"},
 	}); code != http.StatusOK {
 		t.Fatalf("update binding = %d %s", code, body)
 	}
 	l.requireOneAudit(t, "project_secret.update", admin)
-	if code, body = l.call(t, http.MethodDelete, bindPath+"/"+sec.ID.String(), admin, nil); code != http.StatusNoContent {
+	if code, body = l.callFresh(t, http.MethodDelete, bindPath+"/"+sec.ID.String(), admin, nil); code != http.StatusNoContent {
 		t.Fatalf("unbind = %d %s", code, body)
 	}
 	l.requireOneAudit(t, "project_secret.unbind", admin)
 
-	if code, body = l.call(t, http.MethodDelete, "/api/v1/environments/"+env.ID.String(), admin, nil); code != http.StatusNoContent {
+	if code, body = l.callFresh(t, http.MethodDelete, "/api/v1/environments/"+env.ID.String(), admin, nil); code != http.StatusNoContent {
 		t.Fatalf("delete env = %d %s", code, body)
 	}
 	ed := l.requireOneAudit(t, "environment.delete", admin)
@@ -638,7 +654,7 @@ func TestLive_PrivilegeAndTenancyWrites_AuditedWithSessionActor(t *testing.T) {
 	}
 	// Recreate it as prod WITHOUT sending kind: the audit must carry the
 	// kind storage derived from type, so the non_prod -> prod flip shows.
-	if code, body = l.call(t, http.MethodPost, "/api/v1/environments", admin,
+	if code, body = l.callFresh(t, http.MethodPost, "/api/v1/environments", admin,
 		map[string]any{"project_id": proj.ID, "name": "uat", "type": "prod"}); code != http.StatusCreated {
 		t.Fatalf("recreate env = %d %s", code, body)
 	}
@@ -658,7 +674,7 @@ func TestLive_PrivilegeAndTenancyWrites_AuditedWithSessionActor(t *testing.T) {
 
 	// A refused write (no permission) audits nothing.
 	nobody := uuid.New().String()
-	if code, _ := l.call(t, http.MethodPost, "/api/v1/roles", nobody, map[string]any{"name": "x"}); code != http.StatusForbidden {
+	if code, _ := l.callFresh(t, http.MethodPost, "/api/v1/roles", nobody, map[string]any{"name": "x"}); code != http.StatusForbidden {
 		t.Errorf("no-perm create role = %d, want 403", code)
 	}
 	if n := len(l.auditRows(t, "role.create")); n != 1 {

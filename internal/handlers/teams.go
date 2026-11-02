@@ -55,14 +55,14 @@ type Teams struct {
 	teamsConcrete *storage.Teams
 	audit         *storage.AuditEvents
 	logos         *services.LogoService
-	// resolver and teamScope feed the gateway.bind structure check
-	// (api#308, skills#103 phase 1). Nil skips the check.
+	// resolver and teamScope feed the structure check
+	// (api#308, api#192). Nil skips the check.
 	resolver  auth.Resolver
 	teamScope auth.TeamScopeResolver
 }
 
 // WithStructureCheck wires the check that refuses a re-parent widening a
-// team-scoped gateway.bind grant the caller holds (api#308).
+// team-scoped grant the caller holds (api#308, api#192).
 func (h *Teams) WithStructureCheck(r auth.Resolver, tr auth.TeamScopeResolver) *Teams {
 	h.resolver, h.teamScope = r, tr
 	return h
@@ -248,7 +248,9 @@ func (h *Teams) Update(c fiber.Ctx) error {
 		parent = body.ParentTeamID.Value
 	}
 	if body.ParentTeamID.Set && uuidPtrMeta(parent) != uuidPtrMeta(current.ParentTeamID) {
-		if err := structureCheck(c, h.resolver, h.teamScope, &id, nil, parent); err != nil {
+		if err := structureCheck(c, h.resolver, h.teamScope, h.auditRepo(), structureMove{
+			action: "team.update", resource: "team:" + id.String(), movedTeam: &id, dest: parent,
+		}); err != nil {
 			return err
 		}
 	}

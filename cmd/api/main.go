@@ -888,16 +888,30 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// seed role carries job.enqueue, so this is fail-closed by default.
 	v1.Post("/jobs", auth.Require(auth.PermJobEnqueue, rbacResolver), jobsH.Enqueue)
 
+	// Tier-2 step-up gate (RequireFreshMFA): a session must carry a fresh
+	// MFA stamp (within StepUpTTL) to run high-risk actions. It 401s with
+	// `WWW-Authenticate: step-up` when stale, 412 mfa_enrollment_required
+	// when the user has no factor at all, and fails closed when never
+	// stamped. Defined here so the admin writes below, the direct-reveal
+	// submit AND the request-lifecycle routes share one instance.
+	requireMFA := middleware.RequireFreshMFA(sessionSvc, mfaVerifySvc)
+
+	// Writes that change who can do what (api#192): each runs
+	// behind requireMFA and records the actor's own roles on its audit
+	// rows, after the permission check so a caller without it gets 403
+	// and no step-up prompt.
+	actorRoles := auth.RecordActorRoles(userRoleRepo)
+
 	// Dynamic workflow + policy engine.
-	v1.Post("/roles", auth.Require(auth.PermRoleEdit, rbacResolver), adminH.CreateRole)
+	v1.Post("/roles", auth.Require(auth.PermRoleEdit, rbacResolver), requireMFA, actorRoles, adminH.CreateRole)
 	v1.Get("/roles", adminH.ListRoles)
 	v1.Get("/roles/:id", adminH.GetRole)
-	v1.Put("/roles/:id/permissions", auth.Require(auth.PermRoleEdit, rbacResolver), adminH.UpdateRolePermissions)
-	v1.Delete("/roles/:id", auth.Require(auth.PermRoleEdit, rbacResolver), adminH.DeleteRole)
+	v1.Put("/roles/:id/permissions", auth.Require(auth.PermRoleEdit, rbacResolver), requireMFA, actorRoles, adminH.UpdateRolePermissions)
+	v1.Delete("/roles/:id", auth.Require(auth.PermRoleEdit, rbacResolver), requireMFA, actorRoles, adminH.DeleteRole)
 
-	v1.Post("/user-roles", auth.Require(auth.PermUserRoleEdit, rbacResolver), adminH.GrantUserRole)
+	v1.Post("/user-roles", auth.Require(auth.PermUserRoleEdit, rbacResolver), requireMFA, actorRoles, adminH.GrantUserRole)
 	v1.Get("/user-roles", adminH.ListAllUserRoles)
-	v1.Delete("/user-roles/:id", auth.Require(auth.PermUserRoleEdit, rbacResolver), adminH.RevokeUserRole)
+	v1.Delete("/user-roles/:id", auth.Require(auth.PermUserRoleEdit, rbacResolver), requireMFA, actorRoles, adminH.RevokeUserRole)
 	v1.Get("/users/:userID/roles", adminH.ListUserRoles)
 	// Admin user lookup (api#240): names and emails for the user ids in
 	// team members and role assignments, and a search for the grant and
@@ -909,10 +923,10 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// grants a role, so all three need a global user_role.edit.
 	approvalsH := handlers.NewUserApprovals(localUsersRepoInApp, auditRepo)
 	v1.Get("/users/pending", auth.Require(auth.PermUserRoleEdit, rbacResolver), approvalsH.ListPending)
-	v1.Post("/users/:id/approve", auth.Require(auth.PermUserRoleEdit, rbacResolver), approvalsH.Approve)
+	v1.Post("/users/:id/approve", auth.Require(auth.PermUserRoleEdit, rbacResolver), requireMFA, actorRoles, approvalsH.Approve)
 	v1.Post("/users/:id/decline", auth.Require(auth.PermUserRoleEdit, rbacResolver), approvalsH.Decline)
 
-	v1.Post("/workflows", auth.Require(auth.PermWorkflowEdit, rbacResolver), adminH.CreateWorkflow)
+	v1.Post("/workflows", auth.Require(auth.PermWorkflowEdit, rbacResolver), requireMFA, actorRoles, adminH.CreateWorkflow)
 	v1.Get("/workflows", adminH.ListWorkflows)
 	// R-follow-up #1 (api#118): static path MUST come BEFORE the
 	// dynamic /workflows/:id route below — otherwise "scoped-policy-
@@ -921,18 +935,19 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		auth.RequireAny(auth.PermPolicyAuthor, rbacResolver),
 		adminH.ListScopedAuthorableWorkflows)
 	v1.Get("/workflows/:id", adminH.GetWorkflow)
-	v1.Put("/workflows/:id", auth.Require(auth.PermWorkflowEdit, rbacResolver), adminH.UpdateWorkflow)
+	v1.Put("/workflows/:id", auth.Require(auth.PermWorkflowEdit, rbacResolver), requireMFA, actorRoles, adminH.UpdateWorkflow)
 	// ?delete_policy_rules=true deletes the rules routing to it as well,
 	// so it also needs policy.edit, like every other rule delete.
 	v1.Delete("/workflows/:id", auth.Require(auth.PermWorkflowEdit, rbacResolver),
 		auth.RequireWhen(handlers.DeletesPolicyRules, auth.Require(auth.PermPolicyEdit, rbacResolver)),
+		requireMFA, actorRoles,
 		adminH.DeleteWorkflow)
 
-	v1.Post("/policies", auth.Require(auth.PermPolicyEdit, rbacResolver), adminH.CreatePolicy)
+	v1.Post("/policies", auth.Require(auth.PermPolicyEdit, rbacResolver), requireMFA, actorRoles, adminH.CreatePolicy)
 	v1.Get("/policies", adminH.ListPolicies)
 	v1.Get("/policies/:id", adminH.GetPolicy)
-	v1.Put("/policies/:id", auth.Require(auth.PermPolicyEdit, rbacResolver), adminH.UpdatePolicy)
-	v1.Delete("/policies/:id", auth.Require(auth.PermPolicyEdit, rbacResolver), adminH.DeletePolicy)
+	v1.Put("/policies/:id", auth.Require(auth.PermPolicyEdit, rbacResolver), requireMFA, actorRoles, adminH.UpdatePolicy)
+	v1.Delete("/policies/:id", auth.Require(auth.PermPolicyEdit, rbacResolver), requireMFA, actorRoles, adminH.DeletePolicy)
 
 	// R-follow-up #2 (api#121) — platform_settings admin surface.
 	// All three routes gated by policy.edit per §2 lock; broader
@@ -945,7 +960,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 		auth.Require(auth.PermPolicyEdit, rbacResolver),
 		platformSettingsH.Get)
 	v1.Put("/platform-settings/:key",
-		auth.Require(auth.PermPolicyEdit, rbacResolver),
+		auth.Require(auth.PermPolicyEdit, rbacResolver), requireMFA,
 		platformSettingsH.Put)
 
 	// Canonical permission catalog. Read by the Roles admin UI to
@@ -976,7 +991,7 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Get("/projects", tenancyH.ListProjects)
 	v1.Get("/projects/:id", tenancyH.GetProject)
 	v1.Put("/projects/:id/status", auth.Require(auth.PermTeamEdit, rbacResolver), tenancyH.UpdateProjectStatus)
-	v1.Put("/projects/:id/team", auth.Require(auth.PermTeamEdit, rbacResolver), tenancyH.SetProjectTeam)
+	v1.Put("/projects/:id/team", auth.Require(auth.PermTeamEdit, rbacResolver), requireMFA, actorRoles, tenancyH.SetProjectTeam)
 	// Logos: GET follows the project read scope (404 outside it); writes
 	// need team.edit like the other project writes.
 	v1.Get("/projects/:id/logo", tenancyH.GetProjectLogo)
@@ -1005,14 +1020,6 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	v1.Get("/projects/:id/environments/:env_id/secrets", devSecretsH.ListEnvSecrets)
 	v1.Post("/projects/:id/environments/:env_id/request",
 		auth.Require(auth.PermSecretRequest, rbacResolver), devSecretsH.SubmitEnvRequest)
-
-	// Tier-2 step-up gate (RequireFreshMFA): a session must carry a fresh
-	// MFA stamp (within StepUpTTL) to run high-risk actions. It 401s with
-	// `WWW-Authenticate: step-up` when stale, 412 mfa_enrollment_required
-	// when the user has no factor at all, and fails closed when never
-	// stamped. Defined here so the direct-reveal submit below AND the
-	// request-lifecycle routes further down share one instance.
-	requireMFA := middleware.RequireFreshMFA(sessionSvc, mfaVerifySvc)
 
 	// Agent key rotation, admin side (skills#116): a one-time rotation
 	// token, behind agent.mint AND a fresh second factor.
@@ -1093,10 +1100,10 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// parent_team_id. Membership is structural-only; role grants on a
 	// team_id scope expand to the subtree via auth.EffectiveTeamAccess
 	// (lands in a follow-up PR).
-	v1.Post("/teams", auth.Require(auth.PermTeamEdit, rbacResolver), teamsH.Create)
+	v1.Post("/teams", auth.Require(auth.PermTeamEdit, rbacResolver), requireMFA, actorRoles, teamsH.Create)
 	v1.Get("/teams", teamsH.List)
 	v1.Get("/teams/:id", teamsH.Get)
-	v1.Put("/teams/:id", auth.Require(auth.PermTeamEdit, rbacResolver), teamsH.Update)
+	v1.Put("/teams/:id", auth.Require(auth.PermTeamEdit, rbacResolver), requireMFA, actorRoles, teamsH.Update)
 	v1.Put("/teams/:id/status", auth.Require(auth.PermTeamEdit, rbacResolver), teamsH.UpdateStatus)
 	v1.Delete("/teams/:id", auth.Require(auth.PermTeamEdit, rbacResolver), teamsH.Delete)
 	v1.Get("/teams/:id/logo", teamsH.GetTeamLogo)
@@ -1313,11 +1320,15 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	pprH := handlers.NewProjectPolicyRules(policyEng, policyRepo, settingsSvc).
 		WithHistory(policyHistorySvc, auditRepo).
 		WithReadScope(rbacResolver, teamScopeResolver) // API-N-04
-	v1.Post("/projects/:projectID/policy-rules", pprH.Create)
+	// Policy-rule writes check their scope inside the service, which
+	// audits the denial, so the step-up only stops a caller who could
+	// pass that check.
+	policyRuleStepUp := auth.RequireWhen(auth.Holds(auth.PermPolicyAuthor, rbacResolver), requireMFA)
+	v1.Post("/projects/:projectID/policy-rules", policyRuleStepUp, actorRoles, pprH.Create)
 	v1.Get("/projects/:projectID/policy-rules", pprH.List)
 	v1.Get("/projects/:projectID/policy-rules/:ruleID", pprH.Get)
-	v1.Put("/projects/:projectID/policy-rules/:ruleID", pprH.Update)
-	v1.Delete("/projects/:projectID/policy-rules/:ruleID", pprH.Delete)
+	v1.Put("/projects/:projectID/policy-rules/:ruleID", policyRuleStepUp, actorRoles, pprH.Update)
+	v1.Delete("/projects/:projectID/policy-rules/:ruleID", policyRuleStepUp, actorRoles, pprH.Delete)
 	// R-follow-up #5 slice 1c — project-anchored history view.
 	v1.Get("/projects/:projectID/policy-rules/:ruleID/history", pprH.History)
 
@@ -1330,11 +1341,11 @@ func newApp(cfg Config, logger *slog.Logger, pool *storage.Pool, rdb *runtime.Cl
 	// counter signal as the rest of the gate chain.
 	tprH := handlers.NewTeamPolicyRules(policyEng, policyRepo, settingsSvc).
 		WithHistory(policyHistorySvc, auditRepo)
-	v1.Post("/teams/:teamID/policy-rules", tprH.Create)
+	v1.Post("/teams/:teamID/policy-rules", policyRuleStepUp, actorRoles, tprH.Create)
 	v1.Get("/teams/:teamID/policy-rules", tprH.List)
 	v1.Get("/teams/:teamID/policy-rules/:ruleID", tprH.Get)
-	v1.Put("/teams/:teamID/policy-rules/:ruleID", tprH.Update)
-	v1.Delete("/teams/:teamID/policy-rules/:ruleID", tprH.Delete)
+	v1.Put("/teams/:teamID/policy-rules/:ruleID", policyRuleStepUp, actorRoles, tprH.Update)
+	v1.Delete("/teams/:teamID/policy-rules/:ruleID", policyRuleStepUp, actorRoles, tprH.Delete)
 	// R-follow-up #5 slice 1c — team-anchored history view.
 	v1.Get("/teams/:teamID/policy-rules/:ruleID/history", tprH.History)
 

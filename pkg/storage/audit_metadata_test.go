@@ -3,6 +3,7 @@ package storage_test
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -336,5 +337,43 @@ func TestSanitizeAuditMetadata_KeepsCapEnvironmentAndNameKeys(t *testing.T) {
 	}
 	if got := storage.SanitizeAuditMetadata("test.environment", map[string]any{"environment": "الإنتاج"}); got["environment"] != "الإنتاج" {
 		t.Errorf("non-ASCII environment name not kept: %v", got)
+	}
+}
+
+// actor_roles is a list of objects: each one is checked against the same
+// table, so a free-text scope value can't ride in on it.
+func TestSanitizeAuditMetadata_ActorRoles(t *testing.T) {
+	id := uuid.New().String()
+	secret := canary(t)
+	out := storage.SanitizeAuditMetadata("test.actor_roles", map[string]any{
+		"actor_roles": []map[string]any{{
+			"role_id": id, "user_role_id": id, "team_id": id,
+			"scope_keys": []string{"team_id"}, "secret_ref_prefix": secret,
+		}},
+	})
+	if strings.Contains(fmt.Sprint(out), secret) {
+		t.Fatalf("a key off the list survived: %v", out)
+	}
+	list, ok := out["actor_roles"].([]any)
+	if !ok || len(list) != 1 {
+		t.Fatalf("actor_roles = %v", out["actor_roles"])
+	}
+	if got := list[0].(map[string]any)["role_id"]; got != id {
+		t.Fatalf("role_id = %v", got)
+	}
+	if fmt.Sprint(out["_dropped_keys"]) != "[actor_roles.secret_ref_prefix]" {
+		t.Fatalf("_dropped_keys = %v", out["_dropped_keys"])
+	}
+
+	bad := storage.SanitizeAuditMetadata("test.actor_roles", map[string]any{"actor_roles": []any{secret}})
+	if strings.Contains(fmt.Sprint(bad), secret) {
+		t.Fatalf("a list element that isn't an object survived: %v", bad)
+	}
+	if fmt.Sprint(bad["_rejected_keys"]) != "[actor_roles]" {
+		t.Fatalf("_rejected_keys = %v", bad["_rejected_keys"])
+	}
+	bad = storage.SanitizeAuditMetadata("test.actor_roles", map[string]any{"actor_roles": secret})
+	if _, kept := bad["actor_roles"]; kept {
+		t.Fatalf("a value that isn't a list survived: %v", bad)
 	}
 }
