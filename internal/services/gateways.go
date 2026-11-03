@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -96,6 +97,7 @@ type GatewayStore interface {
 	EnvironmentProject(ctx context.Context, envID uuid.UUID) (uuid.UUID, error)
 	SecretBoundToProject(ctx context.Context, secretID, projectID uuid.UUID) (bool, error)
 	ProviderConnectionExists(ctx context.Context, id uuid.UUID) (bool, error)
+	ProviderConnectionBound(ctx context.Context, id, projectID, environmentID uuid.UUID) (bool, error)
 	// Discovery catalog and bind rules (api#308).
 	ListCatalog(ctx context.Context, f storage.CatalogFilter) ([]storage.CatalogItem, error)
 	GetDiscoveredTarget(ctx context.Context, connectorID uuid.UUID, targetID string) (*storage.DiscoveredTarget, error)
@@ -1001,7 +1003,7 @@ func (s *GatewayService) CreateBinding(ctx context.Context, in CreateBindingInpu
 		return nil, bindingInvalid("environment_not_in_project")
 	}
 	// Rule 4: production is platform-only.
-	if !caller.Global && (env.Type == "prod" || env.Type == "other" || env.Kind == "prod") {
+	if !caller.Global && !teamBindableEnvironment(env.Type, env.Kind) {
 		return nil, bindingInvalid("production_binding_platform_only")
 	}
 	// Rule 5: the team relation, for platform admins too.
@@ -1052,7 +1054,14 @@ func (s *GatewayService) CreateBinding(ctx context.Context, in CreateBindingInpu
 			return nil, bindingInvalid("secret_not_in_project")
 		}
 	} else {
-		ok, err := s.store.ProviderConnectionExists(ctx, *in.ProviderConnectionID)
+		// A team-scoped caller may name only a connection bound to the
+		// environment, so the answer never says which ids exist.
+		var ok bool
+		if caller.Global {
+			ok, err = s.store.ProviderConnectionExists(ctx, *in.ProviderConnectionID)
+		} else {
+			ok, err = s.store.ProviderConnectionBound(ctx, *in.ProviderConnectionID, projectID, in.EnvironmentID)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1104,6 +1113,14 @@ func (s *GatewayService) CreateBinding(ctx context.Context, in CreateBindingInpu
 		Status: storage.AuditStatusSuccess, Metadata: meta,
 	})
 	return b, nil
+}
+
+// teamBindableEnvironment is bind rule 4 as an allowlist (D1, S-9): a
+// team-scoped caller binds only into type dev, staging or uat with kind
+// non_prod, so a new type or kind stays platform-only until it is
+// listed here.
+func teamBindableEnvironment(envType, kind string) bool {
+	return kind == "non_prod" && slices.Contains([]string{"dev", "staging", "uat"}, envType)
 }
 
 // teamMayUnbind reports whether a team-scoped caller can see a binding:

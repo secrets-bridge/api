@@ -1407,6 +1407,20 @@ func (r *Gateways) SecretBoundToProject(ctx context.Context, secretID, projectID
 	return ok, nil
 }
 
+// ProviderConnectionBound reports whether a provider connection is bound
+// to a project, for this environment or project-wide.
+func (r *Gateways) ProviderConnectionBound(ctx context.Context, id, projectID, environmentID uuid.UUID) (bool, error) {
+	var ok bool
+	err := r.pool.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM project_provider_connections
+		WHERE provider_connection_id = $1 AND project_id = $2
+		  AND (environment_id IS NULL OR environment_id = $3))`, id, projectID, environmentID).Scan(&ok)
+	if err != nil {
+		return false, fmt.Errorf("storage: provider connection bound: %w", err)
+	}
+	return ok, nil
+}
+
 // ProviderConnectionExists reports whether a provider connection exists.
 func (r *Gateways) ProviderConnectionExists(ctx context.Context, id uuid.UUID) (bool, error) {
 	var ok bool

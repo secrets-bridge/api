@@ -172,10 +172,7 @@ func (s *GatewayService) ListCatalog(ctx context.Context, caller BindCaller, par
 			return nil, ErrCatalogInvalidQuery
 		}
 	}
-	f := storage.CatalogFilter{Limit: catalogDefaultLimit, Now: s.now().UTC()}
-	if !caller.readsAll() {
-		f.Teams = caller.Teams
-	}
+	f := storage.CatalogFilter{All: caller.readsAll(), Teams: caller.Teams, Limit: catalogDefaultLimit, Now: s.now().UTC()}
 	var ok bool
 	if f.GatewayID, ok = parseOptUUID(params["gateway_id"]); !ok {
 		return nil, ErrCatalogInvalidQuery

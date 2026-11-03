@@ -537,13 +537,13 @@ func TestTeamLineageChanged_EmittedInsideTransaction(t *testing.T) {
 	}
 
 	// Move child under parent.
-	if err := teams.UpdateWithLineageAudit(ctx, child.ID, "child", "", &parent.ID,
+	if _, err := teams.UpdateWithLineageAudit(ctx, child.ID, "child", "", &parent.ID,
 		"alice", audit,
 	); err != nil {
 		t.Fatalf("first move: %v", err)
 	}
 	// Move child to other parent.
-	if err := teams.UpdateWithLineageAudit(ctx, child.ID, "child", "", &other.ID,
+	if _, err := teams.UpdateWithLineageAudit(ctx, child.ID, "child", "", &other.ID,
 		"alice", audit,
 	); err != nil {
 		t.Fatalf("second move: %v", err)
@@ -612,7 +612,7 @@ func TestTeamLineageChanged_NoEventWhenParentUnchanged(t *testing.T) {
 	}
 
 	// Name change ONLY — parent stays the same.
-	if err := teams.UpdateWithLineageAudit(ctx, child.ID, "child-renamed", "", &parent.ID,
+	if _, err := teams.UpdateWithLineageAudit(ctx, child.ID, "child-renamed", "", &parent.ID,
 		"alice", audit,
 	); err != nil {
 		t.Fatal(err)

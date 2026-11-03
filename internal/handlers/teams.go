@@ -257,12 +257,14 @@ func (h *Teams) Update(c fiber.Ctx) error {
 	// policy.team_lineage_changed event in the same transaction as
 	// the team UPDATE.
 	if h.teamsConcrete != nil && h.audit != nil {
-		if err := h.teamsConcrete.UpdateWithLineageAudit(c.Context(), id,
+		moved, err := h.teamsConcrete.UpdateWithLineageAudit(c.Context(), id,
 			body.Name, description, parent,
 			auth.AuditActor(c.Context()), h.audit,
-		); err != nil {
+		)
+		if err != nil {
 			return mapTeamErr(err)
 		}
+		services.AuditMovedBindings(c.Context(), h.audit, moved)
 	} else {
 		if err := h.teams.Update(c.Context(), id, body.Name, description, parent); err != nil {
 			return mapTeamErr(err)
@@ -332,13 +334,17 @@ func (h *Teams) Delete(c fiber.Ctx) error {
 	if current, err := h.teams.Get(c.Context(), id); err == nil {
 		parent = current.ParentTeamID
 	}
-	if err := h.teams.Delete(c.Context(), id); err != nil {
+	moved, err := h.teams.DeleteTeam(c.Context(), id)
+	if err != nil {
 		return mapTeamErr(err)
 	}
 	auditWrite(c, h.auditRepo(), "team.delete", "team:"+id.String(), map[string]any{
-		"team_id":        id.String(),
-		"parent_team_id": uuidPtrMeta(parent),
+		"team_id":            id.String(),
+		"parent_team_id":     uuidPtrMeta(parent),
+		"bindings_suspended": moved.BindingsSuspended,
+		"tasks_cancelled":    len(moved.Cancelled),
 	})
+	services.AuditMovedBindings(c.Context(), h.auditRepo(), moved)
 	return c.SendStatus(fiber.StatusNoContent)
 }
 

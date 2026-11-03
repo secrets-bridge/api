@@ -55,6 +55,9 @@ type ProjectRepository interface {
 	// project from any team. The team_id FK in the schema enforces
 	// the referenced team exists.
 	SetTeam(ctx context.Context, id uuid.UUID, teamID *uuid.UUID) error
+	// MoveToTeam is SetTeam that also reports the discovered Gateway
+	// bindings the move suspended.
+	MoveToTeam(ctx context.Context, id uuid.UUID, teamID *uuid.UUID) (*GatewayMoveOutcome, error)
 	// IDsForTeams returns every project whose team_id appears in the
 	// given set. Empty input → empty output. Drives the
 	// auth.TeamScopeResolver expansion path.
@@ -156,17 +159,37 @@ func (r *Projects) UpdateStatus(ctx context.Context, id uuid.UUID, status Projec
 // SetTeam reassigns project.team_id. nil un-scopes the project from
 // any team. The FK in the schema enforces existence of the target.
 func (r *Projects) SetTeam(ctx context.Context, id uuid.UUID, teamID *uuid.UUID) error {
-	tag, err := r.pool.Exec(ctx,
+	_, err := r.MoveToTeam(ctx, id, teamID)
+	return err
+}
+
+// MoveToTeam reassigns project.team_id and, in the same transaction,
+// suspends the discovered Gateway bindings the move leaves without a
+// covering team (ADR 0002 C4).
+func (r *Projects) MoveToTeam(ctx context.Context, id uuid.UUID, teamID *uuid.UUID) (*GatewayMoveOutcome, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("storage: begin project move: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tag, err := tx.Exec(ctx,
 		`UPDATE projects SET team_id = $1 WHERE id = $2`,
 		teamID, id,
 	)
 	if err != nil {
-		return fmt.Errorf("storage: set project team_id: %w", err)
+		return nil, fmt.Errorf("storage: set project team_id: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return ErrNotFound
+		return nil, ErrNotFound
 	}
-	return nil
+	out, err := suspendMovedBindings(ctx, tx, `p.id = $1`, []any{id}, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("storage: commit project move: %w", err)
+	}
+	return out, nil
 }
 
 // IDsForTeams returns every project whose team_id appears in the given
