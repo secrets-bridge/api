@@ -247,6 +247,53 @@ func RequireWhen(when func(fiber.Ctx) bool, guard fiber.Handler) fiber.Handler {
 	}
 }
 
+// Holds reports whether the caller holds perm at any scope, for
+// RequireWhen. A failed lookup counts as held, so the guard still runs.
+func Holds(perm Permission, r Resolver) func(fiber.Ctx) bool {
+	if r == nil {
+		panic("auth: Holds called with nil Resolver")
+	}
+	return func(c fiber.Ctx) bool {
+		userID, ok := IdentityFromContext(c.Context())
+		if !ok {
+			return true
+		}
+		grants, err := r.Resolve(c.Context(), userID)
+		if err != nil {
+			return true
+		}
+		for _, g := range grants {
+			if g.Permission == string(perm) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// RecordActorRoles puts the caller's role assignments on the request
+// context, so every audit row the write goes on to emit records what
+// the actor held at the time (api#192). A failed lookup
+// refuses the write: these rows are the record of who gave what to
+// whom.
+func RecordActorRoles(repo storage.UserRoleRepository) fiber.Handler {
+	if repo == nil {
+		panic("auth: RecordActorRoles called with nil repository")
+	}
+	return func(c fiber.Ctx) error {
+		userID, ok := IdentityFromContext(c.Context())
+		if !ok {
+			return fiber.NewError(fiber.StatusUnauthorized, "authentication required")
+		}
+		roles, err := repo.ListByUser(c.Context(), userID)
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+		}
+		c.SetContext(storage.WithAuditActorRoles(c.Context(), roles))
+		return c.Next()
+	}
+}
+
 // RequireScoped returns a middleware that gates the next handler on
 // the caller holding `perm` AT A SCOPE COVERING THE REQUEST.
 //

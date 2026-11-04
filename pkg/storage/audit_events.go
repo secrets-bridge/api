@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -101,6 +102,47 @@ type AuditEvents struct {
 // NewAuditEvents binds an AuditEvents repository to the given pool.
 func NewAuditEvents(pool *Pool) *AuditEvents { return &AuditEvents{pool: pool} }
 
+type auditActorRolesKey struct{}
+
+// WithAuditActorRoles makes every audit row written under ctx record
+// the actor's role assignments as actor_roles: role and assignment ids,
+// the scope's key names and its project or team id, never a scope value
+// a person typed. The privileged admin writes set it (api#192), so a
+// reviewer can see from which grant a change was made.
+func WithAuditActorRoles(ctx context.Context, roles []*UserRole) context.Context {
+	out := make([]map[string]any, 0, len(roles))
+	for _, ur := range roles {
+		out = append(out, actorRoleMeta(ur))
+	}
+	return context.WithValue(ctx, auditActorRolesKey{}, out)
+}
+
+// actorRoleMeta is one role assignment as audit metadata.
+func actorRoleMeta(ur *UserRole) map[string]any {
+	keys := make([]string, 0, len(ur.Scope))
+	for k := range ur.Scope {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	meta := map[string]any{
+		"user_role_id": ur.ID.String(),
+		"role_id":      ur.RoleID.String(),
+		"scope_keys":   keys,
+	}
+	for _, k := range []string{"project_id", "team_id"} {
+		if v, ok := ur.Scope[k].(string); ok {
+			meta[k] = v
+		}
+	}
+	return meta
+}
+
+func addAuditActorRoles(ctx context.Context, evt *AuditEvent) {
+	if roles, ok := ctx.Value(auditActorRolesKey{}).([]map[string]any); ok {
+		evt.Metadata["actor_roles"] = roles
+	}
+}
+
 // AppendTx is the transactional sibling of Append. Inserts the event
 // using the caller's pgx.Tx so audit emission can ride the same
 // transaction as a domain mutation (used by teams.UpdateWithLineageAudit
@@ -122,6 +164,7 @@ func (r *AuditEvents) AppendTx(ctx context.Context, tx pgx.Tx, evt *AuditEvent) 
 	if evt.Metadata == nil {
 		evt.Metadata = map[string]any{}
 	}
+	addAuditActorRoles(ctx, evt)
 	// Only allowlisted metadata reaches the append-only table (api#263).
 	evt.Metadata = SanitizeAuditMetadata(evt.Action, evt.Metadata)
 	metadataJSON, err := json.Marshal(evt.Metadata)
@@ -152,6 +195,7 @@ func (r *AuditEvents) Append(ctx context.Context, evt *AuditEvent) error {
 	if evt.Metadata == nil {
 		evt.Metadata = map[string]any{}
 	}
+	addAuditActorRoles(ctx, evt)
 	// Only allowlisted metadata reaches the append-only table (api#263).
 	evt.Metadata = SanitizeAuditMetadata(evt.Action, evt.Metadata)
 

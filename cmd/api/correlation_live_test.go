@@ -229,7 +229,7 @@ func TestLive_TeamWrites_AuditedOncePerWrite(t *testing.T) {
 	l := newLiveApp(t)
 	admin := l.grantUser(t, []string{"team.edit"}, `{}`)
 
-	code, body := l.call(t, http.MethodPost, "/api/v1/teams", admin, map[string]any{"name": "team-alpha"})
+	code, body := l.callFresh(t, http.MethodPost, "/api/v1/teams", admin, map[string]any{"name": "team-alpha"})
 	if code != http.StatusCreated {
 		t.Fatalf("create team = %d %s", code, body)
 	}
@@ -241,16 +241,14 @@ func TestLive_TeamWrites_AuditedOncePerWrite(t *testing.T) {
 	}
 
 	// team_members references local_users for both the member and the
-	// acting admin (created_by).
+	// acting admin (created_by, seeded by callFresh).
 	member := uuid.New()
-	for _, u := range []string{member.String(), admin} {
-		if _, err := l.pool.Exec(t.Context(),
-			`INSERT INTO local_users (id, email, password_hash, display_name) VALUES ($1, $2, '\x00', 'x')`,
-			u, u+"@example.com"); err != nil {
-			t.Fatalf("seed user: %v", err)
-		}
+	if _, err := l.pool.Exec(t.Context(),
+		`INSERT INTO local_users (id, email, password_hash, display_name) VALUES ($1, $2, '\x00', 'x')`,
+		member, member.String()+"@example.com"); err != nil {
+		t.Fatalf("seed user: %v", err)
 	}
-	if code, body := l.call(t, http.MethodPost, "/api/v1/teams/"+team.ID.String()+"/members", admin,
+	if code, body := l.callFresh(t, http.MethodPost, "/api/v1/teams/"+team.ID.String()+"/members", admin,
 		map[string]any{"user_id": member}); code != http.StatusCreated {
 		t.Fatalf("add member = %d %s", code, body)
 	}
@@ -258,7 +256,7 @@ func TestLive_TeamWrites_AuditedOncePerWrite(t *testing.T) {
 	if ma.Metadata["user_id"] != member.String() || ma.Metadata["team_id"] != team.ID.String() {
 		t.Errorf("team.member.add metadata = %v", ma.Metadata)
 	}
-	if code, body := l.call(t, http.MethodDelete, "/api/v1/teams/"+team.ID.String()+"/members/"+member.String(), admin, nil); code != http.StatusNoContent {
+	if code, body := l.callFresh(t, http.MethodDelete, "/api/v1/teams/"+team.ID.String()+"/members/"+member.String(), admin, nil); code != http.StatusNoContent {
 		t.Fatalf("remove member = %d %s", code, body)
 	}
 	mr := l.requireOneAudit(t, "team.member.remove", admin)
@@ -266,7 +264,7 @@ func TestLive_TeamWrites_AuditedOncePerWrite(t *testing.T) {
 		t.Errorf("team.member.remove metadata = %v", mr.Metadata)
 	}
 
-	if code, body := l.call(t, http.MethodPut, "/api/v1/teams/"+team.ID.String(), admin,
+	if code, body := l.callFresh(t, http.MethodPut, "/api/v1/teams/"+team.ID.String(), admin,
 		map[string]any{"name": "team-alpha-renamed"}); code != http.StatusOK {
 		t.Fatalf("update team = %d %s", code, body)
 	}
@@ -274,17 +272,17 @@ func TestLive_TeamWrites_AuditedOncePerWrite(t *testing.T) {
 	if keys, _ := tu.Metadata["changed_keys"].([]any); len(keys) != 1 || keys[0] != "name" {
 		t.Errorf("team.update changed_keys = %v, want [name]", tu.Metadata["changed_keys"])
 	}
-	if code, _ := l.call(t, http.MethodPut, "/api/v1/teams/"+team.ID.String()+"/status", admin, map[string]any{"status": "archived"}); code != http.StatusNoContent {
+	if code, _ := l.callFresh(t, http.MethodPut, "/api/v1/teams/"+team.ID.String()+"/status", admin, map[string]any{"status": "archived"}); code != http.StatusNoContent {
 		t.Fatalf("archive team = %d", code)
 	}
 	l.requireOneAudit(t, "team.status.update", admin)
-	if code, _ := l.call(t, http.MethodDelete, "/api/v1/teams/"+team.ID.String(), admin, nil); code != http.StatusNoContent {
+	if code, _ := l.callFresh(t, http.MethodDelete, "/api/v1/teams/"+team.ID.String(), admin, nil); code != http.StatusNoContent {
 		t.Fatalf("delete team = %d", code)
 	}
 	l.requireOneAudit(t, "team.delete", admin)
 
 	// A refused write (no team.edit) writes nothing.
-	if code, _ := l.call(t, http.MethodPost, "/api/v1/teams", uuid.New().String(), map[string]any{"name": "x"}); code != http.StatusForbidden {
+	if code, _ := l.callFresh(t, http.MethodPost, "/api/v1/teams", uuid.New().String(), map[string]any{"name": "x"}); code != http.StatusForbidden {
 		t.Errorf("no-perm create = %d, want 403", code)
 	}
 	if n := len(l.auditRows(t, "team.create")); n != 1 {

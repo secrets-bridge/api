@@ -72,14 +72,14 @@ func TestLive_PendingApproval(t *testing.T) {
 	}
 
 	t.Run("a team-scoped user_role.edit can't approve", func(t *testing.T) {
-		if code, body := l.call(t, http.MethodPost, approve, teamScoped, map[string]any{"role_id": role}); code != http.StatusForbidden {
+		if code, body := l.callFresh(t, http.MethodPost, approve, teamScoped, map[string]any{"role_id": role}); code != http.StatusForbidden {
 			t.Fatalf("approve as team-scoped = %d %s; want 403", code, body)
 		}
 		stillWaiting(t)
 	})
 
 	t.Run("a malformed scope is refused and the account keeps waiting", func(t *testing.T) {
-		code, body := l.call(t, http.MethodPost, approve, admin, map[string]any{
+		code, body := l.callFresh(t, http.MethodPost, approve, admin, map[string]any{
 			"role_id": role, "scope": map[string]any{"project_id": "not-a-uuid"},
 		})
 		if code != http.StatusBadRequest {
@@ -89,7 +89,7 @@ func TestLive_PendingApproval(t *testing.T) {
 	})
 
 	t.Run("approve grants the role and lets the account act", func(t *testing.T) {
-		if code, body := l.call(t, http.MethodPost, approve, admin, map[string]any{"role_id": role}); code != http.StatusOK {
+		if code, body := l.callFresh(t, http.MethodPost, approve, admin, map[string]any{"role_id": role}); code != http.StatusOK {
 			t.Fatalf("approve = %d %s", code, body)
 		}
 		if code, body := l.callAs(t, http.MethodGet, "/api/v1/users/me/projects", as, nil); code != http.StatusOK {

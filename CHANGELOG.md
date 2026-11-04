@@ -12,6 +12,28 @@ on `main`.
 ## [Unreleased]
 
 ### Changed
+- Writes that change who can do what need a fresh second factor
+  (api#192): `POST /roles`, `PUT /roles/:id/permissions`, `DELETE
+  /roles/:id`, `POST /user-roles`, `DELETE /user-roles/:id`, `POST
+  /users/:id/approve`, `POST`, `PUT` and `DELETE` on `/workflows`,
+  `/policies` and both `policy-rules` families, `PUT
+  /platform-settings/:key`, `PUT /projects/:id/team`, `POST /teams` and
+  `PUT /teams/:id`. A stale session gets `401 step_up_required`, an
+  account with no factor `412 mfa_enrollment_required`, and a bearer
+  token, which has no session to stamp, `401`, so a script that makes
+  these writes has to sign in and step up. A caller without the
+  permission still gets the same `403`. Adding a team member stays open:
+  membership grants nothing.
+- The structure check now covers every team-scoped grant, not only
+  `gateway.bind`: `PUT /projects/:id/team` or a `parent_team_id` change on
+  `PUT /teams/:id` is refused with `403 self_scope_expansion_not_allowed`
+  when it would bring a project or team under a team where the caller
+  holds a scoped grant for a permission they don't hold globally. The
+  refusal is audited as denied. Creating a team under such a grant is
+  allowed: a new team is empty, so nothing moves.
+- The audit rows of those writes carry `actor_roles`: the actor's
+  assignments (role and assignment ids, scope key names, and the project
+  or team id), never a free-text scope value.
 - Agent enrollment v2 (skills#116, #327). The Agent's X25519 key is
   generated on the customer side and bound at enrollment after a proof
   of possession. Enrollment takes two calls, both with `schema_version:

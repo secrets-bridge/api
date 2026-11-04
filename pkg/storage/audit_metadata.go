@@ -52,6 +52,7 @@ const (
 	metaNameList                              // list of metaName
 	metaNameListOrScalar                      // list of metaName, or number/bool/token
 	metaObject                                // nested map, its keys checked against this table
+	metaObjectList                            // list of nested maps, their keys checked against this table
 	metaURL                                   // absolute URL: user info, query and fragment are stripped
 	metaErrorText                             // free-text error: never stored, logged sanitized instead
 )
@@ -60,6 +61,8 @@ const (
 // and the shape of its value. A new key goes here in the same change
 // that starts writing it.
 var auditMetaKeys = map[string]auditMetaKind{
+	// lists of objects
+	"actor_roles": metaObjectList,
 	// ids
 	"aaguid": metaID, "agent_id": metaID, "attempted_environment_id": metaID, "attempted_project_id": metaID,
 	"attempted_team_id": metaID, "attempted_workflow_id": metaID, "binding_id": metaID, "connection_id": metaID,
@@ -350,6 +353,24 @@ func (s *auditSanitizer) sanitizeMap(in, out map[string]any, prefix string, dept
 			nested := map[string]any{}
 			s.sanitizeMap(obj, nested, path+".", depth+1)
 			out[k] = nested
+		case metaObjectList:
+			list, ok := v.([]any)
+			if !ok || len(list) > auditMetaMaxList || depth >= auditMetaMaxDepth {
+				s.reject(path, AuditDropBadValue)
+				continue
+			}
+			kept := make([]any, 0, len(list))
+			for _, e := range list {
+				obj, ok := e.(map[string]any)
+				if !ok {
+					s.reject(path, AuditDropBadValue)
+					continue
+				}
+				nested := map[string]any{}
+				s.sanitizeMap(obj, nested, path+".", depth+1)
+				kept = append(kept, nested)
+			}
+			out[k] = kept
 		case metaURL:
 			clean, reason := auditMetaURL(v)
 			if reason != "" {

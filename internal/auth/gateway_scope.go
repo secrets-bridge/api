@@ -10,7 +10,6 @@ package auth
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/gofiber/fiber/v3"
@@ -107,65 +106,4 @@ func RequireGatewayBind(r Resolver) fiber.Handler {
 		}
 		return fiber.NewError(fiber.StatusForbidden, fmt.Sprintf("missing permission %q (global or team scope)", PermGatewayBind))
 	}
-}
-
-// ErrSelfScopeExpansion: a structure change would bring a team or a
-// project under a team where the caller holds a team-scoped gateway.bind
-// grant, widening it without any write to user_roles (skills#103 phase
-// 1, ADR 0002 C4).
-var ErrSelfScopeExpansion = errors.New("auth: self_scope_expansion_not_allowed")
-
-// CheckGatewayBindStructureChange refuses a move that widens one of the
-// caller's team-scoped gateway.bind grants: dest (the new parent of a
-// team, or the new team of a project) is in the subtree of a team the
-// caller holds gateway.bind on, and the moved object was not already
-// in that subtree. movedTeam is the team being re-parented, or nil for a
-// project move; prevTeam is the project's current team (nil when none),
-// unused for a team move. A caller with global gateway.bind widens
-// nothing. Narrowest form: only gateway.bind is checked here.
-func CheckGatewayBindStructureChange(ctx context.Context, userID string, r Resolver, tr TeamScopeResolver, movedTeam, prevTeam, dest *uuid.UUID) error {
-	if dest == nil || r == nil || tr == nil {
-		return nil
-	}
-	grants, err := r.Resolve(ctx, userID)
-	if err != nil {
-		return fmt.Errorf("auth: resolve grants: %w", err)
-	}
-	for _, g := range grants {
-		if g.Permission == string(PermGatewayBind) && len(g.Scope) == 0 {
-			return nil
-		}
-	}
-	for _, g := range grants {
-		if g.Permission != string(PermGatewayBind) {
-			continue
-		}
-		root, ok := teamGrant(g.Scope)
-		if !ok {
-			continue
-		}
-		sub, err := tr.DescendantTeamIDs(ctx, root)
-		if err != nil {
-			return fmt.Errorf("auth: team subtree: %w", err)
-		}
-		in := func(id *uuid.UUID) bool {
-			if id == nil {
-				return false
-			}
-			for _, t := range sub {
-				if t == *id {
-					return true
-				}
-			}
-			return false
-		}
-		before := prevTeam
-		if movedTeam != nil {
-			before = movedTeam
-		}
-		if in(dest) && !in(before) {
-			return ErrSelfScopeExpansion
-		}
-	}
-	return nil
 }

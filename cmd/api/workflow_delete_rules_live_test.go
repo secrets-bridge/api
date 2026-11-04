@@ -20,7 +20,7 @@ func TestLive_WorkflowDeleteWithRules_NeedsPolicyEdit(t *testing.T) {
 
 	workflow := func(name string) string {
 		t.Helper()
-		code, body := l.call(t, http.MethodPost, "/api/v1/workflows", admin, map[string]any{
+		code, body := l.callFresh(t, http.MethodPost, "/api/v1/workflows", admin, map[string]any{
 			"name": name, "min_approvers": 1, "enabled": true,
 			"wrap_ttl_created_seconds": 3600, "wrap_ttl_approved_seconds": 3600,
 			"wrap_ttl_claimed_seconds": 300, "request_ttl_seconds": 3600,
@@ -34,7 +34,7 @@ func TestLive_WorkflowDeleteWithRules_NeedsPolicyEdit(t *testing.T) {
 	}
 	rule := func(workflowID string) string {
 		t.Helper()
-		code, body := l.call(t, http.MethodPost, "/api/v1/policies", admin, map[string]any{
+		code, body := l.callFresh(t, http.MethodPost, "/api/v1/policies", admin, map[string]any{
 			"name": "uses-" + workflowID[:8], "selector": map[string]any{"environment": "uat"},
 			"workflow_id": workflowID, "priority": 400, "enabled": true,
 		})
@@ -47,7 +47,7 @@ func TestLive_WorkflowDeleteWithRules_NeedsPolicyEdit(t *testing.T) {
 	}
 	exists := func(path string) bool {
 		t.Helper()
-		code, body := l.call(t, http.MethodGet, path, admin, nil)
+		code, body := l.callFresh(t, http.MethodGet, path, admin, nil)
 		if code != http.StatusOK && code != http.StatusNotFound {
 			t.Fatalf("GET %s = %d %s", path, code, body)
 		}
@@ -59,7 +59,7 @@ func TestLive_WorkflowDeleteWithRules_NeedsPolicyEdit(t *testing.T) {
 	withRules := "/api/v1/workflows/" + ruled + "?delete_policy_rules=true"
 
 	for who, user := range map[string]string{"workflow.edit only": workflowOnly, "team-scoped policy.edit": teamPolicy} {
-		if code, body := l.call(t, http.MethodDelete, withRules, user, nil); code != http.StatusForbidden {
+		if code, body := l.callFresh(t, http.MethodDelete, withRules, user, nil); code != http.StatusForbidden {
 			t.Fatalf("%s: delete with rules = %d %s; want 403", who, code, body)
 		}
 		if !exists("/api/v1/workflows/"+ruled) || !exists("/api/v1/policies/"+ruleID) {
@@ -69,14 +69,14 @@ func TestLive_WorkflowDeleteWithRules_NeedsPolicyEdit(t *testing.T) {
 
 	// Without the option nothing changes: in use is still 409, and an
 	// unused workflow still deletes with workflow.edit alone.
-	if code, body := l.call(t, http.MethodDelete, "/api/v1/workflows/"+ruled, workflowOnly, nil); code != http.StatusConflict {
+	if code, body := l.callFresh(t, http.MethodDelete, "/api/v1/workflows/"+ruled, workflowOnly, nil); code != http.StatusConflict {
 		t.Fatalf("plain delete of a workflow in use = %d %s; want 409", code, body)
 	}
-	if code, body := l.call(t, http.MethodDelete, "/api/v1/workflows/"+workflow("wf-free"), workflowOnly, nil); code != http.StatusNoContent {
+	if code, body := l.callFresh(t, http.MethodDelete, "/api/v1/workflows/"+workflow("wf-free"), workflowOnly, nil); code != http.StatusNoContent {
 		t.Fatalf("plain delete of an unused workflow = %d %s; want 204", code, body)
 	}
 
-	if code, body := l.call(t, http.MethodDelete, withRules, admin, nil); code != http.StatusNoContent {
+	if code, body := l.callFresh(t, http.MethodDelete, withRules, admin, nil); code != http.StatusNoContent {
 		t.Fatalf("delete with rules as workflow.edit + policy.edit = %d %s; want 204", code, body)
 	}
 	if exists("/api/v1/workflows/"+ruled) || exists("/api/v1/policies/"+ruleID) {

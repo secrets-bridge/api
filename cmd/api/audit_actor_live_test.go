@@ -73,7 +73,7 @@ func TestLive_AuditActors_RealActorEverywhere(t *testing.T) {
 	}
 
 	// Provider connection create / update.
-	code, body := l.call(t, http.MethodPost, "/api/v1/provider-connections", op, map[string]any{
+	code, body := l.callFresh(t, http.MethodPost, "/api/v1/provider-connections", op, map[string]any{
 		"name": "vault-a", "type": "vault", "auth_method": "token",
 		"scope":        map[string]string{"address": "https://vault.example.com", "mount": "secret"},
 		"cluster_name": "tenant-a-uat", "discover_interval_seconds": 300,
@@ -84,14 +84,14 @@ func TestLive_AuditActors_RealActorEverywhere(t *testing.T) {
 	var conn struct{ ID uuid.UUID }
 	mustJSON(t, body, &conn)
 	expect("provider_connection.create", user)
-	if code, body := l.call(t, http.MethodPut, "/api/v1/provider-connections/"+conn.ID.String(), op,
+	if code, body := l.callFresh(t, http.MethodPut, "/api/v1/provider-connections/"+conn.ID.String(), op,
 		map[string]any{"description": "tenant a"}); code != http.StatusOK {
 		t.Fatalf("update connection = %d %s", code, body)
 	}
 	expect("provider_connection.update", user)
 
 	// Enrollment token create + revoke.
-	if code, body := l.call(t, http.MethodPost, "/api/v1/provider-connections/"+conn.ID.String()+"/agent-enrollment-token", op,
+	if code, body := l.callFresh(t, http.MethodPost, "/api/v1/provider-connections/"+conn.ID.String()+"/agent-enrollment-token", op,
 		map[string]any{}); code != http.StatusCreated && code != http.StatusOK {
 		t.Fatalf("enrollment token = %d %s", code, body)
 	}
@@ -100,7 +100,7 @@ func TestLive_AuditActors_RealActorEverywhere(t *testing.T) {
 	if err := l.pool.QueryRow(ctx, `SELECT id FROM agent_enrollment_tokens WHERE provider_connection_id = $1`, conn.ID).Scan(&tokenID); err != nil {
 		t.Fatalf("token id: %v", err)
 	}
-	if code, body := l.call(t, http.MethodPost, "/api/v1/agent-enrollment-tokens/"+tokenID.String()+"/revoke", op,
+	if code, body := l.callFresh(t, http.MethodPost, "/api/v1/agent-enrollment-tokens/"+tokenID.String()+"/revoke", op,
 		map[string]any{"reason": "rotated"}); code != http.StatusNoContent && code != http.StatusOK {
 		t.Fatalf("revoke token = %d %s", code, body)
 	}
@@ -108,7 +108,7 @@ func TestLive_AuditActors_RealActorEverywhere(t *testing.T) {
 
 	// Agent mint, then a discover job the agent claims and completes:
 	// the completion hook's audit row is the agent's, not "worker".
-	code, body = l.call(t, http.MethodPost, "/api/v1/agents", op, agentMintBody("tenant-a-uat-agent"))
+	code, body = l.callFresh(t, http.MethodPost, "/api/v1/agents", op, agentMintBody("tenant-a-uat-agent"))
 	if code != http.StatusCreated {
 		t.Fatalf("mint = %d %s", code, body)
 	}
@@ -117,7 +117,7 @@ func TestLive_AuditActors_RealActorEverywhere(t *testing.T) {
 		AgentSecret string    `json:"agent_secret"`
 	}
 	mustJSON(t, body, &minted)
-	if code, body := l.call(t, http.MethodPost, "/api/v1/provider-connections/"+conn.ID.String()+"/discover-now", op, nil); code != http.StatusAccepted {
+	if code, body := l.callFresh(t, http.MethodPost, "/api/v1/provider-connections/"+conn.ID.String()+"/discover-now", op, nil); code != http.StatusAccepted {
 		t.Fatalf("discover-now = %d %s", code, body)
 	}
 	expect("job.enqueue", user)
@@ -135,7 +135,7 @@ func TestLive_AuditActors_RealActorEverywhere(t *testing.T) {
 	expect("provider_connection.discover_finished", "agent:"+minted.ID.String())
 
 	// Agent revoke (admin surface).
-	if code, body := l.call(t, http.MethodPost, "/api/v1/admin/agents/"+minted.ID.String()+"/revoke", op,
+	if code, body := l.callFresh(t, http.MethodPost, "/api/v1/admin/agents/"+minted.ID.String()+"/revoke", op,
 		map[string]any{"reason": "decommissioned"}); code != http.StatusNoContent && code != http.StatusOK {
 		t.Fatalf("revoke agent = %d %s", code, body)
 	}
@@ -146,7 +146,7 @@ func TestLive_AuditActors_RealActorEverywhere(t *testing.T) {
 	if err := l.pool.QueryRow(ctx, `SELECT id FROM workflow_definitions WHERE is_default LIMIT 1`).Scan(&wfID); err != nil {
 		t.Fatalf("default workflow: %v", err)
 	}
-	code, body = l.call(t, http.MethodPost, "/api/v1/policies", op, map[string]any{
+	code, body = l.callFresh(t, http.MethodPost, "/api/v1/policies", op, map[string]any{
 		"name": "uat", "selector": map[string]any{"environment": "uat"}, "workflow_id": wfID, "priority": 200, "enabled": true,
 	})
 	if code != http.StatusCreated {
@@ -155,7 +155,7 @@ func TestLive_AuditActors_RealActorEverywhere(t *testing.T) {
 	var pol struct{ ID uuid.UUID }
 	mustJSON(t, body, &pol)
 	expect("policy.create", user)
-	if code, body := l.call(t, http.MethodGet, "/api/v1/policies/"+pol.ID.String()+"/history", op, nil); code != http.StatusOK {
+	if code, body := l.callFresh(t, http.MethodGet, "/api/v1/policies/"+pol.ID.String()+"/history", op, nil); code != http.StatusOK {
 		t.Fatalf("history = %d %s", code, body)
 	}
 	expect("audit.read.policy_history", user)
@@ -170,7 +170,7 @@ func TestLive_AuditActors_RealActorEverywhere(t *testing.T) {
 		t.Fatalf("seed env: %v", err)
 	}
 	outsider := l.grantUser(t, []string{"policy.author"}, `{"project_id":"`+projB.String()+`"}`)
-	if code, _ := l.call(t, http.MethodPost, "/api/v1/projects/"+projA.String()+"/policy-rules", outsider, map[string]any{
+	if code, _ := l.callFresh(t, http.MethodPost, "/api/v1/projects/"+projA.String()+"/policy-rules", outsider, map[string]any{
 		"name": "x", "selector": map[string]any{"environment_kind": "non_prod"}, "workflow_id": wfID.String(), "priority": 10, "enabled": true,
 	}); code != http.StatusForbidden {
 		t.Errorf("out-of-scope author create = %d, want 403", code)
@@ -181,7 +181,7 @@ func TestLive_AuditActors_RealActorEverywhere(t *testing.T) {
 	if _, err := l.pool.Exec(ctx, `UPDATE provider_connections SET self_service_bindable = true WHERE id = $1`, conn.ID); err != nil {
 		t.Fatalf("bindable: %v", err)
 	}
-	if code, body := l.call(t, http.MethodPost, "/api/v1/projects/"+projA.String()+"/provider-connection-bindings", op, map[string]any{
+	if code, body := l.callFresh(t, http.MethodPost, "/api/v1/projects/"+projA.String()+"/provider-connection-bindings", op, map[string]any{
 		"provider_connection_id": conn.ID.String(), "environment_id": envA.String(),
 	}); code != http.StatusCreated {
 		t.Fatalf("scoped bind = %d %s", code, body)
@@ -197,7 +197,7 @@ func TestLive_AuditActors_RealActorEverywhere(t *testing.T) {
 		t.Fatalf("read setting: %v", err)
 	}
 	_ = json.Unmarshal(raw, &current)
-	if code, body := l.call(t, http.MethodPut, "/api/v1/platform-settings/platform_reserved_priority", op,
+	if code, body := l.callFresh(t, http.MethodPut, "/api/v1/platform-settings/platform_reserved_priority", op,
 		map[string]any{"value": current.Value}); code != http.StatusOK {
 		t.Fatalf("set setting = %d %s", code, body)
 	}
@@ -211,7 +211,7 @@ func TestLive_AuditActors_RealActorEverywhere(t *testing.T) {
 	if _, err := l.pool.Exec(ctx, `INSERT INTO teams (id, name, parent_team_id) VALUES ($1, 'team-alpha-uat', $2)`, child, teamA); err != nil {
 		t.Fatalf("seed child: %v", err)
 	}
-	if code, body := l.call(t, http.MethodPut, "/api/v1/teams/"+child.String(), op,
+	if code, body := l.callFresh(t, http.MethodPut, "/api/v1/teams/"+child.String(), op,
 		map[string]any{"name": "team-alpha-uat", "parent_team_id": teamB}); code != http.StatusOK {
 		t.Fatalf("move team = %d %s", code, body)
 	}
